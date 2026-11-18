@@ -157,6 +157,41 @@
 #define CUBLAS_STATUS_INTERNAL_ERROR HIPBLAS_STATUS_INTERNAL_ERROR
 #define CUBLAS_STATUS_NOT_SUPPORTED HIPBLAS_STATUS_NOT_SUPPORTED
 
+// The runtime calls of the SSD expert VRAM tier (ggml-cuda/ssd), which builds into this backend from the same sources.
+#define cublasSetWorkspace hipblasSetWorkspace
+#define cudaDevAttrPageableMemoryAccessUsesHostPageTables hipDeviceAttributePageableMemoryAccessUsesHostPageTables
+#define cudaErrorNotReady hipErrorNotReady
+#define cudaEventCreate hipEventCreate
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaEventQuery hipEventQuery
+#define cudaFuncAttributes hipFuncAttributes
+#define cudaFuncGetAttributes(attributes, kernel) hipFuncGetAttributes(attributes, reinterpret_cast<const void *>(kernel))
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocDefault hipHostMallocDefault
+#define cudaHostRegisterDefault hipHostRegisterDefault
+#define cudaMemcpyDefault hipMemcpyDefault
+#define cudaMemoryTypeHost hipMemoryTypeHost
+#define cudaPointerAttributes hipPointerAttribute_t
+#define cudaPointerGetAttributes hipPointerGetAttributes
+#define cudaStreamCreate hipStreamCreate
+#define CUDART_CB // host functions take no calling convention
+// and of the backend's VMM pool and growable buffers (ggml-cuda.cu), which take the memory they map through the
+// allocation reserve and the OOM reclaimer
+#define CUresult hipError_t
+#define CUDA_SUCCESS hipSuccess
+#define CUDA_ERROR_OUT_OF_MEMORY hipErrorOutOfMemory
+#define CUDA_ERROR_UNKNOWN hipErrorUnknown
+#define cudaErrorUnknown hipErrorUnknown
+#define cudaDevAttrL2CacheSize hipDeviceAttributeL2CacheSize
+// and of the machine's memory probe (tools/inferssd-probe/memprobe.cu)
+#define cudaDevAttrIntegrated hipDeviceAttributeIntegrated
+#define cudaDevAttrMultiProcessorCount hipDeviceAttributeMultiprocessorCount
+#define cudaDevAttrPciBusId hipDeviceAttributePciBusId
+#define cudaDevAttrPciDeviceId hipDeviceAttributePciDeviceId
+#define cudaDevAttrPciDomainId hipDeviceAttributePciDomainId
+#define cudaDeviceAttr hipDeviceAttribute_t
+#define cudaUUID_t hipUUID
+
 #if HIP_VERSION >= 60500000
 #define CUBLAS_COMPUTE_16F HIPBLAS_COMPUTE_16F
 #define CUBLAS_COMPUTE_32F HIPBLAS_COMPUTE_32F

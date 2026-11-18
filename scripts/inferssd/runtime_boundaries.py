@@ -40,10 +40,10 @@ def source_issues(path: Path, kind: str, content: str) -> list[str]:
         ):
             issue = "model identity leaks below the model adapter"
         if relative.startswith(POLICY) and re.search(
-            r"\bkimi_cpu_sink\b|\bcuda[A-Z]\w*\s*\(", code
+            r"\bssd_cpu_sink\b|\bcuda[A-Z]\w*\s*\(", code
         ):
             issue = "placement policy reaches a private sink or device"
-        if relative.startswith(MODEL) and re.search(r"\bkimi_cpu_sink\b", code):
+        if relative.startswith(MODEL) and re.search(r"\bssd_cpu_sink\b", code):
             issue = "model adaptation reaches a private sink"
         if issue:
             errors.append(f"{relative}:{number}: {issue}")

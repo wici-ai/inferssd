@@ -28,10 +28,17 @@ int main() {
         const auto data = directory / (std::to_string(seed) + ".bin");
         const auto alias = directory / (std::to_string(seed) + ".tsv");
         std::ofstream stream(data, std::ios::binary);
-        for (size_t i = 0; i < 16384; ++i) { stream.put(char((i + seed) % 251)); }
+        for (size_t i = 0; i < 16384; ++i) {
+            // Two 640-column Q2_0 experts, ten 18-byte blocks each, with scale 0.5.
+            const size_t byte = (i - 12288) % 18;
+            stream.put(i >= 12288 && i < 12648 ? char(byte == 0 ? 0 : byte == 1 ? 0x38 : 0xe4)
+                                              : char((i + seed) % 251));
+        }
         stream.close();
         std::ofstream(alias) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"
-            << "blk.0.ffn_up_exps.weight\t3\t5000\t" << data.string() << "\t4097\n";
+            << "blk.0.ffn_up_exps.weight\t3\t5000\t" << data.string() << "\t4097\n"
+            << "blk.8.ffn_down_exps.weight\t0\t180\t" << data.string() << "\t12288\n"
+            << "blk.8.ffn_down_exps.weight\t1\t180\t" << data.string() << "\t12468\n";
         aliases.push_back(alias.string());
     }
     auto first = ssd::store::source_index::open({aliases[0]});
@@ -57,6 +64,17 @@ int main() {
     require(ssd::platform::pread_exact(fd_b, buffer, 8192, 4096), "actual direct read failed");
     const auto * payload = static_cast<unsigned char *>(buffer);
     for (size_t i = 0; i < 5000; ++i) { require(payload[i + 1] == (4097 + i + 2) % 251, "direct payload changed"); }
+    for (int expert = 0; expert < 2; ++expert) {
+        require(b.resolve(b.userdata, "blk.8.ffn_down_exps.weight", expert, 180, 2, &fd_b, &offset, &bytes),
+                "Q2_0 expert alias lookup failed");
+        require(offset == uint64_t(12288 + expert * 180) && bytes == 180, "Q2_0 expert range changed");
+    }
+    require(!b.resolve(b.userdata, "blk.8.ffn_down_exps.weight", 1, 1290, 2, &fd_b, &offset, &bytes),
+            "legacy F8 byte count accepted for Q2_0");
+    require(ssd::platform::pread_exact(fd_b, buffer, 4096, 12288), "Q2_0 direct read failed");
+    for (size_t i = 0; i < 360; ++i) {
+        require(payload[i] == (i % 18 == 0 ? 0 : i % 18 == 1 ? 0x38 : 0xe4), "Q2_0 payload changed");
+    }
     second.value.reset();
     const auto bad = directory / "bad.tsv";
     std::ofstream(bad) << "tensor\texpert_idx\tnbytes\tsource_path\toffset\n"

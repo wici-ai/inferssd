@@ -49,7 +49,7 @@ struct llama_hparams {
     uint32_t n_ctx_train; // context size the model was trained on
     uint32_t n_embd;
     uint32_t n_embd_inp_enc_impl = 0;
-    uint32_t n_layer;
+    uint32_t n_layer; // the blocks of the model; the file's block_count is n_block()
     int32_t n_layer_kv_from_start = -1; // if non-negative, the first n_layer_kv_from_start layers have KV cache
     uint32_t n_expert = 0;
     uint32_t n_expert_used = 0;
@@ -97,7 +97,7 @@ struct llama_hparams {
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
-    uint32_t nextn_predict_layers = 0;
+    uint32_t nextn_predict_layers = 0; // NextN blocks after the model's in the file; this engine never loads them
 
     float f_norm_eps;
     float f_norm_rms_eps;
@@ -359,6 +359,9 @@ struct llama_hparams {
 
     // dimension of the recurrent state embeddings
     uint32_t n_embd_s() const;
+
+    // the blocks of the file, which per-block metadata covers: the model's and its NextN blocks
+    uint32_t n_block() const;
 
     // whether or not the given layer is recurrent (for hybrid models)
     bool is_recurrent(uint32_t il) const;

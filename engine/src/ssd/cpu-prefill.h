@@ -4,11 +4,11 @@
 
 // Companion to the decode runtime. It borrows the same sink, so prefill adds
 // neither a second read ring nor threads of its own.
-struct llama_kimi_cpu_prefill_runtime {
-    kimi_cpu_prefill * context = nullptr;
-    decltype(&kimi_cpu_prefill_run) run = nullptr;
-    decltype(&kimi_cpu_prefill_run_activation) run_activation = nullptr;
-    decltype(&kimi_cpu_prefill_destroy) destroy = nullptr;
+struct llama_ssd_cpu_prefill_runtime {
+    ssd_cpu_prefill * context = nullptr;
+    decltype(&ssd_cpu_prefill_run) run = nullptr;
+    decltype(&ssd_cpu_prefill_run_activation) run_activation = nullptr;
+    decltype(&ssd_cpu_prefill_destroy) destroy = nullptr;
 
     void reset() {
         if (context) {
@@ -17,7 +17,7 @@ struct llama_kimi_cpu_prefill_runtime {
         }
     }
 
-    void initialize(ggml_backend_reg_t registry, kimi_cpu_sink * sink) {
+    void initialize(ggml_backend_reg_t registry, ssd_cpu_sink * sink) {
         if (context) {
             return;
         }

@@ -1,19 +1,30 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
-#include "ggml-ssd/gpu/kernels.h"
-#include "ggml-ssd/gpu/kimi-vram-tier-api.h"
+#include "export.h"
+#include "ggml-ssd/gpu/vram-tier-api.h"
+#include "gpu-runtime.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
-// Engine of the explicit-format tier path: both GPU matvec stages with the host
-// activation and hidden quantization between them; returns unweighted down rows.
+// Decode engine of the tier (generic-compute-adapter.cu): an f32 input row, up and gate, the activation and down over
+// up to max_hits experts of one format (up, gate and down types; gate's may differ from up's) on the CUDA backend's
+// matrix-vector kernels; returns unweighted down rows.
+// compute runs a call and waits for it (grouped prefill's one-token passes, on the tier's worker). launch queues one
+// on the engine's stream and returns (a decode layer's, on the sink's thread): its experts take the engine's rows
+// [first, first + hits), which no other call in flight shares; the stream waits for `ready` first (null: no wait),
+// records `start` and `end` around the call, and its down rows are in host_rows() once `end` has completed.
 struct vram_format_compute_api {
-    uint32_t version, size; // 2: explicit immutable CPU kernels in create
-    void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, const ssd::gpu::cpu_kernels_v1 *, char *, size_t);
+    uint32_t version, size; // 5
+    void * (*create)(int device, int latent, int hidden, int max_hits, int up_type, int gate_type, int down_type, char *,
+                     size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
-                   const kimi_vram_activation * activation, float * host_down, char * error, size_t error_size);
+                   const ssd_vram_activation * activation, float * host_down, char * error, size_t error_size);
     size_t (*device_scratch_bytes)(void *);
     size_t (*host_scratch_bytes)(void *);
+    int (*launch)(void *, const vram_compute_expert *, int hits, int first, const void * input, size_t input_bytes,
+                  const ssd_vram_activation * activation, cudaEvent_t ready, cudaEvent_t start, cudaEvent_t end,
+                  char * error, size_t error_size);
+    const float * (*host_rows)(void *); // [max_hits][latent]
 };
 typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // Engine of grouped prefill for any expert format the CUDA backend multiplies (group-compute-adapter.cu). Per layer, the
@@ -25,9 +36,8 @@ typedef const vram_format_compute_api * (*vram_format_compute_get_api_fn)();
 // loads every kernel a pass runs, so no device memory is taken between it and release, which gives the buffers back
 // (before decode grows the tier). The kernels stay loaded for the process: the first reserve of a type and shape takes
 // their device memory for good, and meanwhile a scratch of one matrix and its operands, which it frees.
-struct CUevent_st;
 struct vram_group_activation {
-    struct kimi_vram_activation base;
+    struct ssd_vram_activation base;
     const float * post_norm;    // latent weights of the per-expert post norm, or null; copied by begin_layer
     float post_norm_eps;
 };
@@ -53,8 +63,11 @@ struct vram_group_layer_stats {
                                 // whatever the stream waited for between them: the copies they were ready after)
 };
 struct vram_group_compute_api {
-    uint32_t version, size;   // 2
-    void * (*create)(int device, int latent, int hidden, int weight_type, int down_type, char * error, size_t error_size);
+    uint32_t version, size;   // 4
+    // An engine for `formats` expert formats of one geometry: format f has up of up_types[f], gate of gate_types[f]
+    // and down of down_types[f]. A reserve covers every one of them; each layer names its format at begin_layer.
+    void * (*create)(int device, int latent, int hidden, int formats, const int32_t * up_types,
+                     const int32_t * gate_types, const int32_t * down_types, char * error, size_t error_size);
     void (*destroy)(void *);
     // Buffers for passes of up to `rows` input rows and `routes` routes a layer (device and page-locked host memory,
     // the products' own reservations). Grows only; release frees all of it. A pass reserves once, before its first
@@ -65,15 +78,15 @@ struct vram_group_compute_api {
     // Page-locked rows [reserved rows][latent] that the caller fills with the layer's input rows before begin_layer.
     // Valid until a reserve that grows, or release.
     float * (*input_rows)(void *);
-    // A layer of `rows` input rows and `groups` experts: group g's routes are routes[first[g] .. first[g + 1]). Queues
-    // the uploads and the zeroing; copies every argument before it returns.
-    int (*begin_layer)(void *, int rows, const struct vram_group_route * routes, const int32_t * first, int groups,
-                       const struct vram_group_activation * activation, char * error, size_t error_size);
+    // A layer of format `format` (an index of create's), `rows` input rows and `groups` experts: group g's routes are
+    // routes[first[g] .. first[g + 1]). Queues the uploads and the zeroing; copies every argument before it returns.
+    int (*begin_layer)(void *, int format, int rows, const struct vram_group_route * routes, const int32_t * first,
+                       int groups, const struct vram_group_activation * activation, char * error, size_t error_size);
     // Queues group g's chain with these weights. The chain waits for `ready` (a weights upload, or null) on the device;
     // *done (optional) receives an event that completes when the chain no longer reads the weights, valid until the
     // next begin_layer.
-    int (*compute)(void *, int group, const struct vram_compute_expert * weights, struct CUevent_st * ready,
-                   struct CUevent_st ** done, char * error, size_t error_size);
+    int (*compute)(void *, int group, const struct vram_compute_expert * weights, cudaEvent_t ready,
+                   cudaEvent_t * done, char * error, size_t error_size);
     // Waits for the layer and returns its accumulated rows [rows][latent] (page-locked, valid until the next
     // begin_layer) and the layer's stats; group_us (optional, one per group) each chain's time. Every group of the
     // layer must have been computed.
@@ -86,17 +99,6 @@ struct vram_group_compute_api {
 typedef const vram_group_compute_api * (*vram_group_compute_get_api_fn)();
 
 extern "C" {
-const vram_format_compute_api * kimi_vram_format_compute_get_api();
-const vram_format_compute_api * kimi_vram_generic_format_compute_get_api();
-const vram_group_compute_api * kimi_vram_group_compute_get_api();
-void * ggml_ssd_mxfp4_create_for_testing(int, int, int, int, int, int, bool, bool,
-    const ssd::gpu::cpu_kernels_v1 *, char *, size_t) noexcept;
-int ggml_backend_cuda_ssd_mxfp4_set_profile(void *, bool, char *, size_t) noexcept;
+const vram_format_compute_api * ssd_vram_generic_format_compute_get_api();
+SSD_CUDA_EXPORT const vram_group_compute_api * ssd_vram_group_compute_get_api();
 }
-
-struct kimi_mxfp4_gpu_api_v1;
-struct kimi_mxfp4_gpu_chain_api_v1;
-extern "C" void * ggml_ssd_mxfp4_create_with_components_for_testing(
-    int, int, int, int, int, int, bool, bool, const ssd::gpu::cpu_kernels_v1 *,
-    const kimi_mxfp4_gpu_api_v1 *, const kimi_mxfp4_gpu_chain_api_v1 *, char *, size_t) noexcept;
-extern "C" void kimi_vram_mxfp4_selfcheck_reference_for_testing(ssd::gpu::vec_dot_t);

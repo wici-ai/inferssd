@@ -8,16 +8,19 @@ import hashlib
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
+from inferssd.machine.backend import machine_backend
 from inferssd.machine.identity import (
     Command,
     Drive,
     GPUQueryFailed,
     NativeHost,
     UnsupportedPlatform,
+    build_backend,
     cpu_brand,
     drive_info,
     drive_key,
@@ -44,6 +47,7 @@ AGX_LISTING = """\
       "vendor-id" = <6b100000>
     }
 """
+LINUX_MACHINE = "a fake Linux machine: sysfs and procfs trees, POSIX paths"
 
 
 class FakeHost(NativeHost):
@@ -137,6 +141,8 @@ def ok(stdout):
 
 def linux_tree(root, *, capacities=(1024,) * 4, max_khz=None, smt=False, gpu=True):
     """A Linux machine: identity files, CPUs, one NVMe drive and the uname/nvidia-smi replies."""
+    if sys.platform == "win32":
+        pytest.skip(LINUX_MACHINE)
     count = len(capacities)
     write(root, "/etc/machine-id", "0123456789abcdef0123456789abcdef\n")
     write(root, "/etc/os-release", 'NAME="Ubuntu"\nPRETTY_NAME="Ubuntu 24.04.1 LTS"\n')
@@ -214,7 +220,7 @@ def test_linux_identity(tmp_path):
             "gpu_driver": "580.65.06",
             "probe_versions": {
                 "ssd": "inferssd-ssdprobe/1",
-                "cpu": "inferssd-cpuprobe/1",
+                "cpu": "inferssd-cpuprobe/2",
                 "memory": "inferssd-memprobe/1",
             },
         },
@@ -252,6 +258,113 @@ def test_failing_nvidia_smi_is_not_an_absent_gpu(tmp_path):
     # A driver without devices is a machine without GPUs, not a failure.
     commands[SMI] = Command(6, "No devices were found\n")
     assert live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"] == []
+
+
+def pci(root, address, kind, vendor, device, vram=None):
+    base = f"/sys/bus/pci/devices/{address}/"
+    write(root, base + "class", kind + "\n")
+    write(root, base + "vendor", vendor + "\n")
+    write(root, base + "device", device + "\n")
+    if vram is not None:
+        write(root, base + "mem_info_vram_total", f"{vram}\n")
+
+
+def test_linux_lists_the_gpus_a_vulkan_build_can_use(tmp_path):
+    commands = linux_tree(tmp_path)
+    pci(tmp_path, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")  # an Intel iGPU
+    pci(tmp_path, "0000:03:00.0", "0x030000", "0x1002", "0x744c", vram=24 << 30)  # an AMD card
+    pci(tmp_path, "0000:01:00.0", "0x030000", "0x10de", "0x2b85")  # nvidia-smi lists it
+    pci(tmp_path, "0000:05:00.0", "0x030000", "0x1a03", "0x2000")  # a server's BMC display
+    pci(tmp_path, "0000:00:1f.3", "0x040300", "0x8086", "0x51c8")  # Intel audio, not a display
+    gpus = live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"]
+    assert [(gpu["backend"], gpu["uuid"], gpu["name"], gpu["vram_bytes"]) for gpu in gpus] == [
+        ("CUDA", "GPU-1111", "NVIDIA GeForce RTX 5090", 32607 * 1048576),
+        ("Vulkan", "pci-0000:00:02.0", "PCI 8086:7d55", 0),
+        ("Vulkan", "pci-0000:03:00.0", "PCI 1002:744c", 24 << 30),
+    ]
+
+
+def kfd(root, node, simd, *, location=0, unique=None, gpu_id=None):
+    """An amdkfd topology node: a CPU (no SIMDs) or an AMD GPU at a PCI location."""
+    base = f"/sys/class/kfd/kfd/topology/nodes/{node}/"
+    values = {
+        "simd_count": simd,
+        "vendor_id": 4098 if simd else 0,
+        "location_id": location,
+        "domain": 0,
+    }
+    if unique is not None:
+        values["unique_id"] = unique
+    write(root, base + "properties", "".join(f"{key} {value}\n" for key, value in values.items()))
+    if gpu_id is not None:
+        write(root, base + "gpu_id", f"{gpu_id}\n")
+
+
+ROCMINFO = ("rocminfo",)
+
+
+def amd_card(root):
+    """An AMD card at 0000:03:00.0 that amdkfd lists after the CPU node, and an Intel iGPU."""
+    pci(root, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")
+    pci(root, "0000:03:00.0", "0x030000", "0x1002", "0x7551", vram=34208743424)
+    kfd(root, 0, 0)
+    # location_id is the bus, device and function: 3 << 8 for 03:00.0
+    kfd(root, 1, 128, location=3 << 8, unique=13321632177709804703, gpu_id=64106)
+
+
+def test_linux_runs_the_amd_gpus_amdkfd_lists_on_rocm(tmp_path):
+    commands = linux_tree(tmp_path, gpu=False)
+    amd_card(tmp_path)
+    # Without the ROCm runtime the AMD GPU runs on Vulkan, as every display controller there.
+    identity = live_identity(FakeHost(tmp_path, commands=commands))
+    assert [(gpu["backend"], gpu["uuid"]) for gpu in identity["hard"]["gpus"]] == [
+        ("Vulkan", "pci-0000:00:02.0"),
+        ("Vulkan", "pci-0000:03:00.0"),
+    ]
+    assert "memory" not in identity["soft"]["probe_versions"]
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "Vulkan"
+    # With it, ROCm runs the GPU, named by ROCm's UUID (rocminfo, HIP), not again as a Vulkan one.
+    commands[ROCMINFO] = ok("")
+    identity = live_identity(FakeHost(tmp_path, commands=commands))
+    assert [
+        (gpu["backend"], gpu["uuid"], gpu["name"], gpu["vram_bytes"])
+        for gpu in identity["hard"]["gpus"]
+    ] == [
+        ("ROCm", "GPU-b8dff1e274ce6c9f", "PCI 1002:7551", 34208743424),
+        ("Vulkan", "pci-0000:00:02.0", "PCI 8086:7d55", 0),
+    ]
+    assert "memory" in identity["soft"]["probe_versions"]
+    assert identity["soft"]["gpu_driver"] is None  # the kernel's amdgpu: soft.kernel names it
+    write(tmp_path, "/sys/module/amdgpu/version", "6.16.13\n")
+    assert (
+        live_identity(FakeHost(tmp_path, commands=commands))["soft"]["gpu_driver"]
+        == "amdgpu 6.16.13"
+    )
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "ROCm"
+    # A unique ID below 2**60 keeps its 16 digits, as HIP's 16-byte UUID does.
+    kfd(tmp_path, 1, 128, location=3 << 8, unique=0x0123456789ABCDEF, gpu_id=64106)
+    gpus = live_identity(FakeHost(tmp_path, commands=commands))["hard"]["gpus"]
+    assert gpus[0]["uuid"] == "GPU-0123456789abcdef"
+
+
+def test_the_engine_builds_for_the_machines_gpus(tmp_path):
+    assert build_backend([]) is None
+    vulkan = {"backend": "Vulkan", "uuid": "pci-0", "name": "PCI 8086:7d55", "vram_bytes": 0}
+    cuda = {"backend": "CUDA", "uuid": "GPU-1", "name": "NVIDIA", "vram_bytes": 1}
+    metal = {"backend": "Metal", "uuid": "M5:10", "name": "Apple M5", "vram_bytes": 0}
+    rocm = {"backend": "ROCm", "uuid": "GPU-b8df", "name": "PCI 1002:7551", "vram_bytes": 1}
+    assert build_backend([vulkan]) == "Vulkan"
+    assert build_backend([vulkan, cuda]) == "CUDA" and build_backend([metal]) == "Metal"
+    assert build_backend([vulkan, rocm]) == "ROCm" and build_backend([rocm, cuda]) == "CUDA"
+    commands = linux_tree(tmp_path)
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CUDA"
+    del commands[SMI]
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CPU"
+    pci(tmp_path, "0000:00:02.0", "0x030000", "0x8086", "0x7d55")
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "Vulkan"
+    # A driver that cannot list its GPUs still has them.
+    commands[SMI] = Command(18, "Failed to initialize NVML: Driver/library version mismatch\n")
+    assert machine_backend(FakeHost(tmp_path, commands=commands)) == "CUDA"
 
 
 def test_arm_cpu_brand_lists_implementer_and_parts():
@@ -319,7 +432,7 @@ def test_darwin_identity(tmp_path):
             "os_release": "macOS 26.4 (25E246)",
             "kernel": "25.4.0",
             "gpu_driver": None,
-            "probe_versions": {"ssd": "inferssd-ssdprobe/1", "cpu": "inferssd-cpuprobe/1"},
+            "probe_versions": {"ssd": "inferssd-ssdprobe/1", "cpu": "inferssd-cpuprobe/2"},
         },
     }
 
@@ -350,9 +463,9 @@ def test_gpu_core_count_tells_apple_variants_apart(tmp_path):
     assert same_hardware(saved, live) == ["gpus"]
 
 
-def test_windows_is_not_supported_yet(tmp_path):
-    with pytest.raises(UnsupportedPlatform, match="not supported on windows yet"):
-        live_identity(FakeHost(tmp_path, "windows"))
+def test_other_platforms_are_not_supported(tmp_path):
+    with pytest.raises(UnsupportedPlatform, match="not supported on freebsd yet"):
+        live_identity(FakeHost(tmp_path, "freebsd"))
 
 
 def test_drive_key_nvme_partition(tmp_path):
@@ -392,6 +505,7 @@ def test_drive_key_md_array_names_every_member(tmp_path):
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason=LINUX_MACHINE)
 def test_disks_without_serial_keep_their_kernel_names(tmp_path):
     for index, name in enumerate(("vda", "vdb")):
         device = f"/sys/devices/pci0000:00/0000:00:0{index + 5}.0/virtio{index + 2}"
@@ -509,7 +623,7 @@ def test_darwin_drive_reports_unreadable_diskutil_output(tmp_path):
 
 
 def ended_process():
-    child = subprocess.Popen(["true"])
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
 
@@ -536,3 +650,14 @@ def test_only_test_files_of_ended_runs_are_cleared(tmp_path):
         (tmp_path / name).write_bytes(b"x")
     NativeHost().clear_test_files(str(tmp_path))
     assert sorted(os.listdir(tmp_path)) == sorted(names[2:])
+
+
+def test_memory_probe_wherever_cuda_runs():
+    from inferssd.machine.identity import probe_versions
+
+    cuda = [{"backend": "CUDA", "uuid": "GPU-1", "name": "GPU", "vram_bytes": 1}]
+    vulkan = [{"backend": "Vulkan", "uuid": "PCI-1", "name": "iGPU", "vram_bytes": 0}]
+    assert "memory" in probe_versions("linux", cuda)
+    assert "memory" in probe_versions("windows", cuda)
+    assert "memory" not in probe_versions("windows", vulkan)
+    assert "memory" not in probe_versions("linux", [])

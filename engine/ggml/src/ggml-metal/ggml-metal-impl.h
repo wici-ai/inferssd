@@ -316,6 +316,7 @@ typedef struct {
     uint64_t nb3;
     int32_t  n_past;
     int32_t  n_dims;
+    int32_t  n_offs;
     int32_t  n_ctx_orig;
     float    freq_base;
     float    freq_scale;
@@ -328,6 +329,7 @@ typedef struct {
     int32_t  sect_2;
     int32_t  sect_3;
     bool     src2;
+    bool     inplace;
 } ggml_metal_kargs_rope;
 
 typedef struct {
@@ -1163,6 +1165,53 @@ typedef struct {
      int64_t ne00;
     uint64_t nb01;
 } ggml_metal_kargs_argmax;
+
+typedef struct {
+     int32_t n_tokens;
+     int32_t n_iter;
+       float eps;
+    uint64_t nbm0;
+    uint64_t nbm1;
+    uint64_t nbs0;
+    uint64_t nbb0;
+    uint64_t nbd0;
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_dsv4_hc_comb;
+
+typedef struct {
+     int32_t n_embd;
+     int32_t hc;
+     int32_t gated;
+       float scale;
+    uint64_t nbx0;
+    uint64_t nbx1;
+    uint64_t nbx2;
+    uint64_t nbw0;
+    uint64_t nbw1;
+    uint64_t nbw2;
+    uint64_t nbd0;
+    uint64_t nbd1;
+} ggml_metal_kargs_dsv4_hc_pre;
+
+typedef struct {
+     int32_t n_embd;
+     int32_t hc;
+     int32_t has_comb;
+    uint64_t nbx0;
+    uint64_t nbx1;
+    uint64_t nbr0;
+    uint64_t nbr1;
+    uint64_t nbr2;
+    uint64_t nbp0;
+    uint64_t nbp1;
+    uint64_t nbc0;
+    uint64_t nbc1;
+    uint64_t nbc2;
+    uint64_t nbd0;
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_dsv4_hc_post;
 
 typedef struct {
     int64_t  np;

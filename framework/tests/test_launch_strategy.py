@@ -16,11 +16,11 @@ from pathlib import Path
 import pytest
 from test_engine_runtime import Effects, Owner, policy
 from test_launch_platforms import golden
-from test_machine_identity import linux_tree, nvme_key, write
+from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
 from test_machine_profile import Clock, linux_machine
 from test_strategy_inputs import SMI_APPS, SMI_GPUS, RuntimeHost, deepseek_like, write_gguf
-from test_typed_launch import setup
+from test_typed_launch import session, setup
 
 from inferssd.configuration.settings import parse
 from inferssd.contracts import ContractError
@@ -90,17 +90,18 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
     assert result.code == 0 and stderr == ""
     assert STRATEGY_FACTS <= {fact.name for fact in result.observations}
     argv = list(result.argv)
-    # 61 uniform CPUs: 60 unpinned threads, one left for the I/O thread.
-    assert argv[argv.index("-t") : argv.index("-t") + 4] == ["-t", "60", "-tb", "60"]
+    # 61 uniform CPUs, one token measured on 1 and 61 threads: decode on 61, prefill on 60
+    # unpinned threads, one left for the I/O thread.
+    assert argv[argv.index("-t") : argv.index("-t") + 4] == ["-t", "61", "-tb", "60"]
     assert "-C" not in argv and argv[-2:] == ["--ctx-checkpoints", "1"]
-    # With the CUDA GPU a prompt is prefilled in one pass as large as the context.
+    # A prompt is prefilled in one pass as large as the context.
     assert argv[argv.index("-c") : argv.index("-c") + 6] == [
         "-c",
-        "8192",
+        "0",
         "-b",
-        "8192",
+        "1048576",
         "-ub",
-        "8192",
+        "1048576",
     ]
     settings = native(out, spec)
     for key in ("cpu.io_cpus", "cpu.decode_participants", "place.costs"):
@@ -118,7 +119,7 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
     assert settings.at("prefetch.depth").origin == "cli"
     receipt = json.loads((out / "strategy.json").read_text())
     assert line["strategy"] == receipt
-    assert line["launch"]["decode_threads"] == line["launch"]["batch_threads"] == 60
+    assert (line["launch"]["decode_threads"], line["launch"]["batch_threads"]) == (61, 60)
     assert receipt["inputs"]["model_drive"] == X86_DRIVE
     assert receipt["inputs"]["model_paths"] == [spec.model]
     assert sorted(receipt["chosen"]["settings"]) == [
@@ -126,18 +127,16 @@ def test_recorded_strategy_fills_what_the_user_left_unset(tmp_path):
         "cpu.io_cpus",
         "place.costs",
     ]
-    # The toy model's experts are so small that the CPU prefills any pass no slower.
-    assert settings.at("prefill.cpu_max_tokens").origin == "default"
-    assert any(
-        note.startswith("prefill: the CPU route for every pass") for note in receipt["notes"]
-    )
-    assert receipt["chosen"]["threads"] == {"decode": 60, "batch": 60}
+    # Every pass takes the engine's SSD sink.
+    assert any(note.startswith("prefill: the SSD sink for every pass") for note in receipt["notes"])
+    assert receipt["chosen"]["threads"] == {"decode": 61, "batch": 60}
     assert receipt["chosen"]["server_args"] == ["--ctx-checkpoints", "1"]
-    assert receipt["chosen"]["one_pass"] is True
+    assert any(note.startswith("prefill: one pass a prompt") for note in receipt["notes"])
+    # The context is the engine's: the largest that fits memory (0); one pass, as large as it.
     assert (line["launch"]["context"], line["launch"]["batch"], line["launch"]["ubatch"]) == (
-        8192,
-        8192,
-        8192,
+        0,
+        1048576,
+        1048576,
     )
     assert (receipt["kept"], receipt["dropped"]) == ([], [])
     assert any(note.startswith("threads: all placement") for note in receipt["notes"])
@@ -203,7 +202,7 @@ def test_without_a_usable_gpu_the_budget_is_zero_and_no_gpu_is_checked(tmp_path)
 def test_user_launch_checks_still_apply_to_the_merged_result(tmp_path):
     inputs, spec, host, adapter, out = strategic(tmp_path)
     host["gpu_available"] = False
-    with pytest.raises(ValueError, match="requires nvidia-smi"):
+    with pytest.raises(ValueError, match="requires the GPUs' driver"):
         resolved(inputs, spec, adapter, out)
 
 
@@ -260,6 +259,8 @@ def render_golden(case, strategy):
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
+        if name in ("engine_gpu_backends", "machine_characteristics"):
+            return Reply(case["host"].get(name))
         return Reply(case["host"][name])
 
     pools = case["threads"]
@@ -288,7 +289,7 @@ def render_golden(case, strategy):
 
 
 @pytest.mark.parametrize("name", ["windows-qwen4exp", "windows-dsv"])
-def test_windows_skips_the_strategy_with_a_note(name):
+def test_windows_without_characteristics_skips_the_strategy_with_a_note(name):
     expected = golden(name)
     result, written, outputs = render_golden(expected["case"], strategy=True)
     # Nothing new is asked, and the command is the golden one.
@@ -297,7 +298,7 @@ def test_windows_skips_the_strategy_with_a_note(name):
         expected["settings"]
     )
     (receipt,) = [text for path, text in written.items() if path.endswith("strategy.json")]
-    reason = "machine profiling is not supported on windows yet"
+    reason = "no machine characteristics"
     assert json.loads(receipt) == {"skipped": reason}
     assert [o.text for o in outputs if o.channel == "stderr"] == [
         f"inferssd launch: no launch strategy: {reason}\n"
@@ -316,6 +317,17 @@ def test_goldens_without_a_strategy_ask_nothing_new(name):
 
 def recorded(host):
     return RecordedArtifacts(LaunchInput("", ()), host, run=None, replace=None, python="")
+
+
+def test_recorded_engine_gpu_backends():
+    fact = Fact("engine_gpu_backends", ("server",))
+    # Recordings made before the fact existed: the engine's backends are unknown.
+    assert recorded({})(fact).value is None
+    assert recorded({"engine_gpu_backends": ["Metal"]})(fact).value == ["Metal"]
+    assert recorded({"engine_gpu_backends": ["ROCm"]})(fact).value == ["ROCm"]
+    for value in (["OpenCL"], "CUDA", ["CUDA", "CUDA"]):
+        with pytest.raises(ValueError, match="engine_gpu_backends"):
+            recorded({"engine_gpu_backends": value})(fact)
 
 
 def test_recorded_machine_characteristics(tmp_path):
@@ -346,7 +358,9 @@ def test_recorded_model_runtime_and_drive_facts(tmp_path):
     with pytest.raises(ValueError, match="model_facts.roles is required"):
         recorded({"model_facts": partial_header})(Fact("model_facts", (model,)))
     runtime_value = recorded({"runtime_facts": runtime_record()})(Fact("runtime_facts")).value
-    assert runtime_value == dict(runtime_record(), memory_budget_bytes=None)
+    # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
+    gpus = [dict(row, backend="CUDA") for row in runtime_record()["gpus"]]
+    assert runtime_value == dict(runtime_record(), gpus=gpus, memory_budget_bytes=None)
     with pytest.raises(ValueError, match="Missing recorded host fact: runtime_facts"):
         recorded({})(Fact("runtime_facts"))
     with pytest.raises(ValueError, match="must not repeat a CPU"):
@@ -387,7 +401,9 @@ def test_live_strategy_facts(tmp_path):
     assert adapter(Fact("machine_characteristics")).value == "CHARACTERISTICS"
     assert adapter(Fact("runtime_facts")).value == {
         "cpus": [0, 1],
-        "gpus": [{"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0}],
+        "gpus": [
+            {"uuid": "GPU-aaaa", "free_bytes": 30000 << 20, "processes": 0, "backend": "CUDA"}
+        ],
         "available_bytes": 1000 * 1024,
         "memory_budget_bytes": None,
     }
@@ -493,9 +509,9 @@ def test_an_explicit_machine_file_is_used_as_it_is(tmp_path):
 
 
 def test_unprofiled_platforms_launch_without_characteristics(tmp_path):
-    host, files = linux_machine(tmp_path)
+    machine = (FakeHost(tmp_path, "linux"), [str(tmp_path / "model.gguf")])
     for platform in ("windows", "darwin"):
-        text, lines, _ = profile_launch(tmp_path, machine=(host, files), platform=platform)
+        text, lines, _ = profile_launch(tmp_path, machine=machine, platform=platform)
         assert text is None and "not supported" in lines[0]
 
 
@@ -540,7 +556,7 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
 
     monkeypatch.setattr(runtime, "machine_characteristics", measured)
     monkeypatch.setattr(runtime, "LiveArtifacts", live)
-    monkeypatch.setattr(runtime, "NativeEffects", lambda: effects)
+    monkeypatch.setattr(runtime, "NativeEffects", lambda _address: effects)
     monkeypatch.setattr(runtime, "OwnedProcess", lambda *a, **k: owner)
     monkeypatch.setattr(effects, "reservation", object(), raising=False)
     source = MachineSource(reprofile=True)
@@ -582,7 +598,7 @@ def launch_arguments(tmp_path, *extra):
 def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
     words, facts, out = launch_arguments(tmp_path)
     receipt = tmp_path / "resolution.json"
-    monkeypatch.setattr("os.environ", {"PATH": "/bin"})
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
     command = words + ["--dry-run", "--host-facts", str(facts), "--machine", str(X86_FILE)]
     assert main(command + ["--result", str(receipt)]) == 0
     result = json.loads(receipt.read_text())
@@ -593,7 +609,7 @@ def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
 def test_dry_run_without_characteristics_keeps_todays_resolution(tmp_path, monkeypatch):
     words, facts, out = launch_arguments(tmp_path)
     receipt = tmp_path / "resolution.json"
-    monkeypatch.setattr("os.environ", {"PATH": "/bin"})
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
     assert main(words + ["--dry-run", "--host-facts", str(facts), "--result", str(receipt)]) == 0
     result = json.loads(receipt.read_text())
     assert not STRATEGY_FACTS & {fact["name"] for fact in result["observations"]}

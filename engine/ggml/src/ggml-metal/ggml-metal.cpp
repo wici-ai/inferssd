@@ -1,4 +1,5 @@
 #include "ggml-metal.h"
+#include "gpu/graph-lane.h"
 
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -301,6 +302,62 @@ static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_shared(int devi
                     /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_shared_alloc_buffer,
                     /* .get_alignment    = */ ggml_backend_metal_buffer_type_shared_get_alignment,
                     /* .get_max_size     = */ ggml_backend_metal_buffer_type_shared_get_max_size,
+                    /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
+                    /* .is_host          = */ ggml_backend_metal_buffer_type_shared_is_host,
+                },
+                /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_metal_reg(), i),
+                /* .context = */ raw_ctx,
+            };
+
+            bufts.emplace_back(buft);
+        }
+
+        initialized = true;
+    }
+
+    return &bufts[device];
+}
+
+// growable (shared) buffer type: buffers that hold memory for a prefix of their addresses
+// (ggml_metal_buffer_init_growable), for a cache that grows in place. It has the shared buffer type's name, so that
+// the device takes its buffers as its own.
+
+static ggml_backend_buffer_t ggml_backend_metal_buffer_type_growable_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)buft->device->context;
+    ggml_metal_buffer_t res = ggml_metal_buffer_init_growable(ctx_dev, size);
+    if (res == nullptr) {
+        return nullptr;
+    }
+
+    return ggml_backend_buffer_init(buft, ggml_backend_metal_buffer_shared_i, res, size);
+}
+
+static ggml_backend_buffer_type_t ggml_backend_metal_buffer_type_growable(int device) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    static std::vector<ggml_backend_buffer_type> bufts;
+    static std::vector<ggml_backend_metal_buffer_type_ptr> ctxs;
+
+    static bool initialized = false;
+    if (!initialized) {
+        bufts.reserve(g_devices);
+        ctxs.reserve(g_devices);
+
+        for (int i = 0; i < g_devices; ++i) {
+            ggml_backend_metal_buffer_type * raw_ctx =
+                new ggml_backend_metal_buffer_type {
+                    /* .device = */ i,
+                    /* .name   = */ GGML_METAL_NAME + std::to_string(i),
+                };
+            ctxs.emplace_back(raw_ctx);
+
+            ggml_backend_buffer_type buft = {
+                /* .iface = */ {
+                    /* .get_name         = */ ggml_backend_metal_buffer_type_shared_get_name,
+                    /* .alloc_buffer     = */ ggml_backend_metal_buffer_type_growable_alloc_buffer,
+                    /* .get_alignment    = */ ggml_backend_metal_buffer_type_shared_get_alignment,
+                    /* .get_max_size     = */ NULL, // a tensor larger than a Metal buffer is never bound whole
                     /* .get_alloc_size   = */ ggml_backend_metal_buffer_type_shared_get_alloc_size,
                     /* .is_host          = */ ggml_backend_metal_buffer_type_shared_is_host,
                 },
@@ -725,6 +782,22 @@ static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped(ggml_backen
     return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device), ggml_backend_metal_buffer_shared_i, res, size);
 }
 
+// Host memory the SSD engine shows the device for a while (a RAM cache slot until its pages are discarded, the
+// read ring): mapped as buffer_from_host_ptr maps it, without a residency set. A set keeps its buffers wired and
+// adds one more to the device's heartbeat: with one per slot, a Mac kept about 13 GiB of slots wired through
+// decode, and its RAM cache shrank about 10 more times a prefill.
+static ggml_backend_buffer_t ggml_backend_metal_device_buffer_mapped_transient(ggml_backend_dev_t dev, void * ptr,
+        size_t size, size_t max_tensor_size) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    ggml_metal_buffer_t res = ggml_metal_buffer_map_ext(ctx_dev, ptr, size, max_tensor_size, false);
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+    return ggml_backend_buffer_init(ggml_backend_metal_buffer_type_mapped(props_dev->device),
+        ggml_backend_metal_buffer_shared_i, res, size);
+}
+
 static bool ggml_backend_metal_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
 
@@ -866,9 +939,60 @@ static ggml_backend_feature * ggml_backend_metal_get_features(ggml_backend_reg_t
     GGML_UNUSED(reg);
 }
 
+// Whether the device's memory is the host's DRAM (Apple silicon), for the SSD host ledger's pricing.
+static bool ggml_backend_metal_device_shares_host_memory(ggml_backend_dev_t dev) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    return ggml_metal_device_get_props(ctx_dev)->has_unified_memory;
+}
+
+// ggml_backend_dev_buffer_type_growable: the device's growable buffer type, null without shared buffers
+static ggml_backend_buffer_type_t ggml_backend_metal_device_buffer_type_growable(ggml_backend_dev_t dev) {
+    ggml_metal_device_t ctx_dev = (ggml_metal_device_t)dev->context;
+
+    const ggml_metal_device_props * props_dev = ggml_metal_device_get_props(ctx_dev);
+
+    return ggml_metal_device_supports_growable(ctx_dev) ? ggml_backend_metal_buffer_type_growable(props_dev->device) : nullptr;
+}
+
+// ggml_backend_buffer_set_committed: a growable buffer holds memory for its first `bytes`, or no more than those
+static bool ggml_backend_metal_buffer_set_committed(ggml_backend_buffer_t buffer, size_t bytes) {
+    if (!ggml_backend_buffer_is_metal(buffer)) {
+        return true;
+    }
+    return ggml_metal_buffer_set_committed((ggml_metal_buffer_t)buffer->context, bytes);
+}
+
+// ggml_backend_buffer_get_committed: the memory a buffer holds
+static size_t ggml_backend_metal_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_buffer_is_metal(buffer)) {
+        return ggml_backend_buffer_get_size(buffer);
+    }
+    ggml_metal_buffer_t ctx = (ggml_metal_buffer_t)buffer->context;
+    return ggml_metal_buffer_is_growable(ctx) ? ggml_metal_buffer_get_committed(ctx) : ggml_backend_buffer_get_size(buffer);
+}
+
 static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_metal_get_features;
+    }
+    if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
+        return (void *)ssd::gpu::graph_lane_provider;
+    }
+    if (strcmp(name, "ggml_backend_ssd_dev_shares_host_memory") == 0) {
+        return (void *)ggml_backend_metal_device_shares_host_memory;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_type_growable") == 0) {
+        return (void *)ggml_backend_metal_device_buffer_type_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_set_committed") == 0) {
+        return (void *)ggml_backend_metal_buffer_set_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
+        return (void *)ggml_backend_metal_buffer_get_committed;
+    }
+    if (strcmp(name, "ggml_backend_ssd_dev_buffer_from_host_ptr") == 0) {
+        return (void *)ggml_backend_metal_device_buffer_mapped_transient;
     }
 
     return NULL;

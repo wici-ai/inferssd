@@ -27,18 +27,15 @@ static void learning_contract() {
     const size_t before = s.reads.size(); observe_layer(s, 0, 99, 100, 110);
     check(s.reads.size() == before, "cache-only layers cannot evict read observations");
 
-    thread_learning t; t.candidates[0] = 8; t.candidates[1] = 4;
-    for (int i = 0; i < 400; ++i) { check(!observe_threads(t, 100).changed, "first thread probe does not decide"); }
-    check(t.current == 1 && t.decided == -1, "thread probe changes candidates at400 experts");
-    for (int i = 0; i < 399; ++i) { check(!observe_threads(t, 80).changed, "second probe waits for full window"); }
-    const auto chosen = observe_threads(t, 80);
-    check(chosen.changed && t.decided == 1 && chosen.mean0 == 100 && chosen.mean1 == 80, "thread choice uses measured means");
-    for (int i = 0; i < 39999; ++i) { observe_threads(t, 999); }
-    check(t.decided == 1, "chosen participants survive until recheck boundary");
-    observe_threads(t, 999);
-    check(t.decided == -1 && t.current == 0 && t.samples[0] == 0 && t.samples[1] == 0, "recheck resets only at40000 experts");
-    t.locked = true; observe_threads(t, 10);
-    check(t.samples[0] == 0, "explicit participants do not learn or recheck");
+    // 0.7 CPUs of other work over 10 s, the counters within 0.5 CPU-s: one CPU stays with it.
+    check(decode_reserve(0, 7e9, 10e9, 0.5e9) == 1, "measured other work rounds up to whole CPUs");
+    check(decode_reserve(0, 0.2e9, 10e9, 0.1e9) == 1 && decode_reserve(3, 0, 10e9, 0) == 0, "any work keeps a CPU, none keeps none");
+    // A band across a whole CPU (0.95..1.05) keeps the current choice; a narrower one decides.
+    check(decode_reserve(1, 10e9, 10e9, 0.5e9) == 1 && decode_reserve(2, 10e9, 10e9, 0.5e9) == 2, "a straddling band keeps the choice");
+    check(decode_reserve(1, 15e9, 10e9, 0.5e9) == 2, "a band past a whole CPU moves the choice");
+    check(decode_reserve(2, 1e9, 0, 0) == 2, "no wall time measured keeps the choice");
+    check(decode_participants(18, 18, 1) == 17 && decode_participants(16, 61, 2) == 16 && decode_participants(4, 4, 9) == 1,
+          "decode keeps its pool within the CPUs the reserve leaves, and at least one thread");
 }
 
 static void prefetch_contract() {
@@ -53,6 +50,24 @@ static void prefetch_contract() {
     rank = plan_prefetch_rank(7, false, false, 3, 2);
     check(rank.novel && !rank.request && !rank.skipped, "ranks past depth remain counted without requests");
     check(!plan_prefetch_rank(-1, false, false, 0, 2).request, "invalid expert never reaches resolver");
+    // A read pays its use probability where the window outlasts it, p - r where the window ends with a share r of it
+    // left, p - 1 where it ends after the read's issue and before the drive gets to it, nothing where it ends before
+    // the issue; no window seen: p. The rule of succession gives one half without evidence.
+    const std::vector<std::pair<double, double>> long_windows = {{5000, 1}}, short_windows = {{500, 3}, {5000, 1}};
+    check(near(prefetch_read_value(.6, 0, 0, 1000, long_windows), .6), "a read the window covers is worth its use");
+    check(near(prefetch_read_value(.6, 0, 0, 1000, {{500, 1}}), .1), "a read the window ends halfway through is worth p - 1/2");
+    check(near(prefetch_read_value(.6, 1000, 1000, 1000, {{500, 1}}), 0), "a read the window ends before is dropped at no cost");
+    check(near(prefetch_read_value(.4, 0, 0, 1000, short_windows), (3 * -.1 + .4) / 4), "the windows are weighed by how often they occur");
+    check(near(prefetch_read_value(.7, 0, 0, 1000, {}), .7), "no window seen: the read is worth its use");
+    check(near(prefetch_read_value(.6, 0, 1000, 1000, {{500, 1}}), -.4),
+          "a read issued but not reached when the window ends is all left to finish: p - 1");
+    check(near(prefetch_read_value(.6, 1000, 2000, 1000, {{500, 1}}), 0), "a read the window ends before its issue costs nothing");
+    check(near(prefetch_read_value(.9, 0, 1000, 1000, {{500, 1}, {1500, 1}, {2500, 1}}), (-.1 + .4 + .9) / 3),
+          "a read in flight behind others: queued, half read and read windows");
+    check(best_read_run({.5, -.2, -.2, .6}) == 4 && best_read_run({.5, -.4, .1}) == 1 && best_read_run({-.1, .3}) == 2 &&
+          best_read_run({-.1}) == 0 && best_read_run({}) == 0, "a plan keeps the run of reads worth the most");
+    check(near(prefetch_use_probability(0, 0), .5) && near(prefetch_use_probability(9, 10), 10.0 / 12),
+          "use probability by the rule of succession");
 }
 
 static void placement_contract() {
@@ -71,27 +86,29 @@ static void placement_contract() {
 
     t.cpu_one_us = 100; t.vector.device = {0,1,0}; t.vector.moved = {0,1,0};
     t.link_busy_us = 0; t.in_place = false; t.locked_us_per_mb = 1;
-    std::vector<kimi_place_item> items(3);
+    std::vector<ssd_place_item> items(3);
     for (auto & x : items) { x.routes = 1; x.mb = .01; x.locked = x.movable = x.needs_slot = true; }
     std::vector<double> pending(3, 0); pending[1] = .001;
     decode_plan plan; describe_decode(plan, items, pending);
     check(plan.ram == 3 && plan.pending == 1 && plan.locked == 3, "pending prefetch is explicit workload input");
-    kimi_place_limits limits; limits.slots = 1;
+    ssd_place_limits limits; limits.slots = 1;
     auto placed = plan_decode(plan, t, 4, items, limits);
     check(plan.valid && plan.moves == 1 && placed.moved.size() == 1 && plan.gpu[placed.moved[0]], "device-slot limit constrains actual GPU plan");
     items[0].locked = items[1].locked = items[2].locked = false;
     const auto locks = plan_locks(t, 4, items, limits, 300);
     check(locks.considered && !locks.requests.empty() && locks.saved_us > 0, "page-lock plan contains request indices and saved time only");
-    check(near(miss_cost(1, 1, 100, 600, true, 80), 340), "admission compares in-place compute with each miss share of reads");
+    const auto use = miss_costs(1, 100, 600, true, 80), hidden = miss_costs(4, 100, 200, false, 80);
+    check(near(use.ram_us, 80) && near(use.drive_us, 600), "a use from RAM costs the in-place compute, one from the drive its share of the reads");
+    check(near(hidden.ram_us, 100) && near(hidden.drive_us, 100), "a use from the drive costs no less than its compute");
 
     std::vector<prefill_expert> experts = {{9,false,true,true,1024},{2,false,true,true,1024},{1,false,false,false,1024}};
-    std::vector<int> routes = {4,4,4}; std::vector<kimi_place_item> empty;
-    prefill_input input{experts,routes,empty,t,32,1,1,1,4,2,false}; uint64_t candidates = 0;
-    const auto ranked = rank_prefill(input,candidates);
-    check(candidates == 1 && ranked.ranked.size() == 3 && ranked.ranked[0].index == 1 && ranked.ranked[1].index == 0 && ranked.ranked[2].index == 2,
-        "equal-route prefill candidates retain RAM before SSD, then expert-id order");
-    bool in_place = false; const auto selected = plan_prefill(input,ranked,in_place);
-    check(selected.ssd_limit == 1 && !selected.chosen.empty(), "legacy threshold profile consumes the same explicit plan contract");
+    std::vector<int> routes = {4,4,4}; std::vector<ssd_place_item> empty;
+    prefill_input input{experts,routes,empty,t,32,1,2}; uint64_t candidates = 0;
+    const auto counted = count_prefill(input,candidates);
+    check(candidates == 1 && counted.ram_candidates == 2 && counted.ssd_candidates == 1 && counted.ssd_limit == 1,
+        "prefill candidates: leased RAM entries and drive reads, the reads limited by the staging");
+    bool in_place = false; const auto selected = plan_prefill(input,counted,in_place);
+    check(selected.ssd_limit == 1 && selected.chosen.empty(), "a plan without placeable items moves nothing");
 }
 
 static void calibration_contract() {
@@ -111,6 +128,20 @@ static void calibration_contract() {
     f.gpu = {}; f.engine_overhead_us = 0; f.upload_us = 4; f.ssd_upload_us = 6; f.total_worker_us = 50; f.read_wait_us = 10;
     fit = observe_prefill_lines(s,cost,prior,f);
     check(fit.gpu_lane_us == 10 && fit.gpu_overhead_us == 0, "CPU-only sample cannot train GPU overhead from worker bookkeeping");
+
+    // The drive's line follows the newest layer with reads: two layers at 1 GB/s, then one at 10 GB/s and one without
+    // reads, price the next layer's reads at 10 GB/s.
+    prefill_learning d; d.window = 4; cost_lines none;
+    prefill_feedback r = {}; r.ntokens = 32;
+    for (const double us : {1e6, 1e6, 1e5, 0.0}) {
+        r.read_bytes = us > 0 ? 1000000000 : 0; r.read_us = us; (void) observe_prefill_lines(d,none,prior,r);
+    }
+    decode_learning idle;
+    lane_measurement measured = {2, 3, 4, 5, 1, 100, 200, 7, true};
+    lane_geometry lane = {4096, 2048, true, true};
+    const auto t = make_table(none, prior, idle, d, measured, lane, 32, 0);
+    check(d.samples.size() == 4 && near(t.drive_us_per_mb, 100) && t.drive_fixed_us == 0,
+        "the drive's line follows the newest grouped-prefill layer with reads");
 }
 int main() {
     learning_contract(); prefetch_contract(); placement_contract(); calibration_contract();

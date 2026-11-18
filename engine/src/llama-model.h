@@ -545,6 +545,7 @@ struct llama_layer {
     struct ggml_tensor * engram_wkv         = nullptr;
     struct ggml_tensor * engram_q           = nullptr;
     struct ggml_tensor * engram_k           = nullptr;
+    struct ggml_tensor * engram_gate        = nullptr; // engram_q * engram_k, where a file stores their product
 
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
@@ -634,6 +635,7 @@ struct llama_model {
 
     // DeepSeek-V4.1 engram hash constants (upstream keeps these on its per-model class)
     uint32_t              engram_n_layer = 0;
+    bool                  engram_ple_layout = false; // ple.* keys, one per_layer_token_embd, engram_gate
     uint32_t              engram_pad_id  = 0;
     uint32_t              engram_compressed_vocab_size = 0;
     std::vector<uint64_t> engram_multipliers; // [n_engram_layer * max_ngram_size]
@@ -685,6 +687,7 @@ struct llama_model {
     void load_stats  (llama_model_loader & ml);
     void load_arch   (llama_model_loader & ml);
     void load_hparams(llama_model_loader & ml);
+    void drop_nextn_blocks(llama_model_loader & ml); // after load_hparams, to run the model, not to rewrite its file
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 

@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import ntpath
 import posixpath
 import re
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
-from inferssd.configuration.settings import PLATFORMS, Setting, Snapshot, parse, render, uncomment
+from inferssd.configuration.settings import (
+    PLATFORMS,
+    Setting,
+    Snapshot,
+    parse,
+    render,
+    schema,
+    uncomment,
+)
+from inferssd.launch import ram
 from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
-from inferssd.strategy.inputs import model_facts_from
+from inferssd.machine.identity import TIER_BACKENDS
+from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
@@ -24,6 +35,7 @@ PROFILES: dict[str, Optional[str]] = {
     "muse": "muse-spark.jinja",
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
+    "gemma4": None,  # Ordinary RAM inference; no expert index or SSD executor.
 }
 # The profile of each GGUF general.architecture; --profile overrides it.
 ARCHITECTURES = {
@@ -31,12 +43,15 @@ ARCHITECTURES = {
     "muse-spark": "muse",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
+    "gemma4": "gemma4",
 }
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
 SAMPLING: dict[str, tuple[str, ...]] = {
     "dsv": ("--temp", "1.0", "--top-p", "0.95", "--top-k", "0", "--min-p", "0"),
 }
+# The address of this machine only, where the server listens by default.
+LOOPBACK = "127.0.0.1"
 
 
 @dataclass(frozen=True)
@@ -47,8 +62,8 @@ class LaunchSpec:
     overrides: tuple[tuple[str, str], ...] = ()
     binary: Optional[str] = None
     artifact_directory: Optional[str] = None
-    # Unset sizes take CONTEXT and BATCH, or one pass per prompt where the
-    # strategy prefills that way: -b and -ub as large as the context.
+    # Unset sizes take CONTEXT and BATCH; with the strategy, one pass per
+    # prompt: -b and -ub as large as the context.
     context: Optional[int] = None
     batch: Optional[int] = None
     ubatch: Optional[int] = None
@@ -61,9 +76,36 @@ class LaunchSpec:
     # The directory that keeps each model's prompt cache across restarts, in a
     # subdirectory named after the model; None runs without a prompt cache.
     prompt_cache: Optional[str] = None
+    # The IPv4 address the server listens on; see listen_host.
+    host: str = LOOPBACK
 
 
-CONTEXT = 8192
+def listen_host(text: str) -> str:
+    """TEXT as the IPv4 address the server listens on.
+
+    127.0.0.1 is this machine only and 0.0.0.0 every network interface. The
+    launch confirms its listener by address, so a host name is not accepted.
+    """
+    try:
+        return str(ipaddress.IPv4Address(text))
+    except ValueError:
+        raise ValueError("host must be an IPv4 address, such as 127.0.0.1 or 0.0.0.0") from None
+
+
+def connect_host(host: str) -> str:
+    """The address at which this machine reaches a server listening on HOST."""
+    return LOOPBACK if host == "0.0.0.0" else host
+
+
+# A context left unset: with SSD experts, 0, which the engine resolves to the largest multiple of
+# 8192 up to the model's trained context whose KV cache fits memory when full (it holds memory
+# only for the cells in use). A RAM-only model takes the largest multiple of CONTEXT_STEP up to
+# CONTEXT that fits memory.
+AUTO_CONTEXT = 0
+CONTEXT = 65536
+CONTEXT_STEP = 8192
+# One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
+ONE_PASS_BATCH = 1 << 20
 BATCH = 512
 # The disk prompt cache's size limit per model.
 PROMPT_CACHE_MIB = 16384
@@ -151,6 +193,32 @@ def materialized_settings(value: Snapshot) -> str:
     )
 
 
+def cpu_defaults(raw: object, allowed: Sequence[int], given: Threads) -> Threads:
+    """Default CPU work to the available fast cluster; preserve explicit counts."""
+    if not isinstance(raw, Mapping) or type(raw.get("affinity_supported")) is not bool:
+        raise ValueError("invalid CPU topology")
+    clusters = raw.get("clusters")
+    if not isinstance(clusters, list) or not clusters:
+        raise ValueError("invalid CPU clusters")
+    fast: set[int] = set()
+    for cluster in clusters:
+        if not isinstance(cluster, Mapping) or not isinstance(cluster.get("cpus"), list):
+            raise ValueError("invalid CPU cluster")
+        ids = cluster["cpus"]
+        if any(type(cpu) is not int or cpu < 0 for cpu in ids):
+            raise ValueError("invalid CPU IDs")
+        if cluster.get("kind") == "performance":
+            fast.update(ids)
+    selected = sorted(set(allowed) & fast) or sorted(set(allowed))
+    if not selected:
+        raise ValueError("no available CPUs for inference")
+    count = min(256, len(selected))
+    decode, batch = given.decode or count, given.batch or count
+    if raw["affinity_supported"] and max(selected) < 512 and max(decode, batch) <= len(selected):
+        return Threads(decode, batch, tuple(selected))
+    return Threads(decode, batch)
+
+
 def _resolve(
     s: State,
     spec: LaunchSpec,
@@ -158,6 +226,7 @@ def _resolve(
     directory: str,
     memory: int,
     configured: Optional[Snapshot],
+    reserve: int,
 ) -> None:
     reject_legacy_environment(s.env)
     if platform not in PLATFORMS:
@@ -169,6 +238,7 @@ def _resolve(
     sizes = [size for size in (spec.context, spec.batch, spec.ubatch) if size is not None]
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
+    listen_host(spec.host)
     threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
@@ -282,14 +352,53 @@ def _resolve(
         if not s.value("is_file", path):
             raise ValueError("missing GGUF shard: " + path)
     profile = s.inputs.profile
+    observed: object = None
     if not profile:
-        architecture = model_facts_from(s.value("model_facts", *paths)).architecture
+        observed = s.value("model_facts", *paths)
+        architecture = (
+            cast(str, ram.validate(observed)["architecture"])
+            if isinstance(observed, Mapping) and observed.get("architecture") == ram.ARCHITECTURE
+            else model_facts_from(observed).architecture
+        )
         if architecture not in ARCHITECTURES:
             raise ValueError(
                 f"no model profile for the GGUF architecture {architecture}; choose one with "
                 "--profile " + ", ".join(PROFILES)
             )
         profile = ARCHITECTURES[architecture]
+    ordinary = profile == ram.ARCHITECTURE
+    if ordinary:
+        owned = {
+            "--mlock",
+            "--no-mlock",
+            "-ctk",
+            "--cache-type-k",
+            "-ctv",
+            "--cache-type-v",
+            "--ctx-checkpoints",
+            "--swa-checkpoints",
+            "--swa-full",
+            "--override-kv",
+            "--model-draft",
+            "--hf-repo-draft",
+        }
+        if any(
+            x.split("=", 1)[0].replace("_", "-") in owned
+            or x.replace("_", "-").startswith(
+                ("-ctk", "-ctv", "--lora", "--mmproj", "--control-vector", "--spec-", "--draft")
+            )
+            for x in s.inputs.extra
+        ):
+            raise ValueError(
+                "the RAM profile owns model weights, locking, KV storage and checkpoints"
+            )
+        if any(
+            key == "LLAMA_ARG_SWA_FULL" or key.startswith(("LLAMA_ARG_SPEC_", "LLAMA_ARG_MMPROJ"))
+            for key in s.env
+        ):
+            raise ValueError(
+                "the RAM profile does not accept unbudgeted model or KV environment controls"
+            )
     resources = spec.resources
     if resources is not None and resources.platform not in (None, platform):
         raise ValueError("engine resource platform differs from the selected platform")
@@ -301,6 +410,11 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
+    # The engine's GPU backends: the descriptor's, else its build's; None when neither says.
+    gpu_backends = resources.gpu_backends if resources is not None else None
+    if gpu_backends is None:
+        built = s.value("engine_gpu_backends", binary)
+        gpu_backends = None if built is None else tuple(cast(list[str], built))
     bundled = PROFILES[profile]
     template_path = spec.template
     if not template_path and bundled:
@@ -337,13 +451,100 @@ def _resolve(
             ),
         )
     planned: Optional[Planned] = None
-    if spec.strategy:
+    ram_fit: Optional[dict[str, object]] = None
+    # How the engine holds an ordinary model's weights (ram.admission). On Apple silicon the
+    # per-layer embedding table stays in the file unlocked, read by rows as tokens use it, and the
+    # GPU's tensors sit in a Metal buffer the GPU keeps resident; elsewhere the CPU maps and
+    # locks the whole file and other GPU backends read it into their own buffers.
+    weights = (
+        ram.LOOKUPS_IN_FILE if platform == "darwin" else ram.COPIED if gpu_backends else ram.FILE
+    )
+    if ordinary:
+        runtime = runtime_facts_from(s.value("runtime_facts"))
+        configured_budget = cast(int, value.at("host.budget_mib").value) << 20
+        facts = observed if observed is not None else s.value("model_facts", *paths)
+        available = runtime.available_bytes
+        # A context left unset takes the largest step down from CONTEXT that fits the memory
+        # available now, else the smallest step; one given is kept. Either must be admitted.
+        contexts = (
+            [spec.context]
+            if spec.context
+            else list(range(CONTEXT, CONTEXT_STEP - 1, -CONTEXT_STEP))
+        )
+        for index, ram_context in enumerate(contexts):
+            last = index == len(contexts) - 1
+            try:
+                ram_fit = ram.admission(
+                    facts,
+                    context=ram_context,
+                    batch=spec.ubatch or BATCH,
+                    weights=weights,
+                    budget=min(memory, configured_budget) if configured_budget else memory,
+                    available=available,
+                    reserve=reserve,
+                )
+            except ValueError:
+                if last:
+                    raise
+                continue
+            if last or available is None or cast(int, ram_fit["required_bytes"]) <= available:
+                break
+        spec = replace(spec, context=ram_context)
+        if (
+            not gpu_backends
+            and not threads.cpus
+            and not threads.decode_cpus
+            and (threads.decode is None or threads.batch is None)
+        ):
+            threads = threadpools(
+                cpu_defaults(s.value("cpu_topology"), runtime.cpus, threads), platform
+            )
+    elif spec.strategy:
         # The strategy fills what the user left unset; the checks below see the result.
-        planned = plan(s, platform, memory, paths, value, spec.threads)
+        planned = plan(s, platform, memory, paths, value, spec.threads, gpu_backends)
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(argument in protected for argument in planned.server_args[::2]):
             raise ValueError("the launch strategy names a protected server option")
-    if not value.at("expert.source").value:
+        # This newly supported CPU model has no measured thread/compute priors on
+        # many existing profiles. Avoid the unpriced all-core fallback on hybrid
+        # machines; priced strategies and explicit user thread choices still win.
+        costs = dict(cast(tuple[tuple[str, float], ...], value.at("place.costs").value))
+        if (
+            profile == "qwen4exp"
+            and gpu_backends == ()
+            and spec.threads == Threads()
+            and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
+            and value.at("cpu.decode_participants").value == 0
+        ):
+            runtime = runtime_facts_from(s.value("runtime_facts"))
+            io_cpus = set(cast(tuple[int, ...], value.at("cpu.io_cpus").value))
+            threads = threadpools(
+                cpu_defaults(
+                    s.value("cpu_topology"),
+                    [cpu for cpu in runtime.cpus if cpu not in io_cpus],
+                    spec.threads,
+                ),
+                platform,
+            )
+            chosen = dict(cast(Mapping[str, object], planned.receipt.get("chosen", {})))
+            actual = {
+                "decode": threads.decode,
+                "batch": threads.batch,
+                "cpus": list(threads.cpus),
+                "decode_cpus": list(threads.decode_cpus),
+            }
+            strategy_receipt = dict(
+                planned.receipt,
+                model_defaults={
+                    "reason": "qwen4exp CPU compute priors unavailable; use the live fast cluster",
+                    "previous_threads": chosen.get("threads", {}),
+                    "threads": actual,
+                },
+            )
+            chosen["threads"] = actual
+            strategy_receipt["chosen"] = chosen
+            planned = replace(planned, threads=threads, receipt=strategy_receipt)
+    if not ordinary and not value.at("expert.source").value:
         if value.at("expert.source").origin != "default":
             raise ValueError("typed launch requires a nonempty explicit expert.source")
         artifacts = spec.artifact_directory or os_path.join(directory, "artifacts")
@@ -359,7 +560,7 @@ def _resolve(
         value = replace(
             value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)
         )
-    for path in cast(tuple[str, ...], value.at("expert.source").value):
+    for path in () if ordinary else cast(tuple[str, ...], value.at("expert.source").value):
         if not isinstance(path, str) or not s.value("is_file", path):
             raise ValueError("missing typed expert source: " + str(path))
     if platform == "linux":
@@ -386,45 +587,65 @@ def _resolve(
                     "the memory controller is not delegated to your systemd user manager: "
                     "add Delegate=memory to a user@.service drop-in, or launch as root" + guide
                 )
-        if value.at("vram.budget").value != 0:
-            if not s.value("gpu_available"):
-                raise ValueError("typed GPU execution requires nvidia-smi")
+    # The launch reads the VRAM tier's GPUs through their driver: nvidia-smi for CUDA, amdkfd for
+    # ROCm. With the engine's backends unknown, the engine itself refuses a budget it has no tier
+    # for.
+    tier = set(TIER_BACKENDS) & set(gpu_backends or ())
+    if not ordinary and value.at("vram.budget").value != 0 and tier:
+        if not s.value("gpu_available"):
+            raise ValueError(
+                "typed GPU execution requires the GPUs' driver: "
+                "nvidia-smi for CUDA, amdkfd for ROCm"
+            )
+    # A setting of the expert tier needs an engine built with a backend that carries it.
+    for item in () if ordinary else value.entries:
+        backend = schema()["properties"][item.key].get("backend")
+        if backend and item.origin != "default" and gpu_backends is not None:
+            if not set(backend.split(",")) & set(gpu_backends):
+                raise ValueError(
+                    f"{item.key} ({item.location}) configures the expert tier of "
+                    + " or ".join(backend.split(","))
+                    + ", which this engine was built without"
+                )
     # The sink's I/O thread keeps its own CPUs; decode runs on the first decode threads.
-    if set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
+    if not ordinary and set(cast(tuple[int, ...], value.at("cpu.io_cpus").value)) & set(
         threads.cpus + threads.decode_cpus
     ):
         raise ValueError("cpu.io_cpus overlaps the strict compute CPUs")
     participants = cast(int, value.at("cpu.decode_participants").value)
-    if threads.decode is not None and participants > threads.decode:
+    if not ordinary and threads.decode is not None and participants > threads.decode:
         raise ValueError("cpu.decode_participants exceeds the decode thread count")
-    settings = os_path.join(directory, "settings.ssd")
-    telemetry = os_path.join(directory, "native-events.jsonl")
-    s.ask("write_exclusive", settings, materialized_settings(value))
+    settings = None if ordinary else os_path.join(directory, "settings.ssd")
+    telemetry = None if ordinary else os_path.join(directory, "native-events.jsonl")
+    if settings is not None:
+        s.ask("write_exclusive", settings, materialized_settings(value))
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or CONTEXT
+    context = spec.context or (CONTEXT if ordinary else AUTO_CONTEXT)
     one_pass = planned is not None and planned.one_pass
-    batch = spec.batch or (context if one_pass else BATCH)
+    batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
     ubatch = spec.ubatch or (batch if one_pass else BATCH)
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
-    command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
-    for item in value.entries:
+    command = [binary, "-m", model]
+    if settings is not None and telemetry is not None:
+        command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    for item in () if ordinary else value.entries:
         if item.origin == "cli":
             command += [
                 "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
                 literal(item, platform),
             ]
     command += [
-        "--mmap",
+        "--no-mmap" if ordinary and weights == ram.COPIED else "--mmap",
         "--no-repack",
         "--fit",
         "off",
         "--no-warmup",
         "-ngl",
-        "99",
+        "0" if ordinary and not gpu_backends else "99",
         "-c",
         str(context),
         "-b",
@@ -432,6 +653,16 @@ def _resolve(
         "-ub",
         str(ubatch),
     ]
+    if ordinary:
+        command += ["--mlock"] if weights != ram.LOOKUPS_IN_FILE else []
+        command += [
+            "--cache-type-k",
+            "f16",
+            "--cache-type-v",
+            "f16",
+            "--ctx-checkpoints",
+            "1",
+        ]
     if threads.decode is not None:
         command += ["-t", str(threads.decode)]
     if threads.batch is not None:
@@ -466,16 +697,18 @@ def _resolve(
         ]
     command += [
         "--host",
-        "127.0.0.1",
+        spec.host,
         "--port",
         str(spec.port),
         "-np",
         "1",
-        # The SSD executor reads the routed experts; their mapped pages stay unread.
-        "--defer-experts",
     ]
+    if not ordinary:
+        # The SSD executor reads the routed experts; their mapped pages stay unread.
+        command += ["--defer-experts"]
+    # Flash Attention stays the server's auto choice on every platform: on for each layer whose
+    # device runs it, which is every layer wherever the backends implement it.
     if platform == "linux":
-        command += ["-fa", "on"]
         s.scope = (
             ["systemd-run"]
             + (["--user"] if uid != 0 else [])
@@ -499,7 +732,7 @@ def _resolve(
     output: dict[str, object] = {
         "settings": settings,
         "telemetry": telemetry,
-        "effective": value.document(),
+        "effective": value.document() if not ordinary else None,
         "profile": profile,
         "launch": {
             "decode_threads": threads.decode,
@@ -511,6 +744,8 @@ def _resolve(
             "ubatch": ubatch,
         },
     }
+    if ordinary:
+        output["mode"], output["memory"] = "ram", ram_fit
     if planned is not None:
         output["strategy"] = planned.receipt
     s.emit(json.dumps(output, ensure_ascii=False) + "\n")
@@ -525,10 +760,11 @@ def resolve_typed(
     directory: str,
     memory: int,
     configured: Optional[Snapshot] = None,
+    reserve: int = 0,
 ) -> Resolution:
     state = State(inputs, facts)
     try:
-        _resolve(state, spec, platform, directory, memory, configured)
+        _resolve(state, spec, platform, directory, memory, configured, reserve)
     except AwaitFact as missing:
         return state.finish(None, missing.fact)
     return state.finish(0)

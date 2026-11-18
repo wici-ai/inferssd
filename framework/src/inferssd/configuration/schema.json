@@ -51,17 +51,17 @@
             "default": 0
         },
         "prefetch.depth": {
-            "description": "Next-layer predicted experts, not a layer count or Mac read window",
+            "description": "Next-layer predicted experts the prefetch weighs, best first (0: none); it reads those whose reads pay",
             "kind": "integer",
             "unit": "predicted experts",
             "producer": "plan",
             "scope": "all",
             "cli": "--ssd-prefetch-depth",
-            "default_literal": "2",
+            "default_literal": "64",
             "type": "integer",
             "minimum": 0,
             "maximum": 64,
-            "default": 2
+            "default": 64
         },
         "place.costs": {
             "description": "Measured placement cost terms; omitted terms retain calibrated priors",
@@ -132,25 +132,25 @@
             },
             "default": {}
         },
-        "prefill.cpu_max_tokens": {
-            "description": "Largest CPU prefill ubatch; transitional v0.1 setting",
+        "prefill.lookahead": {
+            "description": "Read the next layer's predicted SSD experts while the drive idles between grouped-prefill layers; changes I/O timing only",
             "kind": "integer",
-            "unit": "tokens",
+            "unit": "boolean",
             "producer": "plan",
-            "scope": "linux",
-            "cli": "--ssd-prefill-cpu-max-tokens",
-            "default_literal": "4294967295",
+            "scope": "all",
+            "cli": "--ssd-prefill-lookahead",
+            "default_literal": "1",
             "type": "integer",
             "minimum": 0,
-            "maximum": 4294967295,
-            "default": 4294967295
+            "maximum": 1,
+            "default": 1
         },
         "vram.budget": {
-            "description": "Expert VRAM byte budget or auto",
+            "description": "GPU expert byte budget or auto; 0 keeps experts on the CPU",
             "kind": "budget",
             "unit": "bytes",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
             "cli": "--ssd-vram-budget",
             "default_literal": "auto",
             "oneOf": [
@@ -170,7 +170,8 @@
             "kind": "integer",
             "unit": "slots",
             "producer": "plan",
-            "scope": "linux",
+            "scope": "all",
+            "backend": "CUDA,ROCm",
             "cli": "--ssd-vram-max-slots",
             "default_literal": "0",
             "type": "integer",
@@ -183,7 +184,8 @@
             "kind": "integer",
             "unit": "MiB",
             "producer": "launch",
-            "scope": "linux",
+            "scope": "all",
+            "backend": "CUDA,ROCm",
             "cli": "--ssd-vram-reserve-mib",
             "default_literal": "0",
             "type": "integer",
@@ -192,7 +194,7 @@
             "default": 0
         },
         "host.headroom_mib": {
-            "description": "Host safety headroom in MiB",
+            "description": "Host memory in MiB the expert caches leave free",
             "kind": "integer",
             "unit": "MiB",
             "producer": "plan",
@@ -205,7 +207,7 @@
             "default": 512
         },
         "host.budget_mib": {
-            "description": "Host memory envelope in MiB against this process's own memory; zero derives it at startup",
+            "description": "Host memory envelope in MiB against this process's own memory; zero leaves the machine's physical memory",
             "kind": "integer",
             "unit": "MiB",
             "producer": "plan",

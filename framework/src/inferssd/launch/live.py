@@ -19,7 +19,9 @@ from typing import Optional, Protocol
 
 from inferssd.launch.linux import cpu_count
 from inferssd.launch.recorded import RecordedArtifacts
+from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
+from inferssd.machine.identity import KFD_NODES
 from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
 
@@ -37,7 +39,6 @@ class Host(Protocol):
     def readable(self, path: str) -> bool: ...
     def which(self, name: str) -> bool: ...
     def text(self, path: str) -> str: ...
-    def contains(self, path: str, needle: bytes) -> bool: ...
     def uid(self) -> int: ...
     def suffix(self) -> str: ...
     def system(self) -> str: ...
@@ -62,20 +63,7 @@ class NativeHost:
         return shutil.which(name) is not None
 
     def text(self, path: str) -> str:
-        return Path(path).read_text()
-
-    def contains(self, path: str, needle: bytes) -> bool:
-        try:
-            with open(path, "rb") as stream:
-                tail = b""
-                while chunk := stream.read(1 << 20):
-                    data = tail + chunk
-                    if needle in data:
-                        return True
-                    tail = data[-len(needle) :]
-        except OSError:
-            return False
-        return False
+        return Path(path).read_text(encoding="utf-8", errors="replace")
 
     def uid(self) -> int:
         return os.geteuid()
@@ -94,10 +82,10 @@ class NativeHost:
 
 
 HOST_FACTS = frozenset(
-    "gpu_available ss_available has_uring systemd cgroup_v2 user_manager memory_controller euid "
+    "gpu_available ss_available systemd cgroup_v2 user_manager memory_controller euid "
     "memory_kib filesystem gpu_memory gpu_processes port_busy scope_suffix "
     "platform_system platform_machine default_threads physical_memory disk_free "
-    "runtime_facts model_drive_key".split()
+    "runtime_facts model_drive_key engine_gpu_backends cpu_topology".split()
 )
 
 
@@ -112,17 +100,20 @@ class LiveArtifacts:
         python: str,
         machine: Optional[str] = None,
         strategy_host: Optional[strategy_inputs.Host] = None,
+        index_cache: Optional[Path] = None,
     ) -> None:
         """MACHINE: the characteristics text the launch strategy derives from, if any.
 
         STRATEGY_HOST reads the strategy's runtime facts; by default this host,
-        with the launch's environment.
+        with the launch's environment. INDEX_CACHE keeps expert indexes for later launches.
         """
         self.inputs, self.host = inputs, host
         self.run, self.replace, self.python = run, replace, python
         self.machine = machine
         self.strategy_host = strategy_host or strategy_inputs.NativeHost(dict(inputs.environment))
-        self.artifacts = RecordedArtifacts(inputs, {}, run=run, replace=replace, python=python)
+        self.artifacts = RecordedArtifacts(
+            inputs, {}, run=run, replace=replace, python=python, index_cache=index_cache
+        )
 
     def __call__(self, fact: Fact) -> Reply:
         if fact.name == "machine_characteristics":
@@ -145,8 +136,11 @@ class LiveArtifacts:
 
     def value(self, fact: Fact) -> object:
         name, args, host = fact.name, fact.arguments, self.host
-        if name in ("gpu_available", "ss_available"):
-            return host.which("nvidia-smi" if name == "gpu_available" else "ss")
+        if name == "gpu_available":
+            # The VRAM tier's GPUs can be read: NVIDIA's through nvidia-smi, AMD's through amdkfd.
+            return host.which("nvidia-smi") or host.exists(KFD_NODES)
+        if name == "ss_available":
+            return host.which("ss")
         if name == "gpu_memory":
             result = host.command(
                 ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"]
@@ -158,8 +152,6 @@ class LiveArtifacts:
             )
         if name == "port_busy":
             return self.output(["ss", "-Hltn", "sport = :" + args[0]], check=False)
-        if name == "has_uring":
-            return any(host.contains(path, b"io_uring_queue_init") for path in args)
         if name == "systemd":
             # The same test as sd_booted(): systemd is running as the init system.
             return host.exists("/run/systemd/system")
@@ -213,6 +205,18 @@ class LiveArtifacts:
         if name == "runtime_facts":
             facts = strategy_inputs.read_runtime(host=self.strategy_host)
             return strategy_inputs.runtime_facts_json(facts)
+        if name == "cpu_topology":
+            from inferssd.machine.profile import TOPOLOGY
+
+            return TOPOLOGY[self.strategy_host.platform()][1](self.strategy_host)
         if name == "model_drive_key":
             return strategy_inputs.model_drive_key(args, self.strategy_host)
+        if name == "engine_gpu_backends":
+            # The build the server executable came from: build/bin/inferssd-server lies beside
+            # build/CMakeCache.txt.
+            build = os.path.dirname(os.path.dirname(args[0]))
+            try:
+                return list(cmake_gpu_backends(host.text(os.path.join(build, "CMakeCache.txt"))))
+            except OSError:
+                return None
         raise ValueError("Unknown live host fact: " + name)

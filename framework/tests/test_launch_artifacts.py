@@ -1,7 +1,9 @@
 """Actual typed artifact effects against the already frozen reference transcripts."""
 
 import hashlib
+import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -18,6 +20,7 @@ def forbidden(*args, **kwargs):
     raise AssertionError("No subprocess or engine is allowed in this test")
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the Linux launcher's POSIX paths")
 @pytest.mark.parametrize("record", GOLDENS, ids=lambda r: r["case"]["name"])
 def test_typed_artifact_chain(record, tmp_path):
     base = tmp_path.resolve()
@@ -57,7 +60,6 @@ def test_typed_artifact_chain(record, tmp_path):
         default_threads=old_host["cpu_count"],
         ss_available=True,
         port_busy=old_host["port_busy"],
-        has_uring=old_host["uring"],
         cgroup_v2=record["cgroup_v2"],
         memory_kib=[old_host["mem_total_kib"], old_host["mem_available_kib"]],
         euid=record["uid"],
@@ -139,6 +141,45 @@ def test_mac_alias_hash_and_order(tmp_path):
     )
     assert Path(path).name == hashlib.sha256(("muse\0" + model).encode()).hexdigest()[:20] + ".tsv"
     assert calls == ["generate", ".tsv", ".json"]
+
+
+def test_alias_reused_while_its_inputs_are_unchanged(tmp_path):
+    model = tmp_path / "models" / "synthetic.gguf"
+    model.parent.mkdir()
+    model.write_bytes(b"GGUF")
+    built = []
+
+    def run(argv):
+        built.append(argv)
+        Path(argv[argv.index("--out") + 1]).write_text(f"rows {len(built)}\n")
+        Path(argv[argv.index("--summary-json") + 1]).write_text('{"model_shards":1,"entries":1}')
+
+    def alias(directory, profile=None):
+        return Path(
+            generate_alias(
+                (str(model),),
+                profile,
+                tmp_path / directory,
+                repo="/repo",
+                python="/python",
+                run=run,
+                replace=os.replace,
+                reuse=tmp_path / "kept",
+            )
+        )
+
+    first = alias("run1")
+    assert len(built) == 1 and first.read_text() == "rows 1\n"
+    # the next launch copies the kept index into its own artifacts, with its own summary
+    second = alias("run2")
+    assert len(built) == 1 and second.read_text() == "rows 1\n"
+    assert json.loads(second.with_suffix(".json").read_text())["output_tsv"] == str(second)
+    # a shard changed on disk, or another expert count, builds a new one
+    stat = model.stat()
+    os.utime(model, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+    assert alias("run3").read_text() == "rows 2\n" and len(built) == 2
+    alias("run4", "muse")
+    assert len(built) == 3
 
 
 def test_output_failure_prevents_next_effect():

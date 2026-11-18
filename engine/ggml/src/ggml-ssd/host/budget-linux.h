@@ -21,7 +21,7 @@
 #include <cstring>
 #include <string>
 
-namespace kimi_memory_boost {
+namespace ssd_memory_boost {
 
 // "key: value kB" in /proc/meminfo, in bytes ("key: value" without a unit as is).
 inline bool meminfo_field(const std::string & text, const char * key, uint64_t & value) {
@@ -114,4 +114,4 @@ inline uint64_t headroom(const std::string & meminfo, const std::string & zonein
     return (kept(low_full) - kept(low_now)) * page_size;
 }
 
-} // namespace kimi_memory_boost
+} // namespace ssd_memory_boost

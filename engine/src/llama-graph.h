@@ -20,8 +20,8 @@ struct ggml_tensor;
 
 struct llama_cparams;
 struct llama_layer;
-struct llama_kimi_cpu_sink_node;
-struct llama_kimi_cpu_sink_runtime;
+struct llama_ssd_cpu_sink_node;
+struct llama_ssd_cpu_sink_runtime;
 
 struct llama_memory_context_i;
 
@@ -97,6 +97,10 @@ public:
 
     virtual void set_input(const llama_ubatch * ubatch) = 0;
 
+    // Before the graph takes its memory: the reads of the rows this input will gather for the ubatch are issued
+    // (llama_prefetch_rows), so that they overlap the reservation and what runs before the rows are used.
+    virtual void prefetch(const llama_ubatch * ubatch) { GGML_UNUSED(ubatch); }
+
     // return true if the resulting input tensors using the provided graph parameters would be
     //   the same as the previous input tensors that we have currently stored in the object
     virtual bool can_reuse(const llm_graph_params & params) {
@@ -118,11 +122,15 @@ public:
     virtual ~llm_graph_input_embd() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    void prefetch(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
     ggml_tensor * tokens = nullptr; // I32 [n_batch]
     ggml_tensor * embd   = nullptr; // F32 [n_embd, n_batch]
+
+    // the token embedding where it is host memory: a batch's rows are prefetched (llama_prefetch_rows)
+    const ggml_tensor * table = nullptr;
 
     const int64_t n_embd = 0;
 };
@@ -652,7 +660,8 @@ struct llm_graph_params {
 
     bool cpu_sink_decode = false;
     bool cpu_sink_prefill = false;
-    llama_kimi_cpu_sink_runtime * cpu_sink_runtime = nullptr;
+    bool cpu_sink_prefill_hint = false; // a sink prefill predicts each next layer's routes (prefill.lookahead)
+    llama_ssd_cpu_sink_runtime * cpu_sink_runtime = nullptr;
 
     llm_graph_cb cb;
 
@@ -719,6 +728,7 @@ struct llm_graph_params {
         return
             cpu_sink_decode == other.cpu_sink_decode &&
             cpu_sink_prefill == other.cpu_sink_prefill &&
+            cpu_sink_prefill_hint == other.cpu_sink_prefill_hint &&
             cpu_sink_runtime == other.cpu_sink_runtime &&
             cparams.embeddings  == other.cparams.embeddings  &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
@@ -754,6 +764,7 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+    void prefetch_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it
@@ -784,7 +795,7 @@ public:
 
     std::vector<llm_graph_input_ptr> inputs;
 
-    std::vector<std::unique_ptr<llama_kimi_cpu_sink_node>> cpu_sink_nodes;
+    std::vector<std::unique_ptr<llama_ssd_cpu_sink_node>> cpu_sink_nodes;
 
     ggml_context_ptr ctx_compute;
 
@@ -854,9 +865,10 @@ struct llm_graph_context {
     const int64_t n_outputs;
     const bool cpu_sink_decode;
     const bool cpu_sink_prefill;
-    llama_kimi_cpu_sink_runtime * const cpu_sink_runtime;
-    // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink's
-    // prefetch and its hint statistics (single-token decode only).
+    const bool cpu_sink_prefill_hint;
+    llama_ssd_cpu_sink_runtime * const cpu_sink_runtime;
+    // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink, a decode
+    // token's for its prefetch, every token's of a sink prefill for its read-ahead.
     ggml_tensor * cpu_sink_prefetch_hint = nullptr;
     const int32_t n_ctx_orig; // yarn
 

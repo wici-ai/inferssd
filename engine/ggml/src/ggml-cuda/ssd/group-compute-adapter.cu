@@ -1,7 +1,8 @@
 // The grouped prefill engine for any expert format (vram_group_compute_api, vram-compute-api.h). The matrix products
 // are the CUDA backend's (ggml_cuda_moe_stream_mm_*, its MUL_MAT kernels), normally linked into the backend like the decode
 // engine's matrix-vector products (q2-compute-adapter.cu). Per expert and chunk of at most `chunk` tokens:
-//   1. the chunk's input rows, gathered by row and quantized for the up/gate type (one operand for both);
+//   1. the chunk's input rows, gathered by row and quantized for the up type (one operand for up and gate, and a
+//      second one for a gate of another type);
 //   2. up and gate;
 //   3. the activation (SwiGLU, clamped or not, or SiTU);
 //   4. the hidden rows quantized for the down type;
@@ -13,7 +14,7 @@
 #include "vram-activation.cuh"
 #include "ggml.h"
 
-#include <cuda_runtime.h>
+#include "gpu-runtime.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -21,6 +22,7 @@
 #include "backend-functions.h"
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -28,7 +30,7 @@ using mm_supports_fn = bool (*)(int);
 using mm_create_fn = void * (*)(int);
 using mm_destroy_fn = void (*)(void *);
 using mm_release_fn = void (*)(void *);
-using mm_reserve_fn = bool (*)(void *, int, int64_t, int64_t, int64_t);
+using mm_reserve_fn = bool (*)(void *, int, int64_t, int64_t, int64_t, cudaStream_t);
 using mm_operand_bytes_fn = size_t (*)(void *, int, int64_t, int64_t);
 using mm_quantize_fn = bool (*)(void *, int, const float *, const int32_t *, int64_t, int64_t, int64_t, void *, cudaStream_t);
 using mm_fn = bool (*)(void *, int, const void *, int64_t, int64_t, const void *, int64_t, float *, cudaStream_t);
@@ -42,13 +44,20 @@ void cuda_check(cudaError_t rc, const char * operation) {
 
 size_t aligned(size_t bytes) { return (bytes + 255) & ~size_t(255); }
 
+// The engine's device buffers: an allocation that runs out of memory is retried once the OOM reclaimer gives memory back
+// (the VRAM tier's blocks), as a backend buffer's is. The room the tier makes before a reserve is an estimate of these
+// buffers; the card gives them more (whole 2 MiB pages, the products' own allocations, kernels loaded on first use).
+template <typename T> void device_alloc(int device, T ** ptr, size_t bytes, const char * operation) {
+    cuda_check(ggml_cuda_malloc_reclaiming(reinterpret_cast<void **>(ptr), bytes, device), operation);
+}
+
 __global__ void group_activate(const float * up, const float * gate, float * hidden, int count,
         int kind, float situ_beta, float situ_linear_beta, float swiglu_limit) {
     const int i = int(blockIdx.x * blockDim.x + threadIdx.x);
     if (i >= count) {
         return;
     }
-    hidden[i] = kimi_vram_activate(up[i], gate[i], kind, situ_beta, situ_linear_beta, swiglu_limit);
+    hidden[i] = ssd_vram_activate(up[i], gate[i], kind, situ_beta, situ_linear_beta, swiglu_limit);
 }
 
 constexpr int scatter_threads = 256;
@@ -68,7 +77,7 @@ __global__ void group_scatter(const float * down, int latent, const int32_t * ro
             sum += v * v;
         }
         for (int offset = 16; offset > 0; offset >>= 1) {
-            sum += __shfl_xor_sync(0xffffffff, sum, offset);
+            sum += __shfl_xor_sync(0xffffffff, sum, offset, 32);
         }
         if ((threadIdx.x & 31) == 0) {
             partial[threadIdx.x >> 5] = sum;
@@ -90,7 +99,17 @@ __global__ void group_scatter(const float * down, int latent, const int32_t * ro
 
 struct group_engine {
     static constexpr int chunk = 256; // tokens of one expert per chain pass
-    int device = -1, latent = 0, hidden = 0, up_type = 0, down_type = 0;
+    int device = -1, latent = 0, hidden = 0;
+    // every format the engine serves (up, gate and down types), and the types of the layer begin_layer started
+    struct expert_types { int up, gate, down; };
+    std::vector<expert_types> formats;
+    // "up/down", or "up/gate/down" where gate's type is not up's
+    static std::string name(const expert_types & f) {
+        std::string s = ggml_type_name(ggml_type(f.up));
+        if (f.gate != f.up) { s += std::string("/") + ggml_type_name(ggml_type(f.gate)); }
+        return s + "/" + ggml_type_name(ggml_type(f.down));
+    }
+    int up_type = 0, gate_type = 0, down_type = 0;
     mm_destroy_fn mm_destroy = nullptr;
     mm_release_fn mm_release = nullptr;
     mm_reserve_fn mm_reserve = nullptr;
@@ -105,7 +124,8 @@ struct group_engine {
     char * scratch = nullptr;
     size_t scratch_bytes = 0;
     float * up = nullptr, * gate = nullptr, * act = nullptr, * down = nullptr, * norm = nullptr;
-    void * up_operand = nullptr, * down_operand = nullptr;
+    // gate_operand: the input quantized for a gate of another type than up's (the operand depends on the weight type)
+    void * up_operand = nullptr, * gate_operand = nullptr, * down_operand = nullptr;
     float * host_norm = nullptr;
     // per pass
     int rows_capacity = 0, routes_capacity = 0;
@@ -126,11 +146,25 @@ struct group_engine {
     cudaEvent_t begin_start = nullptr, begin_end = nullptr, finish_start = nullptr, finish_end = nullptr;
     uint64_t layer_h2d = 0;
 
-    group_engine(int device_, int latent_, int hidden_, int weight_type, int down_type_) :
-        device(device_), latent(latent_), hidden(hidden_), up_type(weight_type), down_type(down_type_) {
+    group_engine(int device_, int latent_, int hidden_, int count, const int32_t * up_types, const int32_t * gate_types,
+            const int32_t * down_types) :
+        device(device_), latent(latent_), hidden(hidden_) {
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || latent % 4 || hidden % 4) {
             throw std::runtime_error("unsupported grouped VRAM expert geometry");
         }
+        if (count < 1 || !up_types || !gate_types || !down_types) {
+            throw std::runtime_error("grouped VRAM engine formats");
+        }
+        const auto valid = [](int32_t type) { return type >= 0 && type < GGML_TYPE_COUNT; };
+        for (int f = 0; f < count; ++f) {
+            if (!valid(up_types[f]) || !valid(gate_types[f]) || !valid(down_types[f])) {
+                throw std::runtime_error("grouped VRAM engine formats");
+            }
+            formats.push_back({ up_types[f], gate_types[f], down_types[f] });
+        }
+        up_type = formats[0].up;
+        gate_type = formats[0].gate;
+        down_type = formats[0].down;
         const auto supports = ggml_cuda_moe_stream_mm_supports;
         const auto create = ggml_cuda_moe_stream_mm_create;
         mm_destroy = ggml_cuda_moe_stream_mm_destroy;
@@ -145,12 +179,15 @@ struct group_engine {
                     !mm_device_bytes) {
                 throw std::runtime_error("CUDA grouped expert products are missing from the SSD executor");
             }
-            if (!supports(up_type) || !supports(down_type)) {
-                throw std::runtime_error(std::string("grouped VRAM engine: no CUDA matrix product for ") +
-                    ggml_type_name(ggml_type(up_type)) + "/" + ggml_type_name(ggml_type(down_type)) + " experts");
-            }
-            if (latent % ggml_blck_size(ggml_type(up_type)) || hidden % ggml_blck_size(ggml_type(down_type))) {
-                throw std::runtime_error("grouped VRAM engine: expert rows are not whole blocks");
+            for (const auto & f : formats) {
+                if (!supports(f.up) || !supports(f.gate) || !supports(f.down)) {
+                    throw std::runtime_error(std::string("grouped VRAM engine: no CUDA matrix product for ") + name(f) +
+                        " experts");
+                }
+                if (latent % ggml_blck_size(ggml_type(f.up)) || latent % ggml_blck_size(ggml_type(f.gate)) ||
+                        hidden % ggml_blck_size(ggml_type(f.down))) {
+                    throw std::runtime_error("grouped VRAM engine: expert rows are not whole blocks");
+                }
             }
             cuda_check(cudaSetDevice(device), "cudaSetDevice");
             mm_context = create(device);
@@ -178,18 +215,27 @@ struct group_engine {
         cudaFuncAttributes attributes = {};
         cuda_check(cudaFuncGetAttributes(&attributes, group_activate), "grouped activation kernel");
         cuda_check(cudaFuncGetAttributes(&attributes, group_scatter), "grouped scatter kernel");
-        // up and gate: hidden rows of latent values; down: latent rows of hidden values
-        if (!mm_reserve(mm_context, up_type, hidden, latent, chunk) || !mm_reserve(mm_context, down_type, latent, hidden, chunk)) {
-            mm_release(mm_context);
-            throw std::runtime_error("CUDA grouped expert product reservation");
+        // up and gate: hidden rows of latent values; down: latent rows of hidden values. Every format's products (the
+        // reservations add up; a gate of up's type shares up's), and operands as large as the largest format's.
+        size_t up_operand_bytes = 0, gate_operand_bytes = 0, down_operand_bytes = 0;
+        for (const auto & f : formats) {
+            if (!mm_reserve(mm_context, f.up, hidden, latent, chunk, stream) ||
+                    (f.gate != f.up && !mm_reserve(mm_context, f.gate, hidden, latent, chunk, stream)) ||
+                    !mm_reserve(mm_context, f.down, latent, hidden, chunk, stream)) {
+                mm_release(mm_context);
+                throw std::runtime_error("CUDA grouped expert product reservation");
+            }
+            up_operand_bytes = std::max(up_operand_bytes, mm_operand_bytes(mm_context, f.up, latent, chunk));
+            if (f.gate != f.up) {
+                gate_operand_bytes = std::max(gate_operand_bytes, mm_operand_bytes(mm_context, f.gate, latent, chunk));
+            }
+            down_operand_bytes = std::max(down_operand_bytes, mm_operand_bytes(mm_context, f.down, hidden, chunk));
         }
-        const size_t up_operand_bytes = mm_operand_bytes(mm_context, up_type, latent, chunk);
-        const size_t down_operand_bytes = mm_operand_bytes(mm_context, down_type, hidden, chunk);
         const size_t hidden_bytes = aligned(size_t(chunk) * hidden * sizeof(float));
         const size_t latent_bytes = aligned(size_t(chunk) * latent * sizeof(float));
         scratch_bytes = 3 * hidden_bytes + latent_bytes + aligned(size_t(latent) * sizeof(float)) +
-            aligned(up_operand_bytes) + aligned(down_operand_bytes);
-        const cudaError_t rc = cudaMalloc(reinterpret_cast<void **>(&scratch), scratch_bytes);
+            aligned(up_operand_bytes) + aligned(gate_operand_bytes) + aligned(down_operand_bytes);
+        const cudaError_t rc = ggml_cuda_malloc_reclaiming(reinterpret_cast<void **>(&scratch), scratch_bytes, device);
         if (rc != cudaSuccess) {
             (void) cudaGetLastError();
             scratch = nullptr;
@@ -205,6 +251,7 @@ struct group_engine {
         down = reinterpret_cast<float *>(take(latent_bytes));
         norm = reinterpret_cast<float *>(take(aligned(size_t(latent) * sizeof(float))));
         up_operand = take(aligned(up_operand_bytes));
+        gate_operand = gate_operand_bytes ? take(aligned(gate_operand_bytes)) : nullptr;
         down_operand = take(aligned(down_operand_bytes));
         cuda_check(cudaMemsetAsync(scratch, 0, scratch_bytes, stream), "grouped scratch prefault");
         cuda_check(cudaStreamSynchronize(stream), "grouped scratch prefault drain");
@@ -255,8 +302,12 @@ struct group_engine {
         const bool first = !scratch;
         reserve_fixed();
         if (first) {
-            std::fprintf(stderr, "[kimi_vram_group_engine] status=reserved format=%s/%s latent=%d hidden=%d chunk=%d fixed_bytes=%zu\n",
-                ggml_type_name(ggml_type(up_type)), ggml_type_name(ggml_type(down_type)), latent, hidden, chunk, fixed_bytes());
+            std::string names;
+            for (const auto & f : formats) {
+                names += std::string(names.empty() ? "" : ",") + name(f);
+            }
+            std::fprintf(stderr, "[ssd_vram_group_engine] status=reserved format=%s latent=%d hidden=%d chunk=%d fixed_bytes=%zu\n",
+                names.c_str(), latent, hidden, chunk, fixed_bytes());
         }
         if (rows_wanted <= rows_capacity && routes_wanted <= routes_capacity) {
             return;
@@ -266,10 +317,10 @@ struct group_engine {
         free_pass();
         const size_t row_bytes = size_t(r) * latent * sizeof(float);
         try {
-            cuda_check(cudaMalloc(reinterpret_cast<void **>(&input), row_bytes), "cudaMalloc grouped input");
-            cuda_check(cudaMalloc(reinterpret_cast<void **>(&accumulator), row_bytes), "cudaMalloc grouped accumulator");
-            cuda_check(cudaMalloc(reinterpret_cast<void **>(&route_rows), size_t(n) * sizeof(int32_t)), "cudaMalloc grouped routes");
-            cuda_check(cudaMalloc(reinterpret_cast<void **>(&route_weights), size_t(n) * sizeof(float)), "cudaMalloc grouped weights");
+            device_alloc(device, &input, row_bytes, "cudaMalloc grouped input");
+            device_alloc(device, &accumulator, row_bytes, "cudaMalloc grouped accumulator");
+            device_alloc(device, &route_rows, size_t(n) * sizeof(int32_t), "cudaMalloc grouped routes");
+            device_alloc(device, &route_weights, size_t(n) * sizeof(float), "cudaMalloc grouped weights");
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_input), row_bytes), "cudaMallocHost grouped input");
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_output), row_bytes), "cudaMallocHost grouped output");
             cuda_check(cudaMallocHost(reinterpret_cast<void **>(&host_rows), size_t(n) * sizeof(int32_t)), "cudaMallocHost grouped routes");
@@ -297,21 +348,24 @@ struct group_engine {
         rows = groups = 0;
     }
 
-    void begin_layer(int rows_, const vram_group_route * routes, const int32_t * first_, int groups_,
+    void begin_layer(int format, int rows_, const vram_group_route * routes, const int32_t * first_, int groups_,
             const vram_group_activation * activation_) {
         if (!activation_ || !scratch || rows_ < 1 || rows_ > rows_capacity || groups_ < 0 || (groups_ && (!routes || !first_))) {
             throw std::runtime_error("grouped VRAM engine layer shape");
         }
+        if (format < 0 || format >= int(formats.size())) {
+            throw std::runtime_error("grouped VRAM engine layer format");
+        }
         const auto & a = activation_->base;
-        if (a.kind == KIMI_VRAM_ACTIVATION_SWIGLU_CLAMP) {
+        if (a.kind == SSD_VRAM_ACTIVATION_SWIGLU_CLAMP) {
             if (std::isnan(a.swiglu_limit) || a.swiglu_limit <= 1e-6f) {
                 throw std::runtime_error("grouped VRAM engine invalid SwiGLU clamp");
             }
-        } else if (a.kind == KIMI_VRAM_ACTIVATION_SITU) {
+        } else if (a.kind == SSD_VRAM_ACTIVATION_SITU) {
             if (!std::isfinite(a.situ_beta) || a.situ_beta <= 0.0f || !std::isfinite(a.situ_linear_beta)) {
                 throw std::runtime_error("grouped VRAM engine invalid SiTU parameters");
             }
-        } else if (a.kind != KIMI_VRAM_ACTIVATION_SWIGLU) {
+        } else if (a.kind != SSD_VRAM_ACTIVATION_SWIGLU) {
             throw std::runtime_error("grouped VRAM engine activation kind");
         }
         if (activation_->post_norm && (!std::isfinite(activation_->post_norm_eps) || activation_->post_norm_eps <= 0.0f)) {
@@ -335,6 +389,9 @@ struct group_engine {
         cuda_check(cudaSetDevice(device), "cudaSetDevice");
         // the staging below may still feed a layer that was not finished
         cuda_check(cudaStreamSynchronize(stream), "grouped engine drain");
+        up_type = formats[size_t(format)].up;
+        gate_type = formats[size_t(format)].gate;
+        down_type = formats[size_t(format)].down;
         rows = rows_;
         groups = groups_;
         activation = *activation_;
@@ -389,9 +446,13 @@ struct group_engine {
         const auto & a = activation.base;
         for (int c = first[size_t(group)]; c < first[size_t(group) + 1]; c += chunk) {
             const int n = std::min(chunk, first[size_t(group) + 1] - c);
+            const bool own_gate = gate_type != up_type;
             if (!mm_quantize(mm_context, up_type, input, route_rows + c, latent, latent, n, up_operand, stream) ||
                     !mm(mm_context, up_type, w.up, hidden, latent, up_operand, n, up, stream) ||
-                    !mm(mm_context, up_type, w.gate, hidden, latent, up_operand, n, gate, stream)) {
+                    (own_gate && !mm_quantize(mm_context, gate_type, input, route_rows + c, latent, latent, n,
+                        gate_operand, stream)) ||
+                    !mm(mm_context, gate_type, w.gate, hidden, latent, own_gate ? gate_operand : up_operand, n, gate,
+                        stream)) {
                 throw std::runtime_error("grouped VRAM engine up/gate launch failed");
             }
             const int elements = n * hidden;
@@ -484,9 +545,10 @@ int fail(const std::exception & e, char * error, size_t error_size) {
     return 1;
 }
 
-void * create(int device, int latent, int hidden, int weight_type, int down_type, char * error, size_t error_size) {
+void * create(int device, int latent, int hidden, int formats, const int32_t * up_types, const int32_t * gate_types,
+        const int32_t * down_types, char * error, size_t error_size) {
     try {
-        return new group_engine(device, latent, hidden, weight_type, down_type);
+        return new group_engine(device, latent, hidden, formats, up_types, gate_types, down_types);
     } catch (const std::exception & e) {
         fail(e, error, error_size);
         return nullptr;
@@ -513,16 +575,16 @@ int release(void * context, char * error, size_t error_size) {
 
 float * input_rows(void * context) { return context ? static_cast<group_engine *>(context)->host_input : nullptr; }
 
-int begin_layer(void * context, int rows, const vram_group_route * routes, const int32_t * first, int groups,
+int begin_layer(void * context, int format, int rows, const vram_group_route * routes, const int32_t * first, int groups,
         const vram_group_activation * activation, char * error, size_t error_size) {
     try {
         if (!context) { throw std::runtime_error("null grouped VRAM engine"); }
-        static_cast<group_engine *>(context)->begin_layer(rows, routes, first, groups, activation);
+        static_cast<group_engine *>(context)->begin_layer(format, rows, routes, first, groups, activation);
         return 0;
     } catch (const std::exception & e) { return fail(e, error, error_size); }
 }
 
-int compute(void * context, int group, const vram_compute_expert * weights, CUevent_st * ready, CUevent_st ** done,
+int compute(void * context, int group, const vram_compute_expert * weights, cudaEvent_t ready, cudaEvent_t * done,
         char * error, size_t error_size) {
     try {
         if (!context || !weights) { throw std::runtime_error("null grouped VRAM engine argument"); }
@@ -552,10 +614,9 @@ size_t device_bytes(void * context) { return context ? static_cast<group_engine 
 size_t host_bytes(void * context) { return context ? static_cast<group_engine *>(context)->host_bytes() : 0; }
 } // namespace
 
-extern "C" __attribute__((visibility("default")))
-const vram_group_compute_api * kimi_vram_group_compute_get_api() {
+extern "C" const vram_group_compute_api * ssd_vram_group_compute_get_api() {
     static const vram_group_compute_api api = {
-        2, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
+        4, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
         finish_layer, geometry, device_bytes, host_bytes
     };
     return &api;

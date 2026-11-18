@@ -25,27 +25,7 @@ class llama_io_write_i;
 // "memory" as in abstract memory for the context
 struct llama_memory_i;
 struct llama_memory_context_i;
-
-// The prefill route of one ubatch of n_tokens tokens: the CPU sink's grouped prefill when the sink is on and the ubatch
-// has at most max_tokens tokens, or when the GPU would not take a MUL_MAT_ID of that size off the CPU (the scheduler
-// would compute it from the mmap'd experts on the CPU); the ggml graph on the GPU otherwise, which copies every layer's
-// experts to the device.
-inline bool llama_cpu_sink_prefill_route(bool sink, uint32_t max_tokens, uint32_t n_tokens, bool gpu_offloads) {
-    return sink && (n_tokens <= max_tokens || !gpu_offloads);
-}
-
-// The expert copies of one prefill's graph-route passes (the [moe_prefill_copy] line): begin when the prefill starts,
-// pass for each ubatch on the graph route, end when the prefill ends with the scheduler's counters then.  end returns
-// the line, without a newline, and nothing for a prefill that had no graph-route pass.
-struct llama_prefill_copy_meter {
-    uint32_t passes = 0;
-    uint64_t tokens = 0;
-    ggml_backend_sched_kimi_copy_stats start = {};
-
-    void begin(const ggml_backend_sched_kimi_copy_stats & now) { passes = 0; tokens = 0; start = now; }
-    void pass(uint32_t n_tokens) { ++passes; tokens += n_tokens; }
-    std::string end(const ggml_backend_sched_kimi_copy_stats & now);
-};
+struct llama_memory_params;
 
 // The copies of the weights homed on the drive in one phase of a request (the [dense_stream] line): the prefill from
 // the request's start to its end, the decode from there to the request's end.  begin when the phase starts, add the
@@ -54,31 +34,18 @@ struct llama_prefill_copy_meter {
 struct llama_dense_stream_meter {
     const char * phase = nullptr;       // nullptr: between requests
     uint64_t tokens = 0;
-    ggml_backend_sched_kimi_copy_stats start = {};
+    ggml_backend_sched_ssd_copy_stats start = {};
 
-    void begin(const char * p, const ggml_backend_sched_kimi_copy_stats & now) { phase = p; tokens = 0; start = now; }
+    void begin(const char * p, const ggml_backend_sched_ssd_copy_stats & now) { phase = p; tokens = 0; start = now; }
     void add(uint32_t n_tokens) { tokens += n_tokens; }
-    std::string end(const ggml_backend_sched_kimi_copy_stats & now);
+    std::string end(const ggml_backend_sched_ssd_copy_stats & now);
 };
-
-// Whether one of the GPU devices gpus would compute a MUL_MAT_ID of n_tokens tokens over each of the expert tensors
-// experts, weights in host memory, instead of the CPU: the scheduler's test for such an op
-// (ggml_backend_sched_backend_id_from_cur), that the device supports it and offloads it, the latter by its batch
-// (ne[2]).  An expert tensor the GPU does not take would be computed from the mmap'd experts on the CPU.
-bool llama_gpu_offloads_mul_mat_id(const std::vector<ggml_backend_dev_t> & gpus,
-        const std::vector<const ggml_tensor *> & experts, int64_t n_expert_used, uint32_t n_tokens);
 
 // The ubatch of a request's prefill graph when a graph of the request's own size, target, does not fit (graphs sized
 // to the request).  Every pass of a smaller ubatch reads its layers' experts again, so the search takes the largest
-// size that fits on a route that can serve the request.  When the target takes the ggml graph: the graph's sizes,
-// those above the threshold that the GPU offloads.  When none of them fits: the sink at the target, since one sink
-// pass reads each expert once and a split reads the union again at the same compute; for that the request's
-// threshold max_sink_tokens is raised to the target.  Then smaller sink sizes.  The search is binary, in steps of
-// the granularity, at least 256 tokens and at most half the target, and ends with one token.
-// sink_route(n, max_sink_tokens): whether a ubatch of n tokens takes the sink at that threshold; reserve(n):
-// reserve the graph of n tokens at the threshold in max_sink_tokens.  Returns the selected ubatch, 0 if none fits.
-uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, uint32_t & max_sink_tokens,
-        const std::function<bool(uint32_t, uint32_t)> & sink_route, const std::function<bool(uint32_t)> & reserve);
+// size that fits: binary, in steps of the granularity, at least 256 tokens and at most half the target, and ending
+// with one token.  reserve(n): reserve the graph of n tokens.  Returns the selected ubatch, 0 if none fits.
+uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::function<bool(uint32_t)> & reserve);
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs
@@ -95,6 +62,13 @@ struct llama_context {
     //   - changing attention type
     //   - etc.
     void sched_reserve();
+    // The scheduler and its graphs dropped, a new one reserved on the next sched_reserve().
+    void drop_scheduler();
+    // A new scheduler and graph results holding graphs of up to `max_nodes` nodes, nothing reserved yet.
+    void make_scheduler(size_t max_nodes);
+    // A stand-in graph of `ubatch` tokens over `horizon` positions reserved in a new scheduler: false, and none, when it
+    // does not fit.
+    bool reserve_graph_ubatch(uint32_t ubatch, uint32_t horizon);
 
     void synchronize();
 
@@ -105,16 +79,12 @@ struct llama_context {
     // Request-scoped scheduler/cache exchange used by the default-off K3
     // grouped-prefill capacity ladder.
     bool moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens);
-
-    // whether a prefill ubatch of n_tokens runs on the CPU sink (llama_cpu_sink_prefill_route) in this context, at
-    // this request's threshold or at max_tokens
-    bool cpu_sink_prefill_route(uint32_t n_tokens) const;
-    bool cpu_sink_prefill_route(uint32_t n_tokens, uint32_t max_tokens) const;
-    // whether the scheduler would compute a MUL_MAT_ID of n_tokens over the model's expert tensors on a GPU
-    // (llama_gpu_offloads_mul_mat_id)
-    bool gpu_offloads_experts(uint32_t n_tokens) const;
-    // the threshold: GGML_KIMI_CPU_PREFILL_MAX_TOKENS, else GGML_KIMI_CPU_PREFILL (1: every ubatch, 0: none)
-    uint32_t cpu_prefill_max_tokens_get() const { return cpu_prefill_max_tokens; }
+    // The first ubatch of a prompt whose own graph does not fit: a smaller ubatch for the batch's next split.
+    bool prefill_refit();
+    // at load, after the load's passes: the expert caches filled from the drive (llama_ssd_preload)
+    bool ssd_preload();
+    // up, gate and down of every routed layer, in layer order
+    std::vector<const ggml_tensor *> routed_experts() const;
 
     // room in host memory for an allocation outside the RAM expert cache (llama_host_reserve)
     bool host_reserve(size_t bytes);
@@ -314,7 +284,8 @@ public:
     ggml_status graph_compute(ggml_cgraph * gf, bool batched, llama_memory_context_i * mctx = nullptr);
 
     // reserve a graph with a dummy ubatch of the specified size
-    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill);
+    // `admitted`: what runs once the host ledger has given the graph its room, before its buffers are allocated.
+    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {});
 
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -326,12 +297,19 @@ private:
     void extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
     void dense_graph_cache_begin_phase(int phase);
+    void dense_pool_hold(bool hold);
     void dense_graph_cache_end_phase();
 
     // worst-case memory context for a graph reserve that covers sched_reserve_n_ctx positions
     std::unique_ptr<llama_memory_context_i> memory_init_reserve();
     // positions currently held by the memory module (max over sequences of pos_max + 1)
     uint32_t memory_n_pos() const;
+
+    // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
+    // SSD experts, whose KV cache allocates its cells as they are used).
+    uint32_t fit_context(const llama_memory_params & params_mem) const;
+    // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
+    uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos
     uint32_t reserve_horizon_bucket(uint32_t n_pos) const;
 
@@ -364,12 +342,8 @@ private:
     bool dense_gpu_phase_gate_enabled = false;
     bool dense_gpu_prefill_phase_active = false;
     int dense_gpu_scheduler_graph_phase = 0;
-    bool cpu_sink_enabled = false;
-    uint32_t cpu_prefill_max_tokens = 0; // prefill ubatches up to this size run on the CPU sink
-    // the threshold of this request: cpu_prefill_max_tokens, or the request's size when the graph does not fit
-    uint32_t cpu_prefill_request_max_tokens = 0;
-    // this request's prefill on the graph route: passes, their tokens, the expert-copy counters at its start
-    llama_prefill_copy_meter prefill_copy;
+    bool cpu_sink_enabled = false; // every pass computes the experts on the CPU sink
+    bool cpu_prefill_hint = false; // a sink prefill predicts each next layer's routes for its read-ahead
     llama_dense_stream_meter dense_stream;
     bool cpu_prefill_actual_shape_enabled = false;
     bool cpu_prefill_actual_shape_active = false;
@@ -377,6 +351,12 @@ private:
     uint32_t cpu_prefill_configured_ubatch = 0;
     uint32_t cpu_prefill_selected_ubatch = 0;
     uint32_t cpu_prefill_graph_granularity = 1;
+    // A prefill phase's graph not yet reserved: its first ubatch reserves it (process_ubatch), over this horizon, for
+    // a prompt of this many tokens.
+    bool cpu_prefill_reserve_pending = false;
+    size_t sched_max_nodes = 0; // the graphs the scheduler and its graph results hold (make_scheduler)
+    uint32_t cpu_prefill_horizon = 0;
+    uint32_t cpu_prefill_requested_tokens = 0;
     // Graph reserves cover the positions in use instead of the whole n_ctx
     // (LLAMA_RESERVE_HORIZON=0 restores full-context reserves).
     bool reserve_horizon_enabled = false;
@@ -386,7 +366,7 @@ private:
     bool cpu_sink_decode_active = false;
     bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
-    std::unique_ptr<llama_kimi_cpu_sink_runtime> cpu_sink_runtime;
+    std::unique_ptr<llama_ssd_cpu_sink_runtime> cpu_sink_runtime;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

@@ -1,7 +1,7 @@
 #pragma once
-// Page-locking of a RAM cache's slots for the GPU's copies (kimi_vram_host_api v2 register_host), on a discrete GPU:
-// the CPU sink's registrar (kimi-cpu-sink.cpp). Kept apart from the sink so that its rules are tested alone
-// (tests/test-kimi-host-lock.cpp, with fake page-locking).
+// Page-locking of a RAM cache's slots for the GPU's copies (ssd_vram_host_api v2 register_host), on a discrete GPU:
+// the CPU sink's registrar (ggml-cpu/ssd/cpu-sink.cpp). Kept apart from the sink so that its rules are tested alone
+// (tests/ssd/test-ssd-host-lock.cpp, with fake page-locking).
 //   - Which slots: a registration is bought once and the moves it allows pay per use (rent or buy). The decode plan
 //     reports, per layer, the time the moves it could not make from unlocked slots would have saved (missed); each
 //     such slot accrues its share, and is wanted once that reaches one registration. The rent is the occupant's: a
@@ -30,7 +30,7 @@
 #include <thread>
 #include <vector>
 
-struct kimi_host_lock {
+struct ssd_host_lock {
     // Page-lock [pointer, pointer + bytes) for the device's copies (false: refused, why says why), and undo it.
     std::function<bool(const void * pointer, size_t bytes, std::string * why)> lock_pages;
     std::function<bool(const void * pointer)> unlock_pages;
@@ -51,7 +51,7 @@ struct kimi_host_lock {
     std::string last_error;
     static constexpr size_t wanted_cap = 256;
 
-    ~kimi_host_lock() { stop(); }
+    ~ssd_host_lock() { stop(); }
 
     void start() {
         enabled = true;
@@ -149,10 +149,10 @@ struct kimi_host_lock {
         return size_t(std::count(locked.begin(), locked.end(), uint8_t(1)));
     }
 
-    // [kimi_host_register] receipt (mutex held by the caller or no thread running).
+    // [ssd_host_register] receipt (mutex held by the caller or no thread running).
     void report(FILE * out, const char * reason, size_t stride) const {
         const size_t n = size_t(std::count(locked.begin(), locked.end(), uint8_t(1)));
-        std::fprintf(out, "[kimi_host_register] reason=%s enabled=%d locked=%zu bytes=%llu registered=%llu failures=%llu "
+        std::fprintf(out, "[ssd_host_register] reason=%s enabled=%d locked=%zu bytes=%llu registered=%llu failures=%llu "
             "unregistered=%llu signals=%llu wanted=%llu us_mean=%.0f us_max=%.0f us_total=%.0f error=%s\n",
             reason, int(enabled), n, (unsigned long long) (uint64_t(n) * stride), (unsigned long long) registered,
             (unsigned long long) failures, (unsigned long long) unregistered, (unsigned long long) signals,
@@ -196,7 +196,7 @@ private:
 // together once per allocation of the ring, at a quiescent point the owner picks, and unregistered before the owner
 // reallocates or frees them (unlock). A refused registration undoes the ones made before it: the ring stays pageable,
 // and is not tried again before the next allocation (an unlock).
-struct kimi_ring_lock {
+struct ssd_ring_lock {
     std::function<bool(const void * pointer, size_t bytes, std::string * why)> lock_pages;
     std::function<bool(const void * pointer)> unlock_pages;
     std::vector<const void *> ranges;   // the registered buffers

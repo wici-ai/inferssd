@@ -933,6 +933,13 @@ struct ggml_cuda_type_traits<GGML_TYPE_Q1_0> {
 };
 
 template<>
+struct ggml_cuda_type_traits<GGML_TYPE_Q2_0> {
+    static constexpr int qk = QK2_0;
+    static constexpr int qr = QR2_0;
+    static constexpr int qi = QI2_0;
+};
+
+template<>
 struct ggml_cuda_type_traits<GGML_TYPE_Q4_0> {
     static constexpr int qk = QK4_0;
     static constexpr int qr = QR4_0;
@@ -1113,12 +1120,21 @@ struct ggml_cuda_pool {
     virtual void * alloc(size_t size, size_t * actual_size) = 0;
     virtual void free(void * ptr, size_t size) = 0;
 
-    // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it neither gets device
-    // memory while a graph runs nor keeps memory the graph does not need; returns false if the memory cannot be
-    // obtained. Pools that allocate on demand may ignore this.
-    virtual bool reserve(size_t size) {
+    // Resizes the pool to hold `size` bytes of allocations beyond those in use, so that it gets no device memory
+    // while a graph runs; returns false if the memory cannot be obtained. With `hold` it only grows: a prompt's graphs
+    // hold what the largest of them needs until its decode, since the expert caches take memory back only at that
+    // boundary and giving it back between the prompt's graphs would take it from them again. Without, it keeps none
+    // the graph does not need (a pool without VMM moves to give memory back: base).
+    virtual bool reserve(size_t size, bool hold) {
         GGML_UNUSED(size);
+        GGML_UNUSED(hold);
         return true;
+    }
+
+    // where the pool's memory starts: a captured graph holds addresses into it, so it is replayed only while this
+    // stays (null for a pool without one place)
+    virtual const void * base() const {
+        return nullptr;
     }
 
     // the bytes of device memory the pool holds, allocations in use included
@@ -1419,6 +1435,9 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// cuBLAS allocates internally, outside ggml_cuda_malloc_reclaiming.
+cublasStatus_t ggml_cuda_cublas_create_reclaiming(cublasHandle_t * handle, int device);
+
 struct ggml_backend_cuda_context {
     // Borrowed from the owning llama context; outlives this backend.
     const ssd::runtime_services * ssd_services = nullptr;
@@ -1433,6 +1452,8 @@ struct ggml_backend_cuda_context {
 
     // the largest memory pool need that ggml_backend_cuda_graph_reserve has logged
     size_t pool_reserve_logged = 0;
+    // a prompt's graphs are reserved (ggml_backend_pool_hold): the pool keeps what they need until the decode's reserve
+    bool pool_hold = false;
 
 #ifdef USE_CUDA_GRAPH
     // The default key remains first_node_ptr.  Phase-managed schedulers use a
@@ -1591,7 +1612,7 @@ struct ggml_backend_cuda_context {
     cublasHandle_t cublas_handle(int device) {
         if (cublas_handles[device] == nullptr) {
             ggml_cuda_set_device(device);
-            CUBLAS_CHECK(cublasCreate(&cublas_handles[device]));
+            CUBLAS_CHECK(ggml_cuda_cublas_create_reclaiming(&cublas_handles[device], device));
             CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
         }
         return cublas_handles[device];

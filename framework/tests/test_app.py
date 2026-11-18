@@ -34,6 +34,17 @@ def test_tested_quantizations_and_shards():
         hub.select_files(["../model-Q8_0.gguf"], "Q8_0")
 
 
+def test_new_models_use_complete_quant_tokens_and_ignore_projectors():
+    flash = "bartowski/Qwen3.8-Flash-Next-GGUF"
+    gemma = "google/gemma-4-E4B-it-qat-q4_0-gguf"
+    assert hub.selection(flash) == (flash, "IQ4_XS")
+    assert hub.selection(gemma) == (gemma, "Q4_0")
+    model = "gemma-4-E4B_q4_0-it.gguf"
+    assert hub.select_files([model, "gemma-4-E4B-it-mmproj.gguf"], "Q4_0") == [model]
+    with pytest.raises(ValueError, match="no Q4_0"):
+        hub.select_files(["Q4_0/gemma-4-E4B-Q4_0_4_8.gguf"], "Q4_0")
+
+
 @pytest.fixture
 def fake_hub(monkeypatch):
     names = [f"Model-Q8_0-{n:05}-of-00002.gguf" for n in (1, 2)]
@@ -133,11 +144,27 @@ def test_serve_reuses_owned_launch_and_policy(ready_app, monkeypatch):
     assert main(["serve", "-m", str(ready_app), "--port", "8181"]) == 0
     args = launch.call_args.args[0]
     assert args.execute and args.model == ready_app
-    assert args.port == 8181
+    assert args.port == 8181 and args.host == "127.0.0.1"
     policy = json.loads(args.runtime_policy.read_text())
     assert policy["memory_budget_bytes"] == 48 << 30
     assert "host_reserve_bytes" not in policy and "runtime_seconds" not in policy
     assert not args.output_dir.exists()  # owned runtime reserves it
+
+
+def test_serve_listens_on_the_given_host(ready_app, monkeypatch, capsys):
+    launch = Mock(return_value=0)
+    monkeypatch.setattr(command.typed_command, "run", launch)
+    assert main(["serve", "-m", str(ready_app), "--host", "0.0.0.0"]) == 0
+    assert launch.call_args.args[0].host == "0.0.0.0"
+    assert "http://127.0.0.1:8080/v1" in capsys.readouterr().err
+
+
+def test_a_host_that_is_not_an_ipv4_address_fails_before_download(ready_app, monkeypatch):
+    download = Mock()
+    monkeypatch.setattr(command, "download", download)
+    with pytest.raises(SystemExit):
+        main(["serve", "-hf", next(iter(hub.MODELS)), "--host", "localhost"])
+    download.assert_not_called()
 
 
 def test_hf_and_chat_share_owned_launch(ready_app, monkeypatch):
@@ -210,17 +237,52 @@ def test_session_always_stops_owned_server(tmp_path, monkeypatch, outcome):
     engine.stop.assert_called_once()
 
 
-def test_terminal_stream_and_clear(monkeypatch, capsys):
+def _chat_server(monkeypatch, reasoning):
     stream = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\ndata: [DONE]\n'
+    props = json.dumps({"reasoning": reasoning}).encode()
     opener = Mock()
-    opener.open.side_effect = lambda *a, **kw: io.BytesIO(stream)
+    opener.open.side_effect = lambda target, **kw: io.BytesIO(
+        props if isinstance(target, str) else stream
+    )
     monkeypatch.setattr(chat.urllib.request, "build_opener", lambda _: opener)
+    return opener
+
+
+def _chat_requests(opener):
+    return [
+        json.loads(call.args[0].data)
+        for call in opener.open.call_args_list
+        if not isinstance(call.args[0], str)
+    ]
+
+
+def test_terminal_stream_and_clear(monkeypatch, capsys):
+    opener = _chat_server(
+        monkeypatch, {"can_turn_off": True, "efforts": ["high"], "default_effort": "high"}
+    )
     prompts = iter(["one", "/clear", "two", "/exit"])
     monkeypatch.setattr("builtins.input", lambda _: next(prompts))
     assert chat.chat(8080, None, 16) == 0
-    requests = [json.loads(call.args[0].data) for call in opener.open.call_args_list]
+    requests = _chat_requests(opener)
     assert requests[1]["messages"] == [{"role": "user", "content": "two"}]
+    assert requests[1]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "reasoning_effort" not in requests[1]
     assert "hello" in capsys.readouterr().out
+
+
+def test_terminal_takes_the_least_effort_of_a_template_that_always_thinks(monkeypatch):
+    opener = _chat_server(
+        monkeypatch,
+        {
+            "can_turn_off": False,
+            "efforts": ["low", "medium", "high", "xhigh"],
+            "default_effort": "xhigh",
+        },
+    )
+    assert chat.chat(8080, "hi", 16) == 0
+    [request] = _chat_requests(opener)
+    assert request["reasoning_effort"] == "low"
+    assert "chat_template_kwargs" not in request
 
 
 def test_truncated_stream_is_an_error(monkeypatch):

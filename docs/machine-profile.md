@@ -10,7 +10,9 @@ You do not need to run anything for this: the first `inferssd serve` or `cli` on
 a machine measures it, and later launches reuse the file (see
 [launches](#launches)). `inferssd profile` measures or shows it on its own.
 
-Linux and macOS are supported. Windows is not supported yet.
+Linux, macOS and Windows are supported. On Windows nothing measures the GPUs
+yet: the file records the NVIDIA GPUs `nvidia-smi` lists, with a partial `gpus`
+section, and the other display adapters a Vulkan build can use.
 
 ## Usage
 
@@ -33,7 +35,7 @@ inferssd profile --reprofile --model /models/model-00001-of-00004.gguf
 | --- | --- |
 | `--model PATH` | A model file or directory whose drive is measured. Repeat it for models on other drives. A file named like `name-00001-of-00004.gguf` brings all shards of its set; a directory brings every file below it, and one without a file of 1 GiB is measured with a test file (see [drive measurement](#drive-measurement)). The [speed estimates](#speed-estimates) take the models to be on the drive that holds most of the given files, or with none, on the first directory's. |
 | `--resources FILE` | An [engine resource descriptor](engine-resources.md) whose `probes` map names the probe executables. |
-| `--build DIR` | An engine build directory; the probes are `DIR/bin/inferssd-*probe`. |
+| `--build DIR` | An engine build directory; the probes are `DIR/bin/inferssd-*probe` (`inferssd-*probe.exe` on Windows). |
 | `--reprofile` | Ignore the saved file and measure every section. |
 | `--output PATH` | Use this file instead of the default location. |
 | `--show` | Print the saved file's summary and exit; with `--model`, also the estimates for that drive. Measures nothing. |
@@ -75,44 +77,65 @@ Each launch then combines the file with the model's GGUF header and with what
 it reads at that moment (the CPUs it may use, the usable GPUs and their free
 memory, the available memory) to choose:
 
-- the decode and prefill thread counts and, where the CPUs allow it, which
-  CPUs the decode threads use: the performance cluster alone, one thread
-  pinned to each CPU, when one token streams the model's weight format faster
-  there than on every CPU;
+- the decode thread count: the fewest threads that stream the model's weight
+  format at one token as fast as the best count measured, judged by the
+  calls' middle half (more threads add no bandwidth, only waits; the engine
+  runs decode on fewer while the machine's other work needs their CPUs); where
+  the CPUs allow it, which CPUs the decode threads use: the performance cluster
+  alone, its first CPUs, one thread pinned to each, when one token streams the
+  format faster there than on those decode threads unpinned;
+- the prefill thread count: the measured count that computes the format fastest at
+  the longest prompt measured, of the counts that leave one CPU to the sink's I/O
+  threads (every CPU but one is measured too; a profile without that count takes it
+  when the most threads it measured below it are the fastest there and more threads
+  measured faster still); the same rule on every platform;
+- the CPU the sink's I/O threads keep, where threads can be pinned (`cpu.io_cpus`):
+  outside the pinned decode CPUs, on the slower cluster where there is one, the
+  highest such. Unpinned beside a prefill pool on every other CPU, the I/O thread and
+  its drive queue and completion interrupts move between CPUs that sleep in between,
+  and the drive reads slower;
 - the starting estimates the engine uses to place experts between the CPU and
   the GPU (it refines them as it runs);
-- `vram.budget = 0` when no CUDA GPU is usable, and on macOS the host memory
-  budget from the runtime policy and a host margin of a quarter of the
-  machine's memory (`host.headroom_mib`), since macOS compresses the cold pages
-  of a RAM cache that leaves less free;
-- with one usable CUDA GPU on Linux, which prompt passes the CPU prefills
-  (`prefill.cpu_max_tokens`, the longest pass the CPU prefills no slower than
-  the GPU graph reading the same experts) and one prefill pass per prompt; on
+- `vram.budget = 0` when the engine has CUDA and no CUDA GPU is usable, and on
+  macOS and Windows the host memory budget from the runtime policy;
+- with an engine that has CUDA and one usable CUDA GPU, one prefill pass per prompt; on
   a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`).
 
-Only the prefill route and the pass size change the model's output, the way
-any GPU kernel or batch shape does; the rest keeps it bit for bit. The launch fills only the settings
+Without a measurement of the model's weight format, both pools take every
+allowed CPU but one.
+
+Only the pass size changes the model's output, the way
+any batch shape does; the rest keeps it bit for bit. The launch fills only the settings
 you left at their defaults: a value from `--set` or from the settings file always
 wins, and a choice that contradicts one of your values is left out. Every choice and its reason is written to `strategy.json` in the run
-directory and to the settings file the launch generates. Windows launches do
-not use a profile yet.
+directory and to the settings file the launch generates.
 
 ## What is measured
 
 | Section | Source | Content |
 | --- | --- | --- |
-| `cpu` | sysfs on Linux, `sysctl` on macOS; ISA from `inferssd-cpuprobe` | Logical CPUs with core, package, SMT siblings, `cpu_capacity` and maximum frequency; performance and efficiency clusters; whether threads can be pinned; the instruction-set features ggml reports (build options such as OpenMP or repacking are left out) |
-| `memory` | `/proc/meminfo` or `hw.memsize`; `inferssd-cpuprobe` | Total memory, page size, whether the GPU shares system memory, DRAM read bandwidth per thread count |
-| `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format and thread count: weight bytes per second for one token, FLOP/s for more tokens; on Linux machines with several CPU clusters, also one token with a thread pinned to each CPU of each cluster and of every CPU (rows with `cpus`) |
-| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU `nvidia-smi` lists |
+| `cpu` | sysfs on Linux, `sysctl` on macOS, CPU Sets on Windows; ISA from `inferssd-cpuprobe` | Logical CPUs with core, package, SMT siblings, `cpu_capacity` and maximum frequency; performance and efficiency clusters; whether threads can be pinned; the instruction-set features ggml reports (build options such as OpenMP or repacking are left out) |
+| `memory` | `/proc/meminfo`, `hw.memsize` or `GlobalMemoryStatusEx`; `inferssd-cpuprobe` | Total memory, page size, whether the GPU shares system memory, DRAM read bandwidth per thread count |
+| `compute` | `inferssd-cpuprobe` | ggml CPU matrix-multiply speed per weight format at 1, 2, 4, ... threads up to every CPU, at the performance cluster's size and at every CPU but one: weight bytes per second for one token, FLOP/s for more tokens, with each point's median call and quartiles; on Linux machines with several CPU clusters, also one token with a thread pinned to each CPU of each cluster and of every CPU, and on the performance cluster's first 1, 2, 4, ... CPUs (rows with `cpus`) |
+| `gpus` | `inferssd-memprobe` (Linux with NVIDIA GPUs, or AMD GPUs on ROCm) | VRAM size, host-to-device (pinned and pageable), device-to-host and device-to-device copy rates, and device read bandwidth, for every GPU the engine's CUDA or ROCm runtime finds |
 | `storage:<drive>` | `inferssd-ssdprobe`, one per drive | Random-read bandwidth and latency by request size and queue depth, read with the engine's own reader; the knee queue depth per size |
 
-The identity lists the GPUs: on Linux those `nvidia-smi` reports, on macOS
-the Apple GPU with its core count as `ioreg` reports it (when `ioreg` cannot
-say, the list is empty and profiling continues). The GPU probe measures every
-GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`; on macOS the GPU shares the
+The identity lists the GPUs, each with the backend the engine runs it on: the
+NVIDIA GPUs `nvidia-smi` reports, on CUDA; on Linux with ROCm installed (its
+`rocminfo` on PATH), the AMD GPUs the kernel's compute driver amdkfd lists
+(`/sys/class/kfd/kfd/topology`), on ROCm, by ROCm's UUIDs (`GPU-` and the
+device's unique ID in hex, as `rocminfo` and HIP spell them); on macOS the Apple GPU
+with its core count as `ioreg` reports it, on Metal (when `ioreg` cannot say, the
+list is empty and profiling continues); and the other AMD and the Intel display
+controllers, on Vulkan, found on the PCI bus on Linux and among the display
+adapters in the registry on Windows. Other display controllers, such as a server's
+management display or a virtual machine's, are left out. CUDA and ROCm carry the
+expert VRAM tier. The installers build the engine for the first of CUDA, ROCm,
+Metal and Vulkan among these GPUs, and for the CPU alone when there is none. The
+GPU probe measures every GPU on Linux, regardless of `CUDA_VISIBLE_DEVICES`,
+`HIP_VISIBLE_DEVICES` and `ROCR_VISIBLE_DEVICES`; on macOS the GPU shares the
 machine's memory and is not measured. A GPU the probe cannot measure (too
-little free VRAM, or a CUDA error) makes the `gpus` section partial, with the
+little free VRAM, or a runtime error) makes the `gpus` section partial, with the
 GPU's UUID and the reason. When `nvidia-smi` is
 installed but fails, for example after a driver upgrade without a reboot, the
 `gpus` section fails and the saved GPU identity is kept, so the machine is not
@@ -125,11 +148,23 @@ order and split once at the largest relative drop above 10%; a CPU with
 neither value makes the whole machine one cluster. On macOS the
 `hw.perflevel0.logicalcpu` CPUs form the performance cluster and the rest the
 efficiency cluster. macOS has no thread affinity, so its CPU numbers only count
-CPUs.
+CPUs. On Windows the CPUs are the logical processors of processor group 0,
+numbered as CPU masks number them; the CPUs of the highest CPU Set efficiency
+class form the performance cluster and the rest the efficiency cluster, and a
+machine without a CPU Set for every CPU is one cluster. There `capacity` is the
+efficiency class, `core` the CPU Set's core index, and package and maximum
+frequency are not recorded. Machines with more than one processor group (over
+64 logical CPUs) are not supported on Windows; their `cpu` section is partial.
 
 The knee of a request size is the smallest queue depth whose best run reaches
 the worst run of the fastest queue depth at that size. Each point's bandwidth is
 the median of its runs.
+
+Planning takes the measured size nearest an expert-role read on a log scale,
+then the best positive measured rate from its knee through the engine's or
+reader's queue-depth cap. If the knee exceeds that cap, it uses the best
+measured point within the cap and records that limitation; it does not
+extrapolate to an unmeasured depth.
 
 Every number names its unit: `_bytes`, `_Bps` (bytes per second), `_us`, `_s`,
 `_khz`, and `flops` (FLOP per second).
@@ -142,7 +177,8 @@ launch. Machine IDs and drive serial numbers are stored only as SHA-256 digests.
 
 The SSD probe never writes. It reads random, aligned extents inside existing
 files on the drive being measured, using direct I/O and the same reader the
-engine uses (io_uring on Linux, a pool of reader threads on macOS). Model shards
+engine uses (io_uring on Linux, IoRing or overlapped reads on Windows, a pool of
+reader threads on macOS). Model shards
 are read as raw bytes, so no model format is involved. For each drive the
 probe reads the eight largest files of at least 1 GiB among the given paths.
 
@@ -156,6 +192,13 @@ read as model files, and the next run removes those whose process has ended.
 When no such directory is given, or there is not enough room, the drive's section
 is recorded as failed with the reason.
 
+The test file is also used when every given file is already in the page cache,
+which is how a model looks right after its download on a Mac with memory to
+spare: the probe skips cached pages on macOS, since reading them would measure
+memory, and it finds nothing left to read. The file is written beside the model
+and needs the same 5 GiB free there; without that room the section is recorded
+as failed, and a later run measures the drive once the pages have been evicted.
+
 A drive is identified by its model and a digest of its serial number, or by
 its kernel name when it reports no serial (common for virtual disks). On Linux
 the file's device is followed through partitions and device-mapper or md
@@ -163,7 +206,10 @@ layers to the physical disks; overlay and network filesystems have no disk and
 are identified by filesystem type and mount point. On macOS the key uses the
 model and protocol reported by `diskutil` and a digest of the APFS volume UUID;
 a filesystem without a disk (network shares, FUSE) is identified by its type
-and mount point.
+and mount point. On Windows the file's volume is followed to its physical disks,
+and each disk is identified by the vendor, product, bus and serial number the
+storage driver reports; network shares and volumes without a disk (RAM disks,
+substituted drives) are identified by filesystem type and mount point.
 
 ## Speed estimates
 
@@ -178,8 +224,8 @@ its GGUF headers that the framework keeps. A token's time is the sum of:
 - the experts the RAM cache misses, read from the models' drive at the rate a
   launch takes for the engine's reads.
 
-Memory available now, less the host margin a launch keeps (a quarter of memory
-on macOS), holds the dense weights first, and what does not fit is read from the
+Memory available now, as the engine measures it, less the host margin a launch
+keeps, holds the dense weights first, and what does not fit is read from the
 drive each token; the RAM cache gets the rest and finds an expert as often as the
 share of all experts that fits, as if routing were uniform. GPU time, prefetch
 and the skew of real routing are not measured, so an estimate is a guide: on an
@@ -194,7 +240,7 @@ reason is printed instead.
 | --- | --- |
 | Linux | `$XDG_STATE_HOME/inferssd/machine.json`, by default `~/.local/state/inferssd/machine.json` |
 | macOS | `~/Library/Application Support/inferssd/machine.json` |
-| Windows | `%LOCALAPPDATA%\inferssd\machine.json` (reserved; profiling is not supported yet) |
+| Windows | `%LOCALAPPDATA%\inferssd\machine.json` |
 
 The file is JSON with schema `inferssd-machine/1`. It is replaced atomically,
 and a `machine.json.lock` file next to it keeps two profiles from running at
@@ -214,7 +260,8 @@ The saved file is reused section by section. A run measures:
 - the sections of a probe whose output schema changed;
 - a drive given with `--model` that the file does not describe yet;
 - any section whose last attempt failed or was partial (for example a GPU
-  that was busy).
+  that was busy), except the partial `gpus` section on Windows, which no probe
+  measures.
 
 `cpu`, `memory` and `compute` come from one CPU-probe run and are measured
 together. When nothing needs measuring, the file is left untouched.

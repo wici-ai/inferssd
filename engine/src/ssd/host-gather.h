@@ -5,7 +5,7 @@
 // are read ahead for the whole ubatch before the graph runs). A row of b bytes at an arbitrary offset spans
 // 1 + (b - 1) / page pages on average, so each row gathered costs page + b - 1 bytes, and a table at most its own
 // pages (and one page for the boundary). The host-memory ledger holds this room for a prefill until the first decode
-// token (kimi_cpu_sink_cache_prefill_room).
+// token (ssd_cpu_sink_cache_prefill_room).
 #include "ggml.h"
 #include "ggml-ssd/platform/memory.h"
 

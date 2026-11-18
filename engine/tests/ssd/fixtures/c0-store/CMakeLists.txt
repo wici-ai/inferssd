@@ -121,6 +121,11 @@ endif()
 
 # Resource-dependent direct I/O and mock-provider tests remain device gates.
 set_tests_properties(c0-store c0-config c0-parser-failures PROPERTIES LABELS unit)
+if(COMMAND inferssd_ci_test)
+  inferssd_ci_test(test-c0-store c0-store)
+  inferssd_ci_test(test-c0-config c0-config)
+  inferssd_ci_test(test-c0-parser-failures c0-parser-failures)
+endif()
 set_tests_properties(c0-parser-hooks PROPERTIES LABELS device)
 foreach(variant IN ITEMS cpu required)
   foreach(mode IN ITEMS normal concurrent throw disabled late unload page-cache half-success half-failure)

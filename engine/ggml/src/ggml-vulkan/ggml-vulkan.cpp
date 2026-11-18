@@ -1,4 +1,5 @@
 #include "ggml-vulkan.h"
+#include "gpu/graph-lane.h"
 #include <vulkan/vulkan_core.h>
 #if defined(GGML_VULKAN_RUN_TESTS) || defined(GGML_VULKAN_CHECK_RESULTS)
 #include <chrono>
@@ -51,6 +52,7 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #include <unordered_map>
 #include <memory>
 #include <mutex>
+#include <condition_variable>
 #include <future>
 #include <thread>
 
@@ -262,6 +264,19 @@ static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_interface = {
     /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_alloc_buffer,
     /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
     /* .get_max_size     = */ ggml_backend_vk_buffer_type_get_max_size,
+    /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
+    /* .is_host          = */ NULL,
+};
+
+// A growable buffer type (ggml_backend_dev_buffer_type_growable): a Vulkan buffer type of the device's, which the device
+// supports as its own, whose buffers hold memory for a prefix only
+static ggml_backend_buffer_t ggml_backend_vk_buffer_type_growable_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size);
+static size_t ggml_backend_vk_buffer_type_growable_get_max_size(ggml_backend_buffer_type_t buft);
+static ggml_backend_buffer_type_i ggml_backend_vk_buffer_type_growable_interface = {
+    /* .get_name         = */ ggml_backend_vk_buffer_type_name,
+    /* .alloc_buffer     = */ ggml_backend_vk_buffer_type_growable_alloc_buffer,
+    /* .get_alignment    = */ ggml_backend_vk_buffer_type_get_alignment,
+    /* .get_max_size     = */ ggml_backend_vk_buffer_type_growable_get_max_size,
     /* .get_alloc_size   = */ ggml_backend_vk_buffer_type_get_alloc_size,
     /* .is_host          = */ NULL,
 };
@@ -615,6 +630,8 @@ struct vk_device_struct {
     vk_device_architecture architecture;
     vk_queue compute_queue;
     vk_queue transfer_queue;
+    // the queue that binds memory to sparse buffers; null without sparse residency buffers, and with it growable ones
+    vk_queue * sparse_queue = nullptr;
     bool single_queue;
     bool support_async;
     bool async_use_transfer_queue;
@@ -750,6 +767,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_clamp_f32;
     vk_pipeline pipeline_pad_f32;
     vk_pipeline pipeline_roll_f32;
+    vk_pipeline pipeline_dsv4_hc_comb_f32, pipeline_dsv4_hc_pre_f32, pipeline_dsv4_hc_post_f32;
     vk_pipeline pipeline_repeat_f32, pipeline_repeat_back_f32;
     vk_pipeline pipeline_cpy_f32_f32, pipeline_cpy_f32_f16, pipeline_cpy_f16_f16, pipeline_cpy_f16_f32, pipeline_cpy_f32_bf16, pipeline_cpy_f32_i32, pipeline_cpy_i32_f32;
     vk_pipeline pipeline_contig_cpy_f32_f32, pipeline_contig_cpy_f32_f16, pipeline_contig_cpy_f16_f16, pipeline_contig_cpy_f16_f32, pipeline_contig_cpy_f32_bf16, pipeline_contig_cpy_f32_i32, pipeline_contig_cpy_i32_f32;
@@ -758,6 +776,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_cpy_transpose_16, pipeline_cpy_transpose_32;
     vk_pipeline pipeline_set_rows_i32[GGML_TYPE_COUNT];
     vk_pipeline pipeline_set_rows_i64[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_from_f16_i32[GGML_TYPE_COUNT];
+    vk_pipeline pipeline_set_rows_from_f16_i64[GGML_TYPE_COUNT];
     vk_pipeline pipeline_norm_f32;
     vk_pipeline pipeline_group_norm_f32;
     vk_pipeline pipeline_rms_norm_f32;
@@ -873,6 +893,7 @@ struct vk_device_struct {
     vk_buffer sync_staging;
 
     ggml_backend_buffer_type buffer_type;
+    ggml_backend_buffer_type buffer_type_growable;
 
     bool disable_fusion;
     bool disable_host_visible_vidmem;
@@ -931,6 +952,14 @@ struct vk_buffer_struct {
     size_t size = 0;
     vk::DeviceAddress bda_addr {};
 
+    // A growable buffer: a sparse residency buffer over all its addresses, with one allocation bound after another to
+    // the prefix it holds memory for (ggml_vk_buffer_set_committed)
+    bool sparse = false;
+    uint32_t sparse_memory_type = 0;
+    size_t sparse_block = 0;
+    size_t committed = 0;
+    std::vector<std::pair<vk::DeviceMemory, size_t>> sparse_memory; // each allocation and the bytes it binds
+
     vk_device device;
 
     ~vk_buffer_struct() {
@@ -939,6 +968,13 @@ struct vk_buffer_struct {
         }
         VK_LOG_DEBUG("~vk_buffer_struct(" << buffer << ", " << size << ")");
 
+        if (sparse) {
+            device->device.destroyBuffer(buffer);
+            for (const auto & memory : sparse_memory) {
+                device->device.freeMemory(memory.first);
+            }
+            return;
+        }
         device->device.freeMemory(device_memory);
         device->device.destroyBuffer(buffer);
     }
@@ -1279,6 +1315,16 @@ struct vk_op_binary_push_constants {
     float param1; float param2; int32_t param3;
 };
 
+struct vk_op_dsv4_hc_push_constants {
+    uint32_t ne0;
+    uint32_t hc;
+    uint32_t flag;
+    float param;
+    // src0 to src3, then dst, in floats
+    uint32_t offsets[5];
+    uint32_t nb[5][3];
+};
+
 struct vk_op_multi_add_push_constants {
     // shape for dst
     uint32_t ne20; uint32_t ne21; uint32_t ne22; uint32_t ne23;
@@ -1324,6 +1370,7 @@ struct vk_op_rope_push_constants {
     uint32_t rope_mode;
     uint32_t nrows;
     uint32_t n_dims;
+    uint32_t n_offs;
     float freq_scale;
     float freq_base;
     float ext_factor;
@@ -1954,6 +2001,13 @@ struct ggml_backend_vk_context {
     std::vector<int> query_node_idx;
     int32_t num_queries {};
     int32_t query_idx {};
+
+    // see ggml_vk_keep_awake
+    std::thread keep_awake_thread;
+    std::mutex keep_awake_mutex;
+    std::condition_variable keep_awake_signal;
+    std::chrono::steady_clock::time_point last_graph;
+    bool keep_awake_stop {};
 };
 
 static void * const vk_ptr_base = (void *)(uintptr_t) 0x1000;  // NOLINT
@@ -2637,7 +2691,7 @@ static std::vector<uint32_t> ggml_vk_find_memory_properties(const vk::PhysicalDe
     return indices;
 }
 
-static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::initializer_list<vk::MemoryPropertyFlags> & req_flags_list,
+static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std::vector<vk::MemoryPropertyFlags> & req_flags_list,
                                        void *import_ptr = nullptr) {
     VK_LOG_DEBUG("ggml_vk_create_buffer(" << device->name << ", " << size << ", " << to_string(req_flags_list.begin()[0]) << ", " << to_string(req_flags_list.begin()[req_flags_list.size()-1]) << ")");
     if (size > device->max_buffer_size) {
@@ -2804,34 +2858,42 @@ static vk_buffer ggml_vk_create_buffer_check(vk_device& device, size_t size, vk:
     }
 }
 
+// The memory types a device's buffers take, in order of preference
+static std::vector<vk::MemoryPropertyFlags> ggml_vk_device_memory_flags(const vk_device& device) {
+    if (device->prefer_host_memory) {
+        return { vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal };
+    }
+    if (device->uma) {
+        // The CPU and the GPU share this memory, and a type both can use spares each tensor copy a submit and a
+        // fence wait. Cached, since the CPU reads uncached memory far slower than it writes it. Fall back to
+        // device memory, then to any host memory type
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible |
+                     vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+    }
+    if (device->disable_host_visible_vidmem) {
+        if (device->allow_sysmem_fallback) {
+            return { vk::MemoryPropertyFlagBits::eDeviceLocal,
+                     vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+        }
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal };
+    }
+    // use rebar if available, otherwise fallback to device only visible memory
+    if (device->allow_sysmem_fallback) {
+        return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+                 vk::MemoryPropertyFlagBits::eDeviceLocal,
+                 vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
+    }
+    return { vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
+             vk::MemoryPropertyFlagBits::eDeviceLocal };
+}
+
 static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     vk_buffer buf;
     try {
-        if (device->prefer_host_memory) {
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                       vk::MemoryPropertyFlagBits::eDeviceLocal});
-        } else if (device->uma) {
-            // Fall back to host memory type
-            buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                       vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-        } else if (device->disable_host_visible_vidmem) {
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        } else {
-            // use rebar if available, otherwise fallback to device only visible memory
-            if (device->allow_sysmem_fallback) {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal,
-                                                           vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent});
-            } else {
-                buf = ggml_vk_create_buffer(device, size, {vk::MemoryPropertyFlagBits::eDeviceLocal | vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent,
-                                                           vk::MemoryPropertyFlagBits::eDeviceLocal});
-            }
-        }
+        buf = ggml_vk_create_buffer(device, size, ggml_vk_device_memory_flags(device));
     } catch (const vk::SystemError& e) {
         std::cerr << "ggml_vulkan: Device memory allocation of size " << size << " failed." << std::endl;
         std::cerr << "ggml_vulkan: " << e.what() << std::endl;
@@ -2839,6 +2901,118 @@ static vk_buffer ggml_vk_create_buffer_device(vk_device& device, size_t size) {
     }
 
     return buf;
+}
+
+// A growable buffer: its addresses, and so every tensor in it, are fixed at once; memory comes as
+// ggml_vk_buffer_set_committed binds it. Never mapped: reads and writes go through the GPU's copies.
+static vk_buffer ggml_vk_create_buffer_growable(vk_device& device, size_t size) {
+    if (size > device->max_buffer_size) {
+        throw vk::OutOfDeviceMemoryError("Requested buffer size exceeds device buffer size limit");
+    }
+
+    vk_buffer buf = std::make_shared<vk_buffer_struct>();
+    if (size == 0) {
+        return buf;
+    }
+
+    vk::BufferUsageFlags usage_flags = vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst;
+    if (device->buffer_device_address) {
+        usage_flags |= vk::BufferUsageFlagBits::eShaderDeviceAddress;
+    }
+    buf->buffer = device->device.createBuffer({
+        vk::BufferCreateFlagBits::eSparseBinding | vk::BufferCreateFlagBits::eSparseResidency, size, usage_flags,
+        vk::SharingMode::eExclusive, 0, nullptr });
+
+    // the memory the device's own buffers take, only bound as the buffer grows
+    vk::MemoryRequirements mem_req = device->device.getBufferMemoryRequirements(buf->buffer);
+    vk::PhysicalDeviceMemoryProperties mem_props = device->physical_device.getMemoryProperties();
+    std::vector<uint32_t> memory_types;
+    for (const vk::MemoryPropertyFlags & flags : ggml_vk_device_memory_flags(device)) {
+        memory_types = ggml_vk_find_memory_properties(&mem_props, &mem_req, flags);
+        if (!memory_types.empty()) {
+            break;
+        }
+    }
+    if (memory_types.empty()) {
+        device->device.destroyBuffer(buf->buffer);
+        throw vk::OutOfDeviceMemoryError("No memory type for a sparse buffer");
+    }
+
+    buf->sparse = true;
+    buf->sparse_memory_type = memory_types.front();
+    buf->sparse_block = mem_req.alignment;
+    // reached through the GPU only, whatever the memory type: nothing maps it
+    buf->memory_property_flags = vk::MemoryPropertyFlagBits::eDeviceLocal;
+    buf->ptr = nullptr;
+    buf->device = device;
+    buf->size = size;
+
+    if (device->buffer_device_address) {
+        const vk::BufferDeviceAddressInfo addressInfo(buf->buffer);
+        buf->bda_addr = device->device.getBufferAddress(addressInfo);
+    }
+
+    device->memory_logger->log_allocation(buf, size);
+
+    return buf;
+}
+
+static void ggml_vk_bind_sparse(vk_buffer& buf, const std::vector<vk::SparseMemoryBind>& binds) {
+    vk_device& device = buf->device;
+    const vk::SparseBufferMemoryBindInfo buffer_binds(buf->buffer, (uint32_t) binds.size(), binds.data());
+    vk::BindSparseInfo info;
+    info.setBufferBinds(buffer_binds);
+    device->sparse_queue->queue.bindSparse(info, device->fence);
+    VK_CHECK(device->device.waitForFences({ device->fence }, true, UINT64_MAX), "bindSparse waitForFences");
+    device->device.resetFences({ device->fence });
+}
+
+// Memory for the first `bytes` of a growable buffer, or no more than those: a growth binds one allocation after the
+// prefix, a shrink unbinds and frees the allocations past `bytes` (the one it falls in stays). Nothing may be using
+// what a shrink gives back. False when the device has no memory for a growth.
+static bool ggml_vk_buffer_set_committed(vk_buffer& buf, size_t bytes) {
+    GGML_ASSERT(buf->sparse);
+    vk_device& device = buf->device;
+    std::lock_guard<std::recursive_mutex> guard(device->mutex);
+
+    const size_t block = buf->sparse_block;
+    const size_t target = std::min(buf->size, (bytes + block - 1) / block * block);
+
+    std::vector<vk::SparseMemoryBind> unbinds;
+    std::vector<vk::DeviceMemory> unbound;
+    while (!buf->sparse_memory.empty() && buf->committed - buf->sparse_memory.back().second >= target) {
+        buf->committed -= buf->sparse_memory.back().second;
+        unbinds.push_back({ buf->committed, buf->sparse_memory.back().second, nullptr, 0 });
+        unbound.push_back(buf->sparse_memory.back().first);
+        buf->sparse_memory.pop_back();
+    }
+    if (!unbinds.empty()) {
+        ggml_vk_bind_sparse(buf, unbinds);
+        for (const auto & memory : unbound) {
+            device->device.freeMemory(memory);
+        }
+    }
+    if (target <= buf->committed) {
+        return true;
+    }
+
+    const size_t more = target - buf->committed;
+    const vk::MemoryPriorityAllocateInfoEXT mem_priority_info { 1.0f };
+    vk::MemoryAllocateFlagsInfo mem_flags_info { device->buffer_device_address ? vk::MemoryAllocateFlags(vk::MemoryAllocateFlagBits::eDeviceAddress) : vk::MemoryAllocateFlags() };
+    if (device->memory_priority) {
+        mem_flags_info.setPNext(&mem_priority_info);
+    }
+    vk::DeviceMemory memory;
+    try {
+        memory = device->device.allocateMemory({ (more + block - 1) / block * block, buf->sparse_memory_type, &mem_flags_info });
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_ERROR("ggml_vulkan: no memory for %.2f MiB more of a growable buffer: %s\n", more/1048576.0, e.what());
+        return false;
+    }
+    ggml_vk_bind_sparse(buf, { { buf->committed, more, memory, 0 } });
+    buf->sparse_memory.push_back({ memory, more });
+    buf->committed = target;
+    return true;
 }
 
 static void ggml_vk_destroy_buffer(vk_buffer& buf) {
@@ -4470,6 +4644,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
     SET_ROWS(_i64)
 #undef SET_ROWS
 
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i32[GGML_TYPE_F32], "set_rows_f32_from_f16_i32", set_rows_f32_from_f16_i32_len, set_rows_f32_from_f16_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i64[GGML_TYPE_F32], "set_rows_f32_from_f16_i64", set_rows_f32_from_f16_i64_len, set_rows_f32_from_f16_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i32[GGML_TYPE_F16], "set_rows_f16_from_f16_i32", set_rows_f16_from_f16_i32_len, set_rows_f16_from_f16_i32_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+    ggml_vk_create_pipeline(device, device->pipeline_set_rows_from_f16_i64[GGML_TYPE_F16], "set_rows_f16_from_f16_i64", set_rows_f16_from_f16_i64_len, set_rows_f16_from_f16_i64_data, "main", 3, sizeof(vk_op_binary_push_constants), {1, 1, 1}, {1}, 1, true);
+
 
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q1_0], "cpy_q1_0_f32", cpy_q1_0_f32_len, cpy_q1_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q1_0), 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_cpy_quant_f32[GGML_TYPE_Q4_0], "cpy_q4_0_f32", cpy_q4_0_f32_len, cpy_q4_0_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {(uint32_t)ggml_blck_size(GGML_TYPE_Q4_0), 1, 1}, {}, 1);
@@ -4547,6 +4726,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
     ggml_vk_create_pipeline(device, device->pipeline_pad_f32, "pad_f32", pad_f32_len, pad_f32_data, "main", 2, sizeof(vk_op_pad_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_roll_f32, "roll_f32", roll_f32_len, roll_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
+
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_comb_f32, "dsv4_hc_comb_f32", dsv4_hc_comb_f32_len, dsv4_hc_comb_f32_data, "main", 4, sizeof(vk_op_dsv4_hc_push_constants), {64, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_pre_f32, "dsv4_hc_pre_f32", dsv4_hc_pre_f32_len, dsv4_hc_pre_f32_data, "main", 3, sizeof(vk_op_dsv4_hc_push_constants), {512, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_dsv4_hc_post_f32, "dsv4_hc_post_f32", dsv4_hc_post_f32_len, dsv4_hc_post_f32_data, "main", 5, sizeof(vk_op_dsv4_hc_push_constants), {512, 1, 1}, {}, 1);
 
     ggml_vk_create_pipeline(device, device->pipeline_repeat_f32, "repeat_f32", repeat_f32_len, repeat_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_repeat_back_f32, "repeat_back_f32", repeat_back_f32_len, repeat_back_f32_data, "main", 2, sizeof(vk_op_unary_push_constants), {512, 1, 1}, {}, 1);
@@ -5619,6 +5802,20 @@ static vk_device ggml_vk_get_device(size_t idx) {
             /* .iface    = */ ggml_backend_vk_buffer_type_interface,
             /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_vk_reg(), idx),
             /* .context  = */ new ggml_backend_vk_buffer_type_context{ device->name, device },
+        };
+
+        if (device_features2.features.sparseBinding && device_features2.features.sparseResidencyBuffer) {
+            for (vk_queue * q : { &device->transfer_queue, &device->compute_queue }) {
+                if (queue_family_props[q->queue_family_index].queueFlags & vk::QueueFlagBits::eSparseBinding) {
+                    device->sparse_queue = q;
+                    break;
+                }
+            }
+        }
+        device->buffer_type_growable = {
+            /* .iface    = */ ggml_backend_vk_buffer_type_growable_interface,
+            /* .device   = */ device->buffer_type.device,
+            /* .context  = */ device->buffer_type.context,
         };
 
         device->fence = device->device.createFence({});
@@ -9429,6 +9626,12 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_roll_f32;
         }
         return nullptr;
+    case GGML_OP_DSV4_HC_COMB:
+        return ctx->device->pipeline_dsv4_hc_comb_f32;
+    case GGML_OP_DSV4_HC_PRE:
+        return ctx->device->pipeline_dsv4_hc_pre_f32;
+    case GGML_OP_DSV4_HC_POST:
+        return ctx->device->pipeline_dsv4_hc_post_f32;
     case GGML_OP_REPEAT:
         if (ggml_type_size(src0->type) == sizeof(float) && ggml_type_size(dst->type) == sizeof(float)) {
             return ctx->device->pipeline_repeat_f32;
@@ -9444,6 +9647,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     case GGML_OP_DUP:
         return ggml_vk_get_cpy_pipeline(ctx, src0, dst, dst->type);
     case GGML_OP_SET_ROWS:
+        if (src0->type == GGML_TYPE_F16) {
+            return src1->type == GGML_TYPE_I64 ?
+                ctx->device->pipeline_set_rows_from_f16_i64[dst->type] :
+                ctx->device->pipeline_set_rows_from_f16_i32[dst->type];
+        }
         if (src1->type == GGML_TYPE_I64) {
             return ctx->device->pipeline_set_rows_i64[dst->type];
         } else {
@@ -9864,6 +10072,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
     GGML_UNUSED(src2);
 }
 
+template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_dsv4_hc_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
+    const ggml_tensor * tensors[5] = { src0, src1, src2, src3, dst };
+    for (int i = 0; i < 5; ++i) {
+        p.offsets[i] = tensors[i] ? get_misalign_bytes(ctx, tensors[i]) / sizeof(float) : 0;
+    }
+}
+
 template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk_op_unary_push_constants &p, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * src3, ggml_tensor * dst) {
     const uint32_t a_offset = get_misalign_bytes(ctx, src0) / ggml_type_size(src0->type);
     const uint32_t d_offset = get_misalign_bytes(ctx, dst) / ggml_type_size(dst->type);
@@ -10225,6 +10440,15 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
             }
         }
         break;
+    case GGML_OP_DSV4_HC_COMB:
+        elements = { (uint32_t)dst->ne[2], 1, 1 };
+        break;
+    case GGML_OP_DSV4_HC_PRE:
+        elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], 1 };
+        break;
+    case GGML_OP_DSV4_HC_POST:
+        elements = { (uint32_t)dst->ne[0], (uint32_t)dst->ne[1], (uint32_t)dst->ne[2] };
+        break;
     case GGML_OP_SSM_CONV:
         {
             const uint32_t nr  = src0->ne[1];
@@ -10266,6 +10490,10 @@ static void ggml_vk_op_f32(ggml_backend_vk_context * ctx, vk_context& subctx, co
         }
         // im2col uses only src1 and dst buffers
         ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src1_buf, dst_buf }, pc, elements);
+    } else if (op == GGML_OP_DSV4_HC_POST) {
+        // Empty src3 (identity comb) is possible in hc_post, but the shader needs a buffer
+        vk_subbuffer subbuf3 = use_src3 ? src3_buf : src0_buf;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { src0_buf, src1_buf, src2_buf, subbuf3, dst_buf }, pc, elements);
     } else if (op == GGML_OP_COUNT_EQUAL) {
         // count_equal assumes that destination buffer is initialized with zeroes
         ggml_vk_buffer_memset_async(subctx, dst_buf.buffer, dst_buf.offset, 0, dst_buf.size);
@@ -10917,6 +11145,41 @@ static void ggml_vk_pad(ggml_backend_vk_context * ctx, vk_context& subctx, const
     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_PAD, std::move(p));
 }
 
+static void ggml_vk_dsv4_hc(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+    const ggml_tensor * src3 = dst->src[3];
+
+    vk_op_dsv4_hc_push_constants p = {};
+    switch (dst->op) {
+        case GGML_OP_DSV4_HC_COMB:
+            p.ne0 = (uint32_t)dst->ne[2];
+            p.flag = (uint32_t)ggml_get_op_params_i32(dst, 1);
+            p.param = ggml_get_op_params_f32(dst, 0);
+            break;
+        case GGML_OP_DSV4_HC_PRE:
+            p.ne0 = (uint32_t)dst->ne[0];
+            p.hc = (uint32_t)src0->ne[1];
+            p.flag = (uint32_t)ggml_get_op_params_i32(dst, 1);
+            p.param = ggml_get_op_params_f32(dst, 0);
+            break;
+        default:
+            p.ne0 = (uint32_t)dst->ne[0];
+            p.hc = (uint32_t)src1->ne[1];
+            p.flag = src3 != nullptr;
+            break;
+    }
+    const ggml_tensor * tensors[5] = { src0, src1, src2, src3, dst };
+    for (int i = 0; i < 5; ++i) {
+        for (int j = 0; tensors[i] && j < 3; ++j) {
+            p.nb[i][j] = (uint32_t)(tensors[i]->nb[j] / sizeof(float));
+        }
+    }
+
+    ggml_vk_op_f32(ctx, subctx, src0, src1, src2, src3, dst, dst->op, std::move(p));
+}
+
 static void ggml_vk_roll(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
     const int32_t s0 = ggml_get_op_params_i32(dst, 0);
     const int32_t s1 = ggml_get_op_params_i32(dst, 1);
@@ -11017,6 +11280,7 @@ static uint32_t ggml_vk_rms_partials_size(ggml_backend_vk_context * ctx, const g
 static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *dst, const ggml_tensor *src0, const bool has_ff, bool backprop, const uint32_t set_rows_stride) {
     const int n_dims        = ((const int32_t *) dst->op_params)[1];
     const int mode          = ((const int32_t *) dst->op_params)[2];
+    const int n_offs        = ((const int32_t *) dst->op_params)[15];
     // const int n_ctx         = ((const int32_t *) dst->op_params)[3];
     const int n_ctx_orig    = ((const int32_t *) dst->op_params)[4];
     const float freq_base   = ((const float *)   dst->op_params)[5];
@@ -11046,7 +11310,7 @@ static vk_op_rope_push_constants ggml_vk_make_rope_constants(const ggml_tensor *
     uint32_t nb13 = dst->nb[3] / ggml_type_size(dst->type);
 
     vk_op_rope_push_constants rope {
-        (uint32_t)mode, (uint32_t)ggml_nrows(src0), (uint32_t)n_dims, freq_scale,
+        (uint32_t)mode, (uint32_t)ggml_nrows(src0), (uint32_t)n_dims, (uint32_t)n_offs, freq_scale,
         freq_base, ext_factor, attn_factor, {corr_dims[0], corr_dims[1]}, theta_scale, has_ff,
         { sections[0], sections[1], sections[2], sections[3] }, is_imrope, backprop, set_rows_stride,
 
@@ -13152,6 +13416,12 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
         ggml_vk_roll(ctx, compute_ctx, src0, node);
 
         break;
+    case GGML_OP_DSV4_HC_COMB:
+    case GGML_OP_DSV4_HC_PRE:
+    case GGML_OP_DSV4_HC_POST:
+        ggml_vk_dsv4_hc(ctx, compute_ctx, node);
+
+        break;
     case GGML_OP_CPY:
     case GGML_OP_CONT:
     case GGML_OP_DUP:
@@ -13496,8 +13766,55 @@ static void ggml_vk_graph_cleanup(ggml_backend_vk_context * ctx) {
 }
 
 // Clean up on backend free
+// A GPU left idle can take far longer to start its next submit than to run it: on an integrated GPU, in the gap while
+// the CPU computes a layer's experts, 143 ms inside vkQueueSubmit and another 250-345 ms to its fence, for a few
+// milliseconds of work. A small submit every 20 ms holds the queue out of that state, so while graphs keep coming this
+// thread sends one; it goes quiet once no graph has come for a while.
+static void ggml_vk_keep_awake(ggml_backend_vk_context * ctx) {
+    const auto period = std::chrono::milliseconds(20);
+    const auto window = std::chrono::seconds(10);
+    vk_device & device = ctx->device;
+    vk::Device dev = device->device;
+    vk::CommandPool pool = dev.createCommandPool(vk::CommandPoolCreateInfo({}, device->compute_queue.queue_family_index));
+    vk::CommandBuffer cmd = dev.allocateCommandBuffers(vk::CommandBufferAllocateInfo(pool, vk::CommandBufferLevel::ePrimary, 1)).front();
+    vk_buffer target = ggml_vk_create_buffer_device(device, 4096);
+    cmd.begin(vk::CommandBufferBeginInfo{});
+    cmd.fillBuffer(target->buffer, 0, 4, 0);
+    cmd.end();
+    vk::Fence fence = dev.createFence({});
+    const vk::SubmitInfo submit(0, nullptr, nullptr, 1, &cmd);
+    std::unique_lock<std::mutex> lock(ctx->keep_awake_mutex);
+    while (!ctx->keep_awake_stop) {
+        if (std::chrono::steady_clock::now() - ctx->last_graph > window) {
+            ctx->keep_awake_signal.wait(lock);
+            continue;
+        }
+        lock.unlock();
+        {
+            std::lock_guard<std::mutex> guard(queue_mutex);
+            device->compute_queue.queue.submit(submit, fence);
+        }
+        VK_CHECK(dev.waitForFences({ fence }, true, UINT64_MAX), "keep awake");
+        dev.resetFences({ fence });
+        lock.lock();
+        ctx->keep_awake_signal.wait_for(lock, period, [&] { return ctx->keep_awake_stop; });
+    }
+    lock.unlock();
+    dev.destroyFence(fence);
+    ggml_vk_destroy_buffer(target);
+    dev.destroyCommandPool(pool);
+}
+
 static void ggml_vk_cleanup(ggml_backend_vk_context * ctx) {
     VK_LOG_DEBUG("ggml_vk_cleanup(" << ctx->name << ")");
+    if (ctx->keep_awake_thread.joinable()) {
+        {
+            std::lock_guard<std::mutex> lock(ctx->keep_awake_mutex);
+            ctx->keep_awake_stop = true;
+        }
+        ctx->keep_awake_signal.notify_one();
+        ctx->keep_awake_thread.join();
+    }
     // discard any unsubmitted command buffers
     ctx->compute_ctx.reset();
     // wait for any pending command buffers to finish
@@ -13652,7 +13969,11 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
-    ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
+    // a growable buffer holds memory for its committed prefix only
+    const size_t size = ctx->dev_buffer->sparse ? ctx->dev_buffer->committed : buffer->size;
+    if (size > 0) {
+        ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, size);
+    }
 }
 
 static ggml_backend_buffer_i ggml_backend_vk_buffer_interface = {
@@ -13706,6 +14027,28 @@ static size_t ggml_backend_vk_buffer_type_get_alloc_size(ggml_backend_buffer_typ
     return ggml_nbytes(tensor);
 
     UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_vk_buffer_type_growable_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+
+    vk_buffer dev_buffer = nullptr;
+    try {
+        dev_buffer = ggml_vk_create_buffer_growable(ctx->device, size);
+    } catch (const vk::SystemError& e) {
+        GGML_LOG_ERROR("ggml_vulkan: growable buffer of %.2f MiB failed: %s\n", size/1048576.0, e.what());
+        return nullptr;
+    }
+
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(ctx->device, std::move(dev_buffer), ctx->name);
+
+    return ggml_backend_buffer_init(buft, ggml_backend_vk_buffer_interface, bufctx, size);
+}
+
+// a sparse buffer is not one allocation: it is bound by the buffer size limit only
+static size_t ggml_backend_vk_buffer_type_growable_get_max_size(ggml_backend_buffer_type_t buft) {
+    ggml_backend_vk_buffer_type_context * ctx = (ggml_backend_vk_buffer_type_context *) buft->context;
+    return ctx->device->max_buffer_size;
 }
 
 ggml_backend_buffer_type_t ggml_backend_vk_buffer_type(size_t dev_num) {
@@ -14449,6 +14792,15 @@ static int32_t find_first_set(uint32_t x) {
 static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     VK_LOG_DEBUG("ggml_backend_vk_graph_compute(" << cgraph->n_nodes << " nodes)");
     ggml_backend_vk_context * ctx = (ggml_backend_vk_context *)backend->context;
+
+    {
+        std::lock_guard<std::mutex> lock(ctx->keep_awake_mutex);
+        ctx->last_graph = std::chrono::steady_clock::now();
+        if (!ctx->keep_awake_thread.joinable()) {
+            ctx->keep_awake_thread = std::thread(ggml_vk_keep_awake, ctx);
+        }
+    }
+    ctx->keep_awake_signal.notify_one();
 
     if (vk_instance.debug_utils_support) {
         vk::DebugUtilsLabelEXT dul = {};
@@ -15558,6 +15910,12 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
             }
         case GGML_OP_SET_ROWS:
             {
+                if (op->src[0]->type == GGML_TYPE_F16) {
+                    return op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16;
+                }
+                if (op->src[0]->type != GGML_TYPE_F32) {
+                    return false;
+                }
                 switch (op->type) {
                     case GGML_TYPE_F32:
                     case GGML_TYPE_F16:
@@ -15737,6 +16095,17 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_PAD:
         case GGML_OP_ROLL:
             return op->src[0]->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_COMB:
+        case GGML_OP_DSV4_HC_PRE:
+        case GGML_OP_DSV4_HC_POST:
+            {
+                // float storage only, and a token per invocation or row of invocations in the dispatch
+                const auto is_f32 = [](const ggml_tensor * t) { return t == nullptr || t->type == GGML_TYPE_F32; };
+                const int64_t n_tokens = op->op == GGML_OP_DSV4_HC_PRE ? op->ne[1] : op->ne[2];
+                const int axis = op->op == GGML_OP_DSV4_HC_POST ? 2 : op->op == GGML_OP_DSV4_HC_PRE ? 1 : 0;
+                return is_f32(op) && is_f32(op->src[0]) && is_f32(op->src[1]) && is_f32(op->src[2]) && is_f32(op->src[3]) &&
+                    n_tokens <= (int64_t)device->properties.limits.maxComputeWorkGroupCount[axis];
+            }
         case GGML_OP_DIAG_MASK_INF:
             return ggml_is_contiguous(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
         case GGML_OP_SOFT_MAX:
@@ -16083,11 +16452,48 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
     return devices[device];
 }
 
+// ggml_backend_dev_buffer_type_growable: the device's growable buffer type, null without sparse residency buffers
+static ggml_backend_buffer_type_t ggml_backend_vk_device_buffer_type_growable(ggml_backend_dev_t dev) {
+    ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *) dev->context;
+    vk_device device = ggml_vk_get_device(ctx->device);
+    return device->sparse_queue ? &device->buffer_type_growable : nullptr;
+}
+
+// ggml_backend_buffer_set_committed: a growable buffer holds memory for its first `bytes`, or no more than those;
+// false when the device has no memory for them
+static bool ggml_backend_vk_buffer_set_committed(ggml_backend_buffer_t buffer, size_t bytes) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    return !ctx->dev_buffer->sparse || ggml_vk_buffer_set_committed(ctx->dev_buffer, bytes);
+}
+
+// ggml_backend_buffer_get_committed: the bytes a buffer holds memory for
+static size_t ggml_backend_vk_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *) buffer->context;
+    return ctx->dev_buffer->sparse ? ctx->dev_buffer->committed : ggml_backend_buffer_get_size(buffer);
+}
+
+static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    GGML_UNUSED(reg);
+    if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {
+        return (void *) ssd::gpu::graph_lane_provider;
+    }
+    if (strcmp(name, "ggml_backend_dev_buffer_type_growable") == 0) {
+        return (void *) ggml_backend_vk_device_buffer_type_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_set_committed") == 0) {
+        return (void *) ggml_backend_vk_buffer_set_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
+        return (void *) ggml_backend_vk_buffer_get_committed;
+    }
+    return nullptr;
+}
+
 static const struct ggml_backend_reg_i ggml_backend_vk_reg_i = {
     /* .get_name         = */ ggml_backend_vk_reg_get_name,
     /* .get_device_count = */ ggml_backend_vk_reg_get_device_count,
     /* .get_device       = */ ggml_backend_vk_reg_get_device,
-    /* .get_proc_address = */ NULL,
+    /* .get_proc_address = */ ggml_backend_vk_reg_get_proc_address,
 };
 
 ggml_backend_reg_t ggml_backend_vk_reg() {
@@ -16528,6 +16934,10 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                     tensor_clone = ggml_rope_ext_back(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], n_dims, mode, n_ctx_orig_ggml, freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow);
                 }
             }
+            const int n_offs = ((int32_t *) tensor->op_params)[15];
+            if (n_offs != 0) {
+                tensor_clone = ggml_rope_set_offset(tensor_clone, n_offs);
+            }
         } else if (tensor->op == GGML_OP_UNARY) {
             switch (ggml_get_unary_op(tensor)) {
             case GGML_UNARY_OP_EXP:
@@ -16735,6 +17145,15 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
                                          src_clone[3], src_clone[4], src_clone[5], src_clone[6]);
         } else if (tensor->op == GGML_OP_SSM_CONV) {
             tensor_clone = ggml_ssm_conv(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_COMB) {
+            tensor_clone = ggml_dsv4_hc_comb(ggml_ctx, src_clone[0], src_clone[1], src_clone[2],
+                                             ggml_get_op_params_f32(tensor, 0), ggml_get_op_params_i32(tensor, 1));
+        } else if (tensor->op == GGML_OP_DSV4_HC_PRE) {
+            tensor_clone = ggml_get_op_params_i32(tensor, 1) ?
+                ggml_dsv4_hc_pre_gated(ggml_ctx, src_clone[0], src_clone[1], ggml_get_op_params_f32(tensor, 0)) :
+                ggml_dsv4_hc_pre(ggml_ctx, src_clone[0], src_clone[1]);
+        } else if (tensor->op == GGML_OP_DSV4_HC_POST) {
+            tensor_clone = ggml_dsv4_hc_post(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3]);
         } else if (tensor->op == GGML_OP_ROLL) {
             const int32_t s0 = tensor->op_params[0];
             const int32_t s1 = tensor->op_params[1];

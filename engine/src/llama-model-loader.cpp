@@ -63,6 +63,7 @@ static std::string llama_model_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_F16:      return "F16";
         case LLAMA_FTYPE_MOSTLY_BF16:     return "BF16";
         case LLAMA_FTYPE_MOSTLY_Q1_0:     return "Q1_0";
+        case LLAMA_FTYPE_MOSTLY_Q2_0:     return "Q2_0";
         case LLAMA_FTYPE_MOSTLY_Q4_0:     return "Q4_0";
         case LLAMA_FTYPE_MOSTLY_Q4_1:     return "Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q5_0:     return "Q5_0";
@@ -595,6 +596,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        paths.push_back(fname);
         contexts.emplace_back(ctx);
 
         if (use_mmap && use_direct_io) {
@@ -677,6 +679,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                paths.push_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -803,6 +806,7 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_IQ3_S:   ftype = LLAMA_FTYPE_MOSTLY_IQ3_S;   break;
             case GGML_TYPE_NVFP4:   ftype = LLAMA_FTYPE_MOSTLY_NVFP4;   break;
             case GGML_TYPE_Q1_0:    ftype = LLAMA_FTYPE_MOSTLY_Q1_0;    break;
+            case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             default:
                 {
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
@@ -1385,6 +1389,26 @@ struct ggml_tensor * llama_model_loader::create_tensor_as_view(struct ggml_conte
     return tensor;
 }
 
+std::pair<size_t, size_t> llama_model_loader::drop_blocks(uint32_t first, uint32_t count) {
+    size_t tensors = 0;
+    size_t bytes   = 0;
+    for (auto it = weights_map.begin(); it != weights_map.end();) {
+        int il = -1;
+        if (sscanf(it->first.c_str(), "blk.%d.", &il) == 1 && il >= 0 &&
+                uint32_t(il) >= first && uint32_t(il) - first < count) {
+            n_elements -= ggml_nelements(it->second.tensor);
+            n_bytes    -= ggml_nbytes(it->second.tensor);
+            bytes      += ggml_nbytes(it->second.tensor);
+            tensors++;
+            it = weights_map.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    n_tensors = (int) weights_map.size();
+    return { tensors, bytes };
+}
+
 void llama_model_loader::done_getting_tensors() const {
     if (n_created != n_tensors) {
         throw std::runtime_error(format("%s: wrong number of tensors; expected %d, got %d", __func__, n_tensors, n_created));
@@ -1496,11 +1520,6 @@ bool llama_model_loader::load_all_data(
     }
     GGML_ASSERT(size_data != 0 && "call init_mappings() first");
 
-    constexpr bool drop_mmap_tensor_after_upload = false;
-    size_t mmap_upload_advised_bytes = 0;
-    size_t mmap_upload_drop_ranges = 0;
-    size_t mmap_upload_drop_failures = 0;
-
     std::vector<no_init<uint8_t>> read_buf;
     std::vector<std::future<std::pair<ggml_tensor *, bool>>> validation_result;
     const bool drop_gpu_dense_sources = should_defer_expert_mmaps();
@@ -1511,8 +1530,24 @@ bool llama_model_loader::load_all_data(
     // NVMe raid configurations might require more / larger buffers.
     constexpr size_t n_buffers = 4;
 
+    // Under mmap, a tensor copied into a device buffer was copied from the mapping, whose pages the copy faulted in
+    // through the page cache's read-ahead: 0.9 GB/s on a virtio drive that reads 10.5 GB/s direct in 64 MiB reads.
+    // Where the files read direct, such tensors take the async uploads below, as without mmap, from handles of their
+    // own; the tensors mapped in place stay mapped.
+    llama_files direct_files;
+    if (use_mmap && !check_tensors) {
+        for (const auto & path : paths) {
+            direct_files.emplace_back(new llama_file(path.c_str(), "rb", true));
+            if (!direct_files.back()->has_direct_io()) {
+                direct_files.clear(); // read through the page cache as the mapping is, they would gain nothing
+                break;
+            }
+        }
+    }
+    const llama_files & read_files = use_mmap ? direct_files : files;
+
     size_t alignment = 1;
-    for (const auto & file : files) {
+    for (const auto & file : read_files) {
         alignment = std::max(file->read_alignment(), alignment);
     }
 
@@ -1525,7 +1560,7 @@ bool llama_model_loader::load_all_data(
     std::vector<void *> host_ptrs;
     size_t buffer_idx = 0; // buffer to use for async loads
     ggml_backend_t upload_backend = [&](const char * func) -> ggml_backend_t {
-        if (use_mmap || check_tensors) {
+        if ((use_mmap && direct_files.empty()) || check_tensors) {
             return nullptr;
         }
         // When not using mmaped io use async uploads from pinned memory to GPU memory.
@@ -1598,6 +1633,10 @@ bool llama_model_loader::load_all_data(
         return backend;
     }(__func__);
 
+    if (upload_backend && use_mmap) {
+        LLAMA_LOG_INFO("%s: device %s tensors read with direct I/O into pinned buffers\n", __func__,
+            ggml_backend_dev_name(ggml_backend_get_device(upload_backend)));
+    }
     if (upload_backend) {
         LLAMA_LOG_DEBUG("%s: using async uploads for device %s, buffer type %s, backend %s\n", __func__,
             ggml_backend_dev_name(ggml_backend_get_device(upload_backend)),
@@ -1620,7 +1659,7 @@ bool llama_model_loader::load_all_data(
 
         size_t n_size = ggml_nbytes(cur);
 
-        if (use_mmap) {
+        if (use_mmap && !upload_backend) { // an upload backend is a device buffer's, whose tensors are copied
             const auto & mapping = mappings.at(weight->idx);
             ggml_backend_buffer_t buf_mmap = nullptr;
             if (bufs.count(weight->idx)) {
@@ -1649,25 +1688,14 @@ bool llama_model_loader::load_all_data(
                 ggml_backend_tensor_set(cur, data, 0, n_size);
                 ggml_backend_buffer_t target_buffer = cur->view_src ? cur->view_src->buffer : cur->buffer;
                 uint32_t expert_layer = 0;
-                if (!drop_mmap_tensor_after_upload && drop_gpu_dense_sources && target_buffer &&
+                if (drop_gpu_dense_sources && target_buffer &&
                         !ggml_backend_buffer_is_host(target_buffer) &&
                         !llama_is_expert_tensor_name(ggml_get_name(cur), expert_layer)) {
                     gpu_dense_ranges.at(weight->idx).push_back({ weight->offs, weight->offs + n_size });
                 }
-                if (drop_mmap_tensor_after_upload) {
-                    size_t dropped = 0;
-                    const bool ok = mapping->dontneed_fragment(
-                            weight->offs, weight->offs + n_size, &dropped);
-                    ++mmap_upload_drop_ranges;
-                    if (ok) {
-                        mmap_upload_advised_bytes += dropped;
-                    } else {
-                        ++mmap_upload_drop_failures;
-                    }
-                }
             }
         } else {
-            const auto & file = files.at(weight->idx);
+            const auto & file = read_files.at(weight->idx);
 
             if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
@@ -1744,15 +1772,6 @@ bool llama_model_loader::load_all_data(
         }
 
         size_done += n_size;
-    }
-
-    if (drop_mmap_tensor_after_upload && mmap_upload_drop_ranges > 0) {
-        LLAMA_LOG_INFO(
-                "%s: immediate mmap upload dontneed advised=%.2f MiB ranges=%zu failures=%zu (not reclaimed bytes)\n",
-                __func__,
-                mmap_upload_advised_bytes / 1024.0 / 1024.0,
-                mmap_upload_drop_ranges,
-                mmap_upload_drop_failures);
     }
 
     // free temporary resources used for async uploads
@@ -1842,7 +1861,7 @@ void llama_model_loader::print_info() const {
 void llama_model_loader::mark_ple_lazy(const llama_tensor_weight & weight) {
     if (no_alloc || files.empty()) return; // metadata-only or virtual architecture checks
     if (!use_mmap || check_tensors) {
-        throw std::runtime_error("Qwen PLE requires mmap without whole-table tensor validation");
+        throw std::runtime_error("a lazily mapped PLE table requires mmap without whole-table tensor validation");
     }
     const size_t bytes = ggml_nbytes(weight.tensor);
     if (weight.offs > files.at(weight.idx)->size() || bytes > files.at(weight.idx)->size() - weight.offs) {

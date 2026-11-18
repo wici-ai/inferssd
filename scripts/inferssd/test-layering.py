@@ -19,7 +19,7 @@ class RuntimeBoundaries(unittest.TestCase):
         path = Path("engine/ggml/src/ggml-ssd/place/runtime-policy.h")
         for code in ('#include "../io/reader.h"', '#include "cpu-sink-internal.h"',
                      '#include <thread>', '#include <sys/mman.h>', '#include <sys/socket.h>',
-                     '#include <pthread.h>', '#include "worker.h"', 'struct kimi_cpu_sink * private_state;',
+                     '#include <pthread.h>', '#include "worker.h"', 'struct ssd_cpu_sink * private_state;',
                      'cudaLaunchKernel(kernel);'):
             with self.subTest(code=code):
                 self.assertTrue(source_issues(path, "policy", code))

@@ -70,14 +70,14 @@ public:
     void close() noexcept {
         // As in linux_ring: user buffers are owned by the device until drained.
         if (pending_) {
-            std::fprintf(stderr, "[kimi_cpu_sink] undrained I/O at ring destruction; aborting\n");
+            std::fprintf(stderr, "[ssd_cpu_sink] undrained I/O at ring destruction; aborting\n");
             std::abort();
         }
         if (!backend_) { return; }
         try {
             unregister_buffers();
         } catch (const std::exception & e) {
-            std::fprintf(stderr, "[kimi_cpu_sink_io] cannot unregister before buffer release: %s; aborting\n", e.what());
+            std::fprintf(stderr, "[ssd_cpu_sink_io] cannot unregister before buffer release: %s; aborting\n", e.what());
             std::abort();
         }
         backend_.reset();
@@ -99,7 +99,7 @@ public:
         ++register_count_;
         size_t bytes = 0;
         for (const auto & buffer : fixed_buffers_) { bytes += buffer.len; }
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 registered=%zu bytes=%zu register_count=%llu unregister_count=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_io] read_fixed=1 registered=%zu bytes=%zu register_count=%llu unregister_count=%llu\n",
                      fixed_buffers_.size(), bytes, static_cast<unsigned long long>(register_count_),
                      static_cast<unsigned long long>(unregister_count_));
     }
@@ -111,7 +111,7 @@ public:
         registered_ = false;
         fixed_buffers_.clear();
         ++unregister_count_;
-        std::fprintf(stderr, "[kimi_cpu_sink_io] read_fixed=1 register_count=%llu unregister_count=%llu\n",
+        std::fprintf(stderr, "[ssd_cpu_sink_io] read_fixed=1 register_count=%llu unregister_count=%llu\n",
                      static_cast<unsigned long long>(register_count_), static_cast<unsigned long long>(unregister_count_));
     }
 

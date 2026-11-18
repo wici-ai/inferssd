@@ -16,13 +16,26 @@ import compare_outputs
 import stream_chat
 
 
+@pytest.mark.skipif(not hasattr(signal, "SIGALRM"), reason="no alarm signal")
 def test_whole_request_deadline_restores_the_signal_handler():
     previous = signal.getsignal(signal.SIGALRM)
     with pytest.raises(TimeoutError, match="whole request deadline"):
-        with stream_chat.deadline(0.02):
+        with stream_chat.alarm_deadline(0.02):
             time.sleep(0.2)
     assert signal.getsignal(signal.SIGALRM) == previous
     assert signal.getitimer(signal.ITIMER_REAL) == (0.0, 0.0)
+
+
+def test_the_timer_deadline_interrupts_the_main_thread_and_restores_sigint():
+    previous = signal.getsignal(signal.SIGINT)
+    with pytest.raises(TimeoutError, match="whole request deadline"):
+        with stream_chat.timer_deadline(0.02):
+            for _ in range(500):
+                time.sleep(0.01)
+    assert signal.getsignal(signal.SIGINT) == previous
+    with stream_chat.timer_deadline(5):
+        pass
+    assert signal.getsignal(signal.SIGINT) == previous
 
 
 def fixture(count=256):
@@ -100,6 +113,15 @@ def test_http_contract_retains_prompt_tokens_raw_events_and_failure(tmp_path):
         def log_message(self, *_args):
             pass
 
+        def do_GET(self):
+            assert self.path == "/props"
+            data = json.dumps({"reasoning": {"can_turn_off": True, "efforts": ["high"], "default_effort": "high"}}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             received.append((self.path, body))
@@ -153,6 +175,40 @@ def test_http_contract_retains_prompt_tokens_raw_events_and_failure(tmp_path):
         worker.join()
 
 
+def test_recorder_writes_unicode_json_and_events_as_utf8(tmp_path, monkeypatch):
+    text = "city\u2019s \u4f60\u597d \U0001f680"
+    rows = fixture(8)
+    rows[1]["event"]["content"] = text
+    rows[1]["event"]["completion_probabilities"][0]["token"] = text
+    wire = b"".join(b"data: " + json.dumps(row["event"], ensure_ascii=False).encode("utf-8")
+                    + b"\n\n" for row in rows)
+    monkeypatch.setattr(stream_chat, "get", lambda *_args: {})
+    monkeypatch.setattr(stream_chat, "post", lambda *_args: {"prompt": text, "tokens": [7, 8, 9]})
+    monkeypatch.setattr(stream_chat.urllib.request, "urlopen", lambda *_args, **_kwargs: io.BytesIO(wire))
+    original_open = Path.open
+
+    def legacy_open(path, mode="r", **kwargs):
+        # Reproduce Windows' legacy text default even on a UTF-8 test host.
+        if "b" not in mode and kwargs.get("encoding") is None:
+            kwargs["encoding"] = "cp936"
+        return original_open(path, mode, **kwargs)
+
+    monkeypatch.setattr(Path, "open", legacy_open)
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_bytes(text.encode("utf-8"))
+    args = argparse.Namespace(url="http://127.0.0.1:1", prompt=prompt, input_tokens=3,
+                              output_tokens=8, output=tmp_path / "result.json", timeout=5)
+    assert stream_chat.run(args) == 0
+    result = json.loads(args.output.read_bytes().decode("utf-8"))
+    protocol = json.loads((tmp_path / "result.protocol.json").read_bytes().decode("utf-8"))
+    events = [json.loads(line) for line in
+              (tmp_path / "result.events.jsonl").read_bytes().decode("utf-8").splitlines()]
+    assert result["probabilities"][1]["token"] == text
+    assert protocol["chat_request"]["messages"][0]["content"] == text
+    assert events[1]["event"]["content"] == text
+    assert (tmp_path / "result.events.sse").read_bytes() == wire
+
+
 def test_compare_rejects_different_protocol_and_reports_first_divergence():
     a = summary(fixture(8), 8)
     a.update(status="passed", prompt_sha256="hash", rendered_prompt_sha256="render", prompt_ids=[7, 8, 9])
@@ -184,6 +240,7 @@ def test_template_requires_authoritative_tokens_without_flattened_fallback(tmp_p
         return response
 
     monkeypatch.setattr(stream_chat, "post", fake_post)
+    monkeypatch.setattr(stream_chat, "get", lambda base, endpoint, timeout: {})
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("Literal <|im_end|> text.\n")
     args = argparse.Namespace(prompt=prompt, output=tmp_path / "result.json",
@@ -216,3 +273,18 @@ def test_probability_contract_is_validated_by_recorder_and_comparer(change):
         summary(records, 8)
     with pytest.raises(ValueError):
         compare_outputs.compare(value, value)
+
+
+def test_chat_request_turns_thinking_off_or_takes_the_least_effort():
+    content = "Passage."
+    off = {"messages": [{"role": "user", "content": content}],
+           "chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"}
+    # A template that turns thinking off, as DeepSeek's does, a model that does not think, and an engine before /props reported it
+    assert stream_chat.chat_request(content, {"reasoning": {"can_turn_off": True, "efforts": ["low", "high"], "default_effort": "high"}}) == off
+    assert stream_chat.chat_request(content, {"reasoning": None}) == off
+    assert stream_chat.chat_request(content, {}) == off
+    # Muse's template always thinks: its least effort
+    muse = {"reasoning": {"can_turn_off": False, "efforts": ["low", "medium", "high", "xhigh"], "default_effort": "xhigh"}}
+    assert stream_chat.chat_request(content, muse) == {"messages": [{"role": "user", "content": content}], "reasoning_effort": "low"}
+    assert stream_chat.chat_request(content, {"reasoning": {"can_turn_off": False, "efforts": [], "default_effort": None}}) == {
+        "messages": [{"role": "user", "content": content}]}

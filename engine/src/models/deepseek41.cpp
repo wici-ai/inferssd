@@ -5,6 +5,7 @@
 #include "llama-engram.h"
 #include "llama-impl.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-mmap.h"
 
 #include "ggml-backend.h"
 
@@ -18,10 +19,6 @@
 #include <string>
 #include <vector>
 
-#ifdef __linux__
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
 
 // DeepSeek-V4.1.
 //
@@ -146,26 +143,11 @@ static constexpr int64_t DSV41_CANDIDATE_TOPK_BLOCKS = 2048;
 static constexpr int64_t DSV41_CANDIDATE_BLOCK_SIZE  = 8;
 
 void dsv41_engram_prefetch_rows(const ggml_tensor * table, const std::vector<int32_t> & rows) {
-#ifdef __linux__
     if (!table || !table->data || !table->buffer || !ggml_backend_buffer_is_host(table->buffer)) {
         return;
     }
-    const size_t page     = (size_t) sysconf(_SC_PAGESIZE);
-    const size_t row_size = table->nb[1];
-    for (int32_t r : rows) {
-        if (r < 0 || r >= table->ne[1]) {
-            continue;
-        }
-        const uintptr_t begin = (uintptr_t) table->data + (size_t) r*row_size;
-        const uintptr_t first = begin & ~(uintptr_t) (page - 1);
-        const uintptr_t end   = (begin + row_size + page - 1) & ~(uintptr_t) (page - 1);
-        // advisory only: on failure the row is read by the regular fault in get_rows
-        (void) madvise((void *) first, end - first, MADV_WILLNEED);
-    }
-#else
-    (void) table;
-    (void) rows;
-#endif
+    // advisory only: on failure the row is read by the regular fault in get_rows
+    (void) llama_prefetch_rows(table->data, table->nb[1], table->ne[1], rows.data(), rows.size());
 }
 
 void dsv41_engram_decode_op(ggml_tensor * dst, int ith, int nth, void *) {
@@ -204,13 +186,16 @@ class llm_graph_input_engram : public llm_graph_input_i {
 public:
     llm_graph_input_engram(const llama_model & model,
                            const llama_kv_cache_dsv4_raw_context * mctx,
-                           int eg, bool prefetch) : model(model), mctx(mctx), eg(eg), prefetch(prefetch) {}
+                           int eg, bool advise) : model(model), mctx(mctx), eg(eg), advise(advise) {}
     virtual ~llm_graph_input_engram() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
+    // the ubatch's rows, read ahead before the graph takes its memory
+    void prefetch(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
+        idx_ubatch = nullptr; // a reused input works its rows out again
         const int64_t n_cols = (model.hparams.engram_max_ngram_size - 1) * model.hparams.engram_n_head;
         return rows->ne[0] == n_cols * params.ubatch.n_tokens;
     }
@@ -224,13 +209,39 @@ public:
 
     // which engram layer this is, so the right multipliers and buckets are used
     const int eg;
-    const bool prefetch;
+    // whether the rows are read ahead (model.engram_prefetch)
+    const bool advise;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+
+    // the rows of the ubatch prefetch() worked out, which its set_input() takes
+    std::vector<int32_t> idx;
+    const llama_ubatch * idx_ubatch = nullptr;
+
+    void compute_rows(const llama_ubatch * ubatch);
 };
 
+void llm_graph_input_engram::prefetch(const llama_ubatch * ubatch) {
+    compute_rows(ubatch);
+    idx_ubatch = ubatch;
+    if (advise) {
+        dsv41_engram_prefetch_rows(model.layers[model.hparams.engram_layer_ids[eg]].engram_embd, idx);
+    }
+}
+
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+    if (idx_ubatch != ubatch) {
+        compute_rows(ubatch);
+        if (advise) {
+            dsv41_engram_prefetch_rows(model.layers[model.hparams.engram_layer_ids[eg]].engram_embd, idx);
+        }
+    }
+    idx_ubatch = nullptr;
+    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+void llm_graph_input_engram::compute_rows(const llama_ubatch * ubatch) {
     const auto & hp = model.hparams;
 
     const int64_t n_tokens = ubatch->n_tokens;
@@ -253,7 +264,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         return (uint64_t) model.engram_token_map[t];
     };
 
-    std::vector<int32_t> idx(n_cols * n_tokens);
+    idx.assign(size_t(n_cols * n_tokens), 0);
 
     GGML_ASSERT(mctx != nullptr);
 
@@ -288,12 +299,6 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
-
-    if (prefetch) {
-        dsv41_engram_prefetch_rows(model.layers[hp.engram_layer_ids[eg]].engram_embd, idx);
-    }
-
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
 } // namespace
@@ -523,17 +528,21 @@ ggml_tensor * llm_build_deepseek41::build_engram(
 
     // normalized per (token, hc copy) over n_embd, not jointly over the copies. The reference keeps
     // engram_q and engram_k apart but only ever uses their product, so applying one to each side of
-    // the dot product gives the same result.
+    // the dot product gives the same result; a file that stores the product (engram_gate) applies it
+    // to the query side alone.
     auto grouped_norm = [&](ggml_tensor * t, ggml_tensor * w) {
         t = ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
         t = ggml_rms_norm(ctx0, t, norm_rms_eps);
-        t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
-        t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
+        if (w) {
+            t = ggml_reshape_2d(ctx0, t, hc_dim, nt);
+            t = ggml_mul(ctx0, t, ggml_reshape_2d(ctx0, w, hc_dim, 1));
+        }
         return ggml_reshape_3d(ctx0, t, n_embd, hc, nt);
     };
 
-    ggml_tensor * k = grouped_norm(key, as_f32(model.layers[il].engram_k));
-    ggml_tensor * q = grouped_norm(x,   as_f32(model.layers[il].engram_q));
+    const llama_layer & layer = model.layers[il];
+    ggml_tensor * k = grouped_norm(key, layer.engram_gate ? nullptr : as_f32(layer.engram_k));
+    ggml_tensor * q = grouped_norm(x,   as_f32(layer.engram_gate ? layer.engram_gate : layer.engram_q));
 
     ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
     s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));

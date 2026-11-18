@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import sys
 from functools import partial
 
 import pytest
@@ -44,12 +45,13 @@ def historical_engine(inputs, directory, port, observe, emit, platform="linux"):
         "",
         [],
         environment=dict(inputs.environment),
-        effects=core.NativeEffects(),
+        effects=core.NativeEffects("127.0.0.1"),
         resolve=resolve,
         own=lambda *_: pytest.fail("historical refusal must not reach owner"),
     )
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="the Linux launcher's bash refusal")
 @pytest.mark.parametrize("case", CASES, ids=lambda c: c["name"])
 def test_native_refusal_matches_original_shell_boundary(case):
     old = observe(case)
@@ -65,7 +67,6 @@ def test_native_refusal_matches_original_shell_boundary(case):
 
 REFUSALS = [
     ("port-busy", {}, "Port 18181 is already in use", "port_busy"),
-    ("dense-no-uring", {}, "DENSE_HOMES", "has_uring"),
     ("busy", {}, "The GPU already runs", "gpu_processes"),
     ("base", {"cgroup_v2": False}, "cgroup v2 is required", "cgroup_v2"),
     ("insufficient-memory", {}, "Only ", "memory_kib"),

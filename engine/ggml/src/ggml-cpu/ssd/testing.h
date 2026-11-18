@@ -21,24 +21,27 @@ struct execution_policy {
     std::vector<int> io_cpus;
     int decode_participants = 0, prefetch_depth = 0;
     uint64_t prefetch_fail_every = 0, prefetch_throw_drain = 0, prefetch_throw_schedule = 0;
+    // The grouped prefill's cross-layer read-ahead (production: prefill.lookahead), and its fault injection: every n-th
+    // read-ahead completion fails.
+    bool prefill_lookahead = false;
+    uint64_t lookahead_fail_every = 0;
     std::string cache_policy = "window", cache_allocation = "priority";
     bool cache_keep = false, cache_prefill_read = false, cache_elastic = false, cache_partial_reclaim = false;
     bool cache_reclaimable_file = false;
-    uint64_t cache_reserve_bytes = 2ull << 30;
+    uint64_t cache_reserve_bytes = 512ull << 20; // the reserve a configured server runs with
     size_t cache_prefill_slots = 0;
     std::map<int32_t, size_t> cache_layer_quotas;
     uint64_t vram_budget = 0;
-    bool vram_async = false, vram_exclusive = false, vram_deferred = false, vram_prefill = false;
-    bool vram_locations = false;
+    bool vram_async = false, vram_deferred = false, vram_prefill = false;
     ssd::gpu::testing::tier_options tier;
     std::map<std::string, double> place_costs;
 };
 
 // Test callers own explicit policy inputs until this call returns; the executor
 // copies them before starting its threads. No process-wide mutation is involved.
-[[nodiscard]] GGML_BACKEND_API kimi_cpu_sink * create(
+[[nodiscard]] GGML_BACKEND_API ssd_cpu_sink * create(
     int ring_experts, const execution_policy & policy,
-    const runtime_services * services, kimi_cpu_sink_resolver resolver, void * userdata,
+    const runtime_services * services, ssd_cpu_sink_resolver resolver, void * userdata,
     char * error, size_t error_size) noexcept;
 }  // namespace testing
 }  // namespace cpu

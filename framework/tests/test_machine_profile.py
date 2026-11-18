@@ -8,6 +8,7 @@ import json
 import os
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -90,7 +91,7 @@ def test_linux_profile_end_to_end(tmp_path):
     }
     # The first shard brings its set; the two shards of at least 1 GiB are read, largest first.
     assert runner.calls == [
-        (["/opt/inferssd/bin/inferssd-cpuprobe", "--threads", "1,4"], 1800.0),
+        (["/opt/inferssd/bin/inferssd-cpuprobe", "--threads", "1,2,3,4"], 1800.0),
         (["/opt/inferssd/bin/inferssd-memprobe"], 900.0),
         (["/opt/inferssd/bin/inferssd-ssdprobe", "--file", files[1], "--file", files[0]], 1800.0),
     ]
@@ -193,7 +194,7 @@ def test_missing_probes_record_failed_sections(tmp_path):
     assert "inferssd-cpuprobe not found" in sections["compute"]["detail"]
     assert sections["cpu"]["status"] == "partial" and sections["memory"]["status"] == "partial"
     assert sections["gpus"] == dict(
-        sections["gpus"], status="ok", detail="no NVIDIA GPU found by nvidia-smi"
+        sections["gpus"], status="ok", detail="no GPU on CUDA (nvidia-smi) or ROCm (amdkfd) found"
     )
     storage = sections["storage:" + nvme_key()]
     assert (
@@ -220,7 +221,8 @@ def test_failing_probe_reports_its_reason(tmp_path):
         storage["detail"]
         == "inferssd-ssdprobe exited with status 2: cannot open for direct I/O: /models/x"
     )
-    assert value["sections"]["gpus"]["detail"] == "the probe found no CUDA device"
+    assert host.test_files == [], "only the page-cache case falls back to a test file"
+    assert value["sections"]["gpus"]["detail"] == "the probe found no GPU"
 
 
 def test_missing_model_path_is_an_error(tmp_path):
@@ -251,6 +253,71 @@ def test_a_directory_without_large_files_is_measured_with_a_test_file(tmp_path):
     # Existing files of 1 GiB on the drive are read instead; no test file is written.
     run(host, [str(tmp_path / "models")], FakeRunner(replies()), reprofile=True)
     assert len(host.test_files) == 1
+
+
+CACHED = (
+    "no file has an extent of 16777216 bytes outside the page cache, so reads would measure "
+    "memory instead of the drive"
+)
+
+
+class CachedFilesRunner(FakeRunner):
+    """The SSD probe's answer on a Mac whose model was just written: every page of the given
+    files is in the page cache, so it has nothing to read (exit status 2); a test file, written
+    past the cache, measures fine."""
+
+    def __call__(self, argv, timeout_s, env):
+        if argv[0].endswith("inferssd-ssdprobe") and not any(
+            ".inferssd-drive-test-" in argument for argument in argv
+        ):
+            self.calls.append((list(argv), timeout_s))
+            self.environments.append(dict(env))
+            return Completed(2, "", "inferssd-ssdprobe: " + CACHED + "\n")
+        return super().__call__(argv, timeout_s, env)
+
+
+def test_files_in_the_page_cache_are_measured_with_a_test_file_beside_them(tmp_path):
+    host, files = linux_machine(tmp_path)
+    runner = CachedFilesRunner(replies())
+    value, lines = run(host, files, runner)
+    ssd_calls = [argv for argv, _ in runner.calls if argv[0].endswith("inferssd-ssdprobe")]
+    ((test_file, size, existed),) = host.test_files
+    # The model's files were tried first; the test file lives next to the largest of them.
+    assert ssd_calls[0][1:] == ["--file", files[1], "--file", files[0]]
+    assert ssd_calls[1] == ["/opt/inferssd/bin/inferssd-ssdprobe", "--file", test_file]
+    assert (os.path.dirname(test_file), size, existed) == (os.path.dirname(files[1]), 4 * GIB, True)
+    assert not os.path.exists(test_file)
+    section = value["sections"]["storage:" + nvme_key()]
+    assert section["status"] == "ok" and section["method"] == (
+        "inferssd-ssdprobe/1 random extents in a 4294967296-byte test file of random data, "
+        "removed after, since the given files were in the page cache, io_uring reader"
+    )
+    assert "SSD probe: every given file is in the page cache; measuring in a test file" in lines
+    assert value["storage"][0]["drive_key"] == nvme_key()
+
+
+def test_cached_files_without_room_for_the_test_file_fail_the_drive(tmp_path):
+    host, files = linux_machine(tmp_path)
+    host.free = 5 * GIB - 1
+    value, _ = run(host, files, CachedFilesRunner(replies()))
+    section = value["sections"]["storage:" + nvme_key()]
+    assert section["status"] == "failed"
+    assert section["detail"].startswith("every given file is in the page cache, and the ")
+    assert "leave no room for a 4294967296-byte test file" in section["detail"]
+    assert host.test_files == [] and value["storage"] == []
+
+
+def test_a_killed_runs_test_file_beside_cached_files_is_removed(tmp_path):
+    host, files = linux_machine(tmp_path)
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    left = os.path.join(os.path.dirname(files[1]), f".inferssd-drive-test-{child.pid}-x")
+    with open(left, "wb") as stream:
+        stream.truncate(4 * GIB)
+    value, _ = run(host, files, CachedFilesRunner(replies()))
+    ((test_file, _, _),) = host.test_files
+    assert test_file != left and not os.path.exists(left)
+    assert value["sections"]["storage:" + nvme_key()]["status"] == "ok"
 
 
 def test_a_killed_runs_test_file_is_neither_read_nor_kept(tmp_path):
@@ -419,7 +486,7 @@ def test_linux_clusters_follow_the_engine_split(tmp_path, capacities, max_khz, f
     ]
 
 
-def test_split_fastest_matches_the_engine_rule():
+def test_split_fastest_cuts_at_the_largest_drop():
     assert split_fastest([(0, 100.0), (1, 95.0), (2, 90.0)]) == ([0, 1, 2], [])
     assert split_fastest([(0, 100.0), (1, 95.0), (2, 85.0)]) == ([0, 1], [2])
     assert split_fastest([(3, 50.0), (0, 100.0), (1, 80.0)]) == ([0, 1], [3])
@@ -436,6 +503,7 @@ def test_smt_siblings_and_cores(tmp_path):
     ]
 
 
+@pytest.mark.skipif(sys.platform == "win32", reason="a fake macOS machine: POSIX paths")
 def test_darwin_profile_end_to_end(tmp_path):
     models = tmp_path / "models"
     files = shards(models, [2 * GIB])
@@ -468,7 +536,7 @@ def test_darwin_profile_end_to_end(tmp_path):
     value, _ = run(host, [str(models)], runner)
     validate(value)
     assert executables(runner) == ["inferssd-cpuprobe", "inferssd-ssdprobe"]
-    assert runner.calls[0][0][1:] == ["--threads", "1,4,10"]
+    assert runner.calls[0][0][1:] == ["--threads", "1,2,4,8,9,10"]
     assert value["cpu"]["affinity_supported"] is False
     assert [(row["kind"], len(row["cpus"])) for row in value["cpu"]["clusters"]] == [
         ("performance", 4),
@@ -503,7 +571,15 @@ class PinnedRunner(FakeRunner):
             "rows": 4096,
             "cols": 4096,
             "weight_bytes": 9437184,
-            "points": [{"tokens": 1, "us": 100.0, "weight_Bps": self.rates[listed]}],
+            "points": [
+                {
+                    "tokens": 1,
+                    "us": 100.0,
+                    "us_q1": 98.0,
+                    "us_q3": 103.0,
+                    "weight_Bps": self.rates[listed],
+                }
+            ],
         }
         return Completed(0, json.dumps(dict(CPU_REPORT, compute=[row], cpus=cpus, skipped=[])))
 
@@ -519,7 +595,7 @@ def test_two_clusters_measure_one_token_pinned_to_each_and_to_every_cpu(tmp_path
     ]
     pinned = [argv[1:] for argv, _ in runner.calls if "--cpus" in argv]
     assert pinned == [
-        ["--cpus", "1,2", "--threads", "2", "--tokens", "1"],
+        ["--cpus", "1,2", "--threads", "1,2", "--tokens", "1"],
         ["--cpus", "0,3", "--threads", "2", "--tokens", "1"],
         ["--cpus", "0,1,2,3", "--threads", "4", "--tokens", "1"],
     ]
@@ -532,7 +608,8 @@ def test_two_clusters_measure_one_token_pinned_to_each_and_to_every_cpu(tmp_path
     ]
     assert value["sections"]["compute"]["status"] == "ok"
     assert value["sections"]["compute"]["method"].endswith(
-        "; one token pinned to each cluster and to every CPU"
+        "; one token pinned to each cluster and to every CPU, to the performance cluster's first "
+        "1, 2, 4, ... CPUs too"
     )
     assert any("pinned to each of CPUs 1,2" in line for line in lines)
 

@@ -46,12 +46,22 @@ from inferssd.platform.captured_command import run_captured
 
 EXECUTABLES = PROBES
 TIMEOUT_S = {"ssd": 1800.0, "cpu": 1800.0, "memory": 900.0}
-# The profile describes the whole machine, so a probe sees every device.
-HIDDEN = {"memory": ("CUDA_VISIBLE_DEVICES",)}
+# The profile describes the whole machine, so a probe sees every device: CUDA's and ROCm's
+# visible-device lists are hidden from it.
+HIDDEN = {"memory": ("CUDA_VISIBLE_DEVICES", "HIP_VISIBLE_DEVICES", "ROCR_VISIBLE_DEVICES")}
 
 
 class ProbeError(RuntimeError):
-    """A probe is missing, failed, timed out or printed output outside its schema."""
+    """A probe is missing, failed, timed out or printed output outside its schema.
+
+    `status` is the probe's exit status and `reason` its last stderr line, for a caller
+    that answers one failure differently; both are empty when the probe did not run.
+    """
+
+    def __init__(self, message: str, status: Optional[int] = None, reason: str = "") -> None:
+        super().__init__(message)
+        self.status = status
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -146,7 +156,12 @@ REPORTS: Mapping[str, Check] = {
                         "weight_bytes": POSITIVE,
                         "points": array(
                             record(
-                                {"tokens": POSITIVE, "us": NUMBER},
+                                {
+                                    "tokens": POSITIVE,
+                                    "us": NUMBER,
+                                    "us_q1": NUMBER,
+                                    "us_q3": NUMBER,
+                                },
                                 {"weight_Bps": NUMBER, "flops": NUMBER},
                                 extra=True,
                             )
@@ -229,7 +244,9 @@ class Probes:
             lines = [line.strip() for line in result.stderr.splitlines() if line.strip()]
             raise ProbeError(
                 f"{EXECUTABLES[name]} exited with status {result.returncode}: "
-                + (lines[-1] if lines else "no reason given")
+                + (lines[-1] if lines else "no reason given"),
+                status=result.returncode,
+                reason=lines[-1] if lines else "",
             )
         return parse(name, result.stdout)
 
@@ -290,13 +307,18 @@ def dram_rates(report: Any) -> list[ThreadRate]:
 
 
 def compute_rows(report: Any) -> list[ComputeRow]:
-    """The report's rows; a report pinned to CPUs names them in every row."""
+    """The report's rows; pinned, thread i ran on the i-th CPU, so a row names the first ones."""
     rows: list[ComputeRow] = []
     pinned = sorted(report.get("cpus", []))
     for row in report["compute"]:
         points: list[ComputePoint] = []
         for point in row["points"]:
-            value: ComputePoint = {"tokens": point["tokens"], "us": float(point["us"])}
+            value: ComputePoint = {
+                "tokens": point["tokens"],
+                "us": float(point["us"]),
+                "us_q1": float(point["us_q1"]),
+                "us_q3": float(point["us_q3"]),
+            }
             if point["tokens"] == 1:
                 value["weight_Bps"] = float(point["weight_Bps"])
             else:
@@ -311,7 +333,7 @@ def compute_rows(report: Any) -> list[ComputeRow]:
             "points": points,
         }
         if pinned:
-            value_row["cpus"] = pinned
+            value_row["cpus"] = pinned[: row["threads"]]
         rows.append(value_row)
     return rows
 
@@ -321,7 +343,7 @@ def skipped(report: Any) -> list[str]:
 
 
 def skipped_devices(report: Any) -> dict[int, str]:
-    """Memory probe devices it could not measure, by CUDA index, with the reason."""
+    """Memory probe devices it could not measure, by the runtime's device index, with the reason."""
     return {row["index"]: row["reason"] for row in report.get("skipped", [])}
 
 

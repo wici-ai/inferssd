@@ -1,0 +1,416 @@
+// SPDX-License-Identifier: Apache-2.0
+#pragma once
+#include <stddef.h>
+#include <stdint.h>
+#ifdef __cplusplus
+#include "../platform/file.h"
+#endif
+
+// Private optional transport ABI. The CPU backend remains CUDA independent.
+// Every function except destroy returns 0 on success. Errors must drain work
+// before payload/input/output ownership is returned to the caller.
+struct ssd_vram_source {
+    uint64_t device, inode, size, offset, bytes;
+    int64_t mtime_s, mtime_ns, ctime_s, ctime_ns;
+    uint64_t inode_hi; // the upper half of a 128-bit file id (Windows); 0 on POSIX
+};
+struct ssd_vram_request {
+    struct ssd_vram_source role[3]; // up, gate, down, same packed-file identity
+    int32_t layer, expert;
+    float weight;
+};
+// Layer IDs the tier takes: 0 .. SSD_VRAM_MAX_LAYERS - 1, more than any model has; its slot table indexes that range.
+#define SSD_VRAM_MAX_LAYERS 1024
+#ifdef __cplusplus
+// A role's payload as the RAM cache and the VRAM tier know it: the file behind the expert-pack resolver's
+// descriptor (from ssd::platform::identity), the role's logical offset in it (where the resolver says its bytes
+// start, before a read aligns it) and its logical bytes. The sink keys what it reads by it and a prefill seed what it
+// copies, so that decode finds the seed: both build it here. Times split as POSIX stat reports them.
+static inline ssd_vram_source ssd_vram_source_identity(const ssd::platform::file_identity & file, uint64_t offset,
+        uint64_t bytes) {
+    const auto seconds = [](int64_t ns) { return ns / 1000000000 - (ns % 1000000000 < 0); };
+    const int64_t mtime_s = seconds(file.mtime_ns), ctime_s = seconds(file.ctime_ns);
+    ssd_vram_source s = { file.device, file.id_lo, file.size, offset, bytes,
+        mtime_s, file.mtime_ns - mtime_s * 1000000000, ctime_s, file.ctime_ns - ctime_s * 1000000000, file.id_hi };
+    return s;
+}
+#endif
+struct ssd_vram_tier_api {
+    uint32_t version; // 2
+    uint32_t size;
+    void * (*create)(uint64_t budget_bytes, char * error, size_t error_size);
+    void (*destroy)(void * context);
+    int (*begin)(void * context, uint64_t epoch, uint64_t token, int decode,
+                 char * error, size_t error_size);
+    // Retired implicit-format slot: returns an error and drains the context.
+    // Use the explicit-format extension to prepare expert geometry.
+    int (*prepare)(void * context, const struct ssd_vram_request * requests,
+                   int count, int latent, int hidden, int * slots,
+                   char * error, size_t error_size);
+    // Retired implicit-format slot: returns an error and drains the context.
+    // Field order and signature remain reserved for private transport ABI 2.
+    int (*launch)(void * context, const void * input_q8k, size_t input_bytes,
+                  float beta, float linear_beta, char * error, size_t error_size);
+    // A RAM cache source may be borrowed until finish/cancel when borrow=1;
+    // the caller pins its slot for this entire batch. Ring sources use borrow=0
+    // and must be completely copied before return so I/O may reuse the ring.
+    int (*admit)(void * context, const struct ssd_vram_request * request,
+                 const void * up, const void * gate, const void * down,
+                 int borrow_until_finish, char * error, size_t error_size);
+    // Only original GPU-hit rows are written; CPU rows remain untouched.
+    // Contributions include the separately rounded routing-weight multiply.
+    // stride is floats. finish waits for owned GPU work and unpins all hits.
+    int (*finish)(void * context, float * contributions, size_t stride,
+                  char * error, size_t error_size);
+    int (*cancel)(void * context, char * error, size_t error_size);
+};
+// Optional extension, separate from transport ABI 2.
+// held (version 3): which of `count` experts of `layer` the tier holds now (out[i] 1 or 0): a slot has its bytes,
+// or is reserved for a deferred upload of them that the layer's next prepare collects first, so that prepare would
+// pin it as a hit. A seed counts from its publication: a prefill's planned seeds when the decode phase completes the
+// prefill, Q2's cold-prefill admission right after its copy. Any phase: the next-layer prefetch asks before it reads
+// an expert into RAM, and the RAM cache before it takes a slot (its copy of an expert the tier holds goes first); the
+// answer may change at the next admission, eviction or resize.
+struct ssd_vram_residency_api {
+    uint32_t version, size;   // 3
+    void (*held)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
+};
+// Optional explicit-format extension, separate from transport ABI 2. The ABI 2
+// prepare/launch entries remain the Kimi-K3 Q3_K/SiTU path. For any other expert
+// format the CPU owner calls prepare (with the tensor geometry) instead of ABI 2
+// prepare and launch (with the activation) instead of ABI 2 launch; admit,
+// finish, cancel, begin and the residency ABI are shared. The declaration (the
+// geometry, the layer list and each layer's types) must stay the same for the
+// lifetime of a context; up_type, gate_type and down_type are the call's layer's.
+enum ssd_vram_activation_kind {
+    SSD_VRAM_ACTIVATION_SITU         = 0, // same values as ssd_cpu_sink_activation_kind
+    SSD_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
+    SSD_VRAM_ACTIVATION_SWIGLU       = 2,
+};
+struct ssd_vram_activation {
+    int32_t kind;
+    float situ_beta, situ_linear_beta, swiglu_limit;
+};
+struct ssd_vram_expert_format {
+    int32_t latent, hidden;   // up/gate columns and rows
+    int32_t up_type;          // ggml_type of up of the call's layer
+    int32_t gate_type;        // ggml_type of gate of the call's layer (a quantization may give it another than up's)
+    int32_t down_type;        // ggml_type of down of the call's layer
+    int32_t n_experts;        // routed experts per layer (tensor ne[2])
+    int32_t n_layers;         // entries in layers
+    const int32_t * layers;   // model layer IDs, allocation priority order
+    // Format API 3, prefill API 11, elastic API 6: each listed layer's up, gate and down types, entry for entry with
+    // layers, or all three null when every layer has up_type, gate_type and down_type. Every layer has latent, hidden
+    // and n_experts.
+    const int32_t * layer_up_types;
+    const int32_t * layer_gate_types;
+    const int32_t * layer_down_types;
+};
+struct ssd_vram_format_api {
+    uint32_t version, size;   // 3
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
+                   const struct ssd_vram_expert_format * format, int * slots,
+                   char * error, size_t error_size);
+    // input is the layer's f32 input row (latent floats).
+    int (*launch)(void * context, const void * input, size_t input_bytes,
+                  const struct ssd_vram_activation * activation, char * error, size_t error_size);
+};
+// One host-resident expert selected for transient GPU prefill compute. The
+// request index addresses the distinct-expert union passed to prepare. RAM
+// pointers stay leased by the cache owner. Q2 SSD pointers use dedicated
+// staging through finish/cancel; the batched lane's SSD pointers use a
+// recyclable I/O ring slot and the stage callback below.
+// The tier copies into a dedicated device scratch slot without changing decode
+// residency, or the batched engine reads it in place (prefill_launch in_place).
+enum ssd_vram_prefill_transient_source {
+    SSD_VRAM_PREFILL_TRANSIENT_RAM = 0,
+    SSD_VRAM_PREFILL_TRANSIENT_SSD = 1,
+};
+struct ssd_vram_prefill_transient {
+    int32_t request_index;
+    int32_t source;
+    const void * role[3];
+    // Optional SSD ring handoff: phase 0 waits for the read, phase 1 returns
+    // its I/O credit after the GPU upload (or, in place, the chain reading it)
+    // has finished, and phase 2 probes readiness without waiting. Zero for leased
+    // RAM and for the original dedicated-staging path.
+    int (*stage)(void * context, int32_t request_index, int phase);
+    void * stage_context;
+};
+struct ssd_vram_prefill_stats {
+    uint64_t resident_experts;
+    uint64_t resident_routes;
+    uint64_t transient_experts;
+    uint64_t transient_routes;
+    uint64_t transient_upload_bytes;
+    double transient_upload_us;
+    uint64_t ram_transient_experts;
+    uint64_t ram_transient_routes;
+    uint64_t ram_transient_upload_bytes;
+    double ram_transient_upload_us;
+    uint64_t ssd_transient_experts;
+    uint64_t ssd_transient_routes;
+    uint64_t ssd_transient_upload_bytes;
+    double ssd_transient_upload_us;
+    double total_worker_us;
+    // Version 5. Each expert chain's time from device memory (the batched engine's CUDA events) as sums over the
+    // experts, routes = the expert's distinct tokens: count, sum of routes, of routes squared, of the times, and of
+    // routes times the time; the worker's wait for streamed SSD reads; the GPU output's addition into the caller's
+    // rows at finish.
+    double gpu_fit_experts;
+    double gpu_fit_routes;
+    double gpu_fit_routes_sq;
+    double gpu_fit_us;
+    double gpu_fit_route_us;
+    double read_wait_us;
+    double output_add_us;
+    // Version 6: the transients' copies timed by CUDA events on the upload stream (their DMA, whatever the worker did
+    // meanwhile), and the worker's wait for them after it had computed what it could: the pipeline's stall.
+    double transient_dma_us;
+    double transient_wait_us;
+    // Version 7, the batched engine: the chains of experts read in place from host memory, as sums like gpu_fit_*
+    // (those hold the chains from device memory); the engine's own time outside its chains (the input rows up, the
+    // accumulator's zeroing, the rows down), from its events.
+    double host_fit_experts;
+    double host_fit_routes;
+    double host_fit_routes_sq;
+    double host_fit_us;
+    double host_fit_route_us;
+    double engine_overhead_us;
+};
+// The engine a format's grouped prefill runs on (version 7, lane). Its passes of at most vector_tokens tokens run the
+// vector engine, a call of the layer's residents a token, as decode does; longer passes the batched engine,
+// SSD_VRAM_PREFILL_ENGINE_BATCHED: the grouped engine over the backend's matrix products (any format they serve; the
+// per-expert post norm; streamed transients in place on a GPU that reads host memory so). NONE: the CPU's. A pass's
+// input rows are f32 (version 9).
+enum ssd_vram_prefill_engine {
+    SSD_VRAM_PREFILL_ENGINE_NONE    = 0,
+    SSD_VRAM_PREFILL_ENGINE_BATCHED = 3,
+};
+struct ssd_vram_prefill_lane {
+    int32_t engine;           // enum ssd_vram_prefill_engine
+    int32_t in_place;         // the batched engine can read streamed transients in place from host memory
+    int32_t post_norm;        // the batched engine applies a per-expert post norm (the vector path always does)
+    int32_t vector_tokens;    // passes of at most this many tokens run the vector engine
+    // the batched engine's transfers and device memory (the receipt [ssd_vram_prefill_engine]): over the link per
+    // route and per input row each way; reserved: fixed, and per row
+    uint64_t route_bytes, token_bytes, output_bytes, fixed_bytes, bytes_per_token;
+};
+// A pass's launch options (version 7): the activation, the optional per-expert post norm (latent weights, copied by
+// launch), and whether the batched engine reads this pass's streamed transients in place (the caller's cost table
+// found it no slower than their copies; only where the lane says it can).
+struct ssd_vram_prefill_launch {
+    struct ssd_vram_activation activation;
+    const float * post_norm;
+    float post_norm_eps;
+    int32_t in_place;
+};
+// Optional grouped-prefill extension. Residency hits are pinned read-only.
+// Version 2 can additionally consume selected, already-leased RAM-resident Q2
+// experts through a dedicated transient scratch slot. Version 3 can seed empty
+// decode slots from selected cold-prefill SSD sources. Version 4 also accepts
+// completed O_DIRECT reads from dedicated SSD staging buffers as transient Q2
+// compute sources. Version 5 adds the MXFP4 worker's per-expert times, read waits and output addition to the
+// stats. Version 6 adds the transients' copies timed on the upload stream and the worker's wait for them; a
+// transient from page-locked memory (the read ring registered through the host API) is a DMA copy that overlaps
+// the computation of another. Version 7 adds the lane (which engine a format's passes run on, for any format the
+// decode engine serves), the launch options (the per-expert post norm, in place) and the in-place chains' stats.
+// Version 8 takes the per-layer types of ssd_vram_expert_format; the lane is the prepared layer's. Version 9: every
+// pass's input rows are f32 (the lane's f32_input field is gone).
+// Cold seeds start with zero decode heat and are therefore the
+// first victims unless decode reuses them; the path never evicts an existing
+// decode resident.
+struct ssd_vram_prefill_api {
+    uint32_t version, size;   // 11
+    // requests contains the distinct expert union for one layer. slots receives
+    // -1 for CPU work or an opaque resident slot for GPU work. The tier must
+    // already hold the same explicit format from an earlier decode phase.
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
+                   const struct ssd_vram_expert_format * format, int * slots,
+                   char * error, size_t error_size);
+    // route_request_index is token-major [ntokens][nslots] and indexes requests;
+    // -1 skips a route. input contains ntokens rows separated by input_stride.
+    // launch copies all caller-owned inputs and route metadata before returning.
+    // Returns one only when a dedicated transient scratch slot exists for this
+    // context/format. It is a read-only query at a serialized phase boundary.
+    int (*transient_available)(void * context);
+    int (*launch)(void * context, const void * input, size_t input_stride,
+                  const int32_t * route_request_index, const float * weights,
+                  int nslots, int ntokens,
+                  const struct ssd_vram_prefill_transient * transient, int transient_count,
+                  const struct ssd_vram_prefill_launch * options,
+                  char * error, size_t error_size);
+    // Adds the GPU-resident routes to token-major output rows. Existing output
+    // values are preserved, so the CPU miss executor may run concurrently.
+    int (*finish)(void * context, float * output, size_t output_stride,
+                  struct ssd_vram_prefill_stats * stats,
+                  char * error, size_t error_size);
+    int (*cancel)(void * context, char * error, size_t error_size);
+    // Reserved v7 slots for retired Q2 cold admission: active is always zero;
+    // admit_cold returns an error, clears *admitted and drains the context.
+    int (*cold_admission_active)(void * context);
+    int (*admit_cold)(void * context, const struct ssd_vram_request * request,
+                      const void * up, const void * gate, const void * down,
+                      int * admitted, char * error, size_t error_size);
+    // The format's lane, after prepare (which initializes the format on a cold prefill). Read-only.
+    void (*lane)(void * context, struct ssd_vram_prefill_lane * lane);
+    // Version 10, the seeds of a prefill the CPU sink runs: empty slots filled with the experts it routes most.
+    // seed_routes gives the routes of each request of the next prepare's union (index-aligned with its requests); that
+    // prepare reserves the layer's share of the empty slots for the experts the pass routes most, before it leases its
+    // residents. The tier copies a seed its prefill lane computes from the bytes it reads; seed_host copies one the CPU
+    // computes from its payload (request_index into the prepared union), which stays valid until seed_wait returns for
+    // that request. The seeds are published when the decode phase completes the prefill, or at the first decode token
+    // begun without that completion; a block given back or a cancelled prefill drops them.
+    int (*seed_routes)(void * context, const int32_t * routes, int count, char * error, size_t error_size);
+    int (*seed_host)(void * context, int32_t request_index, const void * up, const void * gate, const void * down,
+                     char * error, size_t error_size);
+    int (*seed_wait)(void * context, int32_t request_index, char * error, size_t error_size);
+};
+// Optional deferred-upload extension (deferred and async uploads on in the tier and its CPU owner). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
+// when *queued is 1 the caller keeps that source unchanged and leased until collect returns the request, and the
+// reserved GPU slot is never evicted meanwhile. collect runs outside prepare..finish and without a live residency
+// lease, except with SSD_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
+// below, then publishes completed uploads and copies their keys into completed (at most capacity; call again while
+// count == capacity). aborted[i] is 1 when that upload's slot went with a block the tier gave back (an OOM or host
+// reclaim, which waits for the copy first): nothing was published, but its RAM source is free again like the others.
+// wait blocks, in any phase, until no upload is in flight, without publishing; call it before the RAM owner unmaps
+// a source. begin for prefill, release, cancel and destroy wait as well.
+enum {
+    SSD_VRAM_COLLECT_ALL = -1,     // wait for the uploads of every layer
+    SSD_VRAM_COLLECT_NONE = -2,    // wait for none
+    // Wait for none, and inside a layer or a residency lease collect nothing and succeed, where the others fail: a
+    // host reclaimer may run at any point of a run.
+    SSD_VRAM_COLLECT_IF_IDLE = -3,
+};
+struct ssd_vram_deferred_api {
+    uint32_t version, size;   // 3
+    int (*admit)(void * context, const struct ssd_vram_request * request, const void * up, const void * gate,
+                 const void * down, int * queued, char * error, size_t error_size);
+    int (*collect)(void * context, int32_t wait_layer, struct ssd_vram_request * completed, int32_t * aborted,
+                   int capacity, int * count, char * error, size_t error_size);
+    int (*wait)(void * context, char * error, size_t error_size);
+};
+// Optional lifecycle extension, separate from the compute/transport ABIs.
+// begin(decode=false) performs the proactive request-boundary shrink and arms
+// allocator recovery. phase_complete(false) disarms after a successful prefill
+// reserve; phase_complete(true) runs only after the decode graph is reserved
+// and grows best-effort into currently free device memory.
+struct ssd_vram_elastic_api {
+    uint32_t version, size;   // 6 (preload)
+    int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
+    // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
+    int (*reserve_accumulate)(void * context, int tokens, char * error, size_t error_size);
+    // At load, after the context reserved its worst-case graph and the RAM cache published its demand: on unified
+    // memory the tier takes its storage and grows into what the host-memory ledger leaves, so that no request waits
+    // for the page population; the next decode adopts it. A discrete GPU keeps its arena where it is and returns.
+    // The request gives the role bytes (one expert of a routed layer), format the geometry.
+    int (*reserve)(void * context, const struct ssd_vram_request * request,
+                   const struct ssd_vram_expert_format * format, char * error, size_t error_size);
+    // At load, after the load's passes, before any request: preload_slots grows a tier made at load into the card if
+    // its memory has settled, then gives in *slots how many slots no entry holds. preload copies one expert no
+    // request has named (request: its key and role bytes) from host memory into one of them, preloaded: any lookup
+    // finds it, and every allocation may take its slot as if it were empty until a request uses it. *copied is 0 when
+    // no slot is empty or the tier holds the expert already.
+    int (*preload_slots)(void * context, int * slots, char * error, size_t error_size);
+    int (*preload)(void * context, const struct ssd_vram_request * request, const void * up, const void * gate,
+                   const void * down, int * copied, char * error, size_t error_size);
+};
+// Optional decode extension: the GPU computes experts that sit in host memory (a RAM cache slot or a ring
+// buffer). How depends on the device, and costs2 says which:
+//   - a device that reads host memory in place through the host page tables (ATS: GB10, Grace Hopper; not HMM,
+//     which migrates the pages) computes from the host pointers;
+//   - a discrete GPU (version 2) copies each job from page-locked host memory (register_host) into device memory
+//     on its own stream, then computes: into the expert's admission reservation when prepare made one (the copy
+//     is the admission; finish publishes it), else into one of `slots` device slots the tier allocates at a token
+//     boundary after a batch first wanted one. A pageable source, or no free slot, refuses the batch.
+// The sink places each expert from measured costs. launch queues jobs behind the layer's resident hits, after
+// the layer's format launch (accepted is 0, and nothing is queued, when this layer has no launched GPU work to
+// follow or the batch is refused); finish waits for them and writes each job's weighted down row to its row of the
+// output, as for hits. A payload must stay valid until finish. costs reports the GPU time per expert measured so
+// far for a resident hit and for a host-memory job (microseconds, 0 until a sample exists).
+// register_host page-locks [pointer, pointer + bytes) and maps it for the device (cudaHostRegister); unregister_host
+// undoes it, and must come before the caller unmaps or discards those pages. A copy may not span two registered
+// ranges. Both return 0 and do nothing where the device reads host memory in place. Either may run on any thread;
+// a registration holds the driver for about a millisecond per 19 MB and delays other threads' CUDA calls meanwhile.
+// The measured lines are those of every copy and every vector-engine call the tier makes, decode's and grouped
+// prefill's alike: the caller prices both from them (ggml-ssd/place/layer-plan.h, ssd_place_table).
+struct ssd_vram_host_job { int32_t row; float weight; const void * role[3]; };
+// The measured lines of the host path (microseconds; 0 until measured).
+struct ssd_vram_host_costs {
+    double resident_call_us, resident_expert_us; // the residents' engine call: call + expert * k
+    double host_call_us, host_expert_us;         // a call of host jobs (in place, or from device memory after the copies)
+    double copy_us_per_mb;                        // a page-locked copy into device memory (0: in place, or not measured)
+    double link_busy_us;                          // copies already queued on the link (deferred admissions)
+    int32_t in_place;                             // 1: the device reads host memory in place; no copy, no slot
+    int32_t slots;                                // discrete: device slots this layer's jobs without a reservation can
+                                                  // take (free scratch slots; before they are allocated, the slots a
+                                                  // first batch would ask for; 0 after their allocation failed)
+    uint64_t reserved_rows;                       // discrete: bit j, the layer's request j (j < 64) holds an admission
+                                                  // reservation a job copies into (no scratch slot needed)
+    // version 3
+    double pageable_us_per_mb;                    // a copy from pageable memory, staged by the copying thread (0: not
+                                                  // measured): admissions, the start-up probe, prefill transients
+    int32_t vector_tokens;                        // grouped prefill passes of at most this many tokens run the vector
+                                                  // engine (one call of the layer's residents a token), as decode does
+    int32_t in_place_only;                        // in place and nothing else: no device memory to compare with, and
+                                                  // the device must be shown the read ring first (register_host)
+};
+struct ssd_vram_host_api {
+    uint32_t version, size;   // 3
+    int (*available)(void * context);
+    int (*launch)(void * context, const struct ssd_vram_host_job * jobs, int count, int * accepted,
+                  char * error, size_t error_size);
+    void (*costs)(void * context, double * resident_us, double * host_us);
+    int (*register_host)(void * context, const void * pointer, size_t bytes, char * error, size_t error_size);
+    int (*unregister_host)(void * context, const void * pointer, char * error, size_t error_size);
+    void (*costs2)(void * context, struct ssd_vram_host_costs * costs);
+};
+// Optional extension, the sink's side of the tier's decisions.
+// set_miss_cost (version 5): what a decode layer's use of an expert the tier does not hold costs, in microseconds,
+// by where it comes from: the RAM cache (its compute) and the drive (the slower of its compute and its share of the
+// layer's drive reads); 0 for one the layer did not have. The tier prices its replacements with them
+// (vram_slot_table::candidate_saving).
+// set_host_demand: host memory the sink may still commit (its RAM cache's mapped but not yet resident
+// slots). On unified memory the tier keeps it free, with the host floor, instead of taking it first.
+// set_host_floor: the floor of the sink's host-memory ledger (file reserve + margin + explicit reserves). On
+// unified memory the tier keeps it free and publishes floor + demand as ggml's allocation reserve.
+// reclaim_host: on unified memory, room for `bytes` of host memory the ledger is about to grant outside the tier.
+// The tier gives its last blocks back (keeping one) while MemAvailable less the floor and the demand is below
+// bytes plus its low watermark, waiting for deferred uploads first (collect reports those in a freed block as
+// aborted). 0 when that much is free; 1 when a layer is live (nothing waits or is freed) or not enough could go.
+// host_bytes (version 3): on unified memory, the DRAM the tier holds (its blocks and prefill scratch); 0 on a
+// discrete GPU. The ledger subtracts it from MemAvailable changes it learns its margin from.
+// set_thread_cpus (version 4): the CPUs (ssd::platform numbers, count >= 1) the tier's worker and upload threads run
+// on: the sink gives the process's other than those of its call's coordinator, which launches a decode layer's engine
+// calls itself. The tier moves its threads there, or places them there when it starts them; until the first call they
+// keep the CPUs of the thread that started them. The sink calls it at its first layer on the tier and again when the
+// coordinator's CPUs change.
+// set_ram_holds (version 5): the sink's RAM cache, which keeps its copy of an expert the tier takes (a backup it
+// drops first when it needs the slot): holds(arg, layer, expert) is nonzero while it has a copy. The tier asks it on
+// the sink's thread, in a decode layer's prepare, to price a replacement (vram_slot_table::ram_copy).
+struct ssd_vram_policy_api {
+    uint32_t version, size;   // 5
+    void (*set_miss_cost)(void * context, double ram_us, double drive_us);
+    void (*set_host_demand)(void * context, uint64_t bytes);
+    void (*set_host_floor)(void * context, uint64_t bytes);
+    int (*reclaim_host)(void * context, uint64_t bytes);
+    uint64_t (*host_bytes)(void * context);
+    int (*set_thread_cpus)(void * context, const int * cpus, int count, char * error, size_t error_size);
+    void (*set_ram_holds)(void * context, int (*holds)(void * arg, int32_t layer, int32_t expert), void * arg);
+};
+#ifdef __cplusplus
+extern "C" {
+#endif
+// The optional DSO exports this symbol. No DSO load or GPU work with budget 0.
+typedef const struct ssd_vram_tier_api * (*ssd_vram_tier_get_api_fn)(void);
+typedef const struct ssd_vram_residency_api * (*ssd_vram_residency_get_api_fn)(void);
+typedef const struct ssd_vram_format_api * (*ssd_vram_format_get_api_fn)(void);
+typedef const struct ssd_vram_prefill_api * (*ssd_vram_prefill_get_api_fn)(void);
+typedef const struct ssd_vram_deferred_api * (*ssd_vram_deferred_get_api_fn)(void);
+typedef const struct ssd_vram_elastic_api * (*ssd_vram_elastic_get_api_fn)(void);
+typedef const struct ssd_vram_host_api * (*ssd_vram_host_get_api_fn)(void);
+typedef const struct ssd_vram_policy_api * (*ssd_vram_policy_get_api_fn)(void);
+const struct ssd_vram_elastic_api * ssd_vram_elastic_get_api(void);
+#ifdef __cplusplus
+}
+#endif

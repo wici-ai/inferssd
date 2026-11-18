@@ -3,8 +3,9 @@
 
 ``ModelFacts`` come from the GGUF header of the model being launched.
 ``RuntimeFacts`` are read when the launch starts, because they change while the
-machine runs: the CPUs this process may use, the CUDA GPUs it can use and
-their free memory, the memory available now, and the user's memory budget.
+machine runs: the CPUs this process may use, the GPUs with the expert VRAM tier
+it can use and their free memory, the memory available now, and the user's
+memory budget.
 Readers take an injectable host and never write anything.
 """
 
@@ -171,12 +172,16 @@ def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
 
 def model_facts(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
     """ModelFacts of the model PATH names; a split model's first shard brings all of them."""
-    return facts_from_headers(gguf_header.read_model(path, filesystem=filesystem))
+    return facts_from_headers(
+        gguf_header.without_nextn(gguf_header.read_model(path, filesystem=filesystem))
+    )
 
 
 def shard_facts(paths: Sequence[str], *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
     """ModelFacts of exactly the shards PATHS, in their order."""
-    return facts_from_headers([gguf_header.read(path, filesystem=filesystem) for path in paths])
+    return facts_from_headers(
+        gguf_header.without_nextn([gguf_header.read(path, filesystem=filesystem) for path in paths])
+    )
 
 
 def _type_counts(value: object, field: str) -> None:
@@ -288,11 +293,13 @@ def model_drive_key(paths: Sequence[str], host: Optional[identity.Host] = None) 
 
 @dataclass(frozen=True)
 class GPUState:
-    """A CUDA GPU the launch can use, as it is now."""
+    """A GPU of a backend with the expert VRAM tier (identity.TIER_BACKENDS) the launch can use,
+    as it is now."""
 
     uuid: str
     free_bytes: Optional[int]  # None where the driver reports no dedicated memory
     processes: int  # compute processes running on it
+    backend: str = "CUDA"  # the backend that runs it: CUDA, or ROCm for an AMD GPU
 
 
 @dataclass(frozen=True)
@@ -300,13 +307,18 @@ class RuntimeFacts:
     """Facts read at launch; never taken from the characteristics file."""
 
     cpus: tuple[int, ...]  # CPUs this process may run on
-    gpus: Optional[tuple[GPUState, ...]]  # usable CUDA GPUs; None when they cannot be read
+    gpus: Optional[tuple[GPUState, ...]]  # usable GPUs of the tier backends; None when unreadable
     # The launcher's view of the memory available now: MemAvailable within the
-    # room of every bounded cgroup (file cache counted as reclaimable), or on
-    # macOS the free, inactive and speculative pages. None when it cannot be
-    # read. The engine sizes its caches from its own reading at run time.
+    # room of every bounded cgroup (file cache counted as reclaimable), on
+    # macOS what an allocation takes before the kernel compresses anything, and
+    # on Windows the available physical memory. None when it cannot be read.
+    # The engine sizes its caches from its own reading at run time.
     available_bytes: Optional[int]
     memory_budget_bytes: Optional[int] = None  # the user's memory budget, when given
+    # The GPU backends of the engine the launch starts, as its build names them; None when
+    # unknown, and then taken to be the backends of the machine's GPUs (engine_gpu_backends).
+    # Set by the launch, not recorded with the facts above.
+    gpu_backends: Optional[tuple[str, ...]] = None
 
 
 class Host(identity.Host, Protocol):
@@ -314,7 +326,10 @@ class Host(identity.Host, Protocol):
     def environment(self) -> Mapping[str, str]: ...
 
 
-GPU_RECORD = record({"uuid": TEXT, "free_bytes": nullable(COUNT), "processes": COUNT})
+# A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
+GPU_RECORD = record(
+    {"uuid": TEXT, "free_bytes": nullable(COUNT), "processes": COUNT}, {"backend": TEXT}
+)
 RUNTIME_RECORD = record(
     {
         "cpus": array(COUNT, minimum=1),
@@ -332,7 +347,12 @@ def runtime_facts_json(facts: RuntimeFacts) -> dict[str, object]:
         "gpus": None
         if facts.gpus is None
         else [
-            {"uuid": gpu.uuid, "free_bytes": gpu.free_bytes, "processes": gpu.processes}
+            {
+                "uuid": gpu.uuid,
+                "free_bytes": gpu.free_bytes,
+                "processes": gpu.processes,
+                "backend": gpu.backend,
+            }
             for gpu in facts.gpus
         ],
         "available_bytes": facts.available_bytes,
@@ -357,6 +377,7 @@ def runtime_facts_from(value: object) -> RuntimeFacts:
                 cast(str, gpu["uuid"]),
                 cast(Optional[int], gpu["free_bytes"]),
                 cast(int, gpu["processes"]),
+                cast(str, gpu.get("backend", "CUDA")),
             )
             for gpu in gpus
         ),
@@ -366,7 +387,7 @@ def runtime_facts_from(value: object) -> RuntimeFacts:
 
 
 class NativeHost(identity.NativeHost):
-    """This host; ENVIRONMENT, the launch's (default: this process's), selects the CUDA GPUs."""
+    """This host; ENVIRONMENT, the launch's (default: this process's), selects the GPUs."""
 
     def __init__(self, environment: Optional[Mapping[str, str]] = None) -> None:
         self.env = environment
@@ -381,12 +402,13 @@ class NativeHost(identity.NativeHost):
 
 
 def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> list[tuple[int, str]]:
-    """The (index, UUID) pairs CUDA_VISIBLE_DEVICES=VALUE leaves, in its order.
+    """The (index, UUID) pairs a visible-devices list VALUE leaves, in its order.
 
-    Like CUDA, the list ends at its first entry that names no GPU or one again.
-    Numbers are taken as nvidia-smi indices, which follow the PCI bus; CUDA
-    numbers devices fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a
-    machine with different GPUs a UUID is the unambiguous choice.
+    As CUDA and ROCm read CUDA_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES, the list
+    ends at its first entry that names no GPU or one again. Numbers are taken as
+    the indices of LISTED: nvidia-smi's follow the PCI bus, and CUDA numbers
+    devices fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a machine
+    with different GPUs a UUID is the unambiguous choice.
     """
     if value is None:
         return list(listed)
@@ -405,6 +427,59 @@ def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> lis
 
 
 def _gpus(host: Host) -> Optional[tuple[GPUState, ...]]:
+    """The tier backends' GPUs the launch can use: NVIDIA's (nvidia-smi) and AMD's on ROCm
+    (amdkfd); None when NVIDIA's cannot be read."""
+    nvidia = _nvidia(host)
+    return None if nvidia is None else nvidia + _rocm(host)
+
+
+# amdkfd lists each process that uses an AMD GPU, with its memory on every GPU it opened. It tears
+# an entry down after the process exits, so an entry counts only while its process runs.
+KFD_PROCESSES = "/sys/class/kfd/kfd/proc"
+
+
+def _rocm(host: Host) -> tuple[GPUState, ...]:
+    """The GPUs ROCm runs (identity.amd_compute) that the launch's environment leaves visible."""
+    listed = identity.amd_compute(host)
+    if not listed:
+        return ()
+    busy: Counter[str] = Counter()
+    try:
+        processes = host.listdir(KFD_PROCESSES)
+    except OSError:
+        processes = []
+    for process in processes:
+        if not host.exists(f"/proc/{process}"):
+            continue
+        for gpu in listed:
+            if gpu.gpu_id and host.exists(f"{KFD_PROCESSES}/{process}/vram_{gpu.gpu_id}"):
+                busy[gpu.uuid] += 1
+    # ROCm applies ROCR_VISIBLE_DEVICES to amdkfd's order, then HIP_VISIBLE_DEVICES (or
+    # CUDA_VISIBLE_DEVICES, which HIP reads for it) to the devices that leaves.
+    environment = host.environment()
+    chosen = visible_gpus(
+        [(index, gpu.uuid) for index, gpu in enumerate(listed)],
+        environment.get("ROCR_VISIBLE_DEVICES"),
+    )
+    chosen = visible_gpus(
+        [(index, uuid) for index, (_, uuid) in enumerate(chosen)],
+        environment.get("HIP_VISIBLE_DEVICES", environment.get("CUDA_VISIBLE_DEVICES")),
+    )
+    address = {gpu.uuid: gpu.address for gpu in listed}
+    states = []
+    for _, uuid in chosen:
+        base = f"/sys/bus/pci/devices/{address[uuid]}/mem_info_vram_"
+        total, used = identity.read(host, base + "total"), identity.read(host, base + "used")
+        free = (
+            int(total) - int(used)
+            if total and used and total.isdigit() and used.isdigit()
+            else None
+        )
+        states.append(GPUState(uuid, free, busy[uuid], "ROCm"))
+    return tuple(states)
+
+
+def _nvidia(host: Host) -> Optional[tuple[GPUState, ...]]:
     if not host.which("nvidia-smi"):
         return ()
     listed = host.command(
@@ -489,19 +564,38 @@ def _available(host: Host, system: str) -> Optional[int]:
             value = room if value is None else min(value, room)
         return value
     if system == "darwin":
-        text = identity.output(host, ["vm_stat"]) or ""
-        page = re.search(r"page size of (\d+) bytes", text)
-        pages = dict(re.findall(r"^Pages (free|inactive|speculative):\s+(\d+)\.", text, re.M))
-        if not page or len(pages) != 3:
+        # As the engine's ledger measures it (ledger-native.cpp): what an allocation takes
+        # before the kernel compresses anything, by its own live thresholds. That is the
+        # free pages above the free target, the file-backed pages above the file cache
+        # minimum, and the purgeable and reusable pages.
+        names = (
+            "vm.pagesize",
+            "vm.page_free_count",
+            "vm.vm_page_free_target",
+            "vm.page_pageable_external_count",
+            "vm.vm_page_filecache_min",
+            "vm.page_purgeable_count",
+            "vm.page_reusable_count",
+        )
+        try:
+            page, free, target, file, minimum, purgeable, reusable = (
+                identity.sysctl_int(host, n) for n in names
+            )
+        except RuntimeError:
             return None
-        return sum(int(count) for count in pages.values()) * int(page.group(1))
+        return (max(0, free - target) + max(0, file - minimum) + purgeable + reusable) * page
+    if system == "windows":
+        try:
+            return host.windows().memory().available_bytes
+        except OSError:
+            return None
     return None
 
 
 def read_runtime(
     *, memory_budget_bytes: Optional[int] = None, host: Optional[Host] = None
 ) -> RuntimeFacts:
-    """Read this machine's runtime facts now (Linux and macOS)."""
+    """Read this machine's runtime facts now."""
     live: Host = host or NativeHost()
     system = live.platform()
     if system == "linux":
@@ -512,6 +606,10 @@ def read_runtime(
         # macOS has no affinity: every logical CPU is usable.
         cpus = cpu_list(f"0-{identity.sysctl_int(live, 'hw.logicalcpu') - 1}")
         gpus = ()
+    elif system == "windows":
+        # Group 0 logical processor indices, as the engine and its CPU masks number them.
+        cpus = live.windows().process_cpus()
+        gpus = _gpus(live)
     else:
         raise identity.UnsupportedPlatform(f"runtime facts are not read on {system} yet")
     return RuntimeFacts(tuple(cpus), gpus, _available(live, system), memory_budget_bytes)

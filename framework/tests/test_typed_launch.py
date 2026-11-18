@@ -1,6 +1,9 @@
 """Typed preparation/ownership contracts; synthetic metadata is not GPU evidence."""
 
 import json
+import os
+import re
+import sys
 from dataclasses import asdict, replace
 from functools import partial
 from pathlib import Path
@@ -44,12 +47,13 @@ def setup(tmp_path, platform="linux", automatic=False):
     settings.write_text(text)
     spec = LaunchSpec(str(model), 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     host = {
-        "platform_system": "Linux" if platform == "linux" else "Darwin",
+        "platform_system": {"linux": "Linux", "darwin": "Darwin", "windows": "Windows"}[platform],
         "platform_machine": "arm64",
         "euid": 0,
         "cgroup_v2": True,
         "gpu_available": True,
         "gpu_processes": "",
+        "engine_gpu_backends": ["Metal"] if platform == "darwin" else ["CUDA"],
     }
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
     out = tmp_path / "run"
@@ -65,6 +69,14 @@ def setup(tmp_path, platform="linux", automatic=False):
         inputs, host, run=indexer, replace=lambda a, b: Path(a).replace(b), python="metadata-python"
     )
     return inputs, spec, host, adapter, out, seen
+
+
+def session(variables, home):
+    """VARIABLES as this process's whole environment, for a user whose home is HOME.
+
+    POSIX finds the home directory without the environment; Windows reads USERPROFILE.
+    """
+    return {**dict(variables), "USERPROFILE": str(home)}
 
 
 def resolve(inputs, spec, adapter, out, platform="linux", configured=None):
@@ -135,7 +147,9 @@ def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, prese
 )
 def test_repo_adapter_reports_the_preset_build_when_none_exists(tmp_path, platform, first):
     inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
-    missing = "missing server executable: .*/" + first + "/bin/inferssd-server"
+    missing = "missing server executable: .*" + re.escape(
+        os.sep + os.path.join(first, "bin", "inferssd-server")
+    )
     with pytest.raises(ValueError, match=missing):
         resolve(inputs, replace(spec, binary=None), adapter, out, platform)
 
@@ -206,13 +220,25 @@ def test_resource_preparation_refuses_before_materialized_settings(tmp_path, fac
     assert not (out / "settings.ssd").exists()
 
 
-def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "host,address",
+    [("127.0.0.1", "127.0.0.1"), ("0.0.0.0", "127.0.0.1"), ("127.0.0.2", "127.0.0.2")],
+)
+def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(
+    tmp_path, monkeypatch, host, address
+):
     inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    spec = replace(spec, host=host)
     effects = Effects()
     owner = Owner(effects)
     captured = {}
     monkeypatch.setattr(runtime, "LiveArtifacts", lambda *a, **kw: adapter)
-    monkeypatch.setattr(runtime, "NativeEffects", lambda: effects)
+
+    def native(at):
+        captured["address"] = at
+        return effects
+
+    monkeypatch.setattr(runtime, "NativeEffects", native)
 
     def owned(result, directory, execution_policy, *, reservation):
         assert execution_policy.platform == "linux"
@@ -236,6 +262,8 @@ def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(tmp_path, mo
         configured=parse(Path(spec.settings_file).read_text(), spec.settings_file),
     )
     assert engine.ok and captured["result"].argv[1:3] == ("-m", spec.model)
+    argv = captured["result"].argv
+    assert argv[argv.index("--host") + 1] == host and captured["address"] == address
     env = dict(captured["result"].effective_environment)
     assert "INFERSSD_DEBUG" not in env  # controller observes JSONL without debug logging
     assert "GGML_KIMI_CPU_SINK_TRACE" not in env and "LLAMA_SERVER_PORT" not in env
@@ -243,9 +271,16 @@ def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(tmp_path, mo
     assert effects.events[-1] == ("busy", 8080)
 
 
+@pytest.mark.parametrize("host", ["localhost", "::1", "127.0.1"])
+def test_launch_refuses_a_host_that_is_not_an_ipv4_address(tmp_path, host):
+    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    with pytest.raises(ValueError, match="IPv4 address"):
+        resolve(inputs, replace(spec, host=host), adapter, out)
+
+
 def test_busy_port_refuses_before_claim_or_owner(tmp_path, monkeypatch):
     effects = Effects(busy=True)
-    monkeypatch.setattr(runtime, "NativeEffects", lambda: effects)
+    monkeypatch.setattr(runtime, "NativeEffects", lambda _address: effects)
     value = runtime.Runtime(
         LaunchInput("/unused", ()),
         policy(tmp_path),
@@ -267,7 +302,7 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
     facts = tmp_path / "facts.json"
     facts.write_text(json.dumps(host))
     receipt = tmp_path / "resolution.json"
-    monkeypatch.setattr("os.environ", dict(inputs.environment))
+    monkeypatch.setattr("os.environ", session(inputs.environment, tmp_path))
     assert (
         main(
             [
@@ -321,7 +356,7 @@ def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypa
     work = tmp_path / "work"
     work.mkdir()
     monkeypatch.chdir(work)
-    monkeypatch.setattr("os.environ", dict(inputs.environment))
+    monkeypatch.setattr("os.environ", session(inputs.environment, tmp_path))
     command = [
         "--dry-run",
         "--platform",
@@ -433,14 +468,16 @@ def test_decode_cpus_pin_only_the_decode_pool(tmp_path):
 
 
 def test_prompt_cache_on_disk_per_model(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    result = resolve(inputs, spec, adapter, out)
+    # The cache is named from the model's path, which follows this host's conventions.
+    platform = "windows" if sys.platform == "win32" else "linux"
+    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    result = resolve(inputs, spec, adapter, out, platform)
     assert result.argv[result.argv.index("--cache-ram") + 1] == "0"
     assert "--cache-disk" not in result.argv
     second = tmp_path / "second"
     second.mkdir()
     cache = str(tmp_path / "prompts")
-    result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second)
+    result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second, platform)
     argv = list(result.argv)
     assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
     assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv

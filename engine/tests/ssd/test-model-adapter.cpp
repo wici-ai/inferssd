@@ -36,13 +36,15 @@ struct fixture {
     llama_ssd::expert_inputs inputs() const {
         return {true, true, &up, &gate, &down, nullptr, nullptr, nullptr,
             nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            256, 1, true, false, false, false, false, &norm, 1e-5f, 0.0f};
+            256, 1, true, false, false, false, &norm, 1e-5f, 0.0f};
     }
 };
 
 // Frozen acceptance expressions from main b3904ade6's shared graph callsite,
 // and those of qwen4exp and qwen35moe: SiLU-gated experts, up and gate of one
-// type, no post norm required. Keep this independent of the extracted requirement flags and validator.
+// type, no post norm required. DeepSeek's once required MXFP4 experts (the GPU
+// tier's hand engine); it takes any format now, as the others do. Keep this
+// independent of the extracted requirement flags and validator.
 bool baseline_accepts(llm_arch arch, float clamp, const llama_ssd::expert_inputs & in) {
     const bool layout = in.backend_available && in.runtime_available && in.up && in.gate && in.down &&
         ggml_is_contiguous(in.up) && ggml_is_contiguous(in.gate) && ggml_is_contiguous(in.down) &&
@@ -54,16 +56,10 @@ bool baseline_accepts(llm_arch arch, float clamp, const llama_ssd::expert_inputs
         !in.up_bias && !in.gate_bias && !in.down_bias &&
         !in.up_scale && !in.gate_scale && !in.down_scale &&
         !in.weight_before_ffn && !in.has_lora;
-    const bool mxfp4 = layout && in.up->type == GGML_TYPE_MXFP4 &&
-        in.gate->type == GGML_TYPE_MXFP4 && in.down->type == GGML_TYPE_MXFP4;
     const bool deepseek = layout && arch == LLM_ARCH_DEEPSEEK41 &&
-        in.silu && !in.cache_compute && (in.n_tokens == 1 || in.prefill) && mxfp4 &&
-        std::isfinite(clamp) && clamp > 1e-6f;
-    const bool muse = layout && arch == LLM_ARCH_MUSE_SPARK && in.silu && !in.cache_compute &&
-        in.post_norm && in.gate->type == in.up->type;
-    const bool qwen = layout && (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE) && in.silu &&
-        !in.cache_compute &&
-        in.gate->type == in.up->type;
+        in.silu && (in.n_tokens == 1 || in.prefill) && std::isfinite(clamp) && clamp > 1e-6f;
+    const bool muse = layout && arch == LLM_ARCH_MUSE_SPARK && in.silu && in.post_norm;
+    const bool qwen = layout && (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE) && in.silu;
     return deepseek || muse || qwen;
 }
 
@@ -86,10 +82,10 @@ bool compare(llm_arch arch, float clamp, const llama_ssd::expert_inputs & in, in
         CHECK(same_bits(out.post_norm_eps, in.post_norm_eps));
         CHECK(same_bits(out.routed_scale, in.routed_scale == 0.0f ? 1.0f : in.routed_scale));
         CHECK(actual.refusal == llama_ssd::expert_refusal::none);
-        CHECK(llama_ssd::describe_refusal(in, actual.refusal).empty());
+        CHECK(llama_ssd::describe_refusal(actual.refusal).empty());
     } else {
         CHECK(actual.refusal != llama_ssd::expert_refusal::none);
-        CHECK(!llama_ssd::describe_refusal(in, actual.refusal).empty());
+        CHECK(!llama_ssd::describe_refusal(actual.refusal).empty());
     }
     return actual.accepted();
 }
@@ -132,11 +128,6 @@ void model_and_numeric_boundaries() {
     CHECK(!compare(LLM_ARCH_MUSE_SPARK, 7.0f, in));
     CHECK(compare(LLM_ARCH_QWEN4EXP, 7.0f, in));
     CHECK(compare(LLM_ARCH_QWEN35MOE, 7.0f, in));
-    in = f.inputs(); in.cache_compute = true;
-    CHECK(!compare(LLM_ARCH_DEEPSEEK41, 7.0f, in));
-    CHECK(!compare(LLM_ARCH_MUSE_SPARK, 7.0f, in));
-    CHECK(!compare(LLM_ARCH_QWEN4EXP, 7.0f, in));
-    CHECK(!compare(LLM_ARCH_QWEN35MOE, 7.0f, in));
     for (int tokens : {1, 2, 32}) {
         for (bool prefill : {false, true}) {
             in = f.inputs(); in.n_tokens = tokens; in.prefill = prefill;
@@ -187,7 +178,7 @@ void qwen_experts(llm_arch arch, ggml_type up_gate, ggml_type down, int64_t n_em
     const ggml_type other_type = up_gate == GGML_TYPE_Q4_K ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
     const ggml_tensor other = tensor(other_type, n_embd, n_ff, n_expert);
     auto mixed = in; mixed.gate = &other;
-    CHECK(!compare(arch, 0.0f, mixed));
+    CHECK(compare(arch, 0.0f, mixed)); // the executor checks the gate's type
 }
 
 void layout_refusals() {
@@ -300,8 +291,6 @@ void refusal_reasons() {
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::lora);
     in = good; in.silu = false;
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::not_silu_gated);
-    in = good; in.cache_compute = true;
-    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::compute_cache);
     in = good; in.n_tokens = 2;
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::token_batch);
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, good, 0.0f) == refusal::invalid_clamp);
@@ -309,30 +298,25 @@ void refusal_reasons() {
     CHECK(refusal_of(LLM_ARCH_MUSE_SPARK, in) == refusal::missing_post_norm);
 }
 
-bool contains(const std::string & text, const char * part) { return text.find(part) != std::string::npos; }
-
-// DeepSeek-V4.1-Flash Q3_K_M as published: Q3_K up and gate, Q4_K down in most layers.
-void quantization_refusals_name_the_types() {
-    using refusal = llama_ssd::expert_refusal;
+// DeepSeek-V4.1-Flash Q3_K_M as published: Q3_K up and gate, Q4_K down in most layers; Qwen3.8-Flash-Next UD-IQ1_S
+// layer 18: IQ2_XXS up, IQ2_S gate, Q2_0 down. The model adds no type rule, so up and gate of different types pass
+// admission: the executor that runs them checks their types.
+void different_up_and_gate_types_pass_admission() {
     fixture f;
     f.up = f.gate = tensor(GGML_TYPE_Q3_K, 256, 512, 4);
     f.down = tensor(GGML_TYPE_Q4_K, 512, 256, 4);
     llama_hparams hparams{};
     hparams.swiglu_clamp_exp[0] = 7.0f;
     const auto deepseek = llama_ssd::describe_experts(LLM_ARCH_DEEPSEEK41, hparams, 0);
-    const auto refused = llama_ssd::validate_experts(deepseek, f.inputs());
-    CHECK(refused.refusal == refusal::quantization);
-    const auto message = llama_ssd::describe_refusal(f.inputs(), refused.refusal);
-    CHECK(contains(message, "not supported yet"));
-    CHECK(contains(message, "up=q3_K gate=q3_K down=q4_K"));
+    CHECK(llama_ssd::validate_experts(deepseek, f.inputs()).accepted());
+    f.gate = tensor(GGML_TYPE_Q4_K, 256, 512, 4);
+    CHECK(llama_ssd::validate_experts(deepseek, f.inputs()).accepted());
 
-    fixture mixed;
-    mixed.up = tensor(GGML_TYPE_Q4_K, 256, 512, 4);
-    mixed.gate = tensor(GGML_TYPE_Q8_0, 256, 512, 4);
-    const auto muse = llama_ssd::describe_experts(LLM_ARCH_MUSE_SPARK, hparams, 0);
-    const auto mismatch = llama_ssd::validate_experts(muse, mixed.inputs());
-    CHECK(mismatch.refusal == refusal::quantization);
-    CHECK(contains(llama_ssd::describe_refusal(mixed.inputs(), mismatch.refusal), "up=q4_K gate=q8_0"));
+    fixture qwen;
+    qwen.up = tensor(GGML_TYPE_IQ2_XXS, 256, 512, 4);
+    qwen.gate = tensor(GGML_TYPE_IQ2_S, 256, 512, 4);
+    qwen.down = tensor(GGML_TYPE_Q2_0, 512, 256, 4);
+    CHECK(llama_ssd::validate_experts(llama_ssd::describe_experts(LLM_ARCH_QWEN4EXP, hparams, 0), qwen.inputs()).accepted());
 }
 } // namespace
 
@@ -343,6 +327,6 @@ int main() {
     layout_refusals();
     quantization_contract();
     refusal_reasons();
-    quantization_refusals_name_the_types();
+    different_up_and_gate_types_pass_admission();
     std::printf("model adapter: %zu frozen acceptance/descriptor comparisons passed\n", comparisons);
 }

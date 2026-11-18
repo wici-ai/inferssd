@@ -96,6 +96,9 @@ typedef sycl::half2 ggml_half2;
 #define QI1_0 (QK1_0 / 32)
 #define QR1_0 1
 
+#define QI2_0 (QK2_0 / 32)
+#define QR2_0 1
+
 
 #define QI4_0 (QK4_0 / (4 * QR4_0))
 #define QR4_0 2
@@ -182,6 +185,13 @@ typedef struct {
 } block_q1_0;
 static_assert(sizeof(block_q1_0) == sizeof(ggml_half) + QK1_0 / 8, "wrong q1_0 block size/padding");
 
+#define QK2_0 64
+typedef struct {
+    ggml_half d;              // delta (scale)
+    uint8_t qs[QK2_0 / 4];   // 2 bits per element
+} block_q2_0;
+static_assert(sizeof(block_q2_0) == sizeof(ggml_half) + QK2_0 / 4, "wrong q2_0 block size/padding");
+
 #define QK4_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -208,6 +218,14 @@ typedef struct {
     uint8_t qs[QK_MXFP4/2];
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
+
+// MXFP8 (OCP MX): 32 E4M3 values sharing one E8M0 scale, value = e4m3(qs[j]) * 2^(e - 127)
+#define QK_MXFP8 32
+typedef struct {
+    uint8_t e;            // E8M0
+    uint8_t qs[QK_MXFP8]; // E4M3 codes
+} block_mxfp8;
+static_assert(sizeof(block_mxfp8) == sizeof(uint8_t) + QK_MXFP8, "wrong mxfp8 block size/padding");
 
 #define QK_NVFP4 64
 #define QK_NVFP4_SUB 16  // sub-block size for per-group scales

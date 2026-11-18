@@ -183,7 +183,8 @@ static void dsv4_state_write_k_cache(
 
     for (uint32_t il : layer_ids) {
         io.write(&il, sizeof(il));
-        dsv4_state_write_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows, s0, ns);
+        ggml_tensor * k = kv->get_k_storage(il);
+        dsv4_state_write_tensor_streams(io, k, (uint32_t) k->ne[1], n_rows, s0, ns);
     }
 }
 
@@ -206,6 +207,11 @@ static void dsv4_state_read_k_cache(
 
     if (version != 1 && version != DSV4_K_CACHE_STATE_VER) {
         throw std::runtime_error("DSV4 K-cache state version mismatch");
+    }
+
+    // the rows read, and the one past them a plan parks padding blocks in, where the cache grows as it is used
+    if (!kv->grow_cells(n_rows_ref + 1)) {
+        throw std::runtime_error("DSV4 K-cache state: no memory for its rows");
     }
 
     const uint32_t kv_size = kv->get_size();
@@ -233,7 +239,8 @@ static void dsv4_state_read_k_cache(
             throw std::runtime_error("DSV4 K-cache layer id mismatch");
         }
 
-        dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
+        ggml_tensor * k = kv->get_k_storage(il);
+        dsv4_state_read_tensor_streams(io, k, (uint32_t) k->ne[1], n_rows_ref, s0, ns);
     }
 }
 

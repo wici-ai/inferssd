@@ -40,12 +40,11 @@ result afterwards (`--reprofile` measures again; `--machine PATH` uses a given
 characteristics file and measures nothing); see [machine profile](../docs/machine-profile.md).
 From that file, the model's GGUF header and the CPUs, GPUs and memory it finds
 at that moment, the launch chooses thread counts, CPU placement, `place.costs`
-and, without a usable CUDA GPU, `vram.budget = 0` (on macOS also
-`host.budget_mib` from the runtime policy). With one usable CUDA GPU on Linux it
-also chooses `prefill.cpu_max_tokens`, the longest prompt pass the CPU prefills
-no slower than the GPU graph, and prefills each prompt in one pass (`-b` and
-`-ub` as large as the context); on a GPU that shares host memory it keeps
-`host.headroom_mib = 4096`, and on macOS a quarter of the machine's memory. It fills only settings left at their registry
+and, for an engine with CUDA but no usable CUDA GPU, `vram.budget = 0` (on macOS also
+`host.budget_mib` from the runtime policy). It prefills each prompt in one pass
+(`-b` and `-ub` as large as the context) on every platform, so that a pass reads
+each expert it routes to once; the engine reserves each prompt's own graph. On a
+CUDA GPU that shares host memory it keeps `host.headroom_mib = 4096`. It fills only settings left at their registry
 defaults and thread options and sizes not given, so explicit values always win.
 The choices are written to the generated `settings.ssd` with `source=strategy`
 receipts and to `strategy.json`, with the values your settings kept and the
@@ -112,8 +111,8 @@ and zero values retain distinct behavior, including failures when consumed.
 Source header reads retain the original mmap lifetime and decoding: metadata
 strings use replacement decoding, while textual artifacts and pack tensor names
 use strict decoding. Split-model discovery uses the original sorted glob and does
-not newly reject missing shards. Type 42 (`F8_E4M3_B128`) remains recognized as
-historical header metadata; this does not claim native execution support.
+not newly reject missing shards. Type 42 is ggml's Q2_0; the owned F8 block
+format that once used it was removed from the engine.
 
 `experts.index` retains mtime-based reuse, including the original set iteration over
 source paths. Recorded filesystem transcripts use `PYTHONHASHSEED=0` as a test
@@ -143,11 +142,12 @@ contract.
 
 ## How serve and cli run the server
 
-`inferssd serve` and `cli` resolve the launch for Linux or macOS from the live
-machine, then start one supervised server on a loopback port. Each launch writes
+`inferssd serve` and `cli` resolve the launch for Linux, macOS or Windows from the live
+machine, then start one supervised server on a loopback port, or for `serve`
+on the IPv4 address `--host` gives. Each launch writes
 a resource policy for the whole machine, `memory_budget_bytes` set to its
 physical memory, and claims a new run directory under
-`~/.local/share/inferssd/state/runs`. Windows is not supported yet.
+`~/.local/share/inferssd/state/runs`.
 
 On Linux the server runs in a systemd scope with cgroup v2 whose memory limit is
 `memory_budget_bytes`, with zero swap and readable ancestor OOM counters and
@@ -155,8 +155,14 @@ memory peak; see the [Linux requirements](../docs/quickstart.md#linux-requiremen
 The worker checks the actual envelope and the server's inherited scope and
 memlock limit. It never raises system limits.
 
+On Windows the server runs in its guardian's job object, whose commit limit is
+`memory_budget_bytes` plus the dedicated memory of the discrete GPUs, since WDDM
+charges their allocations to commit; the worker checks that limit and that the
+server stays in the job. Paging-file use and the memory compression store are system-wide, so
+their growth is sampled, as on macOS.
+
 On macOS the budget is a **sampled soft server RSS threshold**, not a cgroup or a
-hard unified-memory cap. Both platforms monitor while the
+hard unified-memory cap. Every platform is monitored while the
 server runs, and fail the execution if a threshold or the worker fails. Host
 utility calls have a ten-second timeout. These checks do not replace per-host
 validation or prove a model will fit.
@@ -225,3 +231,58 @@ them at the descriptor of a source build instead. The descriptor identifies the
 executable, per-profile templates, optional native probes, and supported
 configuration/telemetry contract. Paths resolve relative to the descriptor, never
 the current directory. See the [deployment guide](../docs/engine-resources.md).
+
+### Decode estimates before inference
+
+`inferssd profile --model <GGUF-or-directory> --estimate-compute --json` adds
+synthetic CUDA matrix measurements to the hardware profile. It does not load or
+run a language model. Rebuild `inferssd-cpuprobe` first; the probe rotates 256 MiB
+of synthetic weights and measures one-token products, including both DeepSeek
+expert matrix orientations. Run profiling on an idle GPU. Saved measurements are
+reused; `--reprofile` replaces them.
+
+Estimation uses the decode thread pool, each expert quantization type, and measured
+GPU matvec rates rather than charging GPU work to the CPU. `--memory-gib 32` limits
+the **estimated host budget** (it does not set a process limit). Optional
+`--host-work-mib` and `--gpu-work-mib` reserve known KV/graph working memory. Without
+these, cache capacity is an upper estimate; these options do not alter launches.
+
+The command leads with a **conditional scenario range**, not a single precise
+prediction. JSON retains `decode_tokens_per_second` as the uniform/serial reference
+and adds `routing_scenarios`, `scenario_range_tokens_per_second`, component times
+and assumptions. The scenario table uses:
+
+| Expert-access hypothesis | Fraction of experts | Fraction of accesses |
+| --- | ---: | ---: |
+| Uniform | 100% | 100% |
+| Moderate concentration | 50% | 75% |
+| Concentrated | 20% | 80% |
+| Strongly concentrated | 20% | 95% |
+
+The remaining accesses still reach the rest of the experts. Caches are assumed to
+admit hotter experts first after warm-up. Each row reports no overlap, half-hidden
+I/O and a conditional range combining measured CPU/GPU/drive quartiles with serial
+to ideal overlap. Inclusive RAM/VRAM capacity avoids double-counting copies; a
+separate disjoint-cache scenario shows the alternative. The Python API accepts
+explicit `RoutingPattern` inputs when model-specific routing evidence exists.
+
+These hypotheses carry **no probabilities**. They are not a measured typical
+range, confidence interval, or guaranteed bound on execution. Microbenchmark
+quartiles describe only the profiling window; they cannot anticipate future shared
+SSD stalls. No historical tokens/s multiplier is used.
+
+Dense CUDA computation currently uses a measured Q8_0 matvec proxy because catalog
+facts do not retain each dense tensor's shape and type. Attention, non-matmul graph
+work, lookup I/O, warm-up and the actual routing distribution remain unpriced.
+CPU-only/unified-memory or missing-GPU-measurement cases retain a CPU cost estimate;
+they do not claim to model GPU execution. Estimates still use the catalog's pinned
+model facts; `--model` selects the storage drive, not arbitrary model metadata.
+A different quantization needs matching model facts before its estimate is valid.
+
+Two defaults stand in for measurements the profile lacks. An expert format the
+probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight
+bytes per second) of the measured format nearest it in bits per weight. A RAM-only
+model without routed experts, such as Gemma 4 E4B, reads its dense weights once a
+token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
+measured RAM read rate. Each estimate names the default it used in its
+assumptions; neither is calibrated against a run.

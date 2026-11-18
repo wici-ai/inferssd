@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,11 @@ from inferssd.telemetry.jsonl import effective_settings, read_events
 
 @pytest.fixture(scope="session")
 def native_contract(tmp_path_factory):
+    if sys.platform == "win32":
+        pytest.skip(
+            "compiled here with a POSIX c++ driver; the Windows engine build "
+            "runs it as ssd_settings_telemetry"
+        )
     root = Path(__file__).resolve().parents[2]
     binary = tmp_path_factory.mktemp("settings-native") / "contract"
     compiler = shutil.which("c++")
@@ -129,14 +135,23 @@ def test_invalid_contract_refused_by_both(native_contract, tmp_path, body):
     assert result.returncode == 1 and str(source) in result.stderr
 
 
+@pytest.mark.parametrize("platform", ["linux", "darwin", "windows"])
+def test_the_cuda_tiers_keys_parse_on_every_platform_by_both(native_contract, tmp_path, platform):
+    # Which engine has the tier decides; the platform does not (see the launch's backend check).
+    text = "inferssd-settings 1\nvram.max_slots=1\nvram.reserve_mib=64\n"
+    source = tmp_path / "tier.ssd"
+    source.write_text(text)
+    parse(text, str(source), platform=platform)
+    result = subprocess.run(
+        [str(native_contract), "--parse", str(source), platform], capture_output=True, text=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
 @pytest.mark.parametrize(
     "platform,body",
     [
-        ("windows", "prefill.cpu_max_tokens=1"),
-        ("windows", "vram.budget=auto"),
-        ("windows", "vram.reserve_mib=0"),
-        ("darwin", "vram.max_slots=1"),
-        ("darwin", "vram.reserve_mib=64"),
+        ("linux", "host.budget_mib=8192"),
     ],
 )
 def test_platform_scope_refused_by_both(native_contract, tmp_path, platform, body):
@@ -171,7 +186,7 @@ def test_cli_precedence_and_snapshot_owned():
     )
     assert value.at("prefetch.depth").value == 6
     assert value.at("prefetch.depth").origin == "cli"
-    assert parse().at("prefetch.depth").value == 2
+    assert parse().at("prefetch.depth").value == 64
 
 
 def test_real_cpp_jsonl_consumed(native_contract, tmp_path):

@@ -376,7 +376,7 @@ result<void> win_ring::init(unsigned depth, bool fixed) noexcept {
         const bool fallback = !backend;
         if (fallback) { backend = std::make_unique<overlapped_backend>(depth); }
         if (!g_backend_logged.exchange(true)) {
-            std::fprintf(stderr, "[kimi_cpu_sink_io] read_ring backend=%s%s%s\n", backend->name(),
+            std::fprintf(stderr, "[ssd_cpu_sink_io] read_ring backend=%s%s%s\n", backend->name(),
                          fallback ? " reason=" : "", fallback ? why.c_str() : "");
         }
         auto state = std::make_unique<impl>();

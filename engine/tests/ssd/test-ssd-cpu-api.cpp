@@ -11,7 +11,7 @@ int main() {
     const auto get = reinterpret_cast<ssd::cpu::get_api_v2>(
         ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
     const auto * api = get ? get() : nullptr;
-    if (!ssd::cpu::valid(api) || api->source_size() != sizeof(kimi_cpu_sink_source)) {
+    if (!ssd::cpu::valid(api) || api->source_size() != sizeof(ssd_cpu_sink_source)) {
         std::fputs("loaded CPU executor table is absent or incompatible\n", stderr);
         return 1;
     }
@@ -30,6 +30,12 @@ int main() {
     changed = *api;
     --changed.runtime_services_size;
     if (ssd::cpu::valid(&changed)) { return 6; }
+    changed = *api;
+    changed.decode_threads = nullptr;
+    if (ssd::cpu::valid(&changed)) { return 7; }
+    changed = *api;
+    changed.request_begin = nullptr;
+    if (ssd::cpu::valid(&changed)) { return 8; }
     std::puts("CPU_EXECUTOR_REGISTRY_ABI_PASS");
     return 0;
 }

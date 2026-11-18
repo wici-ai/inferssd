@@ -31,7 +31,8 @@ class Planned:
     threads: Threads
     server_args: tuple[str, ...]
     receipt: dict[str, object]
-    # Prefill each prompt in one pass: -b and -ub as large as the context.
+    # A derived strategy prefills each prompt in one pass (-b and -ub as large as the context);
+    # a skipped one leaves the launch's sizes.
     one_pass: bool = False
 
 
@@ -42,21 +43,20 @@ def plan(
     paths: Sequence[str],
     settings: Snapshot,
     threads: Threads,
+    gpu_backends: Optional[tuple[str, ...]] = None,
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
     MEMORY is the launch's memory budget: it is the strategy's budget and
-    bounds the memory available to it. Without characteristics, or on a
-    platform that cannot be profiled yet, the launch keeps its inputs and the
-    receipt names why.
+    bounds the memory available to it. GPU_BACKENDS are the engine's, None
+    when unknown. Without characteristics, or when no strategy can be derived
+    from them, the launch keeps its inputs and the receipt names why.
     """
 
     def skipped(reason: str) -> Planned:
         s.emit("inferssd launch: no launch strategy: " + reason + "\n", "stderr")
         return Planned(settings, threads, (), {"skipped": reason})
 
-    if platform == "windows":
-        return skipped("machine profiling is not supported on windows yet")
     text = s.value("machine_characteristics")
     if text is None:
         return skipped("no machine characteristics")
@@ -69,6 +69,7 @@ def plan(
         runtime,
         available_bytes=None if available is None else min(available, memory),
         memory_budget_bytes=memory,
+        gpu_backends=gpu_backends,
     )
     try:
         strategy = derive(characteristics, model, runtime, platform, model_drive_key=key)
@@ -102,11 +103,10 @@ def plan(
                 name: list(value) if name.endswith("cpus") else value
                 for name, value in pools.items()
             },
-            "one_pass": strategy.one_pass,
             "server_args": list(arguments),
         },
         "kept": kept,
         "dropped": list(applied.dropped),
         "notes": list(strategy.notes),
     }
-    return Planned(applied.settings, applied.threads, arguments, receipt, strategy.one_pass)
+    return Planned(applied.settings, applied.threads, arguments, receipt, one_pass=True)

@@ -270,6 +270,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ENGRAM_OFFSETS,                         "%s.engram.offsets"                         },
     { LLM_KV_ENGRAM_TOKEN_MAP,                       "%s.engram.token_map"                       },
     { LLM_KV_ENGRAM_PAD_ID,                          "%s.engram.pad_id"                          },
+    { LLM_KV_ENGRAM_PAD_TOKEN_ID,                    "%s.engram.pad_token_id"                    },
     { LLM_KV_ENGRAM_ENCODING,                        "%s.engram.encoding"                        },
     { LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE,           "%s.engram.compressed_vocab_size"           },
     { LLM_KV_ENGRAM_ROWS,                            "%s.engram.rows"                            },
@@ -648,6 +649,7 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_ENGRAM_K,                               "blk.%d.engram_k" },
     { LLM_TENSOR_ENGRAM_Q,                               "blk.%d.engram_q" },
     { LLM_TENSOR_ENGRAM_WKV,                             "blk.%d.engram_wkv" },
+    { LLM_TENSOR_ENGRAM_GATE,                            "blk.%d.engram_gate" },
     { LLM_TENSOR_FFN_EXP_PROBS_B_VL,                     "blk.%d.exp_probs_b_vl" },
 };
 
@@ -912,6 +914,7 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_ENGRAM_K,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ENGRAM_Q,                   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_ENGRAM_WKV,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_ENGRAM_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
     {LLM_TENSOR_FFN_EXP_PROBS_B_VL,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     // NextN/MTP tensors are currently ignored (reserved for future MTP support)
     // These tensors only exist in the last layer(s) and are treated as output tensors

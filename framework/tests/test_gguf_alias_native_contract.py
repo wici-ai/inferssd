@@ -17,7 +17,7 @@ def test_strict_type_table_matches_compiled_native_traits(tmp_path):
     if compiler is None:
         pytest.skip("native geometry contract requires a C++ compiler")
     repo = Path(__file__).resolve().parents[2]
-    source = (repo / "engine/ggml/src/ggml.c").read_text()
+    source = (repo / "engine/ggml/src/ggml.c").read_text(encoding="utf-8")
     traits = source.split("static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {")[
         1
     ].split("\n};", 1)[0]
@@ -71,4 +71,6 @@ def test_strict_type_table_matches_compiled_native_traits(tmp_path):
             excluded.add(int(number))
     assert native == NATIVE_TYPES
     assert excluded.isdisjoint(NATIVE_TYPES)
-    assert 42 not in NATIVE_TYPES
+    assert NATIVE_TYPES[42] == ("Q2_0", 64, 18)
+    assert NATIVE_TYPES[43] == ("MXFP8", 32, 33)
+    assert 44 not in NATIVE_TYPES

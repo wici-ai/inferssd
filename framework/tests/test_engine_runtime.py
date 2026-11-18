@@ -12,6 +12,7 @@ from observe_engine_reference import Effects as FEffects
 from observe_engine_reference import api as reference_api
 
 from inferssd.engine import core, owned
+from inferssd.launch.typed import reject_legacy_environment
 from inferssd.launch.types import Resolution
 from inferssd.platform.policy import Policy
 from inferssd.platform.run_directory import reserve
@@ -43,6 +44,36 @@ def resolution(scope=(), environment=()):
         None,
         0,
     )
+
+
+@pytest.mark.parametrize("result,busy", [(0, True), (10035, False)])
+def test_loopback_listener_probe_is_bounded_even_when_closed_ports_drop_packets(
+    monkeypatch, result, busy
+):
+    class Socket:
+        timeout = None
+        closed = False
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            self.closed = True
+
+        def settimeout(self, value):
+            self.timeout = value
+
+        def connect_ex(self, address):
+            assert address == ("127.0.0.1", 8080)
+            if self.timeout is None:
+                pytest.fail("a dropped loopback SYN would block launch and eject indefinitely")
+            assert 0 < self.timeout <= 1
+            return result
+
+    connection = Socket()
+    monkeypatch.setattr(core.socket, "socket", lambda: connection)
+    assert core.NativeEffects("127.0.0.1").port_busy(8080) is busy
+    assert connection.closed
 
 
 @pytest.mark.parametrize(
@@ -259,6 +290,17 @@ def test_loader_environment_only_restored_for_server():
     }
     transported = owned.worker_environment(env)
     assert not any(k in transported for k in env if k not in ("PATH", "TOKEN"))
+    restored = dict(transported)
+    restored.update(json.loads(restored.pop("INFERSSD_INTERNAL_SERVER_ENV")))
+    assert restored == env
+
+
+def test_usage_directory_reaches_the_server():
+    # The host's INFERSSD_USAGE_DIR is the server's; the launch neither rejects nor drops it.
+    env = {"PATH": "/fixture/bin", "INFERSSD_USAGE_DIR": "/host/usage"}
+    reject_legacy_environment(env)
+    transported = owned.worker_environment(env)
+    assert transported["INFERSSD_USAGE_DIR"] == "/host/usage"
     restored = dict(transported)
     restored.update(json.loads(restored.pop("INFERSSD_INTERNAL_SERVER_ENV")))
     assert restored == env

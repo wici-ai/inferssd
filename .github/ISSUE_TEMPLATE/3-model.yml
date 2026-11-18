@@ -1,0 +1,53 @@
+name: Model or quantization request
+description: Support for a new model, or another quantization of a supported one.
+labels: ["model-request"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Search the open requests first. If the model is already requested, add a thumbs-up reaction to that issue
+        instead of a comment; reactions help us rank requests.
+  - type: dropdown
+    id: request
+    attributes:
+      label: Request
+      options:
+        - A new model
+        - Another quantization of a supported model
+    validations:
+      required: true
+  - type: input
+    id: name
+    attributes:
+      label: Model name
+    validations:
+      required: true
+  - type: input
+    id: repository
+    attributes:
+      label: Hugging Face repository and revision
+      description: For example `owner/model-GGUF` at a commit.
+    validations:
+      required: true
+  - type: input
+    id: quantization
+    attributes:
+      label: Quantization
+      description: For example `UD-Q4_K_XL`.
+    validations:
+      required: true
+  - type: dropdown
+    id: upstream
+    attributes:
+      label: Does llama.cpp run it?
+      options:
+        - "Yes"
+        - Only a fork of llama.cpp
+        - "No"
+        - Not sure
+    validations:
+      required: true
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Your hardware and why this model

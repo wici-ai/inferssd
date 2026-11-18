@@ -2,21 +2,27 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import socket
-import stat
 import subprocess
 import sys
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
 from inferssd.launch.types import Resolution
+from inferssd.platform.host import (
+    Resources,
+    acquire_lock,
+    borrow_lock,
+    descriptor,
+    link,
+    spawn_detached,
+)
 from inferssd.platform.policy import Policy
-from inferssd.platform.resources import Resources
 from inferssd.platform.run_directory import Reservation
 from inferssd.platform.worker import cleanup_confirmed, save
 
@@ -25,9 +31,13 @@ SERVER_LOG_TAIL_BYTES = 64 * 1024
 
 
 def scope_command(resolution: Resolution, policy: Policy) -> tuple[list[str], Optional[str]]:
-    if policy.platform == "darwin":
+    if policy.platform in ("darwin", "windows"):
+        # The Windows guardian creates the job object that is the scope.
         if resolution.scope:
-            raise ValueError("Darwin launch must not carry a Linux scope")
+            raise ValueError(
+                {"darwin": "Darwin", "windows": "Windows"}[policy.platform]
+                + " launch must not carry a Linux scope"
+            )
         return [], None
     prefix = list(resolution.scope)
     if prefix[:2] not in (["systemd-run", "--scope"], ["systemd-run", "--user"]):
@@ -58,6 +68,12 @@ def server_log_tail(directory: Path) -> str:
     return "\nLast lines of server.log:\n" + "\n".join(lines[-SERVER_LOG_TAIL_LINES:])
 
 
+def listening_host(argv: Sequence[str]) -> str:
+    """The address the server binds: its last --host, else the server's default, loopback."""
+    hosts = [value for option, value in zip(argv, argv[1:]) if option == "--host"]
+    return hosts[-1] if hosts else "127.0.0.1"
+
+
 def worker_environment(environment: dict[str, str]) -> dict[str, str]:
     # Engine loaders/knobs belong to the server, not the Python lock owner.
     # Carry them privately in the process environment; never persist values in
@@ -69,6 +85,9 @@ def worker_environment(environment: dict[str, str]) -> dict[str, str]:
         "LD_",
         "DYLD_",
         "CUDA_",
+        "HIP_",
+        "ROCR_",
+        "HSA_",
         "OMP_",
         "KMP_",
         "OPENBLAS_",
@@ -100,6 +119,7 @@ class OwnedProcess:
         if Path(directory).resolve() != reservation.directory:
             raise ValueError("execution directory differs from reservation")
         self.directory, self.policy = reservation.directory, policy
+        self.host = listening_host(resolution.argv)
         self.connection: Optional[socket.socket] = None
         self.guardian: Optional[subprocess.Popen[bytes]] = None
         self._lock: Optional[int] = None
@@ -118,23 +138,15 @@ class OwnedProcess:
         child_end: Optional[socket.socket] = None
         try:
             if inherited_lock_fd is None:
-                self._lock = os.open(policy.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+                self._lock = acquire_lock(policy.lock_path)
             else:
-                actual, expected = os.fstat(inherited_lock_fd), os.stat(policy.lock_path)
-                if not stat.S_ISREG(actual.st_mode) or (actual.st_dev, actual.st_ino) != (
-                    expected.st_dev,
-                    expected.st_ino,
-                ):
-                    raise ValueError("inherited lease differs from the existing device lock inode")
-                # dup retains the same flock open-file-description. Closing this
-                # owner's copy does not release the caller's batch lease.
-                self._lock = os.dup(inherited_lock_fd)
-            fcntl.flock(self._lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                # The caller's batch lease stays held when this owner's copy closes.
+                self._lock = borrow_lock(inherited_lock_fd, policy.lock_path)
             reservation.verify()
             save(path, specification)
-            self.connection, child_end = socket.socketpair()
+            self.connection, child_end = link()
             with (self.directory / "owner.log").open("xb") as log:
-                self.guardian = subprocess.Popen(
+                self.guardian = spawn_detached(
                     [
                         sys.executable,
                         "-I",
@@ -144,9 +156,9 @@ class OwnedProcess:
                         "--spec",
                         str(path),
                         "--controller-fd",
-                        str(child_end.fileno()),
+                        str(descriptor(child_end.fileno())),
                         "--lock-fd",
-                        str(self._lock),
+                        str(descriptor(self._lock)),
                     ],
                     env=worker_environment(dict(resolution.effective_environment)),
                     stdout=log,
@@ -168,7 +180,10 @@ class OwnedProcess:
 
     def state(self) -> dict[str, Any]:
         path = self.directory / "server-state.json"
-        return json.loads(path.read_text()) if path.exists() else {"pid": None, "returncode": None}
+        if not path.exists():
+            return {"pid": None, "returncode": None}
+        value: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+        return value
 
     def poll(self) -> Optional[int]:
         assert self.guardian is not None
@@ -176,7 +191,10 @@ class OwnedProcess:
         if ended is not None:
             return ended
         receipt = self.directory / "ownership.json"
-        if receipt.exists() and json.loads(receipt.read_text()).get("status") == "failed":
+        if (
+            receipt.exists()
+            and json.loads(receipt.read_text(encoding="utf-8")).get("status") == "failed"
+        ):
             return 1
         value = self.state()["returncode"]
         return None if value is None else int(value)
@@ -185,7 +203,7 @@ class OwnedProcess:
         pid = self.state()["pid"]
         if not isinstance(pid, int):
             raise RuntimeError("owned server PID has not been published")
-        Resources(self.policy).confirm_listener(pid, port)
+        Resources(self.policy).confirm_listener(pid, self.host, port)
 
     def stop(self) -> None:
         assert self.guardian is not None
@@ -205,7 +223,7 @@ class OwnedProcess:
         if self._lock is not None:
             os.close(self._lock)
             self._lock = None
-        receipt = json.loads((self.directory / "ownership.json").read_text())
+        receipt = json.loads((self.directory / "ownership.json").read_text(encoding="utf-8"))
         if ended != 0 or receipt.get("status") != "passed":
             reason = receipt.get("error") or f"guardian exited with {ended}"
             raise RuntimeError(

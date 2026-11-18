@@ -4,7 +4,9 @@ import argparse
 import hashlib
 import json
 import math
+import _thread
 import signal
+import threading
 import time
 import urllib.request
 from contextlib import contextmanager
@@ -22,13 +24,23 @@ def digest(data):
 
 
 def save(path, value):
-    with path.open("x") as stream:
+    with path.open("x", encoding="utf-8") as stream:
         json.dump(value, stream, indent=2, ensure_ascii=False, allow_nan=False)
         stream.write("\n")
 
 
-@contextmanager
 def deadline(seconds):
+    """Raise TimeoutError in the calling (main) thread once SECONDS have passed.
+
+    SIGALRM, where the OS has it, also interrupts a blocked read. Windows has
+    no alarm signal: a timer interrupts the main thread between reads, each of
+    which the socket timeout bounds.
+    """
+    return alarm_deadline(seconds) if hasattr(signal, "SIGALRM") else timer_deadline(seconds)
+
+
+@contextmanager
+def alarm_deadline(seconds):
     def expired(_signal, _frame):
         raise TimeoutError("whole request deadline expired")
     previous = signal.signal(signal.SIGALRM, expired)
@@ -40,6 +52,35 @@ def deadline(seconds):
         signal.signal(signal.SIGALRM, previous)
 
 
+@contextmanager
+def timer_deadline(seconds):
+    state = {"expired": False, "done": False}
+    lock = threading.Lock()
+
+    def interrupted(_signal, _frame):
+        if state["expired"]:
+            raise TimeoutError("whole request deadline expired")
+        raise KeyboardInterrupt
+
+    def expire():
+        with lock:
+            if not state["done"]:
+                state["expired"] = True
+                _thread.interrupt_main()  # as a SIGINT
+
+    previous = signal.signal(signal.SIGINT, interrupted)
+    timer = threading.Timer(seconds, expire)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        with lock:
+            state["done"] = True
+        timer.cancel()
+        signal.signal(signal.SIGINT, previous)
+
+
 def request(url, body):
     return urllib.request.Request(url, json.dumps(body).encode(),
                                   {"Content-Type": "application/json"})
@@ -48,6 +89,24 @@ def request(url, body):
 def post(base, endpoint, body, timeout):
     with urllib.request.urlopen(request(base + endpoint, body), timeout=timeout) as response:
         return decode_json(response.read())
+
+
+def get(base, endpoint, timeout):
+    with urllib.request.urlopen(base + endpoint, timeout=timeout) as response:
+        return decode_json(response.read())
+
+
+def chat_request(content, props):
+    """The benchmark's chat request. Thinking is off where the chat template can turn it off; a template that
+    always thinks, as Muse's does, takes its first reasoning_effort, its least. /props reports both."""
+    chat = {"messages": [{"role": "user", "content": content}]}
+    reasoning = props.get("reasoning") if isinstance(props, dict) else None
+    if isinstance(reasoning, dict) and reasoning.get("can_turn_off") is False:
+        if reasoning.get("efforts"):
+            chat["reasoning_effort"] = reasoning["efforts"][0]
+        return chat
+    chat.update({"chat_template_kwargs": {"enable_thinking": False}, "reasoning_effort": "none"})
+    return chat
 
 
 def events(response, wire=None):
@@ -197,18 +256,16 @@ def record_chat(args, validate_input, protocol_extra=None, validate_result=None)
     protocol = {"prompt_sha256": digest(raw), "prompt_bytes": len(raw),
                 "input_tokens": args.input_tokens, "output_tokens": args.output_tokens,
                 "base_url": args.url.rstrip("/"), "cache_prompt": False,
-                "clock": "time.monotonic_ns", "mode": "native-completion-of-rendered-chat",
+                "clock": "time.perf_counter_ns", "mode": "native-completion-of-rendered-chat",
                 "timeout_s": args.timeout}
     protocol.update(protocol_extra or {})
     result = {"status": "failed", "prompt_sha256": digest(raw)}
     try:
         with deadline(args.timeout):
             base = protocol["base_url"]
-            chat_request = {"messages": [{"role": "user", "content": prompt}],
-                            "chat_template_kwargs": {"enable_thinking": False},
-                            "reasoning_effort": "none"}
-            protocol["chat_request"] = chat_request
-            templated = post(base, "/apply-template", chat_request, args.timeout)
+            chat = chat_request(prompt, get(base, "/props", args.timeout))
+            protocol["chat_request"] = chat
+            templated = post(base, "/apply-template", chat, args.timeout)
             rendered, prompt_ids = templated["prompt"], templated["tokens"]
             # The server retains message provenance when tokenizing a template.
             # Re-tokenizing flattened text could interpret user text as control tokens.
@@ -225,16 +282,16 @@ def record_chat(args, validate_input, protocol_extra=None, validate_result=None)
                              "prompt_ids": prompt_ids, "request": body})
             save(paths["protocol"], protocol)
             records = []
-            start_ns = time.monotonic_ns()
-            with (paths["events"].open("x") as raw_events,
+            start_ns = time.perf_counter_ns()
+            with (paths["events"].open("x", encoding="utf-8") as raw_events,
                   paths["sse"].open("xb") as wire,
                   urllib.request.urlopen(request(base + "/completion", body), timeout=args.timeout) as response):
                 for event in events(response, wire):
-                    row = {"monotonic_ns": time.monotonic_ns(), "event": event}
+                    row = {"monotonic_ns": time.perf_counter_ns(), "event": event}
                     raw_events.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
                     raw_events.flush()
                     records.append(row)
-            end_ns = time.monotonic_ns()
+            end_ns = time.perf_counter_ns()
             summary = summarize(records, start_ns, end_ns, prompt_ids, args.output_tokens)
             if validate_result is not None:
                 validate_result(summary)

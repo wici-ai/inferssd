@@ -136,6 +136,7 @@ struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_id         (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argmax            (ggml_metal_library_t lib, const struct ggml_tensor * op);
+struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort           (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_argsort_merge     (ggml_metal_library_t lib, const struct ggml_tensor * op);
 struct ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_top_k             (ggml_metal_library_t lib, const struct ggml_tensor * op);
@@ -274,6 +275,21 @@ typedef struct ggml_metal_buffer * ggml_metal_buffer_t;
 
 ggml_metal_buffer_t ggml_metal_buffer_init(ggml_metal_device_t dev, size_t size, bool shared);
 ggml_metal_buffer_t ggml_metal_buffer_map (ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size);
+// resident false: no residency set, the buffer is made resident by the command buffers that use it
+ggml_metal_buffer_t ggml_metal_buffer_map_ext(ggml_metal_device_t dev, void * ptr, size_t size, size_t max_tensor_size,
+                                              bool resident);
+
+// A growable buffer: its whole address range is reserved at once (shared memory), and one Metal buffer wraps the
+// prefix that holds memory, which set_committed grows and shrinks at its end; nothing in it moves. A tensor is bound
+// from where it starts. NULL without shared buffers.
+ggml_metal_buffer_t ggml_metal_buffer_init_growable(ggml_metal_device_t dev, size_t size);
+// whether the device has growable buffers (macOS, shared buffers)
+bool ggml_metal_device_supports_growable(ggml_metal_device_t dev);
+// the first `bytes` (in pages) hold memory, and no more: the pages given back read zero again. Shrinks only while no
+// command buffer uses the buffer. False when the device cannot wrap that much.
+bool   ggml_metal_buffer_set_committed(ggml_metal_buffer_t buf, size_t bytes);
+bool   ggml_metal_buffer_is_growable  (ggml_metal_buffer_t buf);
+size_t ggml_metal_buffer_get_committed(ggml_metal_buffer_t buf);
 
 void   ggml_metal_buffer_free     (ggml_metal_buffer_t buf);
 void * ggml_metal_buffer_get_base (ggml_metal_buffer_t buf);

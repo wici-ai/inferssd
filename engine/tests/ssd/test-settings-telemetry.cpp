@@ -3,15 +3,20 @@
 #include "settings/settings.h"
 #include "telemetry/telemetry.h"
 
+#include <cassert>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <random>
+#include <thread>
+
+#ifndef _WIN32
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
-#include <cassert>
 #include <csignal>
-#include <fstream>
-#include <iostream>
-#include <thread>
+#endif
 
 int main(int argc, char ** argv) {
     if (argc == 3 && std::string(argv[1]) == "--events") {
@@ -52,7 +57,7 @@ int main(int argc, char ** argv) {
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);
-    assert(*base.value.integer("prefetch.depth") == 2);
+    assert(*base.value.integer("prefetch.depth") == 64);
     assert(base.value.integer("expert.source") == nullptr);
     assert(base.value.find("unknown") == nullptr);
     const std::string text =
@@ -74,7 +79,7 @@ int main(int argc, char ** argv) {
     assert(parsed.value.find("cpu.decode_participants")->origin == "cli");
     auto copy = parsed.value;
     parsed    = parse("", "");
-    assert(*copy.integer("prefetch.depth") == 4 && *parsed.value.integer("prefetch.depth") == 2);
+    assert(*copy.integer("prefetch.depth") == 4 && *parsed.value.integer("prefetch.depth") == 64);
     for (const std::string bad :
          { "cpu.threads = 4", "cpu.compute_cpus = 0-1", "prefetch.depth = \"4\"", "prefetch.depth = 18446744073709551616",
            "cpu.io_cpus = 1,1", "cpu.io_cpus = 2-0", "cpu.io_cpus = 1-99999999", "cpu.decode_participants = 256", "unknown = 0",
@@ -93,16 +98,17 @@ int main(int argc, char ** argv) {
     assert(!parse("inferssd-settings 2\n", "version.ssd"));
     assert(parse("inferssd-settings 1\nprefetch.depth=8\n", "mac.ssd", {}, "darwin"));
     assert(!parse("inferssd-settings 1\nhost.expert_cache_mib=12288\n", "mac.ssd", {}, "darwin"));
-    assert(!parse("inferssd-settings 1\nvram.budget=auto\n", "mac.ssd", {}, "darwin"));
-    // The executor's keys apply on every platform; the CUDA and Linux prefill keys stay Linux-only.
+    assert(parse("inferssd-settings 1\nvram.budget=0\n", "mac.ssd", {}, "darwin"));
+    // The executor's keys apply on every platform. The CUDA tier's keys too: the engine refuses them where it runs
+    // without the tier, whatever the platform.
     assert(parse("inferssd-settings 1\ncpu.io_cpus=3\ncpu.decode_participants=2\nprefetch.depth=4\n"
                  "place.costs=cpu_fixed_us=204\nhost.headroom_mib=1024\nhost.budget_mib=8192\n"
                  "model.hc_fused=0\n", "win.ssd", {}, "windows"));
     assert(parse("inferssd-settings 1\ncpu.io_cpus=0-2\ncpu.decode_participants=1\nhost.budget_mib=8192\n", "mac.ssd", {},
                  "darwin"));
-    for (const std::string bad : { "vram.budget = auto", "prefill.cpu_max_tokens = 1", "vram.reserve_mib = 0" }) {
-        const auto rejected = parse("inferssd-settings 1\n" + bad + "\n", "win.ssd", {}, "windows");
-        assert(!rejected && rejected.error.find("win.ssd:2") != std::string::npos);
+    for (const std::string platform : { "linux", "darwin", "windows" }) {
+        assert(parse("inferssd-settings 1\nvram.max_slots=1\nvram.reserve_mib=64\n", "tier.ssd",
+                     {}, platform));
     }
     assert(!parse("inferssd-settings 1\nhost.budget_mib=1\n", "linux.ssd"));
     assert(!parse("", "", {}, "freebsd"));
@@ -111,7 +117,13 @@ int main(int argc, char ** argv) {
         assert(scopes.at("host.budget_mib").object.at("scope").text == "darwin,windows");
         assert(scopes.at("cpu.io_cpus").object.at("scope").text == "all");
         assert(scopes.at("cpu.decode_participants").object.at("scope").text == "all");
-        assert(scopes.at("vram.budget").object.at("scope").text == "linux");
+        assert(scopes.at("vram.max_slots").object.at("scope").text == "all");
+        assert(scopes.at("vram.budget").object.at("scope").text == "all");
+        // The VRAM tier's keys name the backends that carry it; the others have none.
+        for (const char * key : { "vram.max_slots", "vram.reserve_mib" }) {
+            assert(scopes.at(key).object.at("backend").text == "CUDA,ROCm");
+        }
+        assert(!scopes.at("vram.budget").object.count("backend") && !scopes.at("cpu.io_cpus").object.count("backend"));
     }
     assert(reject_retired_environment({ "TASKRC", "TASKDATA", "INFERSSD_DEBUG" }));
     assert(!reject_retired_environment({ "TASK123_PROBE" }));
@@ -128,9 +140,12 @@ int main(int argc, char ** argv) {
     const auto help_text = help();
     assert(help_text && help_text.value.find("--ssd-host-budget-mib") != std::string::npos);
 
-    char directory[] = "/tmp/ssdash-config-test-XXXXXX";
-    assert(mkdtemp(directory));
-    const std::string path = std::string(directory) + "/events.jsonl";
+    std::random_device    entropy;
+    std::filesystem::path directory;
+    do {
+        directory = std::filesystem::temp_directory_path() / ("ssdash-config-test-" + std::to_string(entropy()));
+    } while (!std::filesystem::create_directory(directory));
+    const std::string path = (directory / "events.jsonl").string();
     auto              sink = ssd::telemetry::writer::open(path);
     assert(sink);
     assert(!ssd::telemetry::writer::open(path));
@@ -155,15 +170,21 @@ int main(int argc, char ** argv) {
     }
     assert(sink.value->flush());
     sink.value.reset();
-    std::ifstream file(path);
-    std::string   line;
-    uint64_t      sequence = 0;
-    while (std::getline(file, line)) {
-        const auto node = ssd::json::parse(line);
-        assert(node.value.object.at("v").text == "1" && node.value.object.at("seq").text == std::to_string(sequence++));
+    uint64_t sequence = 0;
+    {
+        std::ifstream file(path);
+        std::string   line;
+        while (std::getline(file, line)) {
+            const auto node = ssd::json::parse(line);
+            assert(node.value.object.at("v").text == "1" &&
+                   node.value.object.at("seq").text == std::to_string(sequence++));
+        }
     }
     assert(sequence == 401);
-    const std::string failed_path = std::string(directory) + "/write-failure.jsonl";
+#ifndef _WIN32
+    // A write the OS refuses, from a file size limit (which Windows does not have), in a child process so the limit
+    // and the SIGXFSZ disposition stay there.
+    const std::string failed_path = (directory / "write-failure.jsonl").string();
     const pid_t       child       = fork();
     assert(child >= 0);
     if (!child) {
@@ -185,8 +206,7 @@ int main(int argc, char ** argv) {
     }
     int status = 0;
     assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
-    unlink(failed_path.c_str());
-    unlink(path.c_str());
-    rmdir(directory);
+#endif
+    std::filesystem::remove_all(directory);
     std::cout << "settings/telemetry contracts passed\n";
 }

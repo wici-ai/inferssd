@@ -9,6 +9,7 @@
 #include "ggml-impl.h"
 #include "amx/amx.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cinttypes>
 #include <cstdio>
@@ -38,6 +39,7 @@
 #    include <windows.h>
 #else
 #    include <unistd.h>
+#    include <sys/mman.h>
 #endif
 
 #if defined(__APPLE__)
@@ -474,6 +476,152 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_device_get_buffer_type(ggml_b
     GGML_UNUSED(dev);
 }
 
+#if !defined(_WIN32)
+// A growable host buffer (ggml_backend_dev_buffer_type_growable): its whole address range is reserved at once and
+// holds memory for the pages written; ggml_backend_buffer_set_committed gives back the pages past a prefix, which read
+// zero again. Nothing in it moves.
+struct ggml_backend_cpu_growable {
+    void * data      = nullptr;
+    size_t reserved  = 0; // page aligned
+    size_t committed = 0; // the prefix the buffer holds memory for
+};
+
+static size_t ggml_backend_cpu_growable_page() {
+    return (size_t) sysconf(_SC_PAGESIZE);
+}
+
+static void * ggml_backend_cpu_growable_map(void * at, size_t size) {
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | (at ? MAP_FIXED : 0);
+#ifdef MAP_NORESERVE
+    flags |= MAP_NORESERVE;
+#endif
+    void * data = mmap(at, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    return data == MAP_FAILED ? nullptr : data;
+}
+
+static void ggml_backend_cpu_growable_free_buffer(ggml_backend_buffer_t buffer) {
+    auto * ctx = (ggml_backend_cpu_growable *) buffer->context;
+    munmap(ctx->data, ctx->reserved);
+    delete ctx;
+}
+
+static void * ggml_backend_cpu_growable_get_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_cpu_growable *) buffer->context)->data;
+}
+
+static void ggml_backend_cpu_growable_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    memset((char *) tensor->data + offset, value, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_growable_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    memcpy((char *) tensor->data + offset, data, size);
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_growable_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    memcpy(data, (const char *) tensor->data + offset, size);
+    GGML_UNUSED(buffer);
+}
+
+static bool ggml_backend_cpu_growable_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (ggml_backend_buffer_is_host(src->buffer)) {
+        memcpy(dst->data, src->data, ggml_nbytes(src));
+        return true;
+    }
+    return false;
+    GGML_UNUSED(buffer);
+}
+
+static void ggml_backend_cpu_growable_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    auto * ctx = (ggml_backend_cpu_growable *) buffer->context;
+    memset(ctx->data, value, ctx->committed);
+}
+
+static const ggml_backend_buffer_i ggml_backend_cpu_growable_i = {
+    /* .free_buffer   = */ ggml_backend_cpu_growable_free_buffer,
+    /* .get_base      = */ ggml_backend_cpu_growable_get_base,
+    /* .init_tensor   = */ NULL,
+    /* .memset_tensor = */ ggml_backend_cpu_growable_memset_tensor,
+    /* .set_tensor    = */ ggml_backend_cpu_growable_set_tensor,
+    /* .get_tensor    = */ ggml_backend_cpu_growable_get_tensor,
+    /* .set_tensor_2d = */ NULL,
+    /* .get_tensor_2d = */ NULL,
+    /* .cpy_tensor    = */ ggml_backend_cpu_growable_cpy_tensor,
+    /* .clear         = */ ggml_backend_cpu_growable_clear,
+    /* .reset         = */ NULL,
+};
+
+static const char * ggml_backend_cpu_growable_type_get_name(ggml_backend_buffer_type_t buft) {
+    return "CPU";
+    GGML_UNUSED(buft);
+}
+
+static ggml_backend_buffer_t ggml_backend_cpu_growable_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    const size_t page = ggml_backend_cpu_growable_page();
+    auto * ctx = new ggml_backend_cpu_growable;
+    ctx->reserved = std::max(page, (size + page - 1)/page*page);
+    ctx->data = ggml_backend_cpu_growable_map(nullptr, ctx->reserved);
+    if (!ctx->data) {
+        GGML_LOG_ERROR("%s: reserving %.2f MiB of addresses failed\n", __func__, size/1024.0/1024.0);
+        delete ctx;
+        return nullptr;
+    }
+    return ggml_backend_buffer_init(buft, ggml_backend_cpu_growable_i, ctx, size);
+}
+
+static size_t ggml_backend_cpu_growable_type_get_alignment(ggml_backend_buffer_type_t buft) {
+    return TENSOR_ALIGNMENT;
+    GGML_UNUSED(buft);
+}
+
+static bool ggml_backend_cpu_growable_type_is_host(ggml_backend_buffer_type_t buft) {
+    return true;
+    GGML_UNUSED(buft);
+}
+
+// ggml_backend_dev_buffer_type_growable: host buffers that hold memory for a prefix of their addresses
+static ggml_backend_buffer_type_t ggml_backend_cpu_device_buffer_type_growable(ggml_backend_dev_t dev) {
+    static ggml_backend_buffer_type buft = {
+        /* .iface = */ {
+            /* .get_name       = */ ggml_backend_cpu_growable_type_get_name,
+            /* .alloc_buffer   = */ ggml_backend_cpu_growable_type_alloc_buffer,
+            /* .get_alignment  = */ ggml_backend_cpu_growable_type_get_alignment,
+            /* .get_max_size   = */ NULL,
+            /* .get_alloc_size = */ NULL,
+            /* .is_host        = */ ggml_backend_cpu_growable_type_is_host,
+        },
+        /* .device  = */ ggml_backend_reg_dev_get(ggml_backend_cpu_reg(), 0),
+        /* .context = */ NULL,
+    };
+    return &buft;
+    GGML_UNUSED(dev);
+}
+
+// ggml_backend_buffer_set_committed: a growable buffer holds memory for its first `bytes` (in pages) and no more; the
+// pages it gives back read zero again
+static bool ggml_backend_cpu_buffer_set_committed(ggml_backend_buffer_t buffer, size_t bytes) {
+    if (buffer->iface.free_buffer != ggml_backend_cpu_growable_free_buffer) {
+        return true;
+    }
+    auto * ctx = (ggml_backend_cpu_growable *) buffer->context;
+    const size_t page = ggml_backend_cpu_growable_page();
+    const size_t target = std::min(ctx->reserved, (bytes + page - 1)/page*page);
+    if (target < ctx->committed &&
+            !ggml_backend_cpu_growable_map((char *) ctx->data + target, ctx->committed - target)) {
+        return false;
+    }
+    ctx->committed = target; // a larger prefix takes its pages as they are written
+    return true;
+}
+
+// ggml_backend_buffer_get_committed: the memory a buffer holds
+static size_t ggml_backend_cpu_buffer_get_committed(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_cpu_growable_free_buffer ?
+        ((ggml_backend_cpu_growable *) buffer->context)->committed : ggml_backend_buffer_get_size(buffer);
+}
+#endif
+
 static ggml_backend_buffer_t ggml_backend_cpu_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     return ggml_backend_cpu_buffer_from_ptr(ptr, size);
 
@@ -487,6 +635,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
 
     if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
         return true;
+    }
+
+    // MXFP8 tables are only read by GET_ROWS: nothing computes with them or writes them
+    if (op->type == GGML_TYPE_MXFP8) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && op->src[i]->type == GGML_TYPE_MXFP8 && !(op->op == GGML_OP_GET_ROWS && i == 0)) {
+            return false;
+        }
     }
 
     // check extra buffer types
@@ -702,27 +860,31 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
-        2, sizeof(ssd::cpu::api_v2),
-        &kimi_cpu_sink_source_size,
+        7, sizeof(ssd::cpu::api_v2),
+        &ssd_cpu_sink_source_size,
         &ssd::cpu::create_configured,
-        &kimi_cpu_sink_run,
-        &kimi_cpu_sink_run_activation,
-        &kimi_cpu_sink_destroy,
-        &kimi_cpu_sink_call_open,
-        &kimi_cpu_sink_call_close,
-        &kimi_cpu_sink_call_join,
-        &kimi_cpu_sink_cache_configure,
-        &kimi_cpu_sink_cache_begin,
-        &kimi_cpu_sink_vram_phase_complete,
-        &kimi_cpu_sink_cache_get_stats,
+        &ssd_cpu_sink_run,
+        &ssd_cpu_sink_run_activation,
+        &ssd_cpu_sink_destroy,
+        &ssd_cpu_sink_call_open,
+        &ssd_cpu_sink_call_close,
+        &ssd_cpu_sink_call_join,
+        &ssd_cpu_sink_decode_threads,
+        &ssd_cpu_sink_cache_configure,
+        &ssd_cpu_sink_cache_begin,
+        &ssd_cpu_sink_request_begin,
+        &ssd_cpu_sink_vram_phase_complete,
+        &ssd_cpu_sink_cache_get_stats,
         &ssd::cpu::cache_make_room_configured,
         &ssd::cpu::cache_prefill_room_configured,
-        &kimi_cpu_sink_prefetch_hint,
-        &kimi_cpu_sink_vram_reserve,
-        &kimi_cpu_prefill_create,
-        &kimi_cpu_prefill_run,
-        &kimi_cpu_prefill_run_activation,
-        &kimi_cpu_prefill_destroy,
+        &ssd_cpu_sink_prefetch_hint,
+        &ssd_cpu_sink_prefill_hint,
+        &ssd_cpu_sink_vram_reserve,
+        &ssd_cpu_sink_preload,
+        &ssd_cpu_prefill_create,
+        &ssd_cpu_prefill_run,
+        &ssd_cpu_prefill_run_activation,
+        &ssd_cpu_prefill_destroy,
         &ssd::cpu::take_room_configured,
         &ggml_backend_cpu_set_ssd_runtime_services,
         sizeof(ssd::runtime_services),
@@ -734,49 +896,44 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_cpu_set_ssd_runtime_services") == 0) {
         return (void *) ggml_backend_cpu_set_ssd_runtime_services;
     }
-    if (strcmp(name, "ggml_backend_cpu_ssd_kernels_v1") == 0) {
-        return (void *) ssd::cpu::kernels;
-    }
     if (strcmp(name, "ggml_backend_cpu_ssd_api_v2") == 0) {
         return (void *) ggml_backend_cpu_ssd_api_v2;
     }
-    if (strcmp(name, "kimi_cpu_prefill_create") == 0) {
-        return (void *) kimi_cpu_prefill_create;
+    if (strcmp(name, "ssd_cpu_prefill_create") == 0) {
+        return (void *) ssd_cpu_prefill_create;
     }
-    if (strcmp(name, "kimi_cpu_prefill_run") == 0) {
-        return (void *) kimi_cpu_prefill_run;
+    if (strcmp(name, "ssd_cpu_prefill_run") == 0) {
+        return (void *) ssd_cpu_prefill_run;
     }
-    if (strcmp(name, "kimi_cpu_prefill_run_activation") == 0) {
-        return (void *) kimi_cpu_prefill_run_activation;
+    if (strcmp(name, "ssd_cpu_prefill_run_activation") == 0) {
+        return (void *) ssd_cpu_prefill_run_activation;
     }
-    if (strcmp(name, "kimi_cpu_prefill_destroy") == 0) {
-        return (void *) kimi_cpu_prefill_destroy;
+    if (strcmp(name, "ssd_cpu_prefill_destroy") == 0) {
+        return (void *) ssd_cpu_prefill_destroy;
     }
-    if (strcmp(name, "kimi_cpu_sink_create") == 0) {
-        return (void *) kimi_cpu_sink_create;
+    if (strcmp(name, "ssd_cpu_sink_create") == 0) {
+        return (void *) ssd_cpu_sink_create;
     }
-    if (strcmp(name, "kimi_cpu_sink_set_cache_locations") == 0) { return (void *) kimi_cpu_sink_set_cache_locations; }
-    if (strcmp(name, "kimi_cpu_sink_run_cache_compute") == 0) { return (void *) kimi_cpu_sink_run_cache_compute; }
-    if (strcmp(name, "kimi_cache_compute_config_from_env") == 0) { return (void *) kimi_cache_compute_config_from_env; }
-    if (strcmp(name, "kimi_cache_compute_plan_init") == 0) { return (void *) kimi_cache_compute_plan_init; }
-    if (strcmp(name, "kimi_cache_compute_plan_update") == 0) { return (void *) kimi_cache_compute_plan_update; }
-    if (strcmp(name, "kimi_cpu_sink_run") == 0) {
-        return (void *) kimi_cpu_sink_run;
+    if (strcmp(name, "ssd_cpu_sink_run") == 0) {
+        return (void *) ssd_cpu_sink_run;
     }
-    if (strcmp(name, "kimi_cpu_sink_destroy") == 0) {
-        return (void *) kimi_cpu_sink_destroy;
+    if (strcmp(name, "ssd_cpu_sink_destroy") == 0) {
+        return (void *) ssd_cpu_sink_destroy;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_configure") == 0) {
-        return (void *) kimi_cpu_sink_cache_configure;
+    if (strcmp(name, "ssd_cpu_sink_cache_configure") == 0) {
+        return (void *) ssd_cpu_sink_cache_configure;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_begin") == 0) {
-        return (void *) kimi_cpu_sink_cache_begin;
+    if (strcmp(name, "ssd_cpu_sink_cache_begin") == 0) {
+        return (void *) ssd_cpu_sink_cache_begin;
     }
-    if (strcmp(name, "kimi_cpu_sink_vram_phase_complete") == 0) {
-        return (void *) kimi_cpu_sink_vram_phase_complete;
+    if (strcmp(name, "ssd_cpu_sink_request_begin") == 0) {
+        return (void *) ssd_cpu_sink_request_begin;
     }
-    if (strcmp(name, "kimi_cpu_sink_cache_get_stats") == 0) {
-        return (void *) kimi_cpu_sink_cache_get_stats;
+    if (strcmp(name, "ssd_cpu_sink_vram_phase_complete") == 0) {
+        return (void *) ssd_cpu_sink_vram_phase_complete;
+    }
+    if (strcmp(name, "ssd_cpu_sink_cache_get_stats") == 0) {
+        return (void *) ssd_cpu_sink_cache_get_stats;
     }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
@@ -789,6 +946,17 @@ static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const ch
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cpu_get_features;
     }
+#if !defined(_WIN32)
+    if (strcmp(name, "ggml_backend_dev_buffer_type_growable") == 0) {
+        return (void *)ggml_backend_cpu_device_buffer_type_growable;
+    }
+    if (strcmp(name, "ggml_backend_buffer_set_committed") == 0) {
+        return (void *)ggml_backend_cpu_buffer_set_committed;
+    }
+    if (strcmp(name, "ggml_backend_buffer_get_committed") == 0) {
+        return (void *)ggml_backend_cpu_buffer_get_committed;
+    }
+#endif
     if (strcmp(name, "ggml_backend_set_abort_callback") == 0) {
         return (void *)ggml_backend_cpu_set_abort_callback;
     }

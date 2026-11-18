@@ -226,6 +226,12 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .vec_dot_type             = GGML_TYPE_Q8_0,
         .nrows                    = 1,
     },
+    [GGML_TYPE_Q2_0] = {
+        .from_float               = quantize_row_q2_0,
+        .vec_dot                  = ggml_vec_dot_q2_0_q8_0,
+        .vec_dot_type             = GGML_TYPE_Q8_0,
+        .nrows                    = 1,
+    },
     [GGML_TYPE_Q4_0] = {
         .from_float               = quantize_row_q4_0,
         .vec_dot                  = ggml_vec_dot_q4_0_q8_0,
@@ -499,6 +505,7 @@ struct ggml_compute_state {
     ggml_thread_t thrd;
     int  last_graph;
     bool pending;
+    bool left_out; // the last graph ran on fewer threads than this one's index
 #endif
     bool cpumask[GGML_MAX_N_THREADS];
     struct ggml_threadpool * threadpool;
@@ -3090,6 +3097,7 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
     int n_threads = n_graph & GGML_THREADPOOL_N_THREADS_MASK;
     if (n_graph != state->last_graph) {
         state->pending    = (state->ith < n_threads);
+        state->left_out   = !state->pending;
         state->last_graph = n_graph;
         return true;
     }
@@ -3126,7 +3134,8 @@ static inline bool ggml_graph_compute_poll_for_work(struct ggml_compute_state * 
 static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state * state) {
     struct ggml_threadpool * threadpool = state->threadpool;
 
-    if (ggml_graph_compute_poll_for_work(state)) {
+    // A thread the last graph left out waits without polling: its CPU goes to whatever else runs meanwhile.
+    if (!state->left_out && ggml_graph_compute_poll_for_work(state)) {
         ggml_graph_compute_thread_sync(state);
         return state->pending;
     }

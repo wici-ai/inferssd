@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -144,7 +145,8 @@ def test_profile_does_not_look_for_probes_on_path(tmp_path, monkeypatch, environ
 
 
 def test_installed_resources_prefer_the_variable_over_the_current_release(tmp_path):
-    current = tmp_path / ".local/share/inferssd/current/engine-resources.json"
+    data = "AppData/Local/inferssd" if sys.platform == "win32" else ".local/share/inferssd"
+    current = tmp_path / data / "current/engine-resources.json"
     assert installed_resources({}, tmp_path) == current
     assert installed_resources({"INFERSSD_RESOURCES": ""}, tmp_path) == current
     assert installed_resources({"INFERSSD_RESOURCES": "/a.json"}, tmp_path) == Path("/a.json")
@@ -217,13 +219,16 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
     assert names == ["cpu", "memory", "compute", "gpus", "storage"] + ["estimate"] * len(
         catalog.MODELS
     )
-    # This machine measured Q4_K alone, so no supported model can be priced: each names the
-    # role formats it lacks, as cpu_line does.
-    assert out[7:] == [
-        f"estimate: {model.repo}:{model.quantization} none: no CPU compute measurement of "
-        + ", ".join(sorted({role.format.upper() for role in model.facts.roles} - {"Q4_K"}))
-        for model in catalog.MODELS
-    ]
+    # This machine measured Q4_K alone: every expert model is priced with its other formats taken
+    # from Q4_K's rate, and the RAM-only model by its dense weights from RAM (its GPU measured no
+    # matrix product).
+    for model, line in zip(catalog.MODELS, out[7:]):
+        assert line.startswith(f"estimate: {model.repo}:{model.quantization} ")
+        assert " tok/s" in line and "none:" not in line
+        if model.facts is None:
+            assert "GB of dense weights from RAM at " in line
+        else:
+            assert " ms a token: dense " in line
     assert out[2].endswith("4 logical CPUs (4 uniform); ISA AVX2 FMA F16C")
     assert "DRAM read 11.18 GiB/s with 1 thread" in out[3]
     assert out[4].endswith("1 formats at 4 threads; skipped MXFP4 (no CPU kernel)")
@@ -303,7 +308,8 @@ def test_json_prints_one_object_with_the_machine_and_the_estimates(tmp_path):
     assert [(row["model"], row["quantization"]) for row in value["estimates"]] == [
         (model.repo, model.quantization) for model in catalog.MODELS
     ]
-    assert all(row["decode_tokens_per_second"] is None for row in value["estimates"])
+    # Q4_K alone was measured: the other formats take its rate, so every model has an estimate.
+    assert all(row["decode_tokens_per_second"] > 0 for row in value["estimates"])
     # Without --model the estimates have no drive, and the machine no models drive.
     code, out, _ = execute(["--show", "--json"], host, FakeRunner({}), tmp_path)
     value = json.loads(out[0])

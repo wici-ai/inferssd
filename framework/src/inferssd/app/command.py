@@ -11,9 +11,12 @@ import uuid
 from pathlib import Path
 
 from inferssd.app.hub import download, selection
+from inferssd.configuration.settings import host_platform
 from inferssd.launch import typed_command
 from inferssd.launch.resources import data_directory, installed_resources, read_resources
+from inferssd.launch.typed import LOOPBACK, connect_host, listen_host
 from inferssd.platform.captured_command import run_captured
+from inferssd.platform.windows import win32
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
@@ -35,8 +38,20 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
             type=Path,
             help="engine descriptor of a source build (the installer sets this)",
         )
+        if mode == "serve":
+            parser.add_argument(
+                "--host",
+                default=LOOPBACK,
+                help="IPv4 address to listen on: 127.0.0.1 (default) is this machine only; "
+                "0.0.0.0 also accepts other devices on your network",
+            )
         parser.add_argument("--port", type=int, default=8080)
-        parser.add_argument("--context", type=int, default=8192)
+        parser.add_argument(
+            "--context",
+            type=int,
+            help="context in tokens (default: the largest multiple of 8192, up to the model's "
+            "trained context, that memory holds when full)",
+        )
         parser.add_argument(
             "--settings", type=Path, help="typed settings file (see docs/configuration.md)"
         )
@@ -56,6 +71,8 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
 
 
 def physical_memory() -> int:
+    if sys.platform == "win32":
+        return win32.system_memory()["physical_total_bytes"]
     if sys.platform == "darwin":
         result = run_captured(["sysctl", "-n", "hw.memsize"], timeout=10)
         result.check_returncode()
@@ -69,7 +86,7 @@ def physical_memory() -> int:
 def default_policy(state: Path) -> dict[str, object]:
     """The whole machine: the engine uses what is available and keeps its own margin."""
     return {
-        "platform": sys.platform,
+        "platform": host_platform(),
         "lock_path": str(state / "runtime.lock"),
         "stop_path": str(state / "runtime.stop"),
         "memory_budget_bytes": physical_memory(),
@@ -82,19 +99,22 @@ def run(args: argparse.Namespace) -> int:
     from inferssd.app.chat import chat
     from inferssd.engine.command import run_native
 
-    if sys.platform not in ("linux", "darwin"):
-        raise ValueError("cli and serve currently support Linux CUDA and Apple Silicon macOS")
-    if not 1 <= args.port <= 65535 or args.context < 1:
+    if not 1 <= args.port <= 65535 or (args.context is not None and args.context < 1):
         raise ValueError("port must be 1..65535; context must be positive")
+    # Terminal chat talks to its own server, so only serve listens beyond this machine.
+    host = listen_host(args.host) if args.command == "serve" else LOOPBACK
     if args.command == "cli" and args.max_tokens < 1:
         raise ValueError("max-tokens must be positive")
     if args.machine and args.reprofile:
         raise ValueError("choose --machine or --reprofile")
     resources = args.resources or installed_resources()
     if not resources.is_file():
-        raise ValueError("engine not installed; run scripts/install.sh or pass --resources FILE")
+        raise ValueError(
+            "engine not installed; run the installer (see docs/quickstart.md) "
+            "or pass --resources FILE"
+        )
     deployment = read_resources(resources)
-    if deployment.platform is not None and deployment.platform != sys.platform:
+    if deployment.platform is not None and deployment.platform != host_platform():
         raise ValueError("engine resources target a different platform")
     if not Path(deployment.binary).is_file() or not os.access(deployment.binary, os.X_OK):
         raise ValueError("engine server is missing or not executable; rerun the installer")
@@ -104,13 +124,14 @@ def run(args: argparse.Namespace) -> int:
     state = (data_directory() / "state").resolve()
     state.mkdir(parents=True, exist_ok=True)
     policy_path = state / ("policy-" + uuid.uuid4().hex + ".json")
-    # Keep the policy alongside launch receipts for reproducibility.
-    policy_path.write_text(json.dumps(default_policy(state), indent=2) + "\n")
     if args.hf_repo:
         selection(args.hf_repo)
         model = download(args.hf_repo, args.revision, args.model_dir.expanduser().resolve())
     else:
         model = args.model.expanduser().resolve(strict=True)
+    policy = default_policy(state)
+    # Keep the policy alongside launch receipts for reproducibility.
+    policy_path.write_text(json.dumps(policy, indent=2) + "\n", encoding="utf-8")
     parser = argparse.ArgumentParser()
     typed_command.add_command(parser.add_subparsers(dest="command", required=True))
     command = [
@@ -122,13 +143,15 @@ def run(args: argparse.Namespace) -> int:
         str(policy_path),
         "--model",
         str(model),
+        "--host",
+        host,
         "--port",
         str(args.port),
-        "--context",
-        str(args.context),
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
+    if args.context is not None:
+        command.extend(["--context", str(args.context)])
     for name in ("settings", "machine"):
         if getattr(args, name):
             command.extend(["--" + name, str(getattr(args, name))])
@@ -138,7 +161,12 @@ def run(args: argparse.Namespace) -> int:
         command.append("--reprofile")
     launch = parser.parse_args(command)
     if args.command == "serve":
-        print(f"Starting API at http://127.0.0.1:{args.port}/v1", file=sys.stderr)
+        print(f"Starting API at http://{connect_host(host)}:{args.port}/v1", file=sys.stderr)
+        if host == "0.0.0.0":
+            print(
+                f"Other devices reach it at this machine's network address, port {args.port}",
+                file=sys.stderr,
+            )
         return typed_command.run(launch)
     return run_native(
         launch,

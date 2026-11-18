@@ -8,16 +8,19 @@ none, inside a test file of random data written there and removed after; on
 Linux with an NVIDIA GPU the memory probe measures transfers. Sections the
 saved file still describes correctly are reused (see ``plan_refresh``).
 
-CPU clusters follow the engine's split (``ssd::platform::topology``): Linux
-takes each CPU's ``cpu_capacity``, else ``cpuinfo_max_freq``, sorts them in
-descending order and cuts at the largest relative drop above 10%; one CPU
-without either value makes one cluster. macOS takes ``hw.perflevel0.logicalcpu``
-as the performance cluster and the remaining CPUs as efficiency.
+CPU clusters: Linux takes each CPU's ``cpu_capacity``, else
+``cpuinfo_max_freq``, sorts them in descending order and cuts at the largest
+relative drop above 10%; one CPU without either value makes one cluster. macOS
+takes ``hw.perflevel0.logicalcpu`` as the performance cluster and the remaining
+CPUs as efficiency. Windows takes the CPUs of the highest CPU Set efficiency
+class as the performance cluster; without a CPU Set for every CPU of processor
+group 0 the machine is one cluster.
 """
 
 from __future__ import annotations
 
 import glob
+import ntpath
 import posixpath
 import sys
 import time
@@ -42,6 +45,7 @@ from inferssd.machine.characteristics import (
     Storage,
 )
 from inferssd.machine.identity import (
+    TIER_BACKENDS,
     Drive,
     GPUQueryFailed,
     Host,
@@ -96,7 +100,7 @@ def section(start: float, end: float, method: str, status: str, detail: str = ""
 
 
 def split_fastest(values: Sequence[tuple[int, float]]) -> tuple[list[int], list[int]]:
-    """The engine's split: cut the descending values at the largest relative drop above 10%."""
+    """Cut the descending values at the largest relative drop above 10%."""
     ordered = sorted(values, key=lambda item: -item[1])
     cut, step = len(ordered), 0.10
     for index in range(1, len(ordered)):
@@ -183,13 +187,70 @@ def darwin_topology(host: Host) -> CPU:
     }
 
 
+def windows_topology(host: Host) -> CPU:
+    """Group 0's CPUs; ``capacity`` is the CPU Set efficiency class, ``core`` its CoreIndex."""
+    processors = host.windows().processors()
+    if processors.groups > 1:
+        raise ValueError("more than one processor group (over 64 logical CPUs) is not supported")
+    sets = {row.index: row for row in processors.sets}
+    ids = list(range(processors.group0))
+    known = all(cpu in sets for cpu in ids)
+    best = max(row.efficiency for row in sets.values()) if known else None
+    fast = [cpu for cpu in ids if best is None or sets[cpu].efficiency == best]
+    siblings: dict[int, list[int]] = {}
+    for cpu in ids if known else ():
+        siblings.setdefault(sets[cpu].core, []).append(cpu)
+    logical: list[LogicalCPU] = [
+        {
+            "id": cpu,
+            "core": sets[cpu].core if known else None,
+            "package": None,
+            "smt_siblings": siblings[sets[cpu].core] if known else None,
+            "capacity": sets[cpu].efficiency if known else None,
+            "max_khz": None,
+            "cluster": 0 if cpu in fast else 1,
+        }
+        for cpu in ids
+    ]
+    return {
+        "logical": logical,
+        "clusters": clusters(fast, [cpu for cpu in ids if cpu not in fast]),
+        "affinity_supported": True,
+        "isa": [],
+    }
+
+
+TOPOLOGY = {
+    "linux": ("sysfs", linux_topology),
+    "darwin": ("sysctl", darwin_topology),
+    "windows": ("Win32", windows_topology),
+}
+
+
+def curve_threads(count: int) -> list[int]:
+    """1, 2, 4, ... below COUNT, then COUNT.
+
+    Decode's CPU experts stream weights from memory, which saturates before the
+    CPUs run out; the strategy takes the fewest threads at the best rate.
+    """
+    counts, n = [], 1
+    while n < count:
+        counts.append(n)
+        n *= 2
+    return counts + [count]
+
+
 def probe_threads(cpu: CPU) -> list[int]:
-    """1, the performance-cluster size and every logical CPU, without repeats."""
+    """1, 2, 4, ... up to every logical CPU, the performance-cluster size, and every CPU but one.
+
+    A prompt pass runs on the measured count that computes fastest of those that
+    leave the sink's I/O threads a CPU, so every CPU but one is measured as well.
+    """
     total = len(cpu["logical"])
     fast = next(
         (len(row["cpus"]) for row in cpu["clusters"] if row["kind"] == "performance"), total
     )
-    return sorted({1, fast, total})
+    return sorted({*curve_threads(total), fast, *([total - 1] if total > 1 else [])})
 
 
 def pinned_sets(cpu: CPU) -> list[list[int]]:
@@ -207,14 +268,15 @@ def pinned_sets(cpu: CPU) -> list[list[int]]:
 def model_files(host: Host, paths: Sequence[str]) -> list[tuple[str, int]]:
     """Regular files under PATHS (directories recursively); a split GGUF adds all its shards."""
     found: dict[str, int] = {}
+    os_path = ntpath if host.platform() == "windows" else posixpath
     for path in paths:
-        match = SHARD.match(posixpath.basename(path))
+        match = SHARD.match(os_path.basename(path))
         names = [path]
         if match:
-            directory = posixpath.dirname(path)
+            directory = os_path.dirname(path)
             pattern = f"{glob.escape(match.group(1))}-*-of-{match.group(2)}.gguf"
             if directory:
-                pattern = posixpath.join(glob.escape(directory), pattern)
+                pattern = os_path.join(glob.escape(directory), pattern)
             names = host.glob(pattern) or names
         # An empty directory lists nothing: its drive is measured with a test file.
         listed = [row for name in names for row in host.regular_files(name)]
@@ -271,11 +333,12 @@ def measure_cpu(
     host: Host, identity: Identity, probes: Probes, clock: Clock, progress: Progress
 ) -> tuple[CPU, Memory, Compute, dict[str, Section]]:
     system = identity["hard"]["platform"]
+    source, topology = TOPOLOGY[system]
     start = clock()
     progress("reading CPU topology and memory size")
     topology_error = ""
     try:
-        cpu = linux_topology(host) if system == "linux" else darwin_topology(host)
+        cpu = topology(host)
     except (OSError, ValueError, RuntimeError) as error:
         topology_error = f"topology unavailable: {error}"
         count = identity["hard"]["logical_cpus"]
@@ -293,7 +356,7 @@ def measure_cpu(
                 for index in range(count)
             ],
             "clusters": clusters(range(count), []),
-            "affinity_supported": system == "linux",
+            "affinity_supported": system != "darwin",
             "isa": [],
         }
     memory: Memory = {
@@ -318,10 +381,15 @@ def measure_cpu(
         cpu["isa"] = [name for name in report["ggml_features"] if name not in BUILD_OPTIONS]
         memory["dram_read_Bps"] = dram_rates(report)
         compute["cpu"] = compute_rows(report)
+        performance = next(
+            (sorted(row["cpus"]) for row in cpu["clusters"] if row["kind"] == "performance"), None
+        )
         for group in pinned_sets(cpu):
             listed = ",".join(map(str, group))
+            # Decode may run on the performance cluster alone: its curve, the first CPUs first.
+            counts = curve_threads(len(group)) if group == performance else [len(group)]
             progress(f"CPU probe: one token with a thread pinned to each of CPUs {listed}")
-            arguments = ["--cpus", listed, "--threads", str(len(group)), "--tokens", "1"]
+            arguments = ["--cpus", listed, "--threads", ",".join(map(str, counts)), "--tokens", "1"]
             try:
                 pinned = probes.run("cpu", arguments)
             except ProbeError as error:
@@ -329,9 +397,11 @@ def measure_cpu(
                 continue
             compute["cpu"] += compute_rows(pinned)
         if pinned_sets(cpu):
-            method += "; one token pinned to each cluster and to every CPU"
+            method += (
+                "; one token pinned to each cluster and to every CPU, to the performance "
+                "cluster's first 1, 2, 4, ... CPUs too"
+            )
     end = clock()
-    source = "sysfs" if system == "linux" else "sysctl"
     failed = "the CPU probe failed (see compute)" if probe_error else ""
     isa_missing = f"ISA unknown: {failed}" if failed else ""
     errors = "; ".join(filter(None, (topology_error, isa_missing)))
@@ -379,9 +449,9 @@ def measure_gpus(
         return [], section(start, clock(), "nvidia-smi", "failed", failure)
     if "memory" not in identity["soft"]["probe_versions"]:
         why = (
-            "no NVIDIA GPU found by nvidia-smi"
-            if identity["hard"]["platform"] == "linux"
-            else "the GPU transfer probe runs on Linux with CUDA only"
+            "the GPU transfer probe needs a GPU on CUDA or ROCm"
+            if identity["hard"]["platform"] == "darwin"
+            else "no GPU on CUDA (nvidia-smi) or ROCm (amdkfd) found"
         )
         return [], section(start, clock(), "none", "ok", why)
     progress("GPU probe: VRAM size and transfer rates")
@@ -392,12 +462,12 @@ def measure_gpus(
         return [], section(start, clock(), method, "failed", str(error))
     gpus = gpu_rows(report)
     if not gpus:
-        return [], section(start, clock(), method, "failed", "the probe found no CUDA device")
+        return [], section(start, clock(), method, "failed", "the probe found no GPU")
     measured = {gpu["uuid"].lower() for gpu in gpus}
     missing = [
         gpu["uuid"]
         for gpu in identity["hard"]["gpus"]
-        if gpu["backend"] == "CUDA" and gpu["uuid"].lower() not in measured
+        if gpu["backend"] in TIER_BACKENDS and gpu["uuid"].lower() not in measured
     ]
     reasons = [f"device {index}: {why}" for index, why in sorted(skipped_devices(report).items())]
     notes = []
@@ -428,13 +498,52 @@ def measure_drive(
             f"({drive.bus})"
         )
         method = f"{PROBE_SCHEMAS['ssd']} read-only random extents in {len(chosen)} existing files"
-        return _read_rates(drive, chosen, method, probes, clock, start)
+        try:
+            return _read_rates(drive, chosen, method, probes, clock, start, cached_raises=True)
+        except ProbeError:
+            # Every given file is in the page cache: a model written moments ago, on a
+            # machine with memory to spare. The probe skips cached pages on macOS, since
+            # reading them would measure memory, so the drive is measured in a test file
+            # beside the model instead. Before this the section failed, and every launch
+            # failed it again until the pages were evicted.
+            progress("SSD probe: every given file is in the page cache; measuring in a test file")
+            os_path = ntpath if host.platform() == "windows" else posixpath
+            directory = os_path.dirname(chosen[0])
+            # No given directory clears a test file a killed run left beside the model.
+            host.clear_test_files(directory)
+            return _test_file_rates(
+                host,
+                drive,
+                directory,
+                "every given file is in the page cache",
+                probes,
+                clock,
+                start,
+                progress,
+                cached=True,
+            )
     largest = max((size for _, size in place.files), default=0)
     reason = f"no file of at least {MIN_FILE_BYTES} bytes on this drive among the given paths"
     if not place.directories:
         detail = f"{reason} (largest {largest} bytes)"
         return None, section(start, clock(), "none", "failed", detail)
-    directory = place.directories[0]
+    return _test_file_rates(
+        host, drive, place.directories[0], reason, probes, clock, start, progress
+    )
+
+
+def _test_file_rates(
+    host: Host,
+    drive: Drive,
+    directory: str,
+    reason: str,
+    probes: Probes,
+    clock: Clock,
+    start: float,
+    progress: Progress,
+    cached: bool = False,
+) -> tuple[Optional[Storage], Section]:
+    """Read rates in a test file written to DIRECTORY, because of REASON."""
     free = host.free_bytes(directory)
     if free < TEST_FILE_BYTES + MIN_FILE_BYTES:
         return None, section(
@@ -452,12 +561,17 @@ def measure_drive(
     method = (
         f"{PROBE_SCHEMAS['ssd']} random extents in a {TEST_FILE_BYTES}-byte test file of "
         "random data, removed after"
-    )
+    ) + (", since the given files were in the page cache" if cached else "")
     try:
         with host.test_file(directory, TEST_FILE_BYTES) as path:
             return _read_rates(drive, [path], method, probes, clock, start)
     except OSError as error:
         return None, section(start, clock(), method, "failed", f"the test file failed: {error}")
+
+
+def _in_page_cache(error: ProbeError) -> bool:
+    """The SSD probe found no extent to read outside the page cache (ssdprobe.cpp, status 2)."""
+    return error.status == 2 and "outside the page cache" in error.reason
 
 
 def _read_rates(
@@ -467,12 +581,15 @@ def _read_rates(
     probes: Probes,
     clock: Clock,
     start: float,
+    cached_raises: bool = False,
 ) -> tuple[Optional[Storage], Section]:
     try:
         entry = storage_entry(
             probes.run("ssd", [argument for path in paths for argument in ("--file", path)]), drive
         )
     except ProbeError as error:
+        if cached_raises and _in_page_cache(error):
+            raise
         return None, section(start, clock(), method, "failed", str(error))
     if not entry["random_read"]:
         return None, section(start, clock(), method, "failed", "the probe measured no point")

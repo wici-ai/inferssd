@@ -11,6 +11,11 @@
 #include <algorithm>
 #include <cstdlib>
 #include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -432,7 +437,22 @@ void llama_file::write_u32(uint32_t val) const { pimpl->write_u32(val); }
 
 // llama_mmap
 
+// Waits until no advice of llama_prefetch_rows is pending (below): a mapping goes only after that.
+static void llama_prefetch_drain();
+
 struct llama_mmap::impl {
+    static void align_range(size_t * first, size_t * last, size_t page_size) {
+        size_t offset_in_page = *first & (page_size - 1);
+        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
+        *first += offset_to_page;
+
+        *last = *last & ~(page_size - 1);
+
+        if (*last <= *first) {
+            *last = *first;
+        }
+    }
+
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
     int fadvise_fd = -1;
@@ -476,18 +496,6 @@ struct llama_mmap::impl {
         }
 
         mapped_fragments.emplace_back(0, file->size());
-    }
-
-    static void align_range(size_t * first, size_t * last, size_t page_size) {
-        size_t offset_in_page = *first & (page_size - 1);
-        size_t offset_to_page = offset_in_page == 0 ? 0 : page_size - offset_in_page;
-        *first += offset_to_page;
-
-        *last = *last & ~(page_size - 1);
-
-        if (*last <= *first) {
-            *last = *first;
-        }
     }
 
     bool advise_random_fragment(size_t first, size_t last, size_t * len_out) {
@@ -578,6 +586,7 @@ struct llama_mmap::impl {
 
         void * next_page_start = (uint8_t *) addr + first;
 
+        llama_prefetch_drain();
         if (munmap(next_page_start, len)) {
             LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
         }
@@ -600,6 +609,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        llama_prefetch_drain();
         for (const auto & frag : mapped_fragments) {
             if (munmap((char *) addr + frag.first, frag.second - frag.first)) {
                 LLAMA_LOG_WARN("warning: munmap failed: %s\n", strerror(errno));
@@ -659,10 +669,21 @@ struct llama_mmap::impl {
     }
 
     bool dontneed_fragment(size_t first, size_t last, size_t * len_out) {
-        GGML_UNUSED(first);
-        GGML_UNUSED(last);
+        SYSTEM_INFO system{};
+        GetSystemInfo(&system);
+        align_range(&first, &last, system.dwPageSize);
+        const size_t len = last - first;
         if (len_out) {
-            *len_out = 0;
+            *len_out = len;
+        }
+        if (len == 0) {
+            return true;
+        }
+        // Unlocking pages that are not locked removes them from the working set: a read-only view's pages go to
+        // the standby list, which counts as available memory, as madvise(MADV_DONTNEED) drops them on POSIX.
+        if (!VirtualUnlock((uint8_t *) addr + first, len) && GetLastError() != ERROR_NOT_LOCKED) {
+            LLAMA_LOG_WARN("warning: VirtualUnlock failed: %s\n", llama_format_win_err(GetLastError()).c_str());
+            return false;
         }
         return true;
     }
@@ -682,6 +703,7 @@ struct llama_mmap::impl {
     }
 
     ~impl() {
+        llama_prefetch_drain();
         if (hMapping) {
             if (addr) {
                 if (!UnmapViewOfFile(addr)) {
@@ -898,3 +920,141 @@ const bool llama_mlock::SUPPORTED = false;
 size_t llama_path_max() {
     return PATH_MAX;
 }
+
+namespace {
+
+#if defined(_WIN32) && _WIN32_WINNT >= 0x602
+using llama_prefetch_fn = BOOL (WINAPI *)(HANDLE, ULONG_PTR, PWIN32_MEMORY_RANGE_ENTRY, ULONG);
+llama_prefetch_fn llama_windows_prefetch() {
+    static const auto prefetch = (llama_prefetch_fn)(void *) GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "PrefetchVirtualMemory");
+    return prefetch;
+}
+#endif
+
+// Page runs of one llama_prefetch_rows call: start address and length.
+using llama_page_runs = std::vector<std::pair<uintptr_t, size_t>>;
+
+void llama_advise_runs(const llama_page_runs & runs);
+
+// The advice llama_prefetch_rows queues, given by one thread in the order asked. It lives as long as
+// the process (never destroyed, its thread detached), so no unload waits on a thread.
+struct llama_prefetch_queue {
+    std::mutex mutex;
+    std::condition_variable wake, idle;
+    std::deque<llama_page_runs> jobs;
+    bool busy = false;
+    bool started = false;
+
+    void push(llama_page_runs runs) {
+        std::lock_guard<std::mutex> lock(mutex);
+        jobs.push_back(std::move(runs));
+        if (!started) {
+            started = true;
+            std::thread([this] { run(); }).detach();
+        }
+        wake.notify_one();
+    }
+
+    // Until no advice is queued or being given.
+    void drain() {
+        std::unique_lock<std::mutex> lock(mutex);
+        idle.wait(lock, [&] { return jobs.empty() && !busy; });
+    }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (;;) {
+            wake.wait(lock, [&] { return !jobs.empty(); });
+            llama_page_runs runs = std::move(jobs.front());
+            jobs.pop_front();
+            busy = true;
+            lock.unlock();
+            llama_advise_runs(runs);
+            lock.lock();
+            busy = false;
+            if (jobs.empty()) { idle.notify_all(); }
+        }
+    }
+};
+
+llama_prefetch_queue & llama_prefetch_jobs() {
+    static auto * queue = new llama_prefetch_queue();
+    return *queue;
+}
+
+} // namespace
+
+static void llama_prefetch_drain() {
+    llama_prefetch_jobs().drain();
+}
+
+bool llama_prefetch_rows(const void * table, size_t row_bytes, int64_t n_rows, const int32_t * rows, size_t count) {
+#if defined(_WIN32)
+    SYSTEM_INFO system{};
+    GetSystemInfo(&system);
+    const size_t page = system.dwPageSize;
+#elif defined(_POSIX_MAPPED_FILES)
+    const long query = sysconf(_SC_PAGESIZE);
+    if (query <= 0) { return false; }
+    const size_t page = size_t(query);
+#else
+    (void) table; (void) row_bytes; (void) n_rows; (void) rows; (void) count;
+    return false;
+#endif
+#if defined(_WIN32) || defined(_POSIX_MAPPED_FILES)
+    if (!table || !row_bytes) { return false; }
+    // The pages under the rows, in order, then merged into runs of adjacent pages.
+    const uintptr_t base = reinterpret_cast<uintptr_t>(table);
+    std::vector<uintptr_t> pages;
+    pages.reserve(count * (2 + row_bytes / page));
+    for (size_t i = 0; i < count; ++i) {
+        if (rows[i] < 0 || rows[i] >= n_rows) { continue; }
+        const uintptr_t first = base + size_t(rows[i]) * row_bytes, last = first + row_bytes - 1;
+        for (uintptr_t p = first - first % page; p <= last - last % page; p += page) { pages.push_back(p); }
+    }
+    std::sort(pages.begin(), pages.end());
+    pages.erase(std::unique(pages.begin(), pages.end()), pages.end());
+    std::vector<std::pair<uintptr_t, size_t>> runs;
+    for (size_t i = 0; i < pages.size();) {
+        size_t j = i + 1;
+        while (j < pages.size() && pages[j] == pages[j - 1] + page) { ++j; }
+        runs.emplace_back(pages[i], (j - i) * page);
+        i = j;
+    }
+    if (runs.empty()) { return true; }
+#if defined(_WIN32) && _WIN32_WINNT < 0x602
+    return false;
+#else
+#if defined(_WIN32)
+    if (!llama_windows_prefetch()) { return false; }
+#endif
+    llama_prefetch_jobs().push(std::move(runs));
+    return true;
+#endif
+#endif
+}
+
+namespace {
+
+void llama_advise_runs(const llama_page_runs & runs) {
+#if defined(_WIN32)
+#if _WIN32_WINNT >= 0x602
+    const auto prefetch = llama_windows_prefetch();
+    if (!prefetch) { return; }
+    std::vector<WIN32_MEMORY_RANGE_ENTRY> ranges;
+    ranges.reserve(runs.size());
+    for (const auto & [start, bytes] : runs) { ranges.push_back({ reinterpret_cast<void *>(start), SIZE_T(bytes) }); }
+    (void) prefetch(GetCurrentProcess(), ULONG_PTR(ranges.size()), ranges.data(), 0);
+#else
+    (void) runs;
+#endif
+#elif defined(_POSIX_MAPPED_FILES)
+    for (const auto & [start, bytes] : runs) {
+        (void) madvise(reinterpret_cast<void *>(start), bytes, MADV_WILLNEED);
+    }
+#else
+    (void) runs;
+#endif
+}
+
+} // namespace

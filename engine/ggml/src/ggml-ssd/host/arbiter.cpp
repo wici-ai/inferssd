@@ -11,7 +11,7 @@
 // One arbiter on every OS; only the budget sources differ.
 #if defined(__linux__)
 #include "ledger.h" // cgroup v2 and /proc
-namespace ssd { namespace host { using host_ledger = ::kimi_host_ledger; } }
+namespace ssd { namespace host { using host_ledger = ::ssd_host_ledger; } }
 #else
 #include "ledger-native.h" // job objects or host.budget_mib, and the OS memory status
 namespace ssd { namespace host { using host_ledger = native_ledger; } }
@@ -19,7 +19,6 @@ namespace ssd { namespace host { using host_ledger = native_ledger; } }
 
 namespace ssd { namespace host {
 namespace {
-uint64_t add(uint64_t a, uint64_t b) noexcept { return b > UINT64_MAX - a ? UINT64_MAX : a + b; }
 template<class T> result<T> passed(T value) { return {std::move(value), status::ok, {}}; }
 template<class T> result<T> failed(status code, const char * message) { return {T{}, code, message}; }
 template<> result<void> failed<void>(status code, const char * message) { return {code, message}; }
@@ -27,6 +26,11 @@ template<class T, class F> result<T> guarded(F && call) noexcept {
     try { return call(); }
     catch (const std::bad_alloc &) { return failed<T>(status::resource, "host allocation"); }
     catch (const std::bad_weak_ptr &) { return failed<T>(status::invalid, "host ownership"); }
+    catch (const std::exception & error) {
+        // The error the run ends in names what the callback threw, a reclaimer's fault for one.
+        try { return failed<T>(status::io, (std::string("host callback: ") + error.what()).c_str()); }
+        catch (...) { return failed<T>(status::io, "host callback"); }
+    }
     catch (...) { return failed<T>(status::io, "host callback"); }
 }
 bool same_config(const client_config & a, const client_config & b) noexcept {
@@ -48,15 +52,6 @@ struct client_state {
     size_t reclaims = 0;                      // reclaimer runs in progress, outside the mutex
 };
 }
-uint64_t room::shortage() const noexcept { return std::max(cgroup_shortage, system_shortage); }
-uint64_t room::surplus() const noexcept {
-    if (!fits()) { return 0; }
-    uint64_t value = UINT64_MAX;
-    if (cgroup != room_unreadable) { value = std::min(value, cgroup_surplus); }
-    if (system) { value = std::min(value, system_surplus); }
-    return value;
-}
-
 struct process_arbiter::impl {
     std::mutex mutex;
     std::condition_variable changed;
@@ -72,22 +67,10 @@ struct process_arbiter::impl {
     std::map<uint64_t, pending_ticket> tickets;
 
     explicit impl(reader injected) {
-        budget.reserve = budget.margin = 512ull << 20;
 #if defined(__linux__)
         // The Linux ledger reads /proc and cgroup v2 files, through the injected reader in tests.
         budget.read = std::move(injected);
-        const long page = sysconf(_SC_PAGESIZE);
-        budget.page_size = page > 0 ? uint64_t(page) : 4096;
-        std::string groups;
-        if (budget.get("/proc/self/cgroup", groups)) {
-            for (size_t at = 0; at < groups.size();) {
-                const size_t end = std::min(groups.find('\n', at), groups.size());
-                if (!groups.compare(at, 3, "0::")) {
-                    budget.cgroup = "/sys/fs/cgroup" + groups.substr(at + 3, end - at - 3); break;
-                }
-                at = end + 1;
-            }
-        }
+        budget.locate();
 #else
         (void) injected; // the native ledger asks the OS, not files
 #endif
@@ -164,32 +147,7 @@ struct process_arbiter::impl {
 #if defined(__linux__)
         view.device_held = held_device(); // the native ledgers' envelopes charge device memory to the process
 #endif
-        const auto observed = view.measure(add(extra, pending), full_boost);
-        room out;
-        out.cgroup = static_cast<room_state>(observed.cgroup);
-        out.cgroup_shortage = observed.cgroup_shortage; out.cgroup_surplus = observed.cgroup_surplus;
-        out.system = observed.system; out.available = observed.available; out.floor = observed.floor;
-        out.system_shortage = observed.system_shortage; out.system_surplus = observed.system_surplus;
-        out.boost_headroom = observed.boost_headroom;
-        return out;
-    }
-    bool unbounded_cgroup() const {
-        if (budget.cgroup.empty()) { return false; }
-        const std::string root = "/sys/fs/cgroup";
-        for (std::string path = budget.cgroup; path.size() >= root.size();) {
-            std::string text;
-            if (!budget.get(path + "/memory.max", text)) {
-                return path == root || path == root + "/";
-            }
-            const auto begin = text.find_first_not_of(" \t\n");
-            if (begin == std::string::npos || text.substr(begin, text.find_first_of(" \t\n", begin) - begin) != "max") {
-                return false;
-            }
-            const auto slash = path.find_last_of('/');
-            if (slash == std::string::npos) { break; }
-            path.resize(slash);
-        }
-        return true;
+        return view.measure(add(extra, pending), full_boost);
     }
     // An admission of `extra` bytes that `observed` found short: the context's reclaimer gives back what `who` may
     // ask of it, its steps run without the mutex. False when there is nothing to run.
@@ -233,12 +191,19 @@ struct process_arbiter::impl {
 process_arbiter::process_arbiter(reader injected) noexcept {
     try { impl_.reset(new impl(std::move(injected))); }
     catch (const std::bad_alloc &) { init_status_ = status::resource; }
+    catch (const std::exception & error) {
+        init_status_ = status::io;
+        try { init_error_ = error.what(); } catch (...) {}
+    }
     catch (...) { init_status_ = status::io; }
 }
 process_arbiter::~process_arbiter() = default;
 result<std::unique_ptr<context_client>> process_arbiter::make_client() noexcept {
     return guarded<std::unique_ptr<context_client>>([&]() -> result<std::unique_ptr<context_client>> {
-        if (!impl_) { return failed<std::unique_ptr<context_client>>(init_status_, "host owner initialization"); }
+        if (!impl_) {
+            return failed<std::unique_ptr<context_client>>(init_status_, init_error_.empty() ?
+                "host owner initialization" : ("host owner initialization: " + init_error_).c_str());
+        }
         auto owner = shared_from_this();
         auto state = std::make_shared<detail::client_state>();
         auto client = std::unique_ptr<context_client>(new context_client(std::move(owner), state));
@@ -382,16 +347,24 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
             return failed<allocation_ticket>(status::resource, "host byte overflow");
         }
         const uint64_t extra = add(host, state_->config.unified ? device : 0);
-        // The room measured under the mutex, and the ticket issued under the same lock when it fits.
-        const auto admit = [&]() -> result<allocation_ticket> {
+        // The room measured under the mutex, and the ticket issued under the same lock when it fits: both terms for
+        // the caches' growth; for an allocation the run needs (by_limits), only the limits themselves.
+        const auto admit = [&](bool by_limits) -> result<allocation_ticket> {
             std::lock_guard<std::mutex> lock(owner.mutex);
             if (const auto * error = owner.invalid(*state_)) { return failed<allocation_ticket>(status::invalid, error); }
-            auto observed = owner.measure(extra, true);
-            const bool readable = observed.system || observed.cgroup != room_unreadable;
-            const bool missing_cgroup = observed.cgroup == room_unreadable && (finite || !owner.unbounded_cgroup());
-            if (!observed.fits() || !readable || missing_cgroup) {
-                const auto code = !readable || missing_cgroup ? status::io : status::resource;
-                return {allocation_ticket({}, {}, 0, observed), code, "host budget refused"};
+            // Nothing asked for needs no room: a shortage must not stop a run over memory it already holds. So a take of
+            // nothing measures nothing; a decode layer takes once or twice, mostly nothing, and a measurement reads
+            // the cgroup's and /proc's memory files.
+            room observed;
+            if (extra) {
+                observed = owner.measure(extra, true);
+                const bool readable = by_limits ? observed.limits != room_unreadable :
+                    (observed.system || observed.cgroup != room_unreadable) &&
+                    !(observed.cgroup == room_unreadable && (finite || !owner.budget.unbounded()));
+                if (!(by_limits ? observed.within_limits(extra) : readable && observed.fits())) {
+                    return {allocation_ticket({}, {}, 0, observed), readable ? status::resource : status::io,
+                            by_limits ? "host memory limit refused" : "host budget refused"};
+                }
             }
             const uint64_t held_pages = owner.pages();
             if (extra == UINT64_MAX || held_pages == UINT64_MAX || extra > UINT64_MAX - owner.pending ||
@@ -405,12 +378,20 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
             ++state_->tickets; owner.invalidate_peers(state_->id);
             return passed(allocation_ticket(owner_, state_, id, observed));
         };
-        // One measurement when the room is there. A shortage runs the context's reclaimer, then measures again.
-        auto ticket = admit();
-        if (ticket.code != status::resource) { return ticket; }
-        const auto reclaimed = owner.reclaim(extra, ticket.value.observation(), state_, who);
-        if (!reclaimed) { return failed<allocation_ticket>(reclaimed.code, reclaimed.error.c_str()); }
-        return reclaimed.value ? admit() : std::move(ticket);
+        // One measurement when the room is there. A shortage runs the context's reclaimer, which gives back what both
+        // terms ask. The caches' own growth then measures them again. An allocation outside the caches is one the
+        // run needs: refusing it ends the run, so after the reclaimer only a limit it would not fit refuses it,
+        // and terms that cannot be read do not.
+        const bool needed = who == requester::outside;
+        auto ticket = admit(false);
+        if (ticket.code == status::resource) {
+            const auto reclaimed = owner.reclaim(extra, ticket.value.observation(), state_, who);
+            if (!reclaimed) { return failed<allocation_ticket>(reclaimed.code, reclaimed.error.c_str()); }
+            if (needed) { return admit(true); }
+            return reclaimed.value ? admit(false) : std::move(ticket);
+        }
+        if (needed && ticket.code == status::io) { return admit(true); }
+        return ticket;
     });
 }
 result<bool> context_client::update_file_reserve() noexcept {

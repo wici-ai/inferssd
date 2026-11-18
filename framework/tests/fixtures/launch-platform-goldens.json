@@ -48,7 +48,10 @@
         "user_manager": true,
         "memory_controller": true,
         "gpu_available": true,
-        "gpu_processes": ""
+        "gpu_processes": "",
+        "engine_gpu_backends": [
+          "CUDA"
+        ]
       }
     },
     "argv": [
@@ -69,7 +72,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",
@@ -106,9 +109,7 @@
       "8080",
       "-np",
       "1",
-      "--defer-experts",
-      "-fa",
-      "on"
+      "--defer-experts"
     ],
     "scope": [
       "systemd-run",
@@ -152,7 +153,10 @@
         "cgroup_v2": true,
         "euid": 0,
         "gpu_available": true,
-        "gpu_processes": ""
+        "gpu_processes": "",
+        "engine_gpu_backends": [
+          "CUDA"
+        ]
       }
     },
     "argv": [
@@ -171,7 +175,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",
@@ -186,9 +190,7 @@
       "8080",
       "-np",
       "1",
-      "--defer-experts",
-      "-fa",
-      "on"
+      "--defer-experts"
     ],
     "scope": [
       "systemd-run",
@@ -253,7 +255,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",
@@ -324,7 +326,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",
@@ -337,9 +339,7 @@
       "8080",
       "-np",
       "1",
-      "--defer-experts",
-      "-fa",
-      "on"
+      "--defer-experts"
     ],
     "scope": [
       "systemd-run",
@@ -406,7 +406,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",
@@ -481,7 +481,7 @@
       "-ngl",
       "99",
       "-c",
-      "8192",
+      "0",
       "-b",
       "512",
       "-ub",

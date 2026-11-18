@@ -21,7 +21,11 @@ source tree.
    The bundled engine is based on llama.cpp revision
    f42e29fdf199481effd31f281bf095ec6067757b (upstream build b8961,
    2026-04-28). Muse Spark model support is ported from upstream revision
-   ba3c05f71d. Copyright (c) 2023-2026 The ggml authors. MIT (engine/LICENSE).
+   ba3c05f71d. Q2_0 CPU format support is ported from upstream revision
+   9581154 (group-64 layout, including x86 and ARM dot products). Q2_0 CUDA
+   support is ported from upstream revision 9b2a088, adapted to
+   the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
+   The ggml authors. MIT (engine/LICENSE).
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
@@ -57,8 +61,20 @@ source tree.
    Copyright (c) 2024-2025 The ik_llama.cpp authors.
    The MIT permission notice below applies.
 
-MIT permission notice for entries 1-5
--------------------------------------
+6. Model chat templates
+   engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja is chat_template.jinja
+   from https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash (revision
+   314113f8a7da). Copyright (c) 2023 DeepSeek. The MIT permission notice below
+   applies.
+   engine/models/templates/muse-spark.jinja is chat_template.jinja from
+   https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B (revision
+   0fb02478b025), under the Muse model license.
+   engine/models/templates/unsloth-Qwen3.6-35B-A3B.jinja is the chat template in
+   https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF (revision a483e9e6cbd5),
+   under Apache-2.0.
+
+MIT permission notice for entries 1-5 and the DeepSeek template in entry 6
+--------------------------------------------------------------------------
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -116,5 +132,5 @@ note acknowledges its origin and does not relicense it.
 External runtime dependencies
 -----------------------------
 
-liburing is not vendored. Binary distributions must comply with its selected
-license (the MIT option is available) and the NVIDIA CUDA runtime terms.
+Binary distributions built with CUDA must comply with the NVIDIA CUDA runtime
+terms.

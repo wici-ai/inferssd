@@ -11,7 +11,9 @@ namespace llama_ssd {
 
 // Model facts remain in L3. Neither this description nor its validator knows
 // an executor's private cache, kernels, worker threads, or I/O implementation.
-enum class expert_quantization { unsupported, all_mxfp4, matching_up_gate };
+// executor_checked: the model adds no type rule; the selected executor checks the types of up, gate and down
+// (which may all differ) against its own vec-dot and quantization traits when it initializes.
+enum class expert_quantization { unsupported, executor_checked };
 enum class expert_activation { unsupported, swiglu_clamp, swiglu };
 
 struct expert_requirements {
@@ -44,7 +46,6 @@ struct expert_inputs {
     int64_t n_embd;
     int64_t n_tokens;
     bool silu;
-    bool cache_compute;
     bool prefill;
     bool weight_before_ffn;
     bool has_lora;
@@ -72,9 +73,7 @@ enum class expert_refusal {
     layout,
     extra_parameters,
     lora,
-    quantization,
     not_silu_gated,
-    compute_cache,
     token_batch,
     invalid_clamp,
     missing_post_norm,
@@ -90,7 +89,7 @@ struct expert_validation {
 [[nodiscard]] expert_validation validate_experts(
         const expert_requirements & requirements, const expert_inputs & inputs) noexcept;
 
-// States a refusal for the person running the model, with the types it concerns.
-[[nodiscard]] std::string describe_refusal(const expert_inputs & inputs, expert_refusal refusal);
+// States a refusal for the person running the model.
+[[nodiscard]] std::string describe_refusal(expert_refusal refusal);
 
 } // namespace llama_ssd
