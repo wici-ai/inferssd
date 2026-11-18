@@ -46,6 +46,9 @@ using test_resources::anonymous_bytes;
 
 static void require(bool ok, const std::string & what) { if (!ok) { throw std::runtime_error(what); } }
 static size_t aligned(size_t n) { return (n + 4095) & ~size_t(4095); }
+// A role's slot, as the expert layout sizes every read (ssd_expert_read_of): whole pages from the page that holds its
+// first byte. Every synthetic role starts on a page, so its slot is its bytes in whole pages.
+static uint64_t role_read(uint64_t bytes) { return ssd_expert_read_of(0, bytes).bytes; }
 static std::string tensor_name(int layer, int role) {
     static const char * roles[] = { "up", "gate", "down" };
     return "blk." + std::to_string(layer) + ".ffn_" + roles[role] + "_exps.weight";
@@ -148,6 +151,7 @@ struct fixture {
     int fault_role = -1;      // -1 faults every role; 0/1/2 selects up/gate/down
     int resolve_calls = 0;
     bool native_ranges = false;
+    bool index_only = false; // the file holds the index alone: no expert's bytes are written (cases that read none)
     std::vector<int32_t> stored; // the experts the file holds; empty: all of them
     int alias_layer = -1;        // with stored: the layer whose stored experts any other layer's missing ones alias
     std::vector<int> layer_ids = { 1, 2 }; // the routed layers the file holds
@@ -228,12 +232,15 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
                 ggml_quantize_requires_imatrix(type) ? size_t(cols) : 0, 1.0f);
             for (int e = 0; e < f.experts; ++e) {
                 if (!f.stored.empty() && std::find(f.stored.begin(), f.stored.end(), e) == f.stored.end()) { continue; }
-                std::vector<float> values(size_t(cols) * rows);
-                for (auto & v : values) { v = sample(rng); }
-                entry item; item.raw_bytes = bytes; item.read_bytes = aligned(bytes); item.data.resize(bytes);
-                require(ggml_quantize_chunk(type, values.data(), item.data.data(), 0, rows, cols,
-                        importance.empty() ? nullptr : importance.data()) == bytes,
-                        "fixture quantization bytes mismatch");
+                entry item; item.raw_bytes = bytes; item.read_bytes = aligned(bytes);
+                if (!f.index_only) {
+                    std::vector<float> values(size_t(cols) * rows);
+                    for (auto & v : values) { v = sample(rng); }
+                    item.data.resize(bytes);
+                    require(ggml_quantize_chunk(type, values.data(), item.data.data(), 0, rows, cols,
+                            importance.empty() ? nullptr : importance.data()) == bytes,
+                            "fixture quantization bytes mismatch");
+                }
                 f.entries[{ tensor_name(layer, role), e }] = std::move(item);
             }
         }
@@ -257,8 +264,11 @@ static void make_synthetic(fixture & f, uint32_t seed = 20260908) {
         while (here < target) { size_t count = std::min<uint64_t>(zero.size(), target - here); put_bytes(file, zero.data(), count); here += count; }
     };
     pad_to(data_start);
-    for (const auto & kv : f.entries) { pad_to(kv.second.offset); put_bytes(file, kv.second.data.data(), kv.second.raw_bytes); pad_to(kv.second.offset + kv.second.read_bytes); }
+    if (!f.index_only) {
+        for (const auto & kv : f.entries) { pad_to(kv.second.offset); put_bytes(file, kv.second.data.data(), kv.second.raw_bytes); pad_to(kv.second.offset + kv.second.read_bytes); }
+    }
     file.close(); require(bool(file), "fixture close failed");
+    if (f.index_only) { std::filesystem::resize_file(f.path, off); } // the experts' bytes, never written
     f.fd = test_resources::open_direct(f.path);
 }
 
@@ -2485,9 +2495,10 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
     scoped_fixture_input prefill_env(inputs, "cache_prefill_slots", nullptr);
     scoped_fixture_input quotas_env(inputs, "cache_layer_quotas", nullptr);
     fixture f; f.native_ranges = true; make_synthetic(f);
-    uint64_t stride = 0; // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
-    for (int role = 0; role < 3; ++role) { stride += (f.entries.at({ tensor_name(1, role), 0 }).raw_bytes + 8190) / 4096 * 4096; }
-    stride = cache_slot_bytes(inputs, stride);
+    uint64_t triplet = 0; // each role's slot (role_read)
+    for (int role = 0; role < 3; ++role) { triplet += role_read(f.entries.at({ tensor_name(1, role), 0 }).raw_bytes); }
+    const uint64_t stride = cache_slot_bytes(inputs, triplet); // with partial reclaim: a slot starts on a page
+    uint64_t slot = stride; // the slot of the case run checks (a case without partial reclaim or elastic sets its own)
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 23) - 11) * .019f; }
     auto load = [&](ssd_cpu_sink * sink, std::string * receipt) {
@@ -2513,13 +2524,13 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
             "the load receipt: " + receipt);
     require(cache_snapshot(b.get()).mapped_bytes == 0, "the reference mapped at configure");
     std::vector<float> out_a, out_b;
-    // a native range's slot is its read rounded up to a page prefix: admissions are counted, not their bytes
+    // a slot is a role's read in whole pages: admissions are counted, not their bytes
     auto run = [&](const char * name, ssd_cpu_sink * sink, int layer, const std::vector<int32_t> & ids,
                    const std::vector<float> & weights, size_t hits, size_t admitted, std::vector<float> * out) {
         tensors meta(f, layer);
         const auto expected = reference(f, layer, input, ids, weights, 4, 25);
         const auto r = run_checked(inputs, name, f, sink, meta, input, ids, weights, expected, layer, 25, hits, -1, out);
-        require(r.stats.cache_admitted == admitted && r.stats.cache_admitted_bytes == admitted * stride,
+        require(r.stats.cache_admitted == admitted && r.stats.cache_admitted_bytes == admitted * slot,
                 std::string(name) + ": cache admission count mismatch");
         return r;
     };
@@ -2652,7 +2663,7 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         // the server allocates while it loads: the load step commits fewer slots than geometry enabled, and those owe
         // their room at admission. The first prefill gives resident slots back; at the first decode token the room
         // holds the owed slots and 1.5 more, so one given-back slot comes back, not all. Experts of 51 MiB (Q8_0
-        // 4096 x 4096, no file: nothing is read) keep the process's own movements far below a slot.
+        // 4096 x 4096, an index alone: nothing is read) keep the process's own movements far below a slot.
         auto number = [](const std::string & line, const std::string & key) {
             const size_t at = line.find(" " + key + "=");
             require(at != std::string::npos, "the receipt lacks " + key + ": " + line);
@@ -2660,7 +2671,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        big.index_only = true; make_synthetic(big);
+        const uint64_t role = role_read(ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096);
         const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         const uint64_t cost = slot + slot / 128; // a slot and its page tables, until geometry's receipt prices it
         const uint64_t ring = uint64_t(depth) * 3 * role, room = host_room();
@@ -2753,7 +2765,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        big.index_only = true; make_synthetic(big);
+        const uint64_t role = role_read(ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096);
         const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         auto h = make_sink(inputs, big, threads, depth);
         configure_cache(h.get(), 6 * slot, { 1, 2 }, 6);
@@ -2812,7 +2825,8 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t role = (ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096;
+        big.index_only = true; make_synthetic(big);
+        const uint64_t role = role_read(ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096);
         const uint64_t slot = cache_slot_bytes(inputs, 3 * role);
         const uint64_t cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
         probe_ledger probe;
@@ -2857,31 +2871,34 @@ static void cache_load_tests(fixture_inputs & inputs, int threads, int depth) {
         scoped_fixture_input elastic_env(inputs, "cache_elastic", elastic ? "1" : nullptr);
         scoped_fixture_input prefill(inputs, "cache_prefill_slots", elastic ? "4" : nullptr);
         const std::string kind = elastic ? "elastic, no partial reclaim: " : "no partial reclaim, no elastic: ";
+        slot = cache_slot_bytes(inputs, triplet); // without either, a slot need not start on a page
         auto e = make_sink(inputs, f, threads, depth);
-        configure_cache(e.get(), 12 * stride, { 1, 2 }, 6);
+        configure_cache(e.get(), 12 * slot, { 1, 2 }, 6);
         std::string line;
         load(e.get(), &line);
         const auto at_load = cache_snapshot(e.get());
-        require(elastic ? line.find(" slots=12 of=12 ") != std::string::npos && at_load.committed_bytes == 12 * stride
+        require(elastic ? line.find(" slots=12 of=12 ") != std::string::npos && at_load.committed_bytes == 12 * slot
                         : line.empty() && !at_load.mapped_bytes && !at_load.committed_bytes,
                 kind + "the load step: " + line);
         begin_cache(e.get(), 13, 1, false);
-        if (elastic) { require(cache_snapshot(e.get()).committed_bytes == 4 * stride, kind + "the prefill kept more than 4 slots"); }
+        if (elastic) { require(cache_snapshot(e.get()).committed_bytes == 4 * slot, kind + "the prefill kept more than 4 slots"); }
         begin_cache(e.get(), 13, 2);
         // both page their admissions in: new slots, or (elastic) slots the prefill gave back
         const auto first = run("load_gate_layer1", e.get(), 1, { 1, 2 }, { .4f, .6f }, 0, 2, nullptr);
-        require(first.stats.cache_new_slot_bytes == 2 * stride && cache_snapshot(e.get()).capacity_bytes == 12 * stride,
+        require(first.stats.cache_new_slot_bytes == 2 * slot && cache_snapshot(e.get()).capacity_bytes == 12 * slot,
                 kind + "the first decode's slots");
     }
+    slot = stride;
     {
         // An automatic budget without partial reclaim or elastic: the read ring is not made resident at load either (the
-        // first decode charges it). Experts of 51 MiB (Q8_0 4096 x 4096, no file) make the ring's pages, a slot for each
-        // of the depth's reads, show in the process's resident memory.
+        // first decode charges it). Experts of 51 MiB (Q8_0 4096 x 4096, an index alone) make the ring's pages, a slot
+        // for each of the depth's reads, show in the process's resident memory.
         scoped_fixture_input partial(inputs, "cache_partial_reclaim", nullptr);
         auto resident = [] { return test_resources::resident_bytes(); };
         fixture big;
         big.latent = big.hidden = 4096; big.type = big.down_type = GGML_TYPE_Q8_0; big.experts = 8;
-        const uint64_t slot = 3 * ((ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096 + 8190) / 4096 * 4096);
+        big.index_only = true; make_synthetic(big);
+        const uint64_t slot = 3 * role_read(ggml_row_size(GGML_TYPE_Q8_0, 4096) * 4096);
         auto r = make_sink(inputs, big, threads, depth);
         configure_cache(r.get(), std::numeric_limits<uint64_t>::max(), { 1, 2 }, 6);
         tensors meta(big, 1);
@@ -2934,8 +2951,7 @@ static void work_buffer_reclaim_tests(fixture_inputs & inputs, int threads, int 
     std::vector<float> input(f.latent);
     for (size_t i = 0; i < input.size(); ++i) { input[i] = float(int(i % 29) - 14) * .011f; }
     const auto expected = reference(f, 1, input, ids, weights, 4, 25);
-    // a role as a decode request reserves it: its bytes and a page prefix, in whole pages
-    const uint64_t role = (f.entries.at({ tensor_name(1, 0), 0 }).raw_bytes + 8190) / 4096 * 4096;
+    const uint64_t role = role_read(f.entries.at({ tensor_name(1, 0), 0 }).raw_bytes); // a role's slot
     const uint64_t slot = cache_slot_bytes(inputs, 3 * role), cost = slot + slot / 128, ring = uint64_t(depth) * 3 * role;
 
     // F16 weights: the backend converts the F32 input to F16 into its work buffer, three slots of it.
@@ -3850,10 +3866,10 @@ static void swiglu_tests(fixture_inputs & inputs, int depth, bool q2) {
         { "q8_0_narrow", GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 256, 96, 48, {}, { 2, 64, 65, 300, 2048 } },
         { "bf16_tail", GGML_TYPE_BF16, GGML_TYPE_BF16, 64, 70, 24, {}, { 2, 65, 300 } },
         // formats mixed across a model's layers, as unsloth's dynamic quantizations mix them: layer 1 an IQ2_XXS up
-        // beside an IQ2_S gate over a Q2_0 down, layer 2 IQ3_XXS up and gate over an IQ4_NL down, 2560 x 640
-        { "layers_iq2_mixed_gate_q2_0_then_iq3_xxs_iq4_nl", GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, 2560, 640, 512,
-          { 0, 7, 64, 129, 200, 255, 256, 333, 400, 450, 501, 511 }, { 2, 65 }, GGML_TYPE_IQ2_S,
-          { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL } },
+        // beside an IQ2_S gate over a Q2_0 down, layer 2 IQ3_XXS up and gate over an IQ4_NL down (narrow: the model
+        // shapes above cover these kernels at 2560 x 640, and the q2 suite keeps to the hosted timeout)
+        { "layers_iq2_mixed_gate_q2_0_then_iq3_xxs_iq4_nl", GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0, 512, 256, 24, {}, { 2, 65 },
+          GGML_TYPE_IQ2_S, { GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ4_NL } },
         // layer 1 Q4_K up and gate over a Q6_K down whose expert is not whole pages (as DeepSeek-V4.1 Q4_K_M's),
         // layer 2 MXFP4 throughout (whose roles are not whole pages either)
         { "layers_q4_k_q6_k_then_mxfp4", GGML_TYPE_Q4_K, GGML_TYPE_Q6_K, 256, 256, 24, {}, { 2, 65 }, GGML_TYPE_COUNT,
@@ -4102,11 +4118,11 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
     const auto y1 = graph(1, x);
     const auto y2 = graph(2, y1);
     char error[512] = {};
-    // a slot for every expert of both layers (a role as a decode request reserves it: its bytes and a page prefix)
+    // a slot for every expert of both layers (each role's slot, role_read)
     uint64_t stride = 0;
     for (int role = 0; role < 3; ++role) {
         const auto * t = meta1.role[role];
-        stride += (ggml_row_size(t->type, t->ne[0]) * uint64_t(t->ne[1]) + 8190) / 4096 * 4096;
+        stride += role_read(ggml_row_size(t->type, t->ne[0]) * uint64_t(t->ne[1]));
     }
     stride = cache_slot_bytes(inputs, stride);
     auto make = [&]() {

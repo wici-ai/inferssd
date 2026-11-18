@@ -1906,10 +1906,10 @@ struct ssd_cpu_sink {
         if (!cache.arena) { vram.set_host_demand(host_demand()); }
         vram.reserve();
     }
-    // The RAM cache's arena and pages at load (sink_cache::reserve_at_load), each role as a decode request reserves
-    // it (its bytes and a page prefix, in whole pages), after the read ring the first decode charges before the cache
-    // sizes itself from the room left; experts_used prices the frequency nodes as the first decode layer does. A cache
-    // that cannot give room back takes neither here: the ring and the arena both wait for the first decode token.
+    // The RAM cache's arena and pages at load (sink_cache::reserve_at_load), each slot the layout's largest reads,
+    // after the read ring the first decode charges before the cache sizes itself from the room left; experts_used
+    // prices the frequency nodes as the first decode layer does. A cache that cannot give room back takes neither
+    // here: the ring and the arena both wait for the first decode token.
     void reserve_cache(int experts_used) {
         if (cache.layers.empty() || !cache.keep_across_requests || !cache.gives_room_back() || cache.arena) { return; }
         if (cache.stats.budget_bytes == sink_cache::auto_budget) { reserve_ring(true); }
