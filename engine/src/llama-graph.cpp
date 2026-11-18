@@ -2066,7 +2066,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const auto adapted = llama_ssd::validate_experts(requirements, inputs);
         if (!adapted.accepted()) {
             throw std::runtime_error("layer " + std::to_string(il) + ": " +
-                llama_ssd::describe_refusal(inputs, adapted.refusal));
+                llama_ssd::describe_refusal(adapted.refusal));
         }
         const auto & execution = adapted.execution;
 

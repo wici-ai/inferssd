@@ -1,7 +1,8 @@
 // The grouped prefill engine for any expert format (vram_group_compute_api, vram-compute-api.h). The matrix products
 // are the CUDA backend's (ggml_cuda_moe_stream_mm_*, its MUL_MAT kernels), normally linked into the backend like the decode
 // engine's matrix-vector products (q2-compute-adapter.cu). Per expert and chunk of at most `chunk` tokens:
-//   1. the chunk's input rows, gathered by row and quantized for the up/gate type (one operand for both);
+//   1. the chunk's input rows, gathered by row and quantized for the up type (one operand for up and gate, and a
+//      second one for a gate of another type);
 //   2. up and gate;
 //   3. the activation (SwiGLU, clamped or not, or SiTU);
 //   4. the hidden rows quantized for the down type;
@@ -99,9 +100,16 @@ __global__ void group_scatter(const float * down, int latent, const int32_t * ro
 struct group_engine {
     static constexpr int chunk = 256; // tokens of one expert per chain pass
     int device = -1, latent = 0, hidden = 0;
-    // every format the engine serves (up/gate type, down type), and the types of the layer begin_layer started
-    std::vector<std::pair<int, int>> formats;
-    int up_type = 0, down_type = 0;
+    // every format the engine serves (up, gate and down types), and the types of the layer begin_layer started
+    struct expert_types { int up, gate, down; };
+    std::vector<expert_types> formats;
+    // "up/down", or "up/gate/down" where gate's type is not up's
+    static std::string name(const expert_types & f) {
+        std::string s = ggml_type_name(ggml_type(f.up));
+        if (f.gate != f.up) { s += std::string("/") + ggml_type_name(ggml_type(f.gate)); }
+        return s + "/" + ggml_type_name(ggml_type(f.down));
+    }
+    int up_type = 0, gate_type = 0, down_type = 0;
     mm_destroy_fn mm_destroy = nullptr;
     mm_release_fn mm_release = nullptr;
     mm_reserve_fn mm_reserve = nullptr;
@@ -116,7 +124,8 @@ struct group_engine {
     char * scratch = nullptr;
     size_t scratch_bytes = 0;
     float * up = nullptr, * gate = nullptr, * act = nullptr, * down = nullptr, * norm = nullptr;
-    void * up_operand = nullptr, * down_operand = nullptr;
+    // gate_operand: the input quantized for a gate of another type than up's (the operand depends on the weight type)
+    void * up_operand = nullptr, * gate_operand = nullptr, * down_operand = nullptr;
     float * host_norm = nullptr;
     // per pass
     int rows_capacity = 0, routes_capacity = 0;
@@ -137,22 +146,25 @@ struct group_engine {
     cudaEvent_t begin_start = nullptr, begin_end = nullptr, finish_start = nullptr, finish_end = nullptr;
     uint64_t layer_h2d = 0;
 
-    group_engine(int device_, int latent_, int hidden_, int count, const int32_t * weight_types, const int32_t * down_types) :
+    group_engine(int device_, int latent_, int hidden_, int count, const int32_t * up_types, const int32_t * gate_types,
+            const int32_t * down_types) :
         device(device_), latent(latent_), hidden(hidden_) {
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || latent % 4 || hidden % 4) {
             throw std::runtime_error("unsupported grouped VRAM expert geometry");
         }
-        if (count < 1 || !weight_types || !down_types) {
+        if (count < 1 || !up_types || !gate_types || !down_types) {
             throw std::runtime_error("grouped VRAM engine formats");
         }
+        const auto valid = [](int32_t type) { return type >= 0 && type < GGML_TYPE_COUNT; };
         for (int f = 0; f < count; ++f) {
-            if (weight_types[f] < 0 || weight_types[f] >= GGML_TYPE_COUNT || down_types[f] < 0 || down_types[f] >= GGML_TYPE_COUNT) {
+            if (!valid(up_types[f]) || !valid(gate_types[f]) || !valid(down_types[f])) {
                 throw std::runtime_error("grouped VRAM engine formats");
             }
-            formats.push_back({ weight_types[f], down_types[f] });
+            formats.push_back({ up_types[f], gate_types[f], down_types[f] });
         }
-        up_type = formats[0].first;
-        down_type = formats[0].second;
+        up_type = formats[0].up;
+        gate_type = formats[0].gate;
+        down_type = formats[0].down;
         const auto supports = ggml_cuda_moe_stream_mm_supports;
         const auto create = ggml_cuda_moe_stream_mm_create;
         mm_destroy = ggml_cuda_moe_stream_mm_destroy;
@@ -168,11 +180,12 @@ struct group_engine {
                 throw std::runtime_error("CUDA grouped expert products are missing from the SSD executor");
             }
             for (const auto & f : formats) {
-                if (!supports(f.first) || !supports(f.second)) {
-                    throw std::runtime_error(std::string("grouped VRAM engine: no CUDA matrix product for ") +
-                        ggml_type_name(ggml_type(f.first)) + "/" + ggml_type_name(ggml_type(f.second)) + " experts");
+                if (!supports(f.up) || !supports(f.gate) || !supports(f.down)) {
+                    throw std::runtime_error(std::string("grouped VRAM engine: no CUDA matrix product for ") + name(f) +
+                        " experts");
                 }
-                if (latent % ggml_blck_size(ggml_type(f.first)) || hidden % ggml_blck_size(ggml_type(f.second))) {
+                if (latent % ggml_blck_size(ggml_type(f.up)) || latent % ggml_blck_size(ggml_type(f.gate)) ||
+                        hidden % ggml_blck_size(ggml_type(f.down))) {
                     throw std::runtime_error("grouped VRAM engine: expert rows are not whole blocks");
                 }
             }
@@ -203,21 +216,25 @@ struct group_engine {
         cuda_check(cudaFuncGetAttributes(&attributes, group_activate), "grouped activation kernel");
         cuda_check(cudaFuncGetAttributes(&attributes, group_scatter), "grouped scatter kernel");
         // up and gate: hidden rows of latent values; down: latent rows of hidden values. Every format's products (the
-        // reservations add up), and operands as large as the largest format's.
-        size_t up_operand_bytes = 0, down_operand_bytes = 0;
+        // reservations add up; a gate of up's type shares up's), and operands as large as the largest format's.
+        size_t up_operand_bytes = 0, gate_operand_bytes = 0, down_operand_bytes = 0;
         for (const auto & f : formats) {
-            if (!mm_reserve(mm_context, f.first, hidden, latent, chunk, stream) ||
-                    !mm_reserve(mm_context, f.second, latent, hidden, chunk, stream)) {
+            if (!mm_reserve(mm_context, f.up, hidden, latent, chunk, stream) ||
+                    (f.gate != f.up && !mm_reserve(mm_context, f.gate, hidden, latent, chunk, stream)) ||
+                    !mm_reserve(mm_context, f.down, latent, hidden, chunk, stream)) {
                 mm_release(mm_context);
                 throw std::runtime_error("CUDA grouped expert product reservation");
             }
-            up_operand_bytes = std::max(up_operand_bytes, mm_operand_bytes(mm_context, f.first, latent, chunk));
-            down_operand_bytes = std::max(down_operand_bytes, mm_operand_bytes(mm_context, f.second, hidden, chunk));
+            up_operand_bytes = std::max(up_operand_bytes, mm_operand_bytes(mm_context, f.up, latent, chunk));
+            if (f.gate != f.up) {
+                gate_operand_bytes = std::max(gate_operand_bytes, mm_operand_bytes(mm_context, f.gate, latent, chunk));
+            }
+            down_operand_bytes = std::max(down_operand_bytes, mm_operand_bytes(mm_context, f.down, hidden, chunk));
         }
         const size_t hidden_bytes = aligned(size_t(chunk) * hidden * sizeof(float));
         const size_t latent_bytes = aligned(size_t(chunk) * latent * sizeof(float));
         scratch_bytes = 3 * hidden_bytes + latent_bytes + aligned(size_t(latent) * sizeof(float)) +
-            aligned(up_operand_bytes) + aligned(down_operand_bytes);
+            aligned(up_operand_bytes) + aligned(gate_operand_bytes) + aligned(down_operand_bytes);
         const cudaError_t rc = ggml_cuda_malloc_reclaiming(reinterpret_cast<void **>(&scratch), scratch_bytes, device);
         if (rc != cudaSuccess) {
             (void) cudaGetLastError();
@@ -234,6 +251,7 @@ struct group_engine {
         down = reinterpret_cast<float *>(take(latent_bytes));
         norm = reinterpret_cast<float *>(take(aligned(size_t(latent) * sizeof(float))));
         up_operand = take(aligned(up_operand_bytes));
+        gate_operand = gate_operand_bytes ? take(aligned(gate_operand_bytes)) : nullptr;
         down_operand = take(aligned(down_operand_bytes));
         cuda_check(cudaMemsetAsync(scratch, 0, scratch_bytes, stream), "grouped scratch prefault");
         cuda_check(cudaStreamSynchronize(stream), "grouped scratch prefault drain");
@@ -286,7 +304,7 @@ struct group_engine {
         if (first) {
             std::string names;
             for (const auto & f : formats) {
-                names += std::string(names.empty() ? "" : ",") + ggml_type_name(ggml_type(f.first)) + "/" + ggml_type_name(ggml_type(f.second));
+                names += std::string(names.empty() ? "" : ",") + name(f);
             }
             std::fprintf(stderr, "[ssd_vram_group_engine] status=reserved format=%s latent=%d hidden=%d chunk=%d fixed_bytes=%zu\n",
                 names.c_str(), latent, hidden, chunk, fixed_bytes());
@@ -371,8 +389,9 @@ struct group_engine {
         cuda_check(cudaSetDevice(device), "cudaSetDevice");
         // the staging below may still feed a layer that was not finished
         cuda_check(cudaStreamSynchronize(stream), "grouped engine drain");
-        up_type = formats[size_t(format)].first;
-        down_type = formats[size_t(format)].second;
+        up_type = formats[size_t(format)].up;
+        gate_type = formats[size_t(format)].gate;
+        down_type = formats[size_t(format)].down;
         rows = rows_;
         groups = groups_;
         activation = *activation_;
@@ -427,9 +446,13 @@ struct group_engine {
         const auto & a = activation.base;
         for (int c = first[size_t(group)]; c < first[size_t(group) + 1]; c += chunk) {
             const int n = std::min(chunk, first[size_t(group) + 1] - c);
+            const bool own_gate = gate_type != up_type;
             if (!mm_quantize(mm_context, up_type, input, route_rows + c, latent, latent, n, up_operand, stream) ||
                     !mm(mm_context, up_type, w.up, hidden, latent, up_operand, n, up, stream) ||
-                    !mm(mm_context, up_type, w.gate, hidden, latent, up_operand, n, gate, stream)) {
+                    (own_gate && !mm_quantize(mm_context, gate_type, input, route_rows + c, latent, latent, n,
+                        gate_operand, stream)) ||
+                    !mm(mm_context, gate_type, w.gate, hidden, latent, own_gate ? gate_operand : up_operand, n, gate,
+                        stream)) {
                 throw std::runtime_error("grouped VRAM engine up/gate launch failed");
             }
             const int elements = n * hidden;
@@ -522,10 +545,10 @@ int fail(const std::exception & e, char * error, size_t error_size) {
     return 1;
 }
 
-void * create(int device, int latent, int hidden, int formats, const int32_t * weight_types, const int32_t * down_types,
-        char * error, size_t error_size) {
+void * create(int device, int latent, int hidden, int formats, const int32_t * up_types, const int32_t * gate_types,
+        const int32_t * down_types, char * error, size_t error_size) {
     try {
-        return new group_engine(device, latent, hidden, formats, weight_types, down_types);
+        return new group_engine(device, latent, hidden, formats, up_types, gate_types, down_types);
     } catch (const std::exception & e) {
         fail(e, error, error_size);
         return nullptr;
@@ -593,7 +616,7 @@ size_t host_bytes(void * context) { return context ? static_cast<group_engine *>
 
 extern "C" const vram_group_compute_api * ssd_vram_group_compute_get_api() {
     static const vram_group_compute_api api = {
-        3, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
+        4, sizeof(vram_group_compute_api), create, destroy, reserve, release, input_rows, begin_layer, compute,
         finish_layer, geometry, device_bytes, host_bytes
     };
     return &api;

@@ -53,7 +53,7 @@ void cuda(cudaError_t rc, const char * what) {
 
 const vram_group_compute_api * engine_api() {
     const auto * api = ssd_vram_group_compute_get_api();
-    require(api && api->version == 3 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
+    require(api && api->version == 4 && api->size == sizeof(vram_group_compute_api), "grouped engine API version");
     return api;
 }
 
@@ -62,8 +62,8 @@ struct engine_ptr {
     void * p = nullptr;
     engine_ptr(const vram_group_compute_api * a, int latent, int hidden, ggml_type up, ggml_type down) : api(a) {
         char error[512] = {};
-        const int32_t weight_type = up, down_type = down;
-        p = api->create(0, latent, hidden, 1, &weight_type, &down_type, error, sizeof(error));
+        const int32_t up_type = up, gate_type = up, down_type = down;
+        p = api->create(0, latent, hidden, 1, &up_type, &gate_type, &down_type, error, sizeof(error));
         require(p, std::string("grouped engine create: ") + error);
     }
     ~engine_ptr() { api->destroy(p); }
@@ -442,6 +442,13 @@ void run_numerics(fixture_inputs & inputs, size_t & checks, double & worst) {
     const case_activation situ = { SSD_VRAM_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f };
     const float eps = 1e-8f; // Muse's post_norm_epsilon
     const grouped_fixture fixtures[] = {
+        // Qwen3.8-Flash-Next's mixed expert formats and non-MMQ-aligned down rows.
+        { "qwen-q2", GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, 2560, 640, {
+            { "t1",               1, swiglu, false, eps,   false, false },
+            { "t33",             33, swiglu, false, eps,   false, false },
+            { "t300",           300, swiglu, false, eps,   false, false },
+            { "t33-split",       33, swiglu, false, eps,   true,  false },
+        } },
         // Muse Spark UD-Q4_K_XL's routed experts at a reduced shape
         { "muse", GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 512, 512, {
             { "t1",               1, swiglu, false, eps,   false, false },
@@ -487,11 +494,16 @@ void run_numerics(fixture_inputs & inputs, size_t & checks, double & worst) {
 // make the GPU cheap move transients; the CPU still computes the experts the planner leaves it. mixed_layers: layer 1's
 // down is Q4_K and layer 2's Q5_K (Muse Q4_K_S), declared to the tier at load, both layers' residents in its one pool
 // and each pass over both layers on the one engine.
-void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, bool mixed_layers = false) {
+void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, bool mixed_layers = false, bool qwen_q2 = false) {
     fixture f;
     f.type = GGML_TYPE_Q4_K; f.down_type = GGML_TYPE_Q5_K;
     if (mixed_layers) { f.layer_down_types[1] = GGML_TYPE_Q4_K; }
     f.latent = 512; f.hidden = 512; f.experts = 16;
+    if (qwen_q2) {
+        f.type = GGML_TYPE_IQ3_XXS; f.down_type = GGML_TYPE_Q2_0;
+        f.latent = 2560; f.hidden = 640;
+        if (mixed_layers) { f.layer_down_types[1] = GGML_TYPE_IQ4_NL; }
+    }
     make_synthetic(f, 20261023);
     inputs.set("vram_budget", "0");
     inputs.set("vram_prefill", "0");
@@ -966,6 +978,7 @@ int main(int argc, char ** argv) {
         run_numerics(inputs, checks, worst);
         run_tier_lane(inputs, checks, lane_worst);
         run_tier_lane(inputs, checks, lane_worst, true);
+        run_tier_lane(inputs, checks, lane_worst, true, true);
         run_reserve_reclaim(checks);
         std::printf("SSD_VRAM_GROUP_PASS checks=%zu worst_token_nmse_against_exact=%.3g lane_against_cpu=%.3g\n", checks,
             worst, lane_worst);

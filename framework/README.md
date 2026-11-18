@@ -111,8 +111,8 @@ and zero values retain distinct behavior, including failures when consumed.
 Source header reads retain the original mmap lifetime and decoding: metadata
 strings use replacement decoding, while textual artifacts and pack tensor names
 use strict decoding. Split-model discovery uses the original sorted glob and does
-not newly reject missing shards. Type 42 (`F8_E4M3_B128`) remains recognized as
-historical header metadata; this does not claim native execution support.
+not newly reject missing shards. Type 42 is ggml's Q2_0; the owned F8 block
+format that once used it was removed from the engine.
 
 `experts.index` retains mtime-based reuse, including the original set iteration over
 source paths. Recorded filesystem transcripts use `PYTHONHASHSEED=0` as a test

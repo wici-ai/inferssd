@@ -202,7 +202,7 @@ int main() {
     std::vector<ssd_vram_request> requests(experts);
     std::vector<int> slots(experts, 7);
     const int32_t layers[] = { 0 };
-    const ssd_vram_expert_format format = { latent, hidden, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, experts, 1, layers };
+    const ssd_vram_expert_format format = { latent, hidden, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, experts, 1, layers };
     if (provider->prefill->prepare(lane, requests.data(), experts, &format, slots.data(), error, sizeof(error))) { fail(error); }
     for (int slot : slots) { if (slot != -1) { fail("the lane holds nothing across layers"); } }
     ssd_vram_prefill_lane info = {};
@@ -364,8 +364,8 @@ int main() {
         options = { { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f }, nullptr, 0.0f, 1 };
         // the sink's order for one layer: the pass reserved, the layer prepared, its lane read; true: the lane takes it
         const auto prepare_layer = [&](int layer) {
-            const ssd_vram_expert_format declared = { latent, hidden, up_types[layer], down_types[layer], experts, 3,
-                layer_ids, up_types, down_types };
+            const ssd_vram_expert_format declared = { latent, hidden, up_types[layer], up_types[layer], down_types[layer],
+                experts, 3, layer_ids, up_types, up_types, down_types };
             if (provider->elastic->reserve_accumulate(mixed, tokens, error, sizeof(error))) { fail(error); }
             if (provider->prefill->prepare(mixed, requests.data(), experts, &declared, slots.data(), error, sizeof(error))) { fail(error); }
             ssd_vram_prefill_lane layer_lane = {};
@@ -392,8 +392,8 @@ int main() {
         // An earlier layer taught the lane the declared formats, as the sink's first layer does: the first layer's pass
         // is reserved before any format is known, and stays on the CPU.
         {
-            const ssd_vram_expert_format first = { latent, hidden, up_types[1], down_types[1], experts, 3, layer_ids,
-                up_types, down_types };
+            const ssd_vram_expert_format first = { latent, hidden, up_types[1], up_types[1], down_types[1], experts, 3,
+                layer_ids, up_types, up_types, down_types };
             if (provider->prefill->prepare(mixed, requests.data(), experts, &first, slots.data(), error, sizeof(error))) { fail(error); }
         }
         if (prepare_layer(0) != (refused == GGML_TYPE_COUNT)) { fail("the lane took a layer of a type the device refuses"); }

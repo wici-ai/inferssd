@@ -100,6 +100,8 @@ def test_complete_valid_rows_summary_and_original_five_columns(tmp_path, experts
         (14, 256, 210, "Q6_K"),
         (30, 32, 64, "BF16"),
         (39, 32, 17, "MXFP4"),
+        (42, 64, 18, "Q2_0"),
+        (42, 640, 180, "Q2_0"),
     ],
 )
 def test_native_tensor_sizes(tmp_path, type_id, inner, expected_bytes, type_name):
@@ -207,7 +209,7 @@ def test_short_reads_are_completed_or_rejected_without_zero_fill():
 @pytest.mark.parametrize(
     "tensors,message",
     [
-        ([(EXPERT, (32, 2, 256), 42, 0)], "unsupported native ggml type 42"),
+        ([(EXPERT, (64, 2, 256), 44, 0)], "unsupported native ggml type 44"),
         ([("dense", (32,), 999, 0)], "unsupported native ggml type 999"),
         ([("dense", (), 0, 0)], "invalid dimension count"),
         ([("dense", (1, 1, 1, 1, 1), 0, 0)], "invalid dimension count"),
@@ -431,14 +433,21 @@ def test_all_native_tensor_names_are_byte_bounded_before_reading(tmp_path, monke
     assert m.read_header(path).tensors[0].name == "d" * 127
 
 
-def test_legacy_type42_observation_remains_separate_from_native_admission(tmp_path):
+def test_type42_metadata_and_native_geometry_agree(tmp_path):
     from inferssd.source import header
+    from inferssd.strategy.inputs import Role
 
     path = tmp_path / "model.gguf"
-    fixture(path, tensors=[("dense", (128, 1, 256), 42, 0)])
-    assert header.read(str(path)).tensors[0].type == 42
-    with pytest.raises(ValueError, match="unsupported native ggml type 42"):
-        m.read_header(path)
+    fixture(
+        path,
+        tensors=[("blk.8.ffn_down_exps.weight", (640, 2560, 512), 42, 0)],
+        payload=180 * 2560 * 512,
+    )
+    tensor = header.read(str(path)).tensors[0]
+    assert tensor.type_name == "Q2_0"
+    assert tensor.nbytes == 180 * 2560 * 512
+    assert m.read_header(path).tensors[0].nbytes == tensor.nbytes
+    assert Role("down", (("Q2_0", 1),), 2560, 640).slice_bytes() == 460800
 
 
 def test_path_controls_missing_empty_and_alignment(tmp_path):
@@ -565,3 +574,94 @@ def test_launch_retains_temporary_staging_and_ordered_atomic_failure_boundary(tm
     # Preserve the existing per-file atomic boundary, including a complete new
     # alias after failure of the second publication; no engine may launch then.
     assert len(list(cache.glob("*.tsv"))) == int(failure == "second-publish")
+
+
+def test_q2_0_four_shards_preserve_expert_byte_ranges(tmp_path):
+    paths = [tmp_path / f"model-{i:05d}-of-00004.gguf" for i in range(1, 5)]
+    offsets = []
+    for shard, path in enumerate(paths):
+        tensors = (
+            []
+            if shard == 0
+            else [(f"blk.{(8, 10, 13)[shard - 1]}.ffn_down_exps.weight", (640, 4, 8), 42, 0)]
+        )
+        _, data = fixture(
+            path,
+            tensors=tensors,
+            payload=0 if shard == 0 else 5760,
+            kv=[("split.no", 2, shard), ("split.count", 2, 4), ("split.tensors.count", 5, 3)],
+        )
+        offsets.append(data)
+    rows, summary = m.build_rows(paths, {"down"}, 8)
+    assert len(rows) == 24
+    for row in rows:
+        shard = {8: 1, 10: 2, 13: 3}[row["layer"]]
+        expert = row["expert_idx"]
+        assert row["source_path"] == str(paths[shard])
+        assert row["shard_index"] == shard and row["expert_idx"] == expert
+        assert row["nbytes"] == 720 and row["type"] == "Q2_0"
+        assert row["offset"] == offsets[shard] + expert * 720
+        assert row["aligned"] == int(row["offset"] % 4096 == 0)
+    assert summary["total_payload_bytes"] == 17280
+    assert summary["by_type"] == {"Q2_0": {"tensors": 3, "entries": 24, "bytes": 17280}}
+
+
+@pytest.mark.parametrize(
+    "columns,payload,offset,message",
+    [
+        (32, 180, 0, "quantized row size"),
+        (639, 180, 0, "quantized row size"),
+        (640, 179, 0, "payload range exceeds"),
+        (640, 212, 32, "expected native ordered offset"),
+    ],
+)
+def test_q2_0_rejects_invalid_rows_and_ranges(tmp_path, columns, payload, offset, message):
+    path = tmp_path / "bad.gguf"
+    fixture(path, tensors=[("dense", (columns,), 42, offset)], payload=payload)
+    with pytest.raises(ValueError, match=message):
+        m.read_header(path)
+
+
+def test_old_f8_extent_is_not_used_for_native_q2_0(tmp_path):
+    path = tmp_path / "old.gguf"
+    # Old F8's 129 bytes round up to offset 160; two Q2_0 blocks occupy 36 bytes.
+    fixture(path, tensors=[("dense", (128,), 42, 0), ("after", (1,), 0, 160)])
+    with pytest.raises(ValueError, match="expected native ordered offset 64"):
+        m.read_header(path)
+
+
+@pytest.mark.parametrize("nextn", [False, True])
+def test_native_launch_facts_for_mixed_q2_0_experts(tmp_path, nextn):
+    from inferssd.launch.recorded import RecordedArtifacts
+    from inferssd.launch.types import Fact, LaunchInput
+    from inferssd.strategy.inputs import model_facts, model_facts_from, model_facts_json
+
+    path = tmp_path / "mixed.gguf"
+    # IQ3_XXS: 98 bytes per 256 weights. Q2_0 down: 18 bytes per 64 weights.
+    up_bytes, down_bytes = 980 * 640 * 4, 180 * 2560 * 4
+    tensors = [
+        ("blk.8.ffn_gate_exps.weight", (2560, 640, 4), 18, 0),
+        ("blk.8.ffn_up_exps.weight", (2560, 640, 4), 18, up_bytes),
+        ("blk.8.ffn_down_exps.weight", (640, 2560, 4), 42, 2 * up_bytes),
+    ]
+    payload = 2 * up_bytes + down_bytes
+    kv = [("general.architecture", 8, "qwen4exp"), ("qwen4exp.expert_used_count", 4, 2)]
+    if nextn:
+        tensors.append(("blk.9.ffn_down_exps.weight", (640, 2560, 4), 42, payload))
+        payload += down_bytes
+        kv.extend([("qwen4exp.block_count", 4, 10), ("qwen4exp.nextn_predict_layers", 4, 1)])
+    fixture(path, tensors=tensors, payload=payload, kv=kv)
+    facts = model_facts(str(path))
+    assert facts.layers == 1
+    assert facts.down.format == "Q2_0" and facts.up.format == facts.gate.format == "IQ3_XXS"
+    assert facts.down.slice_bytes() == 460800
+    assert facts.expert_bytes == (2 * up_bytes + down_bytes) // 4
+    assert model_facts_from(model_facts_json(facts)) == facts
+    adapter = RecordedArtifacts(LaunchInput("", ()), {}, run=None, replace=None, python="")
+    assert adapter(Fact("model_facts", (str(path),))).value == model_facts_json(facts)
+    rows, summary = m.build_rows([path], {"up", "gate", "down"}, 4)
+    assert len(rows) == 12 and summary["total_payload_bytes"] == 2 * up_bytes + down_bytes
+    stale = model_facts_json(facts)
+    stale["roles"]["down"]["formats"] = [["F8_E4M3_B128", 1]]
+    with pytest.raises(ValueError):
+        model_facts_from(stale)

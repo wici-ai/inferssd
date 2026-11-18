@@ -80,7 +80,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         return host + size_t(expert) * stride + (role >= 1 ? up : 0) + (role == 2 ? up : 0);
     };
     const int32_t layers[1] = { 1 };
-    const ssd_vram_expert_format format = { latent, hidden, int(type), int(type), n_experts, 1, layers };
+    const ssd_vram_expert_format format = { latent, hidden, int(type), int(type), int(type), n_experts, 1, layers };
     const ssd_vram_activation act = { SSD_VRAM_ACTIVATION_SWIGLU_CLAMP, 0, 0, 7.0f };
     std::vector<float> input(latent);
     for (int i = 0; i < latent; ++i) { input[size_t(i)] = std::sin(0.37f * float(i)); }

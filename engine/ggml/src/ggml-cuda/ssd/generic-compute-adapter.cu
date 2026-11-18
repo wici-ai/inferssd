@@ -54,8 +54,12 @@ struct generic_engine {
     int hidden = 0;
     int max_hits = 0;
     int up_type = GGML_TYPE_COUNT;
+    int gate_type = GGML_TYPE_COUNT;
     int down_type_ = GGML_TYPE_COUNT;
     size_t up_stride = 0;
+    // A gate of another type than up's is quantized for on its own (the Q8_1 input depends on the weight type), into
+    // device_q8 after up's operand.
+    bool gate_operand = false;
     size_t q8_bytes = 0;
     cudaStream_t stream = nullptr;
     // A call's input row is staged at its first row: calls in flight at once do not share it.
@@ -63,7 +67,7 @@ struct generic_engine {
     float * device_up_gate = nullptr;
     float * device_hidden = nullptr;
     float * device_down = nullptr;
-    void * device_q8 = nullptr; // the operand of the products being queued: the stream runs one call after another
+    void * device_q8 = nullptr; // the operands of the products being queued: the stream runs one call after another
     float * host_input = nullptr;
     float * host_down = nullptr;
     uint64_t calls = 0;
@@ -72,29 +76,31 @@ struct generic_engine {
     bool poisoned = false;
     bool closed = false;
 
-    generic_engine(int device_, int latent_, int hidden_, int max_hits_, int weight_type, int down_type) :
+    generic_engine(int device_, int latent_, int hidden_, int max_hits_, int up_type_, int gate_type_, int down_type) :
         device(device_), latent(latent_), hidden(hidden_), max_hits(max_hits_) {
-        if (weight_type == GGML_TYPE_IQ2_XXS && down_type == GGML_TYPE_Q2_K) {
+        if (up_type_ == GGML_TYPE_IQ2_XXS && down_type == GGML_TYPE_Q2_K) {
             throw std::runtime_error("IQ2_XXS/Q2_K expert format is retired");
         }
-        const bool floating = is_float(weight_type) && is_float(down_type);
+        const bool floating = is_float(up_type_) && is_float(gate_type_) && is_float(down_type);
         // A row is whole blocks of its format (up and gate rows span the latent, down rows the hidden), as in a
         // GGUF tensor and ggml's mul_mat_vec_q; the Q8_1 input is padded to MATRIX_ROW_PADDING (q8_1_bytes).
         auto whole_blocks = [](int columns, int type) {
             return type >= 0 && type < GGML_TYPE_COUNT && columns % ggml_blck_size(ggml_type(type)) == 0;
         };
         if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || max_hits < 1 || max_hits > 16 ||
-                !whole_blocks(latent, weight_type) || !whole_blocks(hidden, down_type)) {
+                !whole_blocks(latent, up_type_) || !whole_blocks(latent, gate_type_) || !whole_blocks(hidden, down_type)) {
             throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
         const auto supports = ggml_cuda_moe_stream_mmvq_supports;
-        if (!supports(weight_type) || !supports(down_type)) {
+        if (!supports(up_type_) || !supports(gate_type_) || !supports(down_type)) {
             throw std::runtime_error(std::string("GPU expert layer: no CUDA matrix-vector kernel for ") +
-                ggml_type_name(ggml_type(weight_type)) + "/" + ggml_type_name(ggml_type(down_type)) + " experts");
+                ggml_type_name(ggml_type(up_type_)) + "/" + ggml_type_name(ggml_type(gate_type_)) + "/" +
+                ggml_type_name(ggml_type(down_type)) + " experts");
         }
-        up_type = weight_type; down_type_ = down_type;
+        up_type = up_type_; gate_type = gate_type_; down_type_ = down_type;
         up_stride = ggml_row_size(ggml_type(up_type), latent);
-        q8_bytes = std::max(is_float(up_type) ? 0 : q8_1_bytes(latent),
+        gate_operand = gate_type != up_type && !is_float(gate_type);
+        q8_bytes = std::max((is_float(up_type) ? 0 : q8_1_bytes(latent)) + (gate_operand ? q8_1_bytes(latent) : 0),
             is_float(down_type_) ? 0 : size_t(max_hits) * q8_1_bytes(hidden));
         try {
             cuda_check(cudaSetDevice(device), "cudaSetDevice");
@@ -110,9 +116,11 @@ struct generic_engine {
             close();
             throw;
         }
+        const std::string gate_name = gate_type == up_type ? "" : std::string("/") + ggml_type_name(ggml_type(gate_type));
         std::fprintf(stderr,
-            "[ssd_vram_bridge] format=%s/%s latent=%d hidden=%d input=f32 hidden_quantizer=%s bitwise=0\n",
-            ggml_type_name(ggml_type(up_type)), ggml_type_name(ggml_type(down_type_)), latent, hidden, floating ? "none_f32" : "cuda_q8_1");
+            "[ssd_vram_bridge] format=%s%s/%s latent=%d hidden=%d input=f32 hidden_quantizer=%s bitwise=0\n",
+            ggml_type_name(ggml_type(up_type)), gate_name.c_str(), ggml_type_name(ggml_type(down_type_)), latent, hidden,
+            floating ? "none_f32" : "cuda_q8_1");
     }
 
     void close() noexcept {
@@ -185,13 +193,14 @@ struct generic_engine {
     }
 
     // The operand of products of `type` weights against n rows of `columns` floats, one after another: the rows
-    // themselves for floating weights, else the rows quantized to Q8_1 into device_q8.
-    const void * operand(int type, const float * rows, int columns, int n) {
+    // themselves for floating weights, else the rows quantized to Q8_1 into device_q8 (at byte `offset`).
+    const void * operand(int type, const float * rows, int columns, int n, size_t offset = 0) {
         if (is_float(type)) { return rows; }
-        if (!ggml_cuda_moe_stream_mmvq_quantize_dev(type, rows, columns, n, device_q8, stream)) {
+        void * q8 = static_cast<char *>(device_q8) + offset;
+        if (!ggml_cuda_moe_stream_mmvq_quantize_dev(type, rows, columns, n, q8, stream)) {
             throw std::runtime_error("VRAM expert operand quantize launch failed");
         }
-        return device_q8;
+        return q8;
     }
 
     // dst (rows floats) = weights (rows of `columns` values of `type`) times row k of an operand.
@@ -206,10 +215,10 @@ struct generic_engine {
     }
 
     // Queues a call on the stream over rows [first, first + count): its input; each expert's up and gate against the
-    // input, quantized once, in one product where gate follows up (as in a tier slot); the activation; each expert's
-    // down against its row, the rows quantized at once; and its down rows' copy into host_down. Every output row is
-    // what the matrix-vector kernel gives that row alone: one product over more rows, or one quantization for more
-    // products, changes no bit.
+    // input, quantized once for up and once more for a gate of another type, in one product where gate follows up (as
+    // in a tier slot) and is of up's type; the activation; each expert's down against its row, the rows quantized at
+    // once; and its down rows' copy into host_down. Every output row is what the matrix-vector kernel gives that row
+    // alone: one product over more rows, or one quantization for more products, changes no bit.
     void enqueue(const vram_compute_expert * experts, int count, int first, const void * input, size_t input_bytes,
             const ssd_vram_activation & activation) {
         float * staged = host_input + size_t(first) * latent;
@@ -218,14 +227,16 @@ struct generic_engine {
         cuda_check(cudaSetDevice(device), "cudaSetDevice");
         cuda_check(cudaMemcpyAsync(row_input, staged, input_bytes, cudaMemcpyHostToDevice, stream), "generic input H2D");
         const void * x = operand(up_type, row_input, latent, 1);
+        const void * xg = !gate_operand ? (is_float(gate_type) == is_float(up_type) ? x : row_input) :
+            operand(gate_type, row_input, latent, 1, is_float(up_type) ? 0 : q8_1_bytes(latent));
         for (int i = 0; i < count; ++i) {
             const auto & e = experts[i];
             float * up_gate = device_up_gate + size_t(2 * (first + i)) * hidden;
-            if (e.gate == static_cast<const char *>(e.up) + size_t(hidden) * up_stride) {
+            if (gate_type == up_type && e.gate == static_cast<const char *>(e.up) + size_t(hidden) * up_stride) {
                 product(up_type, e.up, 2 * hidden, latent, x, 0, up_gate);
             } else {
                 product(up_type, e.up, hidden, latent, x, 0, up_gate);
-                product(up_type, e.gate, hidden, latent, x, 0, up_gate + hidden);
+                product(gate_type, e.gate, hidden, latent, xg, 0, up_gate + hidden);
             }
         }
         const int rows = count * hidden;
@@ -266,10 +277,10 @@ struct generic_engine {
     }
 };
 
-void * create(int device, int latent, int hidden, int max_hits, int weight_type, int down_type,
+void * create(int device, int latent, int hidden, int max_hits, int up_type, int gate_type, int down_type,
         char * error, size_t error_size) {
     try {
-        return new generic_engine(device, latent, hidden, max_hits, weight_type, down_type);
+        return new generic_engine(device, latent, hidden, max_hits, up_type, gate_type, down_type);
     } catch (const std::exception & e) {
         if (error && error_size) { std::snprintf(error, error_size, "%s", e.what()); }
         return nullptr;
@@ -341,7 +352,7 @@ size_t host_bytes(void * context) {
 
 extern "C" const vram_format_compute_api * ssd_vram_generic_format_compute_get_api() {
     static const vram_format_compute_api api = {
-        4, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes, launch, host_rows
+        5, sizeof(vram_format_compute_api), create, destroy, compute, device_bytes, host_bytes, launch, host_rows
     };
     return &api;
 }

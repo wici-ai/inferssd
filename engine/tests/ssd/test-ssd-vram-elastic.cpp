@@ -287,7 +287,7 @@ int main() {
         ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
         const int32_t layers[] = {1,2};
-        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
+        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
         for (bool settle : {true, false}) {
             tier t(tier::automatic_budget, inputs.tier_policy());
             t.reserve(r,f);
@@ -394,7 +394,7 @@ int main() {
         ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
         const int32_t layers[] = {1,2};
-        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
+        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
         {
             tier t(10*3*mx, inputs.tier_policy());
             t.reserve(r,f);
@@ -438,7 +438,7 @@ int main() {
         // skipped.
         if (unified) {
             const int32_t three[] = {1,2,3};
-            const ssd_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
+            const ssd_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
             inputs.set("tier.max_slots", "16");
             tier q(10*3*mx, inputs.tier_policy());
             inputs.set("tier.max_slots", "53");

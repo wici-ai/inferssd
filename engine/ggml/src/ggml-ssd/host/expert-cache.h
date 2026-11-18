@@ -134,8 +134,8 @@ struct expert_cache {
     };
     struct layer {
         int32_t id;
-        // its experts' ggml types (up and gate, down), recorded at load from every routed layer's tensors; -1 before
-        int32_t up_type = -1, down_type = -1;
+        // its experts' ggml types (up, gate, down), recorded at load from every routed layer's tensors; -1 before
+        int32_t up_type = -1, gate_type = -1, down_type = -1;
         size_t begin = 0, count = 0;
         uint64_t token = 0;
         bool seen = false;

@@ -21,7 +21,11 @@ source tree.
    The bundled engine is based on llama.cpp revision
    f42e29fdf199481effd31f281bf095ec6067757b (upstream build b8961,
    2026-04-28). Muse Spark model support is ported from upstream revision
-   ba3c05f71d. Copyright (c) 2023-2026 The ggml authors. MIT (engine/LICENSE).
+   ba3c05f71d. Q2_0 CPU format support is ported from upstream revision
+   9581154 (group-64 layout, including x86 and ARM dot products). Q2_0 CUDA
+   support is ported from upstream revision 9b2a088, adapted to
+   the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
+   The ggml authors. MIT (engine/LICENSE).
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp

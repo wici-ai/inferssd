@@ -6,14 +6,16 @@
 #include "gpu-runtime.h"
 struct vram_compute_expert { const void * up; const void * gate; const void * down; };
 // Decode engine of the tier (generic-compute-adapter.cu): an f32 input row, up and gate, the activation and down over
-// up to max_hits experts of one format on the CUDA backend's matrix-vector kernels; returns unweighted down rows.
+// up to max_hits experts of one format (up, gate and down types; gate's may differ from up's) on the CUDA backend's
+// matrix-vector kernels; returns unweighted down rows.
 // compute runs a call and waits for it (grouped prefill's one-token passes, on the tier's worker). launch queues one
 // on the engine's stream and returns (a decode layer's, on the sink's thread): its experts take the engine's rows
 // [first, first + hits), which no other call in flight shares; the stream waits for `ready` first (null: no wait),
 // records `start` and `end` around the call, and its down rows are in host_rows() once `end` has completed.
 struct vram_format_compute_api {
-    uint32_t version, size; // 4
-    void * (*create)(int device, int latent, int hidden, int max_hits, int weight_type, int down_type, char *, size_t);
+    uint32_t version, size; // 5
+    void * (*create)(int device, int latent, int hidden, int max_hits, int up_type, int gate_type, int down_type, char *,
+                     size_t);
     void (*destroy)(void *);
     int (*compute)(void *, const vram_compute_expert *, int hits, const void * input, size_t input_bytes,
                    const ssd_vram_activation * activation, float * host_down, char * error, size_t error_size);
@@ -61,11 +63,11 @@ struct vram_group_layer_stats {
                                 // whatever the stream waited for between them: the copies they were ready after)
 };
 struct vram_group_compute_api {
-    uint32_t version, size;   // 3
-    // An engine for `formats` expert formats of one geometry: format f has up and gate of weight_types[f] and down of
-    // down_types[f]. A reserve covers every one of them; each layer names its format at begin_layer.
-    void * (*create)(int device, int latent, int hidden, int formats, const int32_t * weight_types,
-                     const int32_t * down_types, char * error, size_t error_size);
+    uint32_t version, size;   // 4
+    // An engine for `formats` expert formats of one geometry: format f has up of up_types[f], gate of gate_types[f]
+    // and down of down_types[f]. A reserve covers every one of them; each layer names its format at begin_layer.
+    void * (*create)(int device, int latent, int hidden, int formats, const int32_t * up_types,
+                     const int32_t * gate_types, const int32_t * down_types, char * error, size_t error_size);
     void (*destroy)(void *);
     // Buffers for passes of up to `rows` input rows and `routes` routes a layer (device and page-locked host memory,
     // the products' own reservations). Grows only; release frees all of it. A pass reserves once, before its first

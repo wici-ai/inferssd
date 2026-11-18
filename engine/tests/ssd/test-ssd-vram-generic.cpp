@@ -41,10 +41,12 @@ void set_switch(fixture_inputs & inputs, const char * name, bool enabled) {
 }
 
 // layer1_down: layer 1's down type where it differs from layer 2's (Muse Q4_K_S), declared to the tier at load.
+// native_ranges: roles named by their unrounded payload bytes, as the sink names a GGUF file's tensors.
 void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mode selected, size_t & checks,
         double & worst_rel, double & worst_abs,
-        ggml_type up_type, ggml_type down_type, ggml_type layer1_down = GGML_TYPE_COUNT) {
+        ggml_type up_type, ggml_type down_type, ggml_type layer1_down = GGML_TYPE_COUNT, bool native_ranges = false) {
     fixture f;
+    f.native_ranges = native_ranges;
     f.type = up_type;
     f.down_type = down_type;
     if (layer1_down != GGML_TYPE_COUNT) { f.layer_down_types[1] = layer1_down; }
@@ -164,9 +166,17 @@ int main() {
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
         // Qwen3.8-Flash-Next: a hidden of 640, whole Q8_0 blocks but not whole K-quant super-blocks.
         run_shape(inputs, 2560, 640, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
+        // Its i1-IQ4_XS experts: up and gate roles of 870,400 bytes end mid-page, and down is IQ4_NL (a 640-wide
+        // row is not whole IQ4_XS super-blocks).
+        run_shape(inputs, 2560, 640, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_IQ4_XS,
+            GGML_TYPE_IQ4_NL, GGML_TYPE_COUNT, true);
         run_shape(inputs, 512, 256, 8, {true, "production-mixed-layers"}, checks, worst_rel, worst_abs, GGML_TYPE_Q4_K,
             GGML_TYPE_Q5_K, GGML_TYPE_Q4_K);
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_MXFP4, GGML_TYPE_MXFP4);
+        run_shape(inputs, 2560, 640, 8, {true, "production-generic"}, checks, worst_rel, worst_abs,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0);
+        run_shape(inputs, 2560, 640, 8, {true, "production-mixed-layers"}, checks, worst_rel, worst_abs,
+            GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL);
         run_host_jobs(inputs, GGML_TYPE_Q8_0, checks);
         run_host_jobs(inputs, GGML_TYPE_MXFP4, checks);
         std::printf("REAL_GPU_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",

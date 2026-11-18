@@ -48,7 +48,8 @@ size_t slot_offset(int layer, int role) {
 }
 size_t expert_bytes(int layer) { return slot_offset(layer, 3); }
 ssd_vram_expert_format declared(int layer) {
-    return { latent, hidden, up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types, down_types };
+    return { latent, hidden, up_types[layer - 1], up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types,
+        up_types, down_types };
 }
 // The request the sink builds: each role by its payload, at its own offset of one file.
 ssd_vram_request key(int layer, int expert) {

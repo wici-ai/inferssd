@@ -45,6 +45,32 @@ fetches the model that `test-thread-safety` and `test-state-restore-fragmented` 
 compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
 needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
 
+## Q2_0 support
+
+`test-q2_0` checks the upstream type-42 group-64 layout (18 bytes per block),
+all packed byte values, independent decoded dot products, 640-column rows and
+invalid scales. It runs in hosted CI. The `ssd_cpu_sink_swiglu_q2` and
+`ssd_cpu_sink_swiglu_q2_ordinary` tests include mixed
+IQ3_XXS up/gate and Q2_0 down experts at 2560/640 geometry, compared bit for bit
+with a resident ggml graph for decode and grouped prefill. `ssd_source_index`
+checks the corresponding unaligned 180-byte expert aliases and direct reads.
+The Python alias tests cover four shards, exact ranges and malformed inputs.
+
+CUDA supports Q2_0 conversion, row gathering, matrix-vector and matrix-matrix
+products, including the SSD expert tier. On an owned GPU, run
+`test-ssd-vram-mm`, `test-ssd-vram-generic` and `test-ssd-vram-group`.
+These check literal packed codes (including the fourth level), GPU products
+against CPU and independent reference products, mixed IQ3_XXS/Q2_0 experts
+at 2560/640 geometry, resident cache hits, grouped prefill and layer format
+changes. Rows of 640 values use GPU matrix-vector or dequantization plus
+cuBLAS products because they do not fill the integer matrix kernel's tile.
+`test-backend-ops test -b CUDA0 -p q2_0` checks the standard backend operations.
+
+Synthetic tests do not establish full-model generation correctness: run a model
+with Q2_0 experts at the normal VRAM budget and check GPU expert activity and
+long-prompt prefill; `--set vram.budget=0` keeps every expert on the CPU for
+comparison.
+
 ## Shared expert store
 
 `LLAMA_SSD_STORE` is on by default on Linux, macOS and Windows. The store is a
