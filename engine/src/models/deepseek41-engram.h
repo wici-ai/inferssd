@@ -35,18 +35,6 @@ static inline void llama_dsv41_ple_hash(
     }
 }
 
-// The PLE checkpoint stores the product of the original query/key norm
-// scales. Normalize each HC stream separately, then apply that product once.
-static inline ggml_tensor * llama_dsv41_ple_dot(
-        ggml_context * ctx, ggml_tensor * query, ggml_tensor * key,
-        ggml_tensor * scale, float epsilon) {
-    // Keep the established shared-table graph's multiplication order: moving
-    // the scale after the query/key product changes F32 rounding.
-    ggml_tensor * weighted_query = ggml_mul(ctx, ggml_rms_norm(ctx, query, epsilon), scale);
-    ggml_tensor * product = ggml_mul(ctx, ggml_rms_norm(ctx, key, epsilon), weighted_query);
-    return ggml_scale(ctx, ggml_sum_rows(ctx, product), 1.0f / std::sqrt(float(query->ne[0])));
-}
-
 static inline ggml_tensor * llama_dsv41_ple_gate(ggml_context * ctx, ggml_tensor * dot) {
     ggml_tensor * magnitude = ggml_sqrt(ctx, ggml_clamp(ctx, ggml_abs(ctx, dot), 1e-6f, INFINITY));
     // STEP is strict > 0: the zero dot uses the positive branch, as copysign.

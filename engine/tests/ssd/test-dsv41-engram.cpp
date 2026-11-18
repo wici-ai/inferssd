@@ -6,7 +6,6 @@
 #include "models/deepseek41-engram.h"
 
 #include <algorithm>
-
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -258,52 +257,23 @@ static void ple_hash_test() {
     }
 }
 
-static void ple_fused_gate_test() {
-    constexpr int width = 8, copies = 2, tokens = 3;
-    constexpr float eps = 1e-6f;
-    ggml_context * ctx = ggml_init({2 * 1024 * 1024, nullptr, false});
+static void ple_gate_test() {
+    const std::array<float, 9> dots = {-4.0f, -1.0f, -1e-6f, -1e-8f, 0.0f, 1e-8f, 1e-6f, 1.0f, 4.0f};
+    ggml_context * ctx = ggml_init({1024 * 1024, nullptr, false});
     require(ctx != nullptr, "PLE test context allocation failed");
-    ggml_tensor * query = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, copies, tokens);
-    ggml_tensor * key = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, width, copies, tokens);
-    ggml_tensor * scale = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, copies);
-    auto * q = static_cast<float *>(query->data);
-    auto * k = static_cast<float *>(key->data);
-    auto * w = static_cast<float *>(scale->data);
-    float q_scale[width * copies], k_scale[width * copies];
-    for (int j = 0; j < width * copies; ++j) {
-        q_scale[j] = float(j % 5 - 2) / 3.0f;
-        k_scale[j] = float(j % 7 + 1) / 4.0f;
-        w[j] = q_scale[j] * k_scale[j];
-    }
-    for (int j = 0; j < width * copies * tokens; ++j) {
-        q[j] = j < width ? 0.0f : float(j % 11 - 5) / 4.0f;
-        k[j] = float(j % 13 - 6) / 5.0f;
-    }
-    ggml_tensor * dot = llama_dsv41_ple_dot(ctx, query, key, scale, eps);
+    ggml_tensor * dot = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, dots.size());
+    std::memcpy(dot->data, dots.data(), sizeof(dots));
     ggml_tensor * gate = llama_dsv41_ple_gate(ctx, dot);
     ggml_cgraph * graph = ggml_new_graph(ctx);
     ggml_build_forward_expand(graph, gate);
     require(ggml_graph_compute_with_ctx(ctx, graph, 2) == GGML_STATUS_SUCCESS, "PLE graph execution failed");
-    const auto * actual_dot = static_cast<const float *>(dot->data);
-    const auto * actual_gate = static_cast<const float *>(gate->data);
-    for (int stream = 0; stream < copies * tokens; ++stream) {
-        double qq = 0, kk = 0, weighted = 0;
-        for (int j = 0; j < width; ++j) {
-            const int at = stream * width + j;
-            const int sw = (stream % copies) * width + j;
-            qq += double(q[at]) * q[at];
-            kk += double(k[at]) * k[at];
-            weighted += double(q[at]) * q_scale[sw] * k[at] * k_scale[sw];
-        }
-        const double expected_dot = weighted / std::sqrt(qq / width + eps) /
-                                    std::sqrt(kk / width + eps) / std::sqrt(double(width));
-        const double signed_root = (expected_dot < 0 ? -1.0 : 1.0) *
-                                   std::sqrt(std::max(std::abs(expected_dot), 1e-6));
-        const double expected_gate = 1.0 / (1.0 + std::exp(-signed_root));
-        require(std::abs(actual_dot[stream] - expected_dot) < 2e-6, "PLE fused norm scales mismatch");
-        require(std::abs(actual_gate[stream] - expected_gate) < 2e-6, "PLE signed-root gate mismatch");
+    const auto * actual = static_cast<const float *>(gate->data);
+    for (size_t i = 0; i < dots.size(); ++i) {
+        const double signed_root = std::copysign(std::sqrt(std::max(std::abs(double(dots[i])), 1e-6)), dots[i]);
+        const double expected = 1.0 / (1.0 + std::exp(-signed_root));
+        require(std::abs(actual[i] - expected) < 2e-6, "PLE signed-root gate mismatch");
     }
-    require(actual_gate[0] > 0.5f, "PLE zero-dot gate must use positive sign");
+    require(actual[4] > 0.5f, "PLE zero-dot gate must use positive sign");
     ggml_free(ctx);
 }
 
@@ -315,7 +285,7 @@ int main() {
         row_and_special_test();
         mxfp8_block_test();
         ple_hash_test();
-        ple_fused_gate_test();
+        ple_gate_test();
         std::printf("DSV41_ENGRAM_REFERENCE_OK\n");
         return 0;
     } catch (const std::exception & error) {
