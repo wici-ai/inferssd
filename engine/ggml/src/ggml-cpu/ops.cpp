@@ -8801,16 +8801,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const float m0 = powf(2.0f, -(max_bias       ) / n_head_log2);
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
 
-    // Honor the requested accumulator precision without changing the global
-    // type traits (which also select kernels for ordinary matrix products).
-    // F16 K stays in storage precision; Q and both accumulators remain F32.
-    const bool f32_acc = dst->op_params[3] == GGML_PREC_F32;
-    const bool f32_qk  = f32_acc && k->type == GGML_TYPE_F16;
-    const bool f16_acc = !f32_acc && v->type == GGML_TYPE_F16;
-
-    ggml_type         const k_vec_dot_type = f32_qk ? GGML_TYPE_F32 : ggml_get_type_traits_cpu(k->type)->vec_dot_type;
+    ggml_type         const k_vec_dot_type = ggml_get_type_traits_cpu(k->type)->vec_dot_type;
     ggml_from_float_t const q_to_vec_dot   = ggml_get_type_traits_cpu(k_vec_dot_type)->from_float;
-    ggml_vec_dot_t    const kq_vec_dot     = f32_qk ? (ggml_vec_dot_t) ggml_vec_dot_f16_f32 : ggml_get_type_traits_cpu(k->type)->vec_dot;
+    ggml_vec_dot_t    const kq_vec_dot     = ggml_get_type_traits_cpu(k->type)->vec_dot;
     ggml_to_float_t   const v_to_float     = ggml_get_type_traits(v->type)->to_float;
 
     GGML_ASSERT((                            q_to_vec_dot) && "fattn: unsupported K-type");
@@ -8833,9 +8826,9 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         float       * VKQ32 = (float       *) params->wdata + ith*(1*DK + 2*DV + CACHE_LINE_SIZE_F32); // FP32 VKQ accumulator
         float       * V32   =                 (VKQ32 + 1*DV); // (temporary) FP32 V buffer
         ggml_fp16_t * VKQ16 = (ggml_fp16_t *) (VKQ32 + 1*DV); // (temporary) FP16 VKQ accumulator
-        void        * Q_q   =                 (VKQ32 + 2*DV); // (temporary) DK floats, also fits quantized/FP16 Q
+        ggml_fp16_t * Q_q   = (ggml_fp16_t *) (VKQ32 + 2*DV); // (temporary) buffer for Q converted to quantized/FP16
 
-        if (f16_acc) {
+        if (v->type == GGML_TYPE_F16) {
             memset(VKQ16, 0, DV*sizeof(ggml_fp16_t));
         } else {
             memset(VKQ32, 0, DV*sizeof(float));
@@ -8884,7 +8877,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             const char * v_data = ((const char *) v->data + (ic*nbv1 + iv2*nbv2 + iv3*nbv3));
 
-            if (f16_acc) {
+            if (v->type == GGML_TYPE_F16) {
                 if (s > M) {
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
@@ -8925,7 +8918,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             S = S*ms + vs; // scale and increment sum with partial sum
         }
 
-        if (f16_acc) {
+        if (v->type == GGML_TYPE_F16) {
             for (int64_t d = 0; d < DV; ++d) {
                 VKQ32[d] = GGML_CPU_FP16_TO_FP32(VKQ16[d]);
             }
@@ -9470,7 +9463,7 @@ void ggml_compute_forward_flash_attn_ext(
         case GGML_PREC_DEFAULT:
         case GGML_PREC_F32:
             {
-                // The vector path honors F32 explicitly; tiled already uses F32.
+                // uses F32 accumulators
                 ggml_compute_forward_flash_attn_ext_f16(params, dst);
             } break;
         default:
