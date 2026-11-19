@@ -766,6 +766,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-runtime-routing PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-runtime-routing PRIVATE server-context)
     inferssd_ci_test(test-server-runtime-routing test-server-runtime-routing)
+    llama_build_and_test(ssd/test-server-reasoning-effort.cpp)
+    target_include_directories(test-server-reasoning-effort PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-reasoning-effort PRIVATE server-context)
+    inferssd_ci_test(test-server-reasoning-effort test-server-reasoning-effort)
     if (TARGET ggml-cpu AND NOT WIN32)
         add_executable(test-kv-cache-iswa-state-at ssd/test-kv-cache-iswa-state-at.cpp)
         target_include_directories(test-kv-cache-iswa-state-at PRIVATE ../src ../ggml/src)
@@ -992,7 +996,7 @@ endif()
 # unit: model-free tests that require neither a GPU nor cgroup setup.
 # Keep this list explicit: other synthetic tests may still require Linux I/O facilities.
 foreach(unit_test ssd_prefill_cost test-reasoning-budget
-                  test-server-runtime-routing test-dsv41-engram
+                  test-server-runtime-routing test-server-reasoning-effort test-dsv41-engram
                   kv_cache_iswa_state_at)
     if (TEST ${unit_test})
         set_property(TEST ${unit_test} APPEND PROPERTY LABELS unit)

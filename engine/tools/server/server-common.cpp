@@ -1133,7 +1133,8 @@ void server_turn_memory_record(const common_chat_msg & msg) {
     memory.turns[key] = std::move(turn);
 }
 
-// Refuses a reasoning_effort the chat template does not offer, naming the ones it does.
+// Refuses a reasoning_effort the chat template does not offer, naming the ones it does. "on" is offered wherever the
+// model thinks: thinking on, as the template thinks with no reasoning_effort.
 static void check_reasoning_effort(const std::optional<common_chat_reasoning> & reasoning, const std::string & effort) {
     if (!reasoning) {
         if (effort == "none") {
@@ -1145,12 +1146,10 @@ static void check_reasoning_effort(const std::optional<common_chat_reasoning> & 
     if (reasoning->can_turn_off) {
         offered.push_back("none");
     }
+    offered.push_back("on");
     offered.insert(offered.end(), reasoning->efforts.begin(), reasoning->efforts.end());
     if (std::find(offered.begin(), offered.end(), effort) != offered.end()) {
         return;
-    }
-    if (offered.empty()) {
-        throw std::invalid_argument("This model's chat template takes no \"reasoning_effort\"");
     }
     for (auto & value : offered) {
         value = "\"" + value + "\"";
@@ -1314,10 +1313,12 @@ json oaicompat_chat_params_parse(
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
-    // reasoning_effort (the OpenAI chat-completions field): "none" turns thinking off for this request, any other
-    // effort turns it on and goes to the template as reasoning_effort. Either must be something the template offers,
-    // as /props reports it, so a request never runs as something other than what it asked for. Template kwargs given
-    // in the request take precedence.
+    // reasoning_effort (the OpenAI chat-completions field): "none" turns thinking off for this request, "on" turns it
+    // on as the template thinks with no reasoning_effort, and any other effort turns it on and goes to the template as
+    // reasoning_effort. Each must be something the template offers, as /props reports it, or "on" where the model
+    // thinks, so a request never runs as something other than what it asked for. "on" lets a client whose every
+    // choice sends a value (Codex) ask for thinking where a template only turns it off. Template kwargs given in the
+    // request take precedence.
     if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
         const json & effort = body.at("reasoning_effort");
         if (!effort.is_string()) {
@@ -1325,10 +1326,11 @@ json oaicompat_chat_params_parse(
         }
         check_reasoning_effort(opt.reasoning, effort.get<std::string>());
         const bool   off    = effort.get<std::string>() == "none";
+        const bool   on     = effort.get<std::string>() == "on";
         if (!chat_template_kwargs_object.contains("enable_thinking")) {
             inputs.chat_template_kwargs["enable_thinking"] = off ? "false" : "true";
         }
-        if (!off && !chat_template_kwargs_object.contains("reasoning_effort")) {
+        if (!off && !on && !chat_template_kwargs_object.contains("reasoning_effort")) {
             inputs.chat_template_kwargs["reasoning_effort"] = effort.dump();
         }
     }
