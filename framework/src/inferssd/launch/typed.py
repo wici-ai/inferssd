@@ -21,12 +21,17 @@ from inferssd.configuration.settings import (
     uncomment,
 )
 from inferssd.launch import ram
-from inferssd.launch.darwin import MODEL_OPTIONS
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
 from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
+
+# The engine options that name a model: the launch names the model itself.
+MODEL_OPTIONS = frozenset(
+    ("-m", "--model", "-mu", "--model-url", "-dr", "--docker-repo")
+    + ("-hf", "-hfr", "--hf-repo", "-hff", "--hf-file")
+)
 
 # Each model profile's chat template: a bundled template replaces the GGUF's,
 # and None keeps the template in the GGUF. The expert count comes from the model.
@@ -61,7 +66,6 @@ class LaunchSpec:
     settings_file: Optional[str] = None
     overrides: tuple[tuple[str, str], ...] = ()
     binary: Optional[str] = None
-    artifact_directory: Optional[str] = None
     # Unset sizes take CONTEXT and BATCH; with the strategy, one pass per
     # prompt: -b and -ub as large as the context.
     context: Optional[int] = None
@@ -547,15 +551,13 @@ def _resolve(
     if not ordinary and not value.at("expert.source").value:
         if value.at("expert.source").origin != "default":
             raise ValueError("typed launch requires a nonempty explicit expert.source")
-        artifacts = spec.artifact_directory or os_path.join(directory, "artifacts")
-        s.ask("mkdir", artifacts)
-        alias = s.text("gguf_alias", artifacts, *paths)
+        # The engine indexes the routed experts from the model's own GGUF headers.
         selected = Setting(
             "expert.source",
-            (alias,),
+            tuple(paths),
             "file",
-            "strict GGUF header index",
-            " source=generated; input=complete GGUF shard/header validation",
+            "the model's GGUF files",
+            " source=model; input=its GGUF shards",
         )
         value = replace(
             value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)

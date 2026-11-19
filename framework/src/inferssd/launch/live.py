@@ -11,19 +11,35 @@ from __future__ import annotations
 import datetime
 import os
 import platform
+import re
 import shutil
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
-from inferssd.launch.linux import cpu_count
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine.identity import KFD_NODES
 from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
+
+
+def cpu_count(value: str) -> str:
+    """The CPUs a Linux CPU list (cpuset.cpus.effective) names, each once: "0-3,8" is 5."""
+    seen: set[int] = set()
+
+    def number(text: str) -> int:
+        match = re.match(r"\s*([+-]?\d+)", text)
+        return int(match.group(1)) if match else 0
+
+    for part in value.split(","):
+        pieces = part.split("-")
+        start = number(pieces[0])
+        stop = number(pieces[1]) if len(pieces) == 2 else start
+        seen.update(range(start, stop + 1))
+    return str(len(seen)) if seen else ""
 
 
 @dataclass(frozen=True)
@@ -95,25 +111,18 @@ class LiveArtifacts:
         inputs: LaunchInput,
         *,
         host: Host,
-        run: Callable[[list[str]], None],
-        replace: Callable[[str, str], None],
-        python: str,
         machine: Optional[str] = None,
         strategy_host: Optional[strategy_inputs.Host] = None,
-        index_cache: Optional[Path] = None,
     ) -> None:
         """MACHINE: the characteristics text the launch strategy derives from, if any.
 
         STRATEGY_HOST reads the strategy's runtime facts; by default this host,
-        with the launch's environment. INDEX_CACHE keeps expert indexes for later launches.
+        with the launch's environment.
         """
         self.inputs, self.host = inputs, host
-        self.run, self.replace, self.python = run, replace, python
         self.machine = machine
         self.strategy_host = strategy_host or strategy_inputs.NativeHost(dict(inputs.environment))
-        self.artifacts = RecordedArtifacts(
-            inputs, {}, run=run, replace=replace, python=python, index_cache=index_cache
-        )
+        self.artifacts = RecordedArtifacts(inputs, {})
 
     def __call__(self, fact: Fact) -> Reply:
         if fact.name == "machine_characteristics":
@@ -122,9 +131,7 @@ class LiveArtifacts:
             return self.artifacts(fact)
         value = self.value(fact)
         # Reuse the exact lazy fact-shape contract used by recorded launches.
-        return RecordedArtifacts(
-            self.inputs, {fact.name: value}, run=self.run, replace=self.replace, python=self.python
-        )(fact)
+        return RecordedArtifacts(self.inputs, {fact.name: value})(fact)
 
     def output(self, argv: Sequence[str], *, check: bool = True) -> str:
         result = self.host.command(argv)

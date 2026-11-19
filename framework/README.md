@@ -72,9 +72,9 @@ vram.budget = auto # use admitted capacity
 ```
 
 A model must be a local GGUF or the first shard of a complete set. An omitted
-`expert.source` generates a strict header-validated alias from that set; explicit
-sources must be nonempty existing alias paths. Native source validation remains
-a separate boundary. `serve` and `cli` download a tested model with `-hf`, or take
+`expert.source` names that set, and the engine indexes the routed experts from the
+GGUF headers; explicit sources must be nonempty existing paths (GGUF files, expert
+packs or alias indexes). Native source validation remains a separate boundary. `serve` and `cli` download a tested model with `-hf`, or take
 a local one with `-m`. Other compute processes on the GPU do not stop a launch:
 it leaves them VRAM (`vram.reserve_mib` in the [settings](../docs/configuration.md)).
 

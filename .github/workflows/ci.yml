@@ -83,24 +83,16 @@ jobs:
         run: |
           python3.9 -m venv .venv39
           .venv39/bin/python -m pip install pytest==8.4.2 ./framework
-          .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
+          .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
       - name: Framework tests on Python 3.14
         run: |
           python3.14 -m venv .venv314
           .venv314/bin/python -m pip install pytest==9.1.1 "./framework[hf]"
           .venv314/bin/python -m pytest -q bench/tests framework/tests
-      - name: Mac launcher and alias-index checks
+      - name: Mac measurement checks
         run: |
-          ruff check --isolated --select F framework/tests/fixtures/macos/run-macos-ssd.py framework/tests/fixtures/macos/build-gguf-expert-alias-tsv.py tests/integration/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
-          bash -n framework/tests/fixtures/oracle/launch/scripts/run-macos-ssd.sh
-          python3 -m pytest -q tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
-      - name: Launcher tests
-        shell: bash
-        run: |
-          set -o pipefail
-          bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_settings.sh | tee launcher-settings.log
-          bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_replica.sh | tee launcher-replica.log
-          if grep -E '\bSKIP\b' launcher-settings.log launcher-replica.log; then exit 1; fi
+          ruff check --isolated --select F bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
+          python3 -m pytest -q tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
 
   cpu-unit:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft

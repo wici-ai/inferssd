@@ -12,7 +12,7 @@ from inferssd.launch.types import Threads
 
 
 def flash(tmp_path, platform, backends=()):
-    inputs, spec, host, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, host, adapter, out = setup(tmp_path, platform)
     write_gguf(
         spec.model,
         *moe(
