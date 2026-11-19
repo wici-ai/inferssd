@@ -125,11 +125,13 @@ size_t llama_ssd_schema_json(char * output, size_t size) {
 
 llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     : settings(options.settings), debug(options.debug), stream(services) {
+    // Every SSD context measures host memory, with routed experts or without: the context size
+    // the engine fits (llama_context::fit_context) and the expert caches both take its reading.
+    host_owner = ::host_owner();
+    auto registered = host_owner->make_client();
+    if (!registered) { throw std::runtime_error(registered.error); }
+    host = std::move(registered.value);
     if (!settings.sources()->empty()) {
-        host_owner = ::host_owner();
-        auto registered = host_owner->make_client();
-        if (!registered) { throw std::runtime_error(registered.error); }
-        host = std::move(registered.value);
 #if defined(LLAMA_SSD_STORE)
         auto opened = ssd::store::source_index::open(*settings.sources());
         if (!opened) { throw std::runtime_error(opened.error); }

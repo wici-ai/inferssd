@@ -222,11 +222,13 @@ llama_context::llama_context(
     // keeps a one-token decode graph. The configured ubatch remains available
     // to the recurrent backend and to the next prompt.
     reserve_horizon_enabled = true;
+    // A prompt in one pass, the SSD experts' (each pass reads the experts it routes to once), its ubatch as large as
+    // the context: each prompt reserves its own graph, a smaller ubatch where that does not fit (prefill_refit).
     cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
     if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
-    // The SSD expert architectures size the prompt graph's outputs by the request, not one per token.
-    cpu_prefill_output_sizing_enabled = llama_ssd::describe_experts(model.arch, model.hparams, -1).activation !=
-        llama_ssd::expert_activation::unsupported;
+    // An SSD context's prompt graph holds the outputs the request asks for, not one a token: with routed experts or
+    // without.
+    cpu_prefill_output_sizing_enabled = ssd_runtime != nullptr;
     if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;
@@ -336,7 +338,9 @@ llama_context::llama_context(
             if (!ssd::cpu::valid(api)) {
                 throw std::runtime_error("CPU backend has no compatible SSD executor table");
             }
-            if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
+            // The host budget the settings give (host.headroom_mib, host.budget_mib), with routed experts or without:
+            // the CPU backend's work memory takes its room from it as the expert caches do.
+            if (!api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
                 throw std::runtime_error("cannot configure the context host budget");
             }
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {

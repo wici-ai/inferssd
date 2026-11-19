@@ -71,7 +71,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts] [--dense-ssd]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1055,6 +1055,114 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
     return failures == 0 ? 0 : 1;
 }
 
+// A model without routed experts in an SSD context (settings, no expert source) computes as it does without one: its
+// prompt and its next tokens give the same logits, the CPU's work memory taken from the context's host budget, the
+// prompt's graph holding the one output the request asks for.
+static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
+    struct user_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+    };
+    user_data_t ud;
+    llama_log_get(&ud.callback, &ud.user_data);
+    ud.min_level = log_level;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        user_data_t * ud = (user_data_t *) user_data;
+        ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+    }, &ud);
+
+    const uint32_t n_ctx    = 1024;
+    const uint32_t n_prompt = 600; // more than one batch
+    const uint32_t n_next   = 4;
+
+    char error[512] = {};
+    std::unique_ptr<llama_ssd_options, decltype(&llama_ssd_options_free)> options(
+        llama_ssd_options_create(nullptr, nullptr, 0, nullptr, error, sizeof(error)), llama_ssd_options_free);
+    if (!options) {
+        throw std::runtime_error(std::string("failed to create SSD options: ") + error);
+    }
+
+    // the CPU, and every GPU with the model and its cache on it
+    std::vector<ggml_backend_dev_t> devices = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) };
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            devices.push_back(dev);
+        }
+    }
+
+    int failures = 0;
+    for (ggml_backend_dev_t device : devices) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false, n_ctx);
+        // F16 layer matrices: the CPU converts their activations first, in the work memory it takes from the
+        // context's host budget (F32 ones need none)
+        const LLM_KV kv(LLM_ARCH_LLAMA);
+        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), kv(LLM_KV_BLOCK_COUNT).c_str()));
+        for (uint32_t il = 0; il < n_layer; il++) {
+            for (const char * name : { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_down", "ffn_up" }) {
+                ggml_tensor t;
+                memset(&t, 0, sizeof(ggml_tensor));
+                t.type = GGML_TYPE_F16;
+                ggml_format_name(&t, "blk.%" PRIu32 ".%s.weight", il, name);
+                gguf_add_tensor(gguf_ctx.get(), &t);
+            }
+        }
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        // the CPU as a CPU-only server has it: no device list, the context's own CPU backend running the graph
+        std::vector<ggml_backend_dev_t> devs = { device, nullptr };
+        model_params.devices = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr : devs.data();
+        model_params.n_gpu_layers = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? 0 : 999;
+        size_t tmp = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(n_prompt + n_next, n_vocab, seed);
+
+        // a request as the server makes it: its prompt between the phase's begin and the prefill's end, then its
+        // next tokens one at a time
+        const auto run = [&](const llama_ssd_options * ssd) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = n_ctx;
+            ctx_params.n_batch         = 256;
+            ctx_params.n_ubatch        = 256;
+            ctx_params.n_seq_max       = 1;
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            ctx_params.ssd_options     = ssd;
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            if (!llama_ssd_prefill_phase(lctx.get(), true, n_prompt, n_prompt)) {
+                throw std::runtime_error("failed to begin a request");
+            }
+            std::vector<float> logits = decode_range(lctx.get(), tokens, 0, n_prompt);
+            if (!llama_ssd_prefill_phase(lctx.get(), false, 0, 0)) {
+                throw std::runtime_error("failed to end the prompt");
+            }
+            for (uint32_t p = n_prompt; p < n_prompt + n_next; ++p) {
+                const std::vector<float> next = decode_range(lctx.get(), tokens, p, p + 1);
+                logits.insert(logits.end(), next.begin(), next.end());
+            }
+            return logits;
+        };
+        const std::vector<float> plain = run(nullptr);
+        const std::vector<float> ssd = run(options.get());
+        const bool ok = plain == ssd;
+        printf("%s: llama on %s: SSD context vs none: %s (nmse %.3g)\n", __func__, ggml_backend_dev_name(device),
+                ok ? "identical" : "DIFFERENT", nmse(plain, ssd));
+        failures += ok ? 0 : 1;
+    }
+
+    llama_log_set(ud.callback, ud.user_data);
+    return failures == 0 ? 0 : 1;
+}
+
 // unsloth's DeepSeek-V4.1 GGUFs lay the Engram out another way: ple.* keys, every layer's table in one
 // per_layer_token_embd, stored as MXFP8, whose head offsets run on across the layers, and for each layer
 // the product of engram_q and engram_k as engram_gate. The same weights in either layout give the same logits.
@@ -1223,6 +1331,7 @@ int main(int argc, char ** argv) {
     bool kv_grow = false;
     bool nextn = false;
     bool engram_layouts = false;
+    bool dense_ssd = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
@@ -1235,6 +1344,10 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--engram-layouts") == 0) {
             engram_layouts = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-ssd") == 0) {
+            dense_ssd = true;
             continue;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1285,6 +1398,9 @@ int main(int argc, char ** argv) {
         }
         if (engram_layouts) {
             return test_engram_layouts(seed, log_level);
+        }
+        if (dense_ssd) {
+            return test_dense_ssd(seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

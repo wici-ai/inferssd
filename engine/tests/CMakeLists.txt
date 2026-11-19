@@ -830,9 +830,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-kv-cache-grow ARGS --kv-grow -s 42)
     llama_test(test-llama-archs NAME test-dsv41-engram-layouts ARGS --engram-layouts -s 42)
+    llama_test(test-llama-archs NAME test-llama-archs-dense-ssd ARGS --dense-ssd -s 42)
     # On the hosted macOS runner's paravirtual GPU it aborts on a MUL_MAT the Metal backend does not encode.
     if (NOT APPLE)
-        inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts)
+        inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts test-llama-archs-dense-ssd)
     endif()
     # NextN blocks: every architecture, on the CPU alone
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)
