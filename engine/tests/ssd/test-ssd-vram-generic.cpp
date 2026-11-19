@@ -8,6 +8,7 @@
 #define main original_sink_test_main
 #include "test-ssd-cpu-sink.cpp"
 #undef main
+#include "declared-layout.h"
 #include "host-jobs-test.inc"
 #include "gpu-runtime.h"
 
@@ -79,15 +80,7 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
     const uint64_t ram_bytes = selected.production ? 2 * unit : 0;
     configure_cache(cpu.get(), ram_bytes, {1, 2}, experts);
     configure_cache(mixed.get(), ram_bytes, {1, 2}, experts);
-    if (layer1_down != GGML_TYPE_COUNT) {
-        // the load step with every routed layer's tensors: the sink declares each layer's types to the tier
-        tensors first(f, 1), second(f, 2);
-        const ggml_tensor * layers[] = { first.role[0], first.role[1], first.role[2], second.role[0], second.role[1], second.role[2] };
-        for (ssd_cpu_sink * sink : { cpu.get(), mixed.get() }) {
-            char error[512] = {};
-            require(ssd_cpu_sink_vram_reserve(sink, layers, 2, 4, error, sizeof(error)), std::string("reserve: ") + error);
-        }
-    }
+    // the tier knows each layer's types from the layout the sink declared it when it made it
     uint64_t cpu_reads = 0;
     uint64_t mixed_reads = 0;
     const ssd_cpu_sink_activation activation = {
@@ -116,7 +109,7 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
                 ssd_cpu_sink_stats stats = {};
                 char error[512] = {};
                 const bool ok = ssd_cpu_sink_run_activation(arm ? mixed.get() : cpu.get(),
-                    meta.role[0], meta.role[1], meta.role[2], input.data(), ids.data(), weights.data(),
+                    meta.layer, input.data(), ids.data(), weights.data(),
                     int(ids.size()), &activation, (arm ? got : expected).data(), &stats, error, sizeof(error));
                 require(ok, std::string("generic sink run failed mode=") + selected.name +
                     " token=" + std::to_string(token) + " layer=" + std::to_string(layer) +

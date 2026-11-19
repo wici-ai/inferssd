@@ -9,6 +9,7 @@
 #include "ssd/cpu-sink.h"
 #include "ssd/testing.h"
 #include "test-resources.h"
+#include "expert-layout-fixture.h"
 
 #include <algorithm>
 #include <chrono>
@@ -87,7 +88,7 @@ void make_pack(pack & p, int experts) {
 struct call_context {
     ssd_cpu_sink * sink = nullptr;
     bool empty = false;
-    ggml_tensor * role[3] = {};
+    int32_t layer = ::layer;
     ssd_cpu_sink_stats stats = {};
     bool ok = false;
     char error[512] = {};
@@ -97,7 +98,7 @@ void decode_node(ggml_tensor * dst, int ith, int nth, void * userdata) {
     auto & c = *static_cast<call_context *>(userdata);
     if (ith) { ssd_cpu_sink_call_join(c.sink, ith, nth); return; }
     if (!ssd_cpu_sink_call_open(c.sink, nth, c.error, sizeof(c.error))) { std::fprintf(stderr, "%s\n", c.error); std::abort(); }
-    c.ok = c.empty || ssd_cpu_sink_run(c.sink, c.role[0], c.role[1], c.role[2], static_cast<const float *>(dst->src[0]->data),
+    c.ok = c.empty || ssd_cpu_sink_run(c.sink, c.layer, static_cast<const float *>(dst->src[0]->data),
         static_cast<const int32_t *>(dst->src[1]->data), static_cast<const float *>(dst->src[2]->data), routed,
         4.0f, 25.0f, static_cast<float *>(dst->data), &c.stats, c.error, sizeof(c.error));
     ssd_cpu_sink_call_close(c.sink);
@@ -127,7 +128,17 @@ void run_variant(pack & p, const std::string & variant, int threads, int calls, 
     policy.cache_keep = policy.cache_prefill_read = policy.cache_partial_reclaim = policy.cache_reclaimable_file = true;
     policy.cache_reserve_bytes = 512ull << 20;
     char error[512] = {};
-    ssd_cpu_sink * created = ssd::cpu::testing::create(8, policy, nullptr, pack::resolve, &p, error, sizeof(error));
+    // the layout of the bench's one routed layer, built from its experts' metadata as the engine builds it
+    ggml_context * meta = ggml_init({ 4 * ggml_tensor_overhead(), nullptr, true });
+    require(meta, "bench metadata");
+    ggml_tensor * roles[3] = {};
+    for (int role = 0; role < 3; ++role) {
+        roles[role] = ggml_new_tensor_3d(meta, type, role == 2 ? hidden : latent, role == 2 ? latent : hidden, p.experts);
+        ggml_set_name(roles[role], role_name(role).c_str());
+    }
+    const auto layout = test_layout::build({ { layer, { roles[0], roles[1], roles[2] } } }, pack::resolve, &p);
+    ggml_free(meta);
+    ssd_cpu_sink * created = ssd::cpu::testing::create(8, policy, nullptr, layout->abi(), error, sizeof(error));
     require(created, std::string("bench sink: ") + error);
     std::unique_ptr<ssd_cpu_sink, decltype(&ssd_cpu_sink_destroy)> sink(created, ssd_cpu_sink_destroy);
     const uint64_t triplet = (p.role_bytes[0] + 4095) / 4096 * 4096 * 2 + (p.role_bytes[2] + 4095) / 4096 * 4096;
@@ -135,15 +146,9 @@ void run_variant(pack & p, const std::string & variant, int threads, int calls, 
     require(ssd_cpu_sink_cache_configure(sink.get(), hit ? 2 * routed * triplet : 0, &priority, 1, 2 * routed,
         error, sizeof(error)), std::string("bench cache: ") + error);
 
-    ggml_context * meta = ggml_init({ 4 * ggml_tensor_overhead(), nullptr, true });
-    require(meta, "bench metadata");
     call_context c;
     c.sink = sink.get();
     c.empty = empty;
-    for (int role = 0; role < 3; ++role) {
-        c.role[role] = ggml_new_tensor_3d(meta, type, role == 2 ? hidden : latent, role == 2 ? latent : hidden, p.experts);
-        ggml_set_name(c.role[role], role_name(role).c_str());
-    }
     ggml_context * ctx = ggml_init({ 16 * ggml_tensor_overhead() + ggml_graph_overhead() + (size_t(1) << 20), nullptr, false });
     require(ctx, "bench graph context");
     ggml_tensor * x = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, latent);
@@ -197,7 +202,6 @@ void run_variant(pack & p, const std::string & variant, int threads, int calls, 
         s.median, s.p10, s.p90, double(read_bytes) / double(calls) / double(1 << 20));
     std::fflush(stdout);
     ggml_free(ctx);
-    ggml_free(meta);
 }
 
 } // namespace

@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -226,6 +227,35 @@ def test_release_notes_put_highlights_and_installation_before_the_changes(tmp_pa
     assert plain.startswith("### Install or upgrade\n") and plain.endswith(changes)
 
 
+def test_release_notes_name_pull_requests_and_credit_every_contributor(tmp_path):
+    (tmp_path / "CHANGELOG.md").write_text("# Changelog\n")
+    pull = "https://github.com/wici-ai/inferssd/pull"
+    changes = (
+        "## What's Changed\n"
+        f"* engine: one thing by @Chikati in {pull}/164\n"
+        f"* model: another by @Bi666666 in {pull}/292\n"
+        f"* docs: a third by @Chikati in {pull}/310\n"
+        f"* ci: bump by @dependabot[bot] in {pull}/311\n"
+        "* an entry GitHub may write otherwise\n"
+        "\n## New Contributors\n"
+        f"* @Bi666666 made their first contribution in {pull}/292\n"
+        "\n**Full Changelog**: https://github.com/wici-ai/inferssd/compare/v0.1.4...v0.1.5\n"
+    )
+    notes = release.release_notes(tmp_path, "v0.1.5", "wici-ai/inferssd", changes)
+    changed = notes[notes.index("## What's Changed") :]
+    assert changed == (
+        "## What's Changed\n"
+        "* engine: one thing (#164)\n"
+        "* model: another (#292)\n"
+        "* docs: a third (#310)\n"
+        "* ci: bump (#311)\n"
+        "* an entry GitHub may write otherwise\n"
+        "\n## Contributors\n\n"
+        "@Chikati, @Bi666666\n"
+        "\n**Full Changelog**: https://github.com/wici-ai/inferssd/compare/v0.1.4...v0.1.5\n"
+    )
+
+
 def test_every_published_package_is_a_release_of_main():
     yaml = pytest.importorskip("yaml")
     workflow = yaml.load(
@@ -240,9 +270,16 @@ def test_every_published_package_is_a_release_of_main():
             "source_ref": "${{ needs.validate.outputs.revision }}",
             "release_tag": "${{ needs.validate.outputs.tag }}",
         }
-    assert jobs["windows"]["secrets"] == {
-        "APP_VERSIONING_TOKEN": "${{ secrets.APP_VERSIONING_TOKEN }}"
-    }
+    # Every secret the Windows package workflow reads is declared, required and passed by name: a
+    # reusable workflow's job reads an environment secret only when its caller passes it, and an
+    # unpassed one is an empty string, which once left the signing job without its credential.
+    windows_text = (ROOT / ".github/workflows/package-windows.yml").read_text()
+    declared = yaml.load(windows_text, Loader=yaml.BaseLoader)["on"]["workflow_call"]["secrets"]
+    assert set(re.findall(r"secrets\.([A-Z_]+)", windows_text)) == set(declared)
+    signing = {"ES_USERNAME", "ES_PASSWORD", "ES_CREDENTIAL_ID", "ES_TOTP_SECRET"}
+    assert set(declared) == {"APP_VERSIONING_TOKEN"} | signing
+    assert all(entry["required"] == "true" for entry in declared.values())
+    assert jobs["windows"]["secrets"] == {name: f"${{{{ secrets.{name} }}}}" for name in declared}
     assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
     choice = next(s["run"] for s in jobs["validate"]["steps"] if s.get("id") == "version")
     assert "refs/heads/main" in choice and "sort -V" in choice

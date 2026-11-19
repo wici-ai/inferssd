@@ -39,7 +39,13 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         fixture_api->size == sizeof(ssd::gpu::testing::api) && fixture_api->create,
         "explicit tier fixture factory ABI mismatch");
     const auto options = inputs.tier_policy();
-    const auto create_tier = [&] { return fixture_api->create(2 * stride, &options, error, sizeof(error)); };
+    // routed layer 1 of `type` throughout (its roles whole pages), declared to each tier once it is made
+    const auto layout = declared_layout::uniform(latent, hidden, n_experts, type, type, type, { 1 });
+    const auto create_tier = [&] {
+        void * made = fixture_api->create(2 * stride, &options, error, sizeof(error));
+        if (made && tier_api->declare(made, &layout.c, error, sizeof(error))) { tier_api->destroy(made); made = nullptr; }
+        return made;
+    };
     void * t = create_tier();
     require(t != nullptr, std::string("tier create: ") + error);
     // five experts in host memory, blocks with small scales, in an anonymous mapping like the RAM cache's
@@ -79,8 +85,6 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
     auto payload = [&](int expert, int role) -> const void * {
         return host + size_t(expert) * stride + (role >= 1 ? up : 0) + (role == 2 ? up : 0);
     };
-    const int32_t layers[1] = { 1 };
-    const ssd_vram_expert_format format = { latent, hidden, int(type), int(type), int(type), n_experts, 1, layers };
     const ssd_vram_activation act = { SSD_VRAM_ACTIVATION_SWIGLU_CLAMP, 0, 0, 7.0f };
     std::vector<float> input(latent);
     for (int i = 0; i < latent; ++i) { input[size_t(i)] = std::sin(0.37f * float(i)); }
@@ -96,7 +100,7 @@ inline void run_host_jobs(fixture_inputs & inputs, ggml_type type, size_t & chec
         for (int e : experts) { r.push_back(key(e)); }
         layer_result out;
         out.slots.assign(experts.size(), -1);
-        require(format_api->prepare(t, r.data(), int(r.size()), &format, out.slots.data(), error, sizeof(error)) == 0,
+        require(format_api->prepare(t, r.data(), int(r.size()), out.slots.data(), error, sizeof(error)) == 0,
             std::string("prepare: ") + error);
         require(format_api->launch(t, row_in.data(), row_in.size(), &act, error, sizeof(error)) == 0,
             std::string("launch: ") + error);

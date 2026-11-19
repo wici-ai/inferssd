@@ -17,6 +17,16 @@ on:
       # The signed-file store (scripts/sign-windows.ps1).
       APP_VERSIONING_TOKEN:
         required: true
+      # The eSigner credential. These are the windows-signing environment's secrets, which the sign
+      # job reads only when the caller passes them by name: one not passed is an empty string.
+      ES_USERNAME:
+        required: true
+      ES_PASSWORD:
+        required: true
+      ES_CREDENTIAL_ID:
+        required: true
+      ES_TOTP_SECRET:
+        required: true
   # A pull request builds the packages when it changes how they are built; a change to main that reaches them
   # builds them after the merge.
   push:

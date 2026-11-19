@@ -7,6 +7,7 @@
 </p>
 
 <p align="center">
+  <a href="https://wici.ai/wici-infer#app-download"><b>Download app</b></a> &nbsp;·&nbsp;
   <a href="https://wici.ai/inferssd"><b>Website</b></a> &nbsp;·&nbsp;
   <a href="https://wici.ai/research"><b>Blog</b></a> &nbsp;·&nbsp;
   <a href="https://discord.gg/wici"><b>Discord</b></a> &nbsp;·&nbsp;
@@ -135,7 +136,9 @@ Unified memory is shared by the CPU and GPU. SSD capacities are nominal. See [ha
 
 ## Get started
 
-On macOS or Linux:
+**Desktop app.** [WiCi Infer](https://wici.ai/wici-infer) is a free app for macOS (Apple silicon) and Windows (x64), built on InferSSD. It sets up the engine, downloads models and runs chat, with no terminal. [Download for macOS](https://appapi.wici.ai/versioning/wici-infer/redirect/macos-latest) · [Download for Windows](https://appapi.wici.ai/versioning/wici-infer/redirect/windows-latest)
+
+**Command line.** On macOS or Linux:
 
 ```sh
 curl -fsSL https://github.com/wici-ai/inferssd/releases/latest/download/install.sh | sh

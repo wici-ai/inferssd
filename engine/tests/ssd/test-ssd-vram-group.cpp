@@ -386,7 +386,7 @@ void run_fixture(fixture_inputs & inputs, const vram_group_compute_api * api, co
         auto cpu_run = [&](const std::vector<int32_t> & route_ids) {
             std::vector<float> out(input.size());
             ssd_cpu_prefill_stats stats = {};
-            require(ssd_cpu_prefill_run_activation(prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            require(ssd_cpu_prefill_run_activation(prefill.get(), meta.layer, input.data(),
                 route_ids.data(), weights.data(), nslots, c.tokens, &cpu_activation, out.data(), &stats, error, sizeof(error)),
                 std::string("CPU prefill: ") + error);
             return out;
@@ -518,13 +518,7 @@ void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, boo
     configure_cache(cpu.get(), 0, {1, 2}, f.experts);
     configure_cache(mixed.get(), 0, {1, 2}, f.experts);
     const std::vector<int> layers = mixed_layers ? std::vector<int>{ 1, 2 } : std::vector<int>{ 1 };
-    char error[512] = {};
-    if (mixed_layers) {
-        // the load step: every routed layer's tensors, whose types the sink declares to the tier
-        tensors first(f, 1), second(f, 2);
-        const ggml_tensor * experts[] = { first.role[0], first.role[1], first.role[2], second.role[0], second.role[1], second.role[2] };
-        require(ssd_cpu_sink_vram_reserve(mixed.get(), experts, 2, 8, error, sizeof(error)), error);
-    }
+    char error[512] = {}; // the tier has every layer's types from the layout the sink declared it
     std::vector<float> norm(size_t(f.latent));
     std::mt19937 rng(20261024);
     std::uniform_real_distribution<float> unit(0.5f, 1.5f);
@@ -539,7 +533,7 @@ void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, boo
         for (int layer : layers) {
             tensors meta(f, layer);
             ssd_cpu_sink_stats st = {};
-            require(ssd_cpu_sink_run_activation(mixed.get(), meta.role[0], meta.role[1], meta.role[2], in.data(), ids.data(),
+            require(ssd_cpu_sink_run_activation(mixed.get(), meta.layer, in.data(), ids.data(),
                 w.data(), 4, &activation, out.data(), &st, error, sizeof(error)), error);
         }
         require(ssd_cpu_sink_vram_phase_complete(mixed.get(), true, error, sizeof(error)), error);
@@ -575,9 +569,9 @@ void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, boo
             tensors meta(f, layer);
             std::vector<float> expected(input.size()), got(input.size());
             ssd_cpu_prefill_stats cs = {}, gs = {};
-            require(ssd_cpu_prefill_run_activation(cpu_prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            require(ssd_cpu_prefill_run_activation(cpu_prefill.get(), meta.layer, input.data(),
                 ids.data(), weights.data(), nslots, tokens, &activation, expected.data(), &cs, error, sizeof(error)), error);
-            require(ssd_cpu_prefill_run_activation(gpu_prefill.get(), meta.role[0], meta.role[1], meta.role[2], input.data(),
+            require(ssd_cpu_prefill_run_activation(gpu_prefill.get(), meta.layer, input.data(),
                 ids.data(), weights.data(), nslots, tokens, &activation, got.data(), &gs, error, sizeof(error)), error);
             double lanes = 0.0;
             for (int t = 0; t < tokens; ++t) {
@@ -779,7 +773,7 @@ struct cpu_lane {
     double run(int n) {
         char error[512] = {};
         ssd_cpu_prefill_stats stats = {};
-        require(ssd_cpu_prefill_run_activation(prefill.get(), meta->role[0], meta->role[1], meta->role[2], input.data(),
+        require(ssd_cpu_prefill_run_activation(prefill.get(), meta->layer, input.data(),
             ids.data(), weights.data(), 1, n, &activation, output.data(), &stats, error, sizeof(error)), error);
         return stats.stream.up_gate_us + stats.stream.hidden_quantize_us + stats.stream.down_reduce_us;
     }

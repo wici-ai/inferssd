@@ -1,6 +1,8 @@
 #pragma once
 
 #include "cpu-sink.h"
+#include "ggml-cpu.h"
+#include "ggml-ssd/store/expert-layout.h"
 #include <cmath>
 #include <cstdint>
 #include <functional>
@@ -26,6 +28,21 @@ inline void ssd_cpu_sink_normalize_expert(float * values, int rows, const float 
 // Streaming is a prefill operation: it disables decode cache (normally releases
 // it; optional cross-request retention checks the same memory guard) and
 // always uses ring targets. Cache admission requires a subsequent decode begin.
+// The CPU's kernels for one format of the sink's expert layout, chosen when the sink is created: each role's vec_dot
+// against a row of the role's input quantized to its vec_dot_type, the latent's for up and gate (one quantization of
+// the input serves both, so their vec_dot_types match) and the hidden's for down.
+struct ssd_cpu_expert_kernels {
+    ggml_vec_dot_t dot[SSD_EXPERT_ROLES];
+    ggml_type input_type, hidden_type;                // the vec_dot_types of up (and gate) and of down
+    ggml_from_float_t quantize_input, quantize_hidden;
+    size_t row_bytes[SSD_EXPERT_ROLES];               // a weight row of each role
+    size_t input_row_bytes, hidden_row_bytes;         // a quantized latent row, a quantized hidden row
+    bool mxfp4;                                       // every role is MXFP4
+};
+// The sink's expert layout, and the kernels of routed layer `layer`'s format (null for any other layer).
+const ssd_expert_layout & ssd_cpu_sink_layout(const struct ssd_cpu_sink * sink) noexcept;
+const ssd_cpu_expert_kernels * ssd_cpu_sink_kernels(const struct ssd_cpu_sink * sink, int32_t layer) noexcept;
+
 using ssd_cpu_sink_parallel_fn = void (*)(void * userdata, int ith, int nth);
 using ssd_cpu_sink_consumer_fn = void (*)(void * userdata, size_t expert,
         const void * up, const void * gate, const void * down);
@@ -69,9 +86,7 @@ void ssd_cpu_sink_parallel(struct ssd_cpu_sink * sink,
 void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow);
 void ssd_cpu_sink_parallel_last(struct ssd_cpu_sink * sink,
         ssd_cpu_sink_parallel_fn function, void * userdata);
-bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const int32_t * ids, int nexperts,
+bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * ids, int nexperts,
         struct ssd_cpu_sink_prefill_batch * batch,
         ssd_cpu_sink_consumer_fn consumer, void * userdata,
         struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
