@@ -282,6 +282,17 @@ if (TARGET ggml-ssd-c0-store)
     inferssd_ci_test(test-ssd-source-index ssd_source_index)
 endif()
 
+# A model's facts from its headers, as the engine would load it (llama_ssd_model_facts).
+if (LLAMA_SSD_STORE)
+    add_executable(test-ssd-model-facts ssd/test-model-facts.cpp)
+    target_compile_features(test-ssd-model-facts PRIVATE cxx_std_17)
+    target_include_directories(test-ssd-model-facts PRIVATE ../ggml/src ../vendor)
+    target_link_libraries(test-ssd-model-facts PRIVATE llama ggml-base)
+    add_test(NAME ssd_model_facts COMMAND test-ssd-model-facts ${CMAKE_CURRENT_SOURCE_DIR}/ssd/fixtures/model-facts.json)
+    set_tests_properties(ssd_model_facts PROPERTIES LABELS main TIMEOUT 30)
+    inferssd_ci_test(test-ssd-model-facts ssd_model_facts)
+endif()
+
 if (TARGET ggml-cpu)
     add_executable(test-ssd-prepared-graph ssd/test-ssd-prepared-graph.cpp)
     target_compile_features(test-ssd-prepared-graph PRIVATE cxx_std_17)
