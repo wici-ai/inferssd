@@ -1625,6 +1625,82 @@ static void test_convert_responses_to_chatcmpl() {
         assert_equals(false, result.contains("max_output_tokens"));
         assert_equals(100, result.at("max_tokens").get<int>());
     }
+
+    // An output without a call_id (the ChatGPT app adds its open-Page snapshot to every later turn this way)
+    // answers no call: it goes in as user text, and every chat template in the repository renders it.
+    {
+        json input = json::parse(R"({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Hello."}]},
+                {"type": "function_call_output", "id": "fco_1", "namespace": "agent", "name": "codex_apps_open_page",
+                 "output": "{\"page_id\":null}"},
+                {"type": "function_call_output", "id": "fco_2", "call_id": "", "name": "snapshot",
+                 "output": [{"type": "input_text", "text": "part 1"}, {"type": "input_image", "image_url": "x"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "and now?"}]}
+            ],
+            "model": "test-model"
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        const json & msgs = result.at("messages");
+        assert_equals((size_t)5, msgs.size());
+        assert_equals(std::string("user"), msgs[2].at("role").get<std::string>());
+        assert_equals(std::string("[tool_result without a matching tool_call: agent::codex_apps_open_page]\n{\"page_id\":null}"),
+            msgs[2].at("content")[0].at("text").get<std::string>());
+        assert_equals(std::string("user"), msgs[3].at("role").get<std::string>());
+        assert_equals(std::string("[tool_result without a matching tool_call: snapshot]\npart 1\n[Unsupported input_image]"),
+            msgs[3].at("content")[0].at("text").get<std::string>());
+        assert_equals(std::string("user"), msgs[4].at("role").get<std::string>());
+
+        for (const char * path : {"models/templates/unsloth-Qwen3.6-35B-A3B.jinja", "models/templates/google-gemma-4-31B-it.jinja",
+                                  "models/templates/deepseek-ai-DeepSeek-V4.1.jinja", "models/templates/muse-spark.jinja"}) {
+            auto tmpls = read_templates(path);
+            common_chat_templates_inputs inputs;
+            inputs.messages = common_chat_msgs_parse_oaicompat(msgs);
+            const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+            assert_equals(true, prompt.find("agent::codex_apps_open_page]") != std::string::npos);
+            assert_equals(true, prompt.find("and now?") != std::string::npos);
+        }
+    }
+
+    // Tools that additional_tools input items declare (Codex sends the tools of its Responses Lite models this
+    // way, again in later turns) join the request's tools once each; the items themselves are no messages.
+    {
+        json input = json::parse(R"({
+            "input": [
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [
+                        {"type": "function", "name": "exec_command", "description": "Run a command.",
+                         "parameters": {"type": "object", "properties": {}}},
+                        {"type": "custom", "name": "apply_patch", "description": "Edit files."}
+                    ]}
+                ]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                {"type": "additional_tools", "role": "developer", "tools": [
+                    {"type": "namespace", "name": "functions", "description": "", "tools": [
+                        {"type": "function", "name": "exec_command", "description": "A later copy.",
+                         "parameters": {"type": "object", "properties": {}}}
+                    ]},
+                    {"type": "function", "name": "get_goal", "description": "Read the goal.",
+                     "parameters": {"type": "object", "properties": {}}}
+                ]}
+            ],
+            "model": "test-model",
+            "tool_choice": "auto"
+        })");
+
+        json result = server_chat_convert_responses_to_chatcmpl(input);
+
+        assert_equals((size_t)1, result.at("messages").size());
+        const json & tools = result.at("tools");
+        assert_equals((size_t)2, tools.size());
+        assert_equals(std::string("functions::exec_command"), tools[0].at("function").at("name").get<std::string>());
+        assert_equals(std::string("Run a command."), tools[0].at("function").at("description").get<std::string>());
+        assert_equals(std::string("get_goal"), tools[1].at("function").at("name").get<std::string>());
+        assert_equals(std::string("auto"), result.at("tool_choice").get<std::string>());
+    }
 }
 
 static void test_muse_spark_peg_parsers(bool detailed_debug) {

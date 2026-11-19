@@ -2,6 +2,24 @@
 #include "server-common.h"
 
 #include <sstream>
+#include <unordered_set>
+
+// The text of a Responses tool output: a string as is, or the text parts of an array joined by newlines.
+static std::string responses_output_text(const json & output) {
+    if (output.is_string()) {
+        return output.get<std::string>();
+    }
+    std::string text;
+    for (const json & part : output) {
+        const std::string type = json_value(part, "type", std::string());
+        if (!text.empty()) {
+            text += "\n";
+        }
+        text += type == "input_text" || type == "output_text" ? json_value(part, "text", std::string())
+                                                              : "[Unsupported " + type + "]";
+    }
+    return text;
+}
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
@@ -15,6 +33,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
+    std::vector<json> input_tools; // tools that additional_tools input items declare
 
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
@@ -193,7 +212,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_calls", json::array({tool_call})}
                     });
                 }
-            } else if (exists_and_is_string(item, "call_id") &&
+            } else if (exists_and_is_string(item, "call_id") && !item.at("call_id").get<std::string>().empty() &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "function_call_output"
@@ -226,6 +245,33 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 }
+            } else if ((exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "function_call_output"
+            ) {
+                // An output without a call_id answers no call: Codex adds context this way, such as the ChatGPT
+                // app's snapshot of the open Page from the second turn on. A chat template takes a tool message
+                // only after a tool call, so it goes in as user text under the marker CC Switch's Codex proxy uses.
+                std::string name = json_value(item, "name", std::string());
+                const std::string ns = json_value(item, "namespace", std::string());
+                if (!ns.empty() && !name.empty()) {
+                    name = ns + "::" + name;
+                }
+                const std::string text = "[tool_result without a matching tool_call" +
+                    (name.empty() ? std::string() : ": " + name) + "]\n" + responses_output_text(item.at("output"));
+                chatcmpl_messages.push_back(json {
+                    {"role",    "user"},
+                    {"content", json::array({ json {
+                        {"text", text},
+                        {"type", "text"},
+                    }})},
+                });
+            } else if (exists_and_is_string(item, "type") && item.at("type") == "additional_tools") {
+                // Codex sends the tools of some models (those it runs on Responses Lite) as this input item
+                // instead of the tools field; they join the request's tools.
+                for (const json & tool : json_value(item, "tools", json::array())) {
+                    input_tools.push_back(tool);
+                }
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
@@ -257,14 +303,32 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
 
     chatcmpl_body["messages"] = chatcmpl_messages;
 
-    if (response_body.contains("tools")) {
-        if (!response_body.at("tools").is_array()) {
-            throw std::invalid_argument("'tools' must be an array of objects");
+    if (response_body.contains("tools") && !response_body.at("tools").is_array()) {
+        throw std::invalid_argument("'tools' must be an array of objects");
+    }
+    if (response_body.contains("tools") || !input_tools.empty()) {
+        std::vector<json> resp_tools;
+        if (response_body.contains("tools")) {
+            resp_tools.insert(resp_tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
         }
-        std::vector<json> chatcmpl_tools;
-        for (json resp_tool : response_body.at("tools")) {
-            json chatcmpl_tool;
+        resp_tools.insert(resp_tools.end(), input_tools.begin(), input_tools.end());
 
+        // A tool keeps its first definition: Codex declares its additional_tools again in later turns.
+        std::vector<json> chatcmpl_tools;
+        std::unordered_set<std::string> tool_names;
+        const auto add_tool = [&](json function) {
+            if (!tool_names.insert(json_value(function, "name", std::string())).second) {
+                return;
+            }
+            if (!function.contains("strict")) {
+                function["strict"] = true;
+            }
+            chatcmpl_tools.push_back(json {
+                {"type",     "function"},
+                {"function", function},
+            });
+        };
+        for (json resp_tool : resp_tools) {
             const std::string type = json_value(resp_tool, "type", std::string());
             if (type == "namespace") {
                 // A namespace groups function tools (Codex: sub-agents, one per MCP server). Offer each as
@@ -282,13 +346,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     if (!ns_desc.empty()) {
                         sub_tool["description"] = ns_desc + "\n" + json_value(sub_tool, "description", std::string());
                     }
-                    if (!sub_tool.contains("strict")) {
-                        sub_tool["strict"] = true;
-                    }
-                    chatcmpl_tools.push_back(json {
-                        {"type",     "function"},
-                        {"function", sub_tool},
-                    });
+                    add_tool(sub_tool);
                 }
                 continue;
             }
@@ -299,13 +357,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 continue;
             }
             resp_tool.erase("type");
-            chatcmpl_tool["type"] = "function";
-
-            if (!resp_tool.contains("strict")) {
-                resp_tool["strict"] = true;
-            }
-            chatcmpl_tool["function"] = resp_tool;
-            chatcmpl_tools.push_back(chatcmpl_tool);
+            add_tool(resp_tool);
         }
         chatcmpl_body.erase("tools");
         if (!chatcmpl_tools.empty()) {
