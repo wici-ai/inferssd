@@ -5,7 +5,7 @@ set -eu
 
 # The release workflow replaces this with the tag it publishes.
 DEFAULT_REF=main
-# The prebuilt package of main for Apple silicon, as .github/workflows/package-macos.yml
+# The latest release's prebuilt package for Apple silicon, as .github/workflows/release.yml
 # publishes it (docs/macos-package.md).
 PACKAGES=https://appapi.wici.ai/versioning/inferssd/config/latest-macos.json
 

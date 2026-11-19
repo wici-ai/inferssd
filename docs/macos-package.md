@@ -58,14 +58,16 @@ replaced by a stub that fails, and profiles the machine.
 
 Every published package is a release's. **Actions > Release**, run by hand on `main`, releases
 its head as its version, `<yymmdd>.<build>`: the commit's day (UTC) and `main`'s commit count, as
-every build is named. It calls **Package macOS** and **Package Windows** at that commit, with the
-release's tag, which is the version, and each package is checked against it. macOS builds on
-macOS 15 and checks on macOS 15 and 26; Windows also checks installation without developer
-tools, and signs (see [the Windows package](windows-package.md)). Only after both platforms pass
-does the release job attach the archives, manifests and pinned installers to the GitHub release
-named by the version, which tags the commit when it is published, and point the package lists at the
-archives with `scripts/publish-package.py`, which publishes nothing but a release's package.
-`APP_VERSIONING_TOKEN` is required.
+every build is named. It calls **Package macOS**, and **Package Windows** once for Vulkan and once
+for CUDA, at that commit, with the release's tag, which is the version, and each package is checked
+against it. macOS builds on macOS 15 and checks on macOS 15 and 26; Windows also checks
+installation without developer tools, and signs (see [the Windows package](windows-package.md)).
+Each package, once its own checks pass, reaches the CDN and its package list points at it
+(`scripts/publish-package.py`, which publishes nothing but a release's package): none waits for
+the slowest, so the macOS and Vulkan packages reach the app while the CUDA one still builds. Once
+all three are published, the release job attaches the archives, manifests and pinned installers to
+the GitHub release named by the version, which tags the commit when it is published. A version
+that is already a tag stops the run before anything is built. `APP_VERSIONING_TOKEN` is required.
 
 The release's notes list the pull requests merged since the last release, by their titles; a
 release with highlights of its own has a section in [CHANGELOG.md](../CHANGELOG.md), which comes
@@ -75,15 +77,15 @@ With `github_release` off, a run builds, checks and signs the same packages and 
 lists at them, which the installers from `main` and the desktop app follow, but makes no GitHub
 release and no tag, so no notes or pinned installers are published. The CDN then holds the
 version, and a release built again at the same commit would be refused there: the next GitHub
-release needs a newer commit on `main`.
+release needs a newer commit on `main`. The same holds for a run whose later package fails: the
+packages already published stay, and the failed one's list keeps its earlier version.
 
 Each release's installers pin their package lists to that same GitHub release. The installer
 from `main` follows the latest package list; explicit `INFERSSD_REF` or `INFERSSD_FROM_SOURCE`
 requests a source build.
 
-**Package macOS** also runs, building and checking without publishing, for pull requests that
-change how the package is built, after each merge to `main` that changes the engine, the framework
-or the packaging, and by hand on any branch. The publisher uploads to
+**Package macOS** also runs by hand on any branch, building and checking without publishing; run
+it for a change to how the package is built. Pull requests and merges to `main` build no package. The publisher uploads to
 `https://cdn.wici.ai/apps/inferssd/`, checks the served bytes before updating the list, and
 refuses a list older than the one already published.
 

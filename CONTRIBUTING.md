@@ -114,8 +114,11 @@ Python tests use synthetic inputs and do not start a model. Run them with Python
 transcript checks are bound to those versions and skip on others. CI runs both. Unexpected skipped tests are
 failures. Native test targets are described in [testing](docs/testing.md). CI builds the documented CMake presets,
 runs the native tests labelled `ci` on Linux, macOS and Windows hosted runners, and compiles the CUDA server
-whenever the engine or build configuration changes. The macOS and Windows packages are built for pull requests
-that change how they are built and after each merge to `main`.
+whenever the engine or build configuration changes. These checks run for pull requests and not again after the
+merge: `main` takes only squash merges of pull requests that are up to date with it, so a merge's commit is the
+code its pull request's checks ran on. The macOS and Windows packages are built only by a release,
+and by hand (**Actions > Package macOS** or **Package Windows**, on any branch) for a change to how they are
+built.
 
 Device performance checks are triggered by maintainers after review and run only for pull requests from
 branches in this repository; fork pull requests receive hosted CI only. See [device CI](bench/ci/README.md).
