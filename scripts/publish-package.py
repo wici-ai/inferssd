@@ -75,11 +75,11 @@ def main() -> None:
     if package.get("platform") != platform:
         fail("the package platform does not match its name")
     tag = package.get("tag")
-    if (not isinstance(tag, str) or not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
-            or package.get("version") != tag[1:]):
+    if (not isinstance(tag, str) or not re.fullmatch(r"[0-9]{6}\.[1-9][0-9]*", tag)
+            or package.get("version") != tag):
         fail("only a release's package is published: it has no release tag")
     name = package.get("name")
-    if name != f"inferssd-{tag[1:]}-{suffix}" or package.get("file") != name + extension:
+    if name != f"inferssd-{tag}-{suffix}" or package.get("file") != name + extension:
         fail("the package filename does not match its platform and version")
     archive = manifest.with_name(package["file"])
     data = archive.read_bytes()
@@ -138,7 +138,7 @@ def main() -> None:
         fail(f"writing {listing_name} answered {status}: {body[:300]!r}")
     stored = json.loads(body)
     print(f"{stored['url']} now names {upload['url']}")
-    print(f"{package['version']} ({package['label']}), sha256 {digest}")
+    print(f"{package['label']}, sha256 {digest}")
 
 
 if __name__ == "__main__":

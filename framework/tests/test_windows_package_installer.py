@@ -53,10 +53,10 @@ def windows_install(tmp_path):
         native=None,
         minimum_windows="10.0.10240",
     ):
-        name = f"inferssd-261109.{build}.aaaaaaa-windows-x64-{backend}"
+        name = f"inferssd-261109.{build}-windows-x64-{backend}"
         archive = tmp_path / (name + ".zip")
         metadata = {
-            "version": "0.1.3",
+            "version": f"261109.{build}",
             "build": build,
             "revision": "a" * 40,
             "date": "2026-11-09",
@@ -149,7 +149,7 @@ def test_failed_package_keeps_the_working_installation(windows_install, failure)
     old, wrapper = (home / "current").resolve(), (bindir / "inferssd.cmd").read_bytes()
     member = {
         "traversal": "../outside.txt",
-        "inner-traversal": "inferssd-261109.402.aaaaaaa-windows-x64-vulkan/../outside.txt",
+        "inner-traversal": "inferssd-261109.402-windows-x64-vulkan/../outside.txt",
     }.get(failure)
     bad, _ = make(
         402,
@@ -292,7 +292,7 @@ def test_installs_the_cuda_package_a_package_list_names(windows_install):
     listing, name = make_package(403, backend="cuda")
     result = run(listing)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "261109.403.aaaaaaa, cuda" in result.stdout
+    assert "Downloading InferSSD 261109.403, cuda" in result.stdout
     assert (home / "current" / "bin" / "inferssd-server.exe").is_file()
 
 

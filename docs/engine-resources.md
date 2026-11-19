@@ -11,9 +11,9 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
   "schema": "inferssd-engine 1",
   "binary": "bin/inferssd-server",
   "revision": "the-deployed-source-revision",
-  "version": "0.1.6.dev3",
+  "version": "261119.301",
   "tag": null,
-  "build": 292,
+  "build": 301,
   "date": "2026-11-19",
   "branch": "main",
   "templates": {
@@ -34,21 +34,21 @@ A descriptor is ordinary JSON. Relative paths resolve against its own directory:
 from: the commit, the branch's commit count up to it, the commit's day (UTC) and
 the branch. `scripts/engine-resources.py` reads them from the checkout's Git
 metadata, so a local build and the installer's build record them the same way;
-`inferssd --version --json` reports them, and `--version` alone adds them to its
-line as `<yymmdd>.<build>.<commit>`. A shallow clone counts only the commits it
+`inferssd --version --json` reports them, with the build's `label`,
+`<yymmdd>.<build>.<commit>`. A shallow clone counts only the commits it
 has, so the installer clones with `--filter=blob:none`; a source archive has no
 Git metadata, and the four are `"unknown"` and `null`. The WiCi AI desktop app
 decides on its own, by `build`, whether an engine is one it works with; the
 engine does not know the app.
 
-`version` and `tag` say which release the build is. A build of a released
-commit is that release's version, `0.1.5`, with its tag, `v0.1.5`; the Release
-workflow, which creates the tag once the packages are published, passes it to
-the packages it builds in `INFERSSD_RELEASE_TAG`. Any other build is the next
-patch's development version, counted from the latest release tag before it, as
-setuptools-scm counts (`0.1.6.dev3`, three commits after `v0.1.5`), and has no
-tag. Without a release tag, both are `null` and `inferssd --version` reports the
-framework's own version.
+`version` is `<yymmdd>.<build>`, the commit's day and the build number:
+`261119.301`. `inferssd --version` prints it with the commit,
+`inferssd 261119.301 (61a66d5)`. `tag` says the build is a release: a release's
+tag is its version, so a build of a released commit has the tag `261119.301`;
+the Release workflow, which creates the tag once the packages are published,
+passes it to the packages it builds in `INFERSSD_RELEASE_TAG`. Any other build
+has no tag. Without Git metadata, both are `null` and `inferssd --version`
+reports the framework's own version.
 
 Use `darwin` for an Apple Silicon deployment and `windows` for a Windows one.
 `gpu_backends` lists the GPU backends the engine was built with, of `CUDA`,

@@ -127,8 +127,8 @@ try {
     if ($LASTEXITCODE -ne 0 -or !$version.label) { throw 'The packaged command has no valid build label.' }
     Native $command @('serve', '--help')
   } finally { $env:INFERSSD_RESOURCES = $previousResources }
-  # A release is named by its version, any other build by its label.
-  $name = 'inferssd-' + $(if ($version.tag) { $version.version } else { $version.label }) + '-' + $suffix
+  if ($version.version -notmatch '^[0-9]{6}\.[1-9][0-9]*$') { throw 'The packaged command has no <yymmdd>.<build> version.' }
+  $name = 'inferssd-' + $version.version + '-' + $suffix
   $archiveRoot = Join-Path $stage 'archive'
   [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
   Move-Item -LiteralPath $package -Destination (Join-Path $archiveRoot $name)

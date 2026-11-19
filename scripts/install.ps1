@@ -288,7 +288,7 @@ No administrator rights are used. Models, settings and previous releases are pre
             # No Windows build is refused by its number: the packaged programs run below, and one Windows
             # cannot start fails the installation with the reason (Assert-Ran).
             $backend = [string]$package.backend
-            Write-Output "Downloading InferSSD $($package.label), $backend ($([math]::Ceiling($package.size / 1000000)) MB)."
+            Write-Output "Downloading InferSSD $($package.version), $backend ($([math]::Ceiling($package.size / 1000000)) MB)."
             $archive = Join-Path $release 'package.zip'
             Download-File $package.url $archive
             $hash = [Security.Cryptography.SHA256]::Create()
@@ -318,7 +318,7 @@ No administrator rights are used. Models, settings and previous releases are pre
                     return $target
                 }
                 foreach ($entry in $zip.Entries) { [void](Entry-Path $entry) }
-                Write-Output "Unpacking InferSSD $($package.label)."
+                Write-Output "Unpacking InferSSD $($package.version)."
                 foreach ($entry in $zip.Entries) {
                     $target = Entry-Path $entry
                     if (!$target) { continue }

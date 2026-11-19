@@ -32,8 +32,8 @@ installed, in `capabilities.gpu_backends` (`["CUDA"]` or `["Vulkan"]`), so an up
 package's list, `latest-windows-cuda.json` or `latest-windows-vulkan.json`.
 
 An archive has one directory, `inferssd-<version>-windows-x64-vulkan` (or `-cuda`), named by the
-release's version (by the build label, `<date.build.commit>`, for a package built outside a
-release, which is never published), containing:
+build's version, `<yymmdd>.<build>` (a package built outside a release is never published),
+containing:
 
 - `bin/inferssd.exe`: a relocatable native console entry point, forwarding arguments, standard
   handles and exit status to the package's own Python.
@@ -50,9 +50,10 @@ the macOS package. Published bytes are immutable.
 
 ## Build and verify
 
-Every published package is a release's. **Actions > Release**, run by hand on `main`, takes the
-next version and calls the reusable Windows and macOS package workflows at main's head with the
-release's tag (see [the macOS package](macos-package.md#releases)). After both platforms' checks
+Every published package is a release's. **Actions > Release**, run by hand on `main`, takes
+main's head's version, `<yymmdd>.<build>`, and calls the reusable Windows and macOS package
+workflows at that commit with the release's tag, which is the version (see
+[the macOS package](macos-package.md#releases)). After both platforms' checks
 pass, its release job prepares one GitHub release containing the three archives (macOS, Windows
 Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, updates the latest package
 lists, and only then publishes the complete release, which tags the commit. There is no separate
@@ -74,7 +75,7 @@ For a local build, enter an x64 Visual Studio tools environment, install the Vul
 
 ```powershell
 scripts/package-windows.ps1 -OutputDirectory dist
-scripts/check-package-windows.ps1 -Archive dist/inferssd-<label>-windows-x64-vulkan.zip
+scripts/check-package-windows.ps1 -Archive dist/inferssd-<version>-windows-x64-vulkan.zip
 ```
 
 For the CUDA package, install the CUDA toolkit instead (`scripts/install-cuda-redist.ps1` puts
@@ -108,7 +109,7 @@ published. Each newly signed file is also stored under the SHA-256 of its unsign
 later release reuses it instead of signing it again: a release signs the files that changed,
 mostly the engine's own, and a third-party file again only when its pinned version changes.
 
-The job runs in the `windows-signing` environment, limited to `main` and version tags, which
+The job runs in the `windows-signing` environment, limited to `main`, which
 holds the eSigner credential (`ES_USERNAME`, `ES_PASSWORD`, `ES_CREDENTIAL_ID`, `ES_TOTP_SECRET`)
 and the variable `WINDOWS_SIGNING_THUMBPRINT`, the SHA-1 thumbprint every WiCi AI signature must
 come from; `APP_VERSIONING_TOKEN` stores the signed files.

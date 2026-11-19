@@ -1,7 +1,8 @@
-"""scripts/engine-resources.py names a build's version from the clone's release tags."""
+"""scripts/engine-resources.py names a build's version, <yymmdd>.<build>, from its history."""
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -18,9 +19,11 @@ IDENTITY = {
     "GIT_COMMITTER_NAME": "test",
     "GIT_COMMITTER_EMAIL": "test@example.com",
 }
+# 14:42 in UTC+8 on 2026-11-19 is 06:42 UTC, the same day.
+DAY = "2026-11-19T14:42:55+08:00"
 
 
-def git(repository, *arguments):
+def git(repository, *arguments, date=DAY):
     subprocess.run(
         [
             "git",
@@ -34,7 +37,7 @@ def git(repository, *arguments):
         ],
         check=True,
         capture_output=True,
-        env={**os.environ, **IDENTITY},
+        env={**os.environ, **IDENTITY, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date},
     )
 
 
@@ -80,26 +83,38 @@ def resources(clone, **environ):
     return value["version"], value["tag"]
 
 
+def commits(clone, count, date=DAY):
+    for number in range(count):
+        git(clone[0], "commit", "-q", "--allow-empty", "-m", f"change {number}", date=date)
+
+
+def test_every_build_is_named_by_its_day_and_build_number(clone):
+    commits(clone, 2)
+    assert resources(clone) == ("261119.3", None)
+
+
+def test_the_day_is_the_commits_in_utc(clone):
+    commits(clone, 1, date="2026-11-19T23:30:00-05:00")
+    assert resources(clone) == ("261120.2", None)
+
+
 def test_a_tagged_commit_is_its_release(clone):
+    git(clone[0], "tag", "261119.1")
+    assert resources(clone) == ("261119.1", "261119.1")
+    # A tag of the old form, or of another build, does not make it one.
+    commits(clone, 1)
     git(clone[0], "tag", "v0.1.5")
-    assert resources(clone) == ("0.1.5", "v0.1.5")
-
-
-def test_a_later_commit_is_the_next_patch_in_development(clone):
-    git(clone[0], "tag", "v0.1.5")
-    for message in ("second", "third", "fourth"):
-        git(clone[0], "commit", "-q", "--allow-empty", "-m", message)
-    assert resources(clone) == ("0.1.6.dev3", None)
+    git(clone[0], "tag", "261119.1-rc")
+    assert resources(clone) == ("261119.2", None)
 
 
 def test_the_release_workflow_names_the_tag_it_is_about_to_create(clone):
-    git(clone[0], "tag", "v0.1.5")
-    git(clone[0], "commit", "-q", "--allow-empty", "-m", "second")
-    assert resources(clone, INFERSSD_RELEASE_TAG="v0.2.0") == ("0.2.0", "v0.2.0")
-    refused = resources(clone, INFERSSD_RELEASE_TAG="0.2.0")
-    assert refused.returncode != 0 and "vX.Y.Z" in refused.stderr
+    commits(clone, 1)
+    assert resources(clone, INFERSSD_RELEASE_TAG="261119.2") == ("261119.2", "261119.2")
+    refused = resources(clone, INFERSSD_RELEASE_TAG="261119.1")
+    assert refused.returncode != 0 and "not this build's version" in refused.stderr
 
 
-def test_without_a_release_tag_there_is_no_version(clone):
-    git(clone[0], "tag", "nightly")
-    assert resources(clone) == (None, None)
+def test_without_git_metadata_there_is_no_version(clone, tmp_path):
+    shutil.rmtree(clone[0] / ".git")
+    assert resources(clone, GIT_CEILING_DIRECTORIES=str(tmp_path)) == (None, None)

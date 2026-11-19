@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       release_tag:
-        description: The release's tag, vX.Y.Z, which gives the packages their version and names
+        description: The release's tag, its version <yymmdd>.<build>, which the packages are checked against
         required: true
         type: string
     secrets:

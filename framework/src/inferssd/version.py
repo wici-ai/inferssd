@@ -1,11 +1,11 @@
 """What `inferssd --version` says: the version, and the build this engine was made from.
 
-scripts/engine-resources.py reads them from the clone at install time. The version is a release's
-own, 0.1.5, with its tag, v0.1.5; any other build is the next release's development version,
-0.1.6.dev3. The build number is the branch's commit count and the day the commit's; together with
-the commit they name the build, <yymmdd>.<build>.<commit>. Whether an engine is one the app works
-with is the app's own call, by this build number. The GPU backends the build was made with come
-from the same file, so a caller can tell the Windows packages, one per backend, apart.
+scripts/engine-resources.py reads them from the clone at install time. The version is
+<yymmdd>.<build>, 261119.300: the day the commit's and the build number the branch's commit count.
+A release is the version its tag names, the same 261119.300. With the commit, the version names the
+build, <yymmdd>.<build>.<commit>. Whether an engine is one the app works with is the app's own
+call, by this build number. The GPU backends the build was made with come from the same file, so a
+caller can tell the Windows packages, one per backend, apart.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ def label(build: Optional[int], date: Optional[str], revision: Optional[str]) ->
     return f"{date[2:4]}{date[5:7]}{date[8:10]}.{build}.{revision[:7]}"
 
 
-TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
+VERSION = re.compile(r"[0-9]{6}\.[1-9][0-9]*")
 
 
 def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
@@ -58,7 +58,7 @@ def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
     if isinstance(version, str) and version:
         value["version"] = version
     tag = data.get("tag")
-    if isinstance(tag, str) and TAG.fullmatch(tag) and tag[1:] == value["version"]:
+    if isinstance(tag, str) and VERSION.fullmatch(tag) and tag == value["version"]:
         value["tag"] = tag
     for key, kind in (("build", int), ("revision", str), ("date", str), ("branch", str)):
         item = data.get(key)
@@ -79,6 +79,6 @@ def report(environ: Mapping[str, str] = os.environ) -> dict[str, Any]:
 
 
 def line(value: Mapping[str, Any]) -> str:
-    """The line for people: `inferssd 0.1.5 (261118.289.1a2b3c4)`, the label when there is one."""
+    """The line for people: `inferssd 261119.300 (1a2b3c4)`, with the commit when there is one."""
     text = f"inferssd {value['version']}"
-    return f"{text} ({value['label']})" if value.get("label") else text
+    return f"{text} ({value['revision'][:7]})" if value.get("revision") else text

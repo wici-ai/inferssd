@@ -164,8 +164,8 @@ def test_descriptor_carries_the_build_it_was_made_from(tmp_path):
         "revision": "fixture",
     }
     made = {
-        "version": "0.1.5",
-        "tag": "v0.1.5",
+        "version": "261106.202",
+        "tag": "261106.202",
         "build": 202,
         "date": "2026-11-06",
         "branch": "main",
