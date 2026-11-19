@@ -38,7 +38,7 @@ prefill `-tb` counts and, on Linux, the CPUs they run on.
 An executed launch measures the machine before its first launch and reuses the
 result afterwards (`--reprofile` measures again; `--machine PATH` uses a given
 characteristics file and measures nothing); see [machine profile](../docs/machine-profile.md).
-From that file, the model's GGUF header and the CPUs, GPUs and memory it finds
+From that file, the engine's facts of the model and the CPUs, GPUs and memory it finds
 at that moment, the launch chooses thread counts, CPU placement, `place.costs`
 and, for an engine with CUDA but no usable CUDA GPU, `vram.budget = 0` (on macOS also
 `host.budget_mib` from the runtime policy). It prefills each prompt in one pass
@@ -78,11 +78,13 @@ packs or alias indexes). Native source validation remains a separate boundary. `
 a local one with `-m`. Other compute processes on the GPU do not stop a launch:
 it leaves them VRAM (`vram.reserve_mib` in the [settings](../docs/configuration.md)).
 
-The source operations behind the legacy artifact formats (`index`, `facts`,
-`lane_args`, `dense` and `iolog`) remain Python functions in
-`inferssd.source.experts`, with explicit filesystem and output ports; they read
-headers only and never run a probe. A generated alias is not a payload-integrity
-certificate.
+The framework reads no GGUF file itself. Before it starts a server, a launch
+asks that server for the model's facts (`inferssd-server --ssd-model-facts
+MODEL`): the engine reads the headers as its load does, without reading a weight
+or starting a backend, and prints its files, metadata, tensors and the layout of
+the routed experts as JSON (`inferssd.engine.model`). The strategy and the RAM
+admission take their model facts from it, and a recorded dry run takes them from
+its host facts.
 
 ## Compatibility and failure behavior
 
@@ -106,37 +108,16 @@ Legacy artifact mappings are typing views, not new schemas. They are not copied,
 normalized, validated or filled with defaults on ingestion. Missing, null, empty
 and zero values retain distinct behavior, including failures when consumed.
 
-### File and output ordering
-
-Source header reads retain the original mmap lifetime and decoding: metadata
-strings use replacement decoding, while textual artifacts and pack tensor names
-use strict decoding. Split-model discovery uses the original sorted glob and does
-not newly reject missing shards. Type 42 is ggml's Q2_0; the owned F8 block
-format that once used it was removed from the engine.
-
-`experts.index` retains mtime-based reuse, including the original set iteration over
-source paths. Recorded filesystem transcripts use `PYTHONHASHSEED=0` as a test
-condition; dynamic comparisons also check another seed. Production iteration is
-unchanged. GGUF alias output is closed and replaced before the expert JSON is
-written. Failure can leave a directory, temporary file or the already-published
-alias, as in the reference. Pack indexing does not create a GGUF alias. Dense
-placement keeps input order and validates each consumed line before writing its
-alias. No new
-whole-artifact validation, transaction, random seed default or filesystem probe
-is inserted into these paths.
-
 ## Python interfaces
 
 | Area | Modules and boundary |
 | --- | --- |
-| Source metadata | `source.header`, `source.experts`, `source.files`: header/parser and legacy artifact operations with explicit filesystem, output and random ports |
 | Machine | `machine.*`: identity, probes, characteristics and their store, behind `inferssd profile` |
 | Launch | `launch.*`, `strategy.*`, `configuration.settings`: typed settings, the launch strategy and the typed launch behind `serve` and `cli` |
-| Owned runtime | `engine.*`, `platform.*`: the guardian, worker and owned server |
+| Owned runtime | `engine.*`, `platform.*`: the guardian, worker and owned server, and the engine's facts of a model (`engine.model`) |
 | Native observations | `telemetry.jsonl`, `telemetry.observations`, `telemetry.files`: versioned native events and local file access |
 
-Source operations borrow their filesystem ports; import and adapter construction
-perform no file or process work. These interfaces preserve existing semantics;
+Import and adapter construction perform no file or process work. These interfaces preserve existing semantics;
 they are not a claim that every legacy artifact now has a versioned, validated
 contract.
 

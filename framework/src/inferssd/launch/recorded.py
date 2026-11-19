@@ -1,72 +1,24 @@
-"""Local artifact preparation plus required recorded host facts; never starts an engine."""
+"""Local file facts plus required recorded host facts; never starts an engine."""
 
 from __future__ import annotations
 
-import glob
-import io
 import os
-import shlex
-import sys
-import traceback
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
 
 from inferssd.launch import ram
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
-from inferssd.source import experts
-from inferssd.source import header as gguf_header
 from inferssd.strategy import inputs as strategy_inputs
-
-
-def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
-    """Keep the subprocess-style reply boundary using the typed artifact functions.
-
-    Tracebacks identify the actual Python source. They are not rewritten to look
-    like the former shell's helper process. SystemExit and partial writes remain.
-    """
-    stdout, stderr = io.StringIO(), io.StringIO()
-
-    def emit(*values: object, **keywords: Any) -> None:
-        stream = stderr if keywords.pop("file", None) is sys.stderr else stdout
-        print(*values, file=stream, **keywords)
-
-    try:
-        if name == "index":
-            experts.index(arguments[0], None, arguments[1], emit=emit)
-        elif name == "source_facts":
-            experts.facts(arguments[0], arguments[1] or None, emit=emit)
-        elif name == "dense":
-            experts.dense(*arguments, emit=emit)
-        else:
-            raise ValueError("Unknown artifact operation: " + name)
-    except SystemExit as error:
-        if isinstance(error.code, int):
-            code = error.code
-        elif error.code is None:
-            code = 0
-        else:
-            stderr.write(str(error.code) + "\n")
-            code = 1
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), code)
-    except Exception:
-        stderr.write(traceback.format_exc())
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), 1)
-    values = (
-        dict(word.split("=", 1) for word in shlex.split(stdout.getvalue()))
-        if name != "index"
-        else {}
-    )
-    return Reply(values, stdout.getvalue(), stderr.getvalue())
 
 
 class RecordedArtifacts:
     """Filesystem effects are local; host observations must be supplied explicitly.
 
     A missing host field fails only when requested. This object does not call
-    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable.
+    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable, so the
+    model's facts (the engine's) are recorded too.
     """
 
     def __init__(self, inputs: LaunchInput, host: Mapping[str, object]):
@@ -81,39 +33,15 @@ class RecordedArtifacts:
         if name == "read_text":
             with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())
-        if name == "model_matches":
-            directory, pattern = args
-            paths = [
-                path
-                for level in ("", "*/", "*/*/")
-                for path in sorted(glob.glob(directory + "/" + level + pattern))
-            ]
-            return Reply(tuple(paths))
-        if name == "absolute_directory":
-            return Reply(str(Path(args[0]).resolve(strict=True)))
         if name == "resolved_path":
             path = args[0]
             if path == "~" or path.startswith("~/"):
                 path = dict(self.inputs.environment).get("HOME", str(Path.home())) + path[1:]
             return Reply(str(Path(path).expanduser().resolve()))
-        if name == "older":
-            return Reply(os.stat(args[0]).st_mtime < os.stat(args[1]).st_mtime)
-        if name == "mkdir":
-            Path(args[0]).mkdir(parents=True, exist_ok=True)
-            return Reply()
         if name == "write_exclusive":
             with Path(args[0]).open("x", encoding="utf-8", newline="\n") as stream:
                 stream.write(args[1])
             return Reply()
-        if name in ("index", "source_facts", "dense"):
-            return metadata(name, args)
-        if name == "model_facts" and name not in self.host:
-            # Read from the model's own headers.
-            headers = gguf_header.without_nextn([gguf_header.read(path) for path in args])
-            if headers[0].kv.get("general.architecture") == ram.ARCHITECTURE:
-                return Reply(ram.facts(headers))
-            model = strategy_inputs.facts_from_headers(headers)
-            return Reply(strategy_inputs.model_facts_json(model))
         if name == "cpu_topology" and name not in self.host:
             saved = self.host.get("machine_characteristics")
             if saved is not None:

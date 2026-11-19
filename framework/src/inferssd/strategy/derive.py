@@ -2,7 +2,7 @@
 """Derive one launch's native settings, thread pools and server arguments.
 
 ``derive`` is a pure function of the machine characteristics, the model's
-header facts, the runtime facts and the platform. It chooses thread counts and
+facts, the runtime facts and the platform. It chooses thread counts and
 CPU placement, placement cost priors, and the host memory budget and margin; a
 launch with a strategy prefills each prompt in one pass.
 The pass shape changes the computation, for speed; everything else keeps it

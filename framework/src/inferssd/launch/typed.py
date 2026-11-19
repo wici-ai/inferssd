@@ -355,14 +355,32 @@ def _resolve(
     for path in paths:
         if not s.value("is_file", path):
             raise ValueError("missing GGUF shard: " + path)
+    resources = spec.resources
+    if resources is not None and resources.platform not in (None, platform):
+        raise ValueError("engine resource platform differs from the selected platform")
+    binary_path = server_binary(
+        platform, spec.binary, resources, s.inputs.repo, lambda path: bool(s.value("is_file", path))
+    )
+    if not binary_path:
+        raise ValueError("provide --binary or an engine resource descriptor")
+    binary = s.text("resolved_path", binary_path)
+    if not s.value("is_file", binary) or not s.value("is_executable", binary):
+        raise ValueError("missing server executable: " + binary)
+    # The engine's facts of the model, read once for the profile, the RAM fit and the strategy.
+    observed: list[object] = []
+
+    def model_facts() -> object:
+        if not observed:
+            observed.append(s.value("model_facts", binary, model))
+        return observed[0]
+
     profile = s.inputs.profile
-    observed: object = None
     if not profile:
-        observed = s.value("model_facts", *paths)
+        facts = model_facts()
         architecture = (
-            cast(str, ram.validate(observed)["architecture"])
-            if isinstance(observed, Mapping) and observed.get("architecture") == ram.ARCHITECTURE
-            else model_facts_from(observed).architecture
+            cast(str, ram.validate(facts)["architecture"])
+            if isinstance(facts, Mapping) and facts.get("architecture") == ram.ARCHITECTURE
+            else model_facts_from(facts).architecture
         )
         if architecture not in ARCHITECTURES:
             raise ValueError(
@@ -403,17 +421,6 @@ def _resolve(
             raise ValueError(
                 "the RAM profile does not accept unbudgeted model or KV environment controls"
             )
-    resources = spec.resources
-    if resources is not None and resources.platform not in (None, platform):
-        raise ValueError("engine resource platform differs from the selected platform")
-    binary_path = server_binary(
-        platform, spec.binary, resources, s.inputs.repo, lambda path: bool(s.value("is_file", path))
-    )
-    if not binary_path:
-        raise ValueError("provide --binary or an engine resource descriptor")
-    binary = s.text("resolved_path", binary_path)
-    if not s.value("is_file", binary) or not s.value("is_executable", binary):
-        raise ValueError("missing server executable: " + binary)
     # The engine's GPU backends: the descriptor's, else its build's; None when neither says.
     gpu_backends = resources.gpu_backends if resources is not None else None
     if gpu_backends is None:
@@ -466,7 +473,7 @@ def _resolve(
     if ordinary:
         runtime = runtime_facts_from(s.value("runtime_facts"))
         configured_budget = cast(int, value.at("host.budget_mib").value) << 20
-        facts = observed if observed is not None else s.value("model_facts", *paths)
+        facts = model_facts()
         available = runtime.available_bytes
         # A context left unset takes the largest step down from CONTEXT that fits the memory
         # available now, else the smallest step; one given is kept. Either must be admitted.
@@ -505,7 +512,16 @@ def _resolve(
             )
     elif spec.strategy:
         # The strategy fills what the user left unset; the checks below see the result.
-        planned = plan(s, platform, memory, paths, value, spec.threads, gpu_backends)
+        planned = plan(
+            s,
+            platform,
+            memory,
+            paths,
+            lambda: model_facts_from(model_facts()),
+            value,
+            spec.threads,
+            gpu_backends,
+        )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(argument in protected for argument in planned.server_args[::2]):
             raise ValueError("the launch strategy names a protected server option")

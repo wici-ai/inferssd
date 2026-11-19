@@ -10,6 +10,7 @@ bounds. Attention, graph overhead and cache warm-up are not measured here.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,7 +23,7 @@ from inferssd.strategy.derive import (
     single_gpu,
     tier_gpus,
 )
-from inferssd.strategy.inputs import BLOCKS, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import ModelFacts, RuntimeFacts
 
 GB = 1e9
 ENGINE_RESERVE_BYTES = 512 << 20
@@ -131,31 +132,33 @@ def matvec_rate(
     return point["weight_Bps"] * point["us"] / duration if duration > 0 else point["weight_Bps"]
 
 
-def bits_per_weight(name: str) -> float:
-    block, size = BLOCKS[name.upper()]
-    return 8 * size / block
-
-
-def format_proxies(rows: list[ComputeRow], names: set[str]) -> dict[str, str]:
-    """Each of NAMES priced as itself when ROWS measure it at one token, else as the measured
-    format nearest it in bits per weight (the higher of two as near): a default for a format the
-    probe does not measure, such as IQ4_XS and IQ4_NL, until a run calibrates it. A name with no
-    block size, or rows that measure nothing, has no entry."""
-    measured = {
-        row["format"].upper()
-        for row in rows
-        if row["format"].upper() in BLOCKS
-        and any(p["tokens"] == 1 and p.get("weight_Bps", 0) > 0 for p in row["points"])
+def model_bits(model: ModelFacts) -> dict[str, float]:
+    """Bits per weight of each ggml type the model's routed experts take, from their bytes."""
+    return {
+        name.upper(): role.bits_per_weight(name)
+        for role in model.roles
+        for name, _, _ in role.formats
     }
-    proxies = {}
-    for name in names:
-        if name.upper() in measured:
-            proxies[name] = name.upper()
-        elif name.upper() in BLOCKS and measured:
-            want = bits_per_weight(name)
-            proxies[name] = min(
-                measured, key=lambda m: (abs(bits_per_weight(m) - want), -bits_per_weight(m), m)
+
+
+def format_proxies(rows: list[ComputeRow], wanted: Mapping[str, float]) -> dict[str, str]:
+    """Each format of WANTED (with its bits per weight) priced as itself when ROWS measure it at
+    one token, else as the measured format nearest it in bits per weight (the higher of two as
+    near): a default for a format the probe does not measure, such as IQ4_XS and IQ4_NL, until a
+    run calibrates it. A row's bits per weight are its weight bytes over its matrix. Rows that
+    measure nothing give no entry."""
+    measured: dict[str, float] = {}
+    for row in rows:
+        if any(p["tokens"] == 1 and p.get("weight_Bps", 0) > 0 for p in row["points"]):
+            measured.setdefault(
+                row["format"].upper(), 8 * row["weight_bytes"] / (row["rows"] * row["cols"])
             )
+    proxies = {}
+    for name, want in wanted.items():
+        if name in measured:
+            proxies[name] = name
+        elif measured:
+            proxies[name] = min(measured, key=lambda m: (abs(measured[m] - want), -measured[m], m))
     return proxies
 
 
@@ -175,9 +178,9 @@ def cpu_decode_seconds(
 ) -> tuple[Optional[float], str]:
     """One expert, using only one-token points and all of its quantization types."""
     rows = [row for row in c["compute"]["cpu"] if not row.get("cpus")]
-    names = {name.upper() for role in model.roles for name, _ in role.formats}
+    names = model_bits(model)
     proxies = format_proxies(rows, names)
-    missing = sorted(names - set(proxies))
+    missing = sorted(set(names) - set(proxies))
     if missing:
         return None, "no CPU compute measurement of " + ", ".join(missing)
     rates = {}
@@ -186,7 +189,7 @@ def cpu_decode_seconds(
         values = [
             matvec_rate(selected, proxies[name.upper()], role.rows, role.cols, timing)
             for role in model.roles
-            for name, _ in role.formats
+            for name, _, _ in role.formats
         ]
         if all(rate is not None for rate in values):
             rates[count] = [rate or 0 for rate in values]
@@ -197,7 +200,7 @@ def cpu_decode_seconds(
     share = (threads - lower) / (upper - lower) if upper != lower else 0
     total, index = 0.0, 0
     for role in model.roles:
-        for name, layers in role.formats:
+        for name, layers, _ in role.formats:
             rate = rates[lower][index] + share * (rates[upper][index] - rates[lower][index])
             total += layers / model.layers * role.slice_bytes(name) / rate
             index += 1
@@ -244,7 +247,7 @@ def decode_estimate(
     if min(host_work_bytes, gpu_work_bytes, dense_read_bytes) < 0:
         raise ValueError("memory sizes must be nonnegative")
     if not model.experts_used or not model.routed_bytes:
-        return Estimate(None, "the GGUF header names no routed experts per token")
+        return Estimate(None, "the model names no routed experts per token")
     memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
     if memory_Bps <= 0:
         return Estimate(None, "no memory read rate in the profile")
@@ -286,13 +289,13 @@ def decode_estimate(
     gpu_fast_s = 0.0
     gpu_slow_s = 0.0
     missing = []
-    names = {name.upper() for role in model.roles for name, _ in role.formats}
+    names = model_bits(model)
     cpu_proxies = format_proxies(
         [row for row in characteristics["compute"]["cpu"] if not row.get("cpus")], names
     )
     gpu_proxies = format_proxies(rows, names)
     for role in model.roles:
-        for name, layers in role.formats:
+        for name, layers, _ in role.formats:
             used = gpu_proxies.get(name.upper(), name)
             rate = matvec_rate(rows, used, role.rows, role.cols)
             if rate is None:

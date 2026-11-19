@@ -4,7 +4,7 @@
 InferSSD measures each machine once and keeps the result in a characteristics
 file. The file describes the machine only: its CPUs, memory, GPUs and
 the drives that hold models. It holds no model data, no placement and no cache
-sizes; each launch works those out from the model's GGUF header and this file.
+sizes; each launch works those out from the engine's facts of the model and this file.
 
 You do not need to run anything for this: the first `inferssd serve` or `cli` on
 a machine measures it, and later launches reuse the file (see
@@ -73,7 +73,8 @@ what it would have measured.
 | `--reprofile` | Measure every section again before launching. |
 | `--machine PATH` | Use this characteristics file as it is and measure nothing, for example one file measured once and shared by several runs. A dry-run reads it too. |
 
-Each launch then combines the file with the model's GGUF header and with what
+Each launch then combines the file with the engine's facts of the model (its
+server reads the GGUF headers, `inferssd-server --ssd-model-facts`) and with what
 it reads at that moment (the CPUs it may use, the usable GPUs and their free
 memory, the available memory) to choose:
 
@@ -214,8 +215,8 @@ substituted drives) are identified by filesystem type and mount point.
 ## Speed estimates
 
 With `--model`, `inferssd profile` estimates the decode speed of each supported
-model, before it is downloaded, from this machine's profile and the facts of
-its GGUF headers that the framework keeps. A token's time is the sum of:
+model, before it is downloaded, from this machine's profile and the engine's
+facts of its tested quantization that the framework keeps. A token's time is the sum of:
 
 - the dense weights a token reads, at the fastest measured memory read rate
   (the token embeddings and DeepSeek-V4.1's engram tables, of which a token

@@ -11,6 +11,7 @@ from functools import partial
 from typing import Optional
 
 from inferssd.configuration.settings import Snapshot
+from inferssd.engine import model as engine_model
 from inferssd.engine.core import Engine, NativeEffects
 from inferssd.engine.owned import OwnedProcess
 from inferssd.launch import ram
@@ -55,18 +56,28 @@ class Runtime:
         if self.machine is None or specification is None or not specification.strategy:
             return None
         if self.characteristics_text is None:
-            if ram.is_model(specification.model):
-                # Ordinary models need a live RAM check, not expert/SSD calibration.
-                self.characteristics_text = (None,)
-                return None
             platform, repo = self.policy.platform, self.inputs.repo
             resources = specification.resources
             binary = server_binary(platform, specification.binary, resources, repo, os.path.isfile)
             binary = os.path.realpath(binary) if binary else None
+            if binary and self.ordinary(binary, specification.model):
+                # Ordinary models need a live RAM check, not expert/SSD calibration.
+                self.characteristics_text = (None,)
+                return None
             probes = probe_paths(platform, binary, resources, repo, os.path.isfile)
             text = machine_characteristics(self.machine, platform, specification.model, probes)
             self.characteristics_text = (text,)
         return self.characteristics_text[0]
+
+    def ordinary(self, binary: str, model: str) -> bool:
+        """Whether MODEL is an ordinary RAM profile, as the engine BINARY reads it."""
+        try:
+            facts = engine_model.query(
+                binary, model, lambda argv: self.host.command(argv, timeout=engine_model.TIMEOUT_S)
+            )
+        except ValueError:
+            return False  # Normal preparation reports invalid/missing model inputs.
+        return bool(facts["architecture"] == ram.ARCHITECTURE)
 
     def resolve(
         self,

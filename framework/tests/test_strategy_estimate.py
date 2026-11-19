@@ -51,9 +51,9 @@ def test_the_catalog_is_the_download_list_and_its_facts_add_up():
         # Each type's total is exactly its roles' layers of that type, over every expert.
         per_type: Counter[str] = Counter()
         for role in facts.roles:
-            assert sum(layers for _, layers in role.formats) == facts.layers
-            for name, layers in role.formats:
-                per_type[name] += layers * facts.experts * role.slice_bytes(name)
+            assert sum(layers for _, layers, _ in role.formats) == facts.layers
+            for name, layers, size in role.formats:
+                per_type[name] += layers * facts.experts * size
         assert dict(facts.format_bytes) == dict(per_type)
         assert facts.expert_bytes <= facts.expert_read_bytes
         assert facts.mean_expert_read_bytes <= facts.expert_read_bytes

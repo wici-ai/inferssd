@@ -1,12 +1,9 @@
-"""Header-derived admission for ordinary Gemma inference without an expert store."""
+"""Admission for ordinary Gemma inference without an expert store, from the engine's model facts."""
 
 from __future__ import annotations
 
-import struct
-from collections.abc import Mapping, Sequence
-from typing import Optional, cast
-
-from inferssd.source import header
+from collections.abc import Mapping
+from typing import Any, Optional, cast
 
 ARCHITECTURE = "gemma4"
 WORKSPACE_BYTES = 1 << 30
@@ -14,18 +11,11 @@ WORKSPACE_BYTES = 1 << 30
 FILE, COPIED, LOOKUPS_IN_FILE = "file", "copied", "lookups-in-file"
 
 
-def is_model(path: str) -> bool:
-    """Whether PATH is an ordinary RAM profile, without running SSD calibration."""
-    try:
-        return bool(header.read(path).kv.get("general.architecture") == ARCHITECTURE)
-    except (OSError, ValueError, struct.error):
-        return False  # Normal preparation reports invalid/missing model inputs.
-
-
-def facts(headers: Sequence[header.Header]) -> dict[str, object]:
-    """The mapped weights and unique F16 KV layers described by these headers."""
-    kv = headers[0].kv
-    if kv.get("general.architecture") != ARCHITECTURE:
+def facts(model: Mapping[str, Any]) -> dict[str, object]:
+    """The mapped weights and unique F16 KV layers of MODEL, the engine's facts of a model
+    (inferssd.engine.model.validate)."""
+    kv = model["metadata"]
+    if model["architecture"] != ARCHITECTURE:
         raise ValueError("the RAM profile requires a Gemma4 GGUF")
 
     def count(name: str, default: Optional[int] = None) -> int:
@@ -50,18 +40,18 @@ def facts(headers: Sequence[header.Header]) -> dict[str, object]:
         raise ValueError("invalid Gemma4 sliding-window pattern")
     swa_key = count("attention.key_length_swa", key)
     swa_value = count("attention.value_length_swa", value)
-    tensors = [tensor for item in headers for tensor in item.tensors]
+    tensors = model["tensors"]
+    ends = [0] * len(model["files"])
+    for t in tensors:
+        ends[t["file"]] = max(ends[t["file"]], t["offset"] + t["bytes"])
     return {
         "architecture": ARCHITECTURE,
         # Include the header and alignment: --mmap can keep those pages resident too.
-        "model_bytes": sum(
-            max((t.offset + t.nbytes for t in item.tensors), default=item.data_offset)
-            for item in headers
-        ),
-        "tensor_bytes": sum(t.nbytes for t in tensors),
-        "embedding_bytes": sum(t.nbytes for t in tensors if t.name == "token_embd.weight"),
+        "model_bytes": sum(ends),
+        "tensor_bytes": sum(t["bytes"] for t in tensors),
+        "embedding_bytes": sum(t["bytes"] for t in tensors if t["name"] == "token_embd.weight"),
         # The per-layer embedding table, a row lookup of one row a token.
-        "ple_bytes": sum(t.nbytes for t in tensors if t.name == "per_layer_token_embd.weight"),
+        "ple_bytes": sum(t["bytes"] for t in tensors if t["name"] == "per_layer_token_embd.weight"),
         # Shared tail layers reuse earlier KV storage. Sliding layers retain a window
         # plus the batch being processed, as llama_memory_iswa does.
         "kv_layers": [
@@ -75,9 +65,9 @@ def facts(headers: Sequence[header.Header]) -> dict[str, object]:
 
 
 def validate(raw: object) -> dict[str, object]:
-    """Validate recorded header facts without inventing missing RAM dimensions."""
+    """Validate recorded RAM model facts without inventing missing dimensions."""
     if not isinstance(raw, Mapping) or raw.get("architecture") != ARCHITECTURE:
-        raise ValueError("the RAM profile requires Gemma4 header facts")
+        raise ValueError("the RAM profile requires Gemma4 model facts")
     for key in ("model_bytes", "tensor_bytes", "embedding_bytes"):
         if type(raw.get(key)) is not int or raw[key] <= 0:
             raise ValueError("invalid RAM model fact: " + key)

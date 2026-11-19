@@ -19,7 +19,15 @@ from test_launch_platforms import golden
 from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
 from test_machine_profile import Clock, linux_machine
-from test_strategy_inputs import SMI_APPS, SMI_GPUS, RuntimeHost, deepseek_like, write_gguf
+from test_strategy_inputs import (
+    SMI_APPS,
+    SMI_GPUS,
+    EngineHost,
+    RuntimeHost,
+    deepseek_like,
+    engine_facts,
+    recorded_facts,
+)
 from test_typed_launch import session, setup
 
 from inferssd.configuration.settings import parse
@@ -38,7 +46,6 @@ from inferssd.launch.types import Fact, LaunchInput, Reply, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.machine.identity import Command
 from inferssd.machine.store import LockBusy, default_path
-from inferssd.strategy.inputs import model_facts_json, shard_facts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
 X86_FILE = MACHINES / "linux-x86-rtx5090.json"
@@ -343,17 +350,18 @@ def test_recorded_machine_characteristics(tmp_path):
 
 
 def test_recorded_model_runtime_and_drive_facts(tmp_path):
-    model = str(write_gguf(tmp_path / "dsv.gguf", *deepseek_like()))
-    header = model_facts_json(shard_facts([model]))
-    # Without a recording the header is read from the model itself.
-    assert recorded({})(Fact("model_facts", (model,))).value == header
-    stored = dict(header, dense_bytes=7)
-    assert recorded({"model_facts": stored})(Fact("model_facts", ("/absent.gguf",))).value == (
+    model = str(tmp_path / "dsv.gguf")
+    facts = recorded_facts(*deepseek_like(), path=model)
+    # A recorded launch never starts the engine: the model's facts are recorded too.
+    with pytest.raises(ValueError, match="Missing recorded host fact: model_facts"):
+        recorded({})(Fact("model_facts", ("/bin/server", model)))
+    stored = dict(facts, dense_bytes=7)
+    assert recorded({"model_facts": stored})(Fact("model_facts", ("/bin/server", model))).value == (
         stored
     )
-    partial_header = {key: value for key, value in header.items() if key != "roles"}
+    partial = {key: value for key, value in facts.items() if key != "roles"}
     with pytest.raises(ValueError, match="model_facts.roles is required"):
-        recorded({"model_facts": partial_header})(Fact("model_facts", (model,)))
+        recorded({"model_facts": partial})(Fact("model_facts", ("/bin/server", model)))
     runtime_value = recorded({"runtime_facts": runtime_record()})(Fact("runtime_facts")).value
     # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
     gpus = [dict(row, backend="CUDA") for row in runtime_record()["gpus"]]
@@ -404,6 +412,29 @@ def test_live_strategy_facts(tmp_path):
     assert adapter(Fact("model_drive_key", (str(model),))).value == nvme_key()
     plain = LiveArtifacts(LaunchInput("", ()), host=None)
     assert plain(Fact("machine_characteristics")).value is None
+
+
+def test_live_model_facts_are_the_engines(tmp_path):
+    model = str(tmp_path / "dsv.gguf")
+    printed = {"model": json.dumps(engine_facts(*deepseek_like(), path=model))}
+    asked = []
+
+    class EngineHost:
+        def command(self, argv, timeout=10):
+            asked.append((list(argv), timeout))
+            if printed["model"] is None:
+                return Command(1, "", "error: " + model + ": no such file\n")
+            return Command(0, printed["model"])
+
+    adapter = LiveArtifacts(LaunchInput("", ()), host=EngineHost())
+    # The server the launch starts reads the model; the strategy takes its facts.
+    assert adapter(Fact("model_facts", ("/bin/server", model))).value == recorded_facts(
+        *deepseek_like(), path=model
+    )
+    assert asked == [(["/bin/server", "--ssd-model-facts", model], 120.0)]
+    printed["model"] = None
+    with pytest.raises(ValueError, match="the engine cannot read the model .*: no such file"):
+        adapter(Fact("model_facts", ("/bin/server", model)))
 
 
 def profile_launch(tmp_path, source=MachineSource(), probes=None, runner=None, **options):
@@ -554,10 +585,12 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "OwnedProcess", lambda *a, **k: owner)
     monkeypatch.setattr(effects, "reservation", object(), raising=False)
     source = MachineSource(reprofile=True)
+    # The engine reads the model: an expert model, so the machine is measured.
+    host = EngineHost(engine_facts(*deepseek_like(), path=spec.model))
     value = runtime.Runtime(
         inputs,
         policy(tmp_path, "linux"),
-        host=object(),
+        host=host,
         emit=lambda _: None,
         configuration=spec,
         machine=source,
@@ -568,6 +601,7 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
     ((given, platform, model, probes, events),) = calls
     assert (given, platform, model, probes, events) == (source, "linux", spec.model, {}, [])
     assert adapters and all(options["machine"] == dumps(load(X86_FILE)) for options in adapters)
+    assert [argv[1:] for argv in host.asked] == [["--ssd-model-facts", spec.model]]
     engine.stop()
     plain = runtime.Runtime(
         inputs, policy(tmp_path, "linux"), host=object(), emit=lambda _: None, machine=source

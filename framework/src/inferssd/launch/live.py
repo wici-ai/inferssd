@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional, Protocol
 
+from inferssd.engine import model as engine_model
+from inferssd.launch import ram
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
@@ -42,6 +44,15 @@ def cpu_count(value: str) -> str:
     return str(len(seen)) if seen else ""
 
 
+def model_facts(binary: str, path: str, run: engine_model.Run) -> object:
+    """The model_facts fact of the model PATH as the server BINARY would load it: its RAM facts
+    for an ordinary model, else its expert model's facts (inferssd.strategy.inputs)."""
+    model = engine_model.query(binary, path, run)
+    if model["architecture"] == ram.ARCHITECTURE:
+        return ram.facts(model)
+    return strategy_inputs.model_facts_json(strategy_inputs.facts_from_engine(model))
+
+
 @dataclass(frozen=True)
 class Command:
     returncode: int
@@ -50,7 +61,7 @@ class Command:
 
 
 class Host(Protocol):
-    def command(self, argv: Sequence[str]) -> Command: ...
+    def command(self, argv: Sequence[str], timeout: float = 10) -> Command: ...
     def exists(self, path: str) -> bool: ...
     def readable(self, path: str) -> bool: ...
     def which(self, name: str) -> bool: ...
@@ -65,8 +76,8 @@ class Host(Protocol):
 class NativeHost:
     """Concrete standard-library host operations, with bounded command waits."""
 
-    def command(self, argv: Sequence[str]) -> Command:
-        result = run_captured(argv, timeout=10)
+    def command(self, argv: Sequence[str], timeout: float = 10) -> Command:
+        result = run_captured(argv, timeout=timeout)
         return Command(result.returncode, result.stdout, result.stderr)
 
     def exists(self, path: str) -> bool:
@@ -101,7 +112,7 @@ HOST_FACTS = frozenset(
     "gpu_available ss_available systemd cgroup_v2 user_manager memory_controller euid "
     "memory_kib filesystem gpu_memory gpu_processes port_busy scope_suffix "
     "platform_system platform_machine default_threads physical_memory disk_free "
-    "runtime_facts model_drive_key engine_gpu_backends cpu_topology".split()
+    "runtime_facts model_drive_key engine_gpu_backends cpu_topology model_facts".split()
 )
 
 
@@ -218,6 +229,11 @@ class LiveArtifacts:
             return TOPOLOGY[self.strategy_host.platform()][1](self.strategy_host)
         if name == "model_drive_key":
             return strategy_inputs.model_drive_key(args, self.strategy_host)
+        if name == "model_facts":
+            # The engine's facts of the model ARGS[1], as the server ARGS[0] would load it.
+            return model_facts(
+                args[0], args[1], lambda argv: host.command(argv, timeout=engine_model.TIMEOUT_S)
+            )
         if name == "engine_gpu_backends":
             # The build the server executable came from: build/bin/inferssd-server lies beside
             # build/CMakeCache.txt.

@@ -3,7 +3,6 @@
 import json
 import os
 import re
-import struct
 import sys
 from dataclasses import asdict, replace
 from functools import partial
@@ -11,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
-from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, write_gguf
+from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, recorded_facts
 
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
@@ -22,17 +21,11 @@ from inferssd.launch.typed_command import main
 from inferssd.launch.types import LaunchInput, Threads
 
 
-def gguf_fixture(path, *, tensors, payload):
-    """A GGUF v3 file without metadata: TENSORS are (name, shape, ggml type, data offset), and
-    PAYLOAD zero bytes of data follow the header at its 32-byte alignment."""
-    raw = b"GGUF" + struct.pack("<IQQ", 3, len(tensors), 0)
-    for name, shape, kind, offset in tensors:
-        encoded = name.encode()
-        raw += struct.pack("<Q", len(encoded)) + encoded
-        raw += struct.pack(f"<I{len(shape)}QIQ", len(shape), *shape, kind, offset)
-    with path.open("wb") as stream:
-        stream.write(raw)
-        stream.truncate((len(raw) + 31) // 32 * 32 + payload)
+def model_file(path, host, tensors, kv):
+    """PATH, a model file whose facts, the engine's of TENSORS and KV, HOST records."""
+    path.write_bytes(b"GGUF")
+    host["model_facts"] = recorded_facts(tensors, kv, path=str(path))
+    return str(path)
 
 
 def setup(tmp_path, platform="linux", automatic=False):
@@ -44,12 +37,6 @@ def setup(tmp_path, platform="linux", automatic=False):
     binary.parent.mkdir()
     binary.write_text("must never execute")
     binary.chmod(0o755)
-    model = root / "model.gguf"
-    tensors = [
-        (f"blk.0.ffn_{role}_exps.weight", (32, 32, 256), 8, i * 278528)
-        for i, role in enumerate(("up", "gate", "down"))
-    ]
-    gguf_fixture(model, tensors=tensors, payload=3 * 278528)
     settings = root / "input.ssd"
     source = root / "provided.tsv"
     source.write_text("explicit source fixture; resolver does not validate payloads")
@@ -57,7 +44,6 @@ def setup(tmp_path, platform="linux", automatic=False):
     if not automatic:
         text += "expert.source=" + json.dumps([str(source)]) + " # provided index\n"
     settings.write_text(text)
-    spec = LaunchSpec(str(model), 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     host = {
         "platform_system": {"linux": "Linux", "darwin": "Darwin", "windows": "Windows"}[platform],
         "platform_machine": "arm64",
@@ -67,6 +53,9 @@ def setup(tmp_path, platform="linux", automatic=False):
         "gpu_processes": "",
         "engine_gpu_backends": ["Metal"] if platform == "darwin" else ["CUDA"],
     }
+    tensors = [(f"blk.0.ffn_{r}_exps.weight", (32, 32, 256), Q8_0) for r in ("up", "gate", "down")]
+    model = model_file(root / "model.gguf", host, tensors, {})
+    spec = LaunchSpec(model, 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
     out = tmp_path / "run"
     out.mkdir()
@@ -577,8 +566,8 @@ def qwen_like(arch="qwen4exp"):
     ],
 )
 def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
-    inputs, spec, _, adapter, out = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *layout()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *layout())
     (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
     result = resolve(replace(inputs, profile=""), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == profile
@@ -597,8 +586,8 @@ def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
 
 
 def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_refused(tmp_path):
-    inputs, spec, _, adapter, out = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *deepseek_like())
     result = resolve(replace(inputs, profile="muse"), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == "muse" and "--temp" not in result.argv
     tensors, kv = moe(
@@ -612,7 +601,7 @@ def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_re
         up=Q8_0,
         down=Q8_0,
     )
-    other = str(write_gguf(tmp_path / "other.gguf", tensors, kv))
+    other = model_file(tmp_path / "other.gguf", host, tensors, kv)
     second = tmp_path / "second"
     second.mkdir()
     with pytest.raises(ValueError, match="no model profile for the GGUF architecture mystery"):
@@ -620,8 +609,8 @@ def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_re
 
 
 def test_the_users_sampling_wins(tmp_path):
-    inputs, spec, _, adapter, out = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *deepseek_like())
     (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
     inputs = replace(inputs, profile="", extra=("--temp", "0.6", "--top-k=40"))
     argv = list(resolve(inputs, replace(spec, model=model), adapter, out).argv)

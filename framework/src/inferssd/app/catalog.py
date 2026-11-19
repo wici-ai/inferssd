@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The models InferSSD supports, with the header facts of their tested quantization.
+"""The models InferSSD supports, with the facts of their tested quantization.
 
-Each model's facts are ``model_facts_json`` of its shards' GGUF headers at the
-revision named, so a speed estimate needs no download. ``lookup_bytes`` counts
+Each model's facts are ``model_facts_json`` of the engine's facts of its shards
+(``inferssd-server --ssd-model-facts``) at the revision named, so a speed
+estimate needs no download. ``lookup_bytes`` counts
 the dense tensors a token reads one row of rather than whole: the token
 embeddings, DeepSeek-V4.1's engram tables and Gemma 4's per-layer embeddings
 (Gemma's token embeddings are also its output projection, read whole). A RAM-only
@@ -51,9 +52,9 @@ MODELS: tuple[Model, ...] = (
                 "experts": 384,
                 "experts_used": 6,
                 "roles": {
-                    "gate": {"formats": [["MXFP4", 40]], "rows": 2304, "cols": 5120},
-                    "up": {"formats": [["MXFP4", 40]], "rows": 2304, "cols": 5120},
-                    "down": {"formats": [["MXFP4", 40]], "rows": 5120, "cols": 2304},
+                    "gate": {"formats": [["MXFP4", 40, 6266880]], "rows": 2304, "cols": 5120},
+                    "up": {"formats": [["MXFP4", 40, 6266880]], "rows": 2304, "cols": 5120},
+                    "down": {"formats": [["MXFP4", 40, 6266880]], "rows": 5120, "cols": 2304},
                 },
                 "expert_bytes": 18800640,
                 "expert_read_bytes": 18812928,
@@ -75,9 +76,9 @@ MODELS: tuple[Model, ...] = (
                 "experts": 256,
                 "experts_used": 8,
                 "roles": {
-                    "gate": {"formats": [["Q4_K", 62]], "rows": 4096, "cols": 4096},
-                    "up": {"formats": [["Q4_K", 62]], "rows": 4096, "cols": 4096},
-                    "down": {"formats": [["Q5_K", 62]], "rows": 4096, "cols": 4096},
+                    "gate": {"formats": [["Q4_K", 62, 9437184]], "rows": 4096, "cols": 4096},
+                    "up": {"formats": [["Q4_K", 62, 9437184]], "rows": 4096, "cols": 4096},
+                    "down": {"formats": [["Q5_K", 62, 11534336]], "rows": 4096, "cols": 4096},
                 },
                 "expert_bytes": 30408704,
                 "expert_read_bytes": 30420992,
@@ -99,9 +100,21 @@ MODELS: tuple[Model, ...] = (
                 "experts": 256,
                 "experts_used": 8,
                 "roles": {
-                    "gate": {"formats": [["Q4_K", 39], ["Q5_K", 1]], "rows": 512, "cols": 2048},
-                    "up": {"formats": [["Q4_K", 39], ["Q5_K", 1]], "rows": 512, "cols": 2048},
-                    "down": {"formats": [["Q5_K", 36], ["Q6_K", 4]], "rows": 2048, "cols": 512},
+                    "gate": {
+                        "formats": [["Q4_K", 39, 589824], ["Q5_K", 1, 720896]],
+                        "rows": 512,
+                        "cols": 2048,
+                    },
+                    "up": {
+                        "formats": [["Q4_K", 39, 589824], ["Q5_K", 1, 720896]],
+                        "rows": 512,
+                        "cols": 2048,
+                    },
+                    "down": {
+                        "formats": [["Q5_K", 36, 720896], ["Q6_K", 4, 860160]],
+                        "rows": 2048,
+                        "cols": 512,
+                    },
                 },
                 "expert_bytes": 2301952,
                 "expert_read_bytes": 2314240,
@@ -127,9 +140,9 @@ MODELS: tuple[Model, ...] = (
                 "experts": 512,
                 "experts_used": 10,
                 "roles": {
-                    "gate": {"formats": [["IQ4_XS", 48]], "rows": 640, "cols": 2560},
-                    "up": {"formats": [["IQ4_XS", 48]], "rows": 640, "cols": 2560},
-                    "down": {"formats": [["IQ4_NL", 48]], "rows": 2560, "cols": 640},
+                    "gate": {"formats": [["IQ4_XS", 48, 870400]], "rows": 640, "cols": 2560},
+                    "up": {"formats": [["IQ4_XS", 48, 870400]], "rows": 640, "cols": 2560},
+                    "down": {"formats": [["IQ4_NL", 48, 921600]], "rows": 2560, "cols": 640},
                 },
                 "expert_bytes": 2662400,
                 "expert_read_bytes": 2678784,

@@ -3,10 +3,11 @@
 import json
 from dataclasses import replace
 from functools import partial
+from types import SimpleNamespace
 
 import pytest
 from test_engine_runtime import policy
-from test_strategy_inputs import F32, write_gguf
+from test_strategy_inputs import F32, engine_facts
 from test_typed_launch import setup
 
 from inferssd.engine import runtime
@@ -15,24 +16,23 @@ from inferssd.launch.machine import MachineSource
 from inferssd.launch.prepare import prepare
 from inferssd.launch.typed import resolve_typed
 from inferssd.launch.types import Threads
-from inferssd.source import header as gguf_header
-from inferssd.source.header import Header, Tensor
+
+GEMMA = (
+    [("token_embd.weight", (32, 32), F32), ("per_layer_token_embd.weight", (64, 32), F32)],
+    {
+        "general.architecture": "gemma4",
+        "gemma4.block_count": 4,
+        "gemma4.attention.shared_kv_layers": 1,
+        "gemma4.attention.head_count_kv": 1,
+        "gemma4.attention.key_length": 64,
+        "gemma4.attention.value_length": 64,
+    },
+)
 
 
 def gemma(tmp_path, platform, backends):
     inputs, spec, host, adapter, out = setup(tmp_path, platform)
-    write_gguf(
-        spec.model,
-        [("token_embd.weight", (32, 32), F32), ("per_layer_token_embd.weight", (64, 32), F32)],
-        {
-            "general.architecture": "gemma4",
-            "gemma4.block_count": 4,
-            "gemma4.attention.shared_kv_layers": 1,
-            "gemma4.attention.head_count_kv": 1,
-            "gemma4.attention.key_length": 64,
-            "gemma4.attention.value_length": 64,
-        },
-    )
+    host["model_facts"] = ram.facts(engine_facts(*GEMMA, path=spec.model))
     # The application's existing global SSD settings are valid inputs, but must
     # not activate an expert store or backend-specific tier for this RAM model.
     with open(spec.settings_file, "w", encoding="utf-8") as stream:
@@ -93,7 +93,7 @@ def test_same_ram_profile_uses_existing_native_backends(
     assert receipt["profile"] == "gemma4" and receipt["mode"] == "ram"
     memory = receipt["memory"]
     assert memory["required_bytes"] <= memory["budget_bytes"]
-    facts = ram.facts([gguf_header.read(spec.model)])
+    facts = ram.facts(engine_facts(*GEMMA, path=spec.model))
     assert facts["ple_bytes"] == 8192
     assert memory["weights_bytes"] == (facts["model_bytes"] if weights is None else weights)
 
@@ -226,18 +226,27 @@ def test_ram_model_skips_ssd_machine_calibration(tmp_path, monkeypatch):
     monkeypatch.setattr(
         runtime, "machine_characteristics", lambda *_: pytest.fail("SSD calibration")
     )
+    asked = []
+
+    def command(argv, timeout):
+        # The engine's facts of the model say it is a Gemma 4 model.
+        asked.append(argv[1:])
+        facts = json.dumps(engine_facts(*GEMMA, path=spec.model))
+        return SimpleNamespace(returncode=0, stdout=facts, stderr="")
+
     instance = runtime.Runtime(
         inputs,
         policy(out, "windows"),
-        host=object(),
+        host=SimpleNamespace(command=command),
         emit=lambda _: None,
         configuration=spec,
         machine=MachineSource(),
     )
     assert instance.characteristics(spec) is None
+    assert asked == [["--ssd-model-facts", spec.model]]
 
 
-def test_gemma_header_accounts_shared_kv_and_sliding_windows():
+def test_gemma_facts_account_shared_kv_and_sliding_windows():
     # E4B: the last18 layers share KV; of the first24,20 slide and4 keep full context.
     kv = {
         "general.architecture": "gemma4",
@@ -252,14 +261,6 @@ def test_gemma_header_accounts_shared_kv_and_sliding_windows():
         "gemma4.attention.sliding_window_pattern": [True] * 5 + [False],
     }
     kv["gemma4.attention.sliding_window_pattern"] *= 7
-    header = Header(
-        "gemma.gguf",
-        3,
-        kv,
-        [Tensor("token_embd.weight", F32, (32, 32), 4096, 4096, "gemma.gguf")],
-        32,
-        4096,
-    )
-    metadata = ram.facts([header])
+    metadata = ram.facts(engine_facts([("token_embd.weight", (32, 32), F32)], kv))
     fit = ram.admission(metadata, context=8192, batch=512, weights=ram.FILE, budget=8 << 30)
     assert fit["kv_bytes"] == 168 << 20  # The native ordinary engine's F16 KV allocation.

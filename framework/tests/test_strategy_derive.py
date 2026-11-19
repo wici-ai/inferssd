@@ -16,9 +16,9 @@ from test_strategy_inputs import (
     Q5_K,
     Q8_0,
     deepseek_like,
+    facts_of,
     moe,
     muse_like,
-    write_gguf,
 )
 
 from inferssd.configuration.settings import parse, render, schema
@@ -37,7 +37,7 @@ from inferssd.strategy.derive import (
     offered,
     prefill_threads,
 )
-from inferssd.strategy.inputs import GPUState, RuntimeFacts, model_facts
+from inferssd.strategy.inputs import GPUState, RuntimeFacts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
 X86 = "linux-x86-rtx5090.json"  # 61 uniform vCPUs, RTX 5090, virtual disk
@@ -59,8 +59,8 @@ def drive(characteristics):
 def models(tmp_path_factory):
     directory = tmp_path_factory.mktemp("models")
     return {
-        "dsv": model_facts(str(write_gguf(directory / "dsv.gguf", *deepseek_like()))),
-        "muse": model_facts(str(write_gguf(directory / "muse.gguf", *muse_like()))),
+        "dsv": facts_of(*deepseek_like(), path=str(directory / "dsv.gguf")),
+        "muse": facts_of(*muse_like(), path=str(directory / "muse.gguf")),
     }
 
 
@@ -532,7 +532,7 @@ def test_unmeasured_format_falls_back(models, tmp_path):
     tensors, kv = moe(
         "toy", layers=2, experts=4, used=2, latent=4096, hidden=1024, gate=Q3_K, up=Q3_K, down=Q3_K
     )
-    q3 = model_facts(str(write_gguf(tmp_path / "q3.gguf", tensors, kv)))
+    q3 = facts_of(tensors, kv, path=str(tmp_path / "q3.gguf"))
     c = machine(MAC)
     s = derive(c, q3, runtime(range(10)), "darwin", model_drive_key=drive(c))
     # Q3_K was not measured: every allowed CPU but one for both pools, and no CPU line.
@@ -713,7 +713,7 @@ def test_dense_only_shapes_do_not_reach_the_cpu_line(models, tmp_path):
     tensors, kv = moe(
         "toy", layers=1, experts=4, used=2, latent=4096, hidden=1024, gate=Q8_0, up=Q8_0, down=Q8_0
     )
-    facts = model_facts(str(write_gguf(tmp_path / "q8.gguf", tensors, kv)))
+    facts = facts_of(tensors, kv, path=str(tmp_path / "q8.gguf"))
     line, why = cpu_line(machine(X86), facts, 60)
     assert line is not None and "latent 4096 hidden 1024" in why
 
@@ -739,7 +739,7 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
         up=experts,
         down=down,
     )
-    mixed = model_facts(str(write_gguf(tmp_path / "mixed.gguf", tensors, kv)))
+    mixed = facts_of(tensors, kv, path=str(tmp_path / "mixed.gguf"))
     c = machine(X86)
     gpu = GPUState(X86_GPU, 30 << 30, 0)
     s = derive(c, mixed, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))

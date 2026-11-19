@@ -70,13 +70,17 @@ RESOLVE = """\
 import json, os, platform, sys
 source, machine, policy, folder, shards = sys.argv[1:6]
 sys.path.insert(0, source)
+from inferssd.engine.model import TIMEOUT_S
+from inferssd.launch.live import model_facts
 from inferssd.launch.typed_command import main as launch
+from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs
-# The facts an executed launch reads live, read here the same way.
-runtime = inputs.read_runtime()
+# The facts an executed launch reads live, read here the same way: the model's from the side's server.
+runtime, server = inputs.read_runtime(), sys.argv[sys.argv.index("--binary") + 1]
 facts = dict(platform_system=platform.system(), platform_machine=platform.machine(),
              runtime_facts=inputs.runtime_facts_json(runtime),
-             model_drive_key=inputs.model_drive_key(json.loads(shards)))
+             model_drive_key=inputs.model_drive_key(json.loads(shards)),
+             model_facts=model_facts(server, json.loads(shards)[0], lambda argv: run_captured(argv, timeout=TIMEOUT_S)))
 if facts["platform_system"] == "Linux":
     # The broker runs the server in its own resource scope and found the GPU idle,
     # so the launcher's checks for a scope of its own are stated, not probed.
