@@ -71,9 +71,9 @@ version. The asset preparation step rejects packages with a different version, t
 revision, build, label or checksum. Existing published releases are never overwritten. A draft
 remains private until all assets and every package list are ready.
 
-**Package Windows** also runs, building and checking without signing or publishing, for pull
-requests that change how the packages are built, after each merge to `main` that changes the
-engine, the framework or the packaging, and by hand on any branch, producing
+**Package Windows** also runs by hand on any branch, building and checking without signing or
+publishing; run it for a change to how the packages are built. Pull requests and merges to `main`
+build no package. A run produces
 `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions artifacts. GitHub's runner has
 no GPU, so the CUDA package's check also shows that it starts without an NVIDIA driver.
 

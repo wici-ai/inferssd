@@ -1,7 +1,8 @@
 name: Package Windows
 
-# Build the prebuilt Windows packages, one per GPU backend, and check them. Release builds them for
-# each release, which signs them here and publishes them (release.yml). See docs/windows-package.md.
+# Build the prebuilt Windows packages, one per GPU backend, and check them. Only Release builds them,
+# for each release, which signs them here and publishes them (release.yml), and a run by hand, on any
+# branch, which builds and checks. See docs/windows-package.md.
 on:
   workflow_call:
     inputs:
@@ -34,68 +35,36 @@ on:
         required: true
       ES_TOTP_SECRET:
         required: true
-  # A pull request builds the packages when it changes how they are built; a change to main that reaches them
-  # builds them after the merge.
-  push:
-    branches: [main]
-    paths:
-      - 'engine/**'
-      - 'framework/**'
-      - CMakeLists.txt
-      - CMakePresets.json
-      - 'scripts/package-windows*'
-      - 'scripts/check-package-windows*'
-      - scripts/install-cuda-redist.ps1
-      - scripts/windows-launcher.cpp
-      - scripts/engine-resources.py
-      - scripts/install.ps1
-      - scripts/sign-windows.ps1
-      - .github/workflows/package-windows.yml
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'scripts/package-windows*'
-      - 'scripts/check-package-windows*'
-      - scripts/install-cuda-redist.ps1
-      - scripts/windows-launcher.cpp
-      - scripts/engine-resources.py
-      - scripts/install.ps1
-      - scripts/sign-windows.ps1
-      - .github/workflows/package-windows.yml
-  # By hand, on any branch: build and check. Only Release signs and publishes.
+  # By hand, on any branch: build and check. Only Release signs and publishes. Pull requests and
+  # merges do not build packages.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A pull request's newer run replaces its older one; a branch's other runs queue in its group, and
-  # a release's run in its own, one per backend, so a release's two calls do not queue behind each other.
+  # A branch's runs queue in its group, and a release's run in its own, one per backend, so a release's
+  # two calls do not queue behind each other.
   group: package-windows-${{ inputs.release_tag || github.ref }}-${{ join(fromJSON(inputs.backends || '["vulkan", "cuda"]'), '-') }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   # One package for each GPU backend the launch's table names on Windows: CUDA for NVIDIA GPUs,
   # Vulkan for the others and the CPU. The installer picks by the machine's GPU.
   build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
         backend: ${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}
-    # The CUDA package, the longest build by far, builds on the organization's larger runner for a
-    # release and a run by hand. Pull requests and main pushes, which anyone can start, build on the
-    # standard runner.
-    runs-on: >-
-      ${{ matrix.backend == 'cuda' && (inputs.release_tag || github.event_name == 'workflow_dispatch')
-      && 'release-packaging-runner-windows' || 'windows-2025' }}
+    # The CUDA package, the longest build by far, builds on the organization's larger runner.
+    runs-on: ${{ matrix.backend == 'cuda' && 'release-packaging-runner-windows' || 'windows-2025' }}
     timeout-minutes: 240
     env:
       CUDA_REDIST: 12.9.1
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the build-time Vulkan SDK
@@ -159,8 +128,7 @@ jobs:
           retention-days: 30
 
   # A release signs what it publishes: every code file in the packages carries WiCi AI's signature
-  # or its vendor's (docs/windows-package.md). Pull requests, main pushes and manual runs sign
-  # nothing. The signed packages replace the built ones, so the check runs on the published bytes.
+  # or its vendor's (docs/windows-package.md). A run by hand signs nothing. The signed packages replace the built ones, so the check runs on the published bytes.
   # Each package is signed on its own; a file the other package shares, signed first, is taken from
   # the signed-file store (scripts/sign-windows.ps1).
   sign:
@@ -236,7 +204,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:

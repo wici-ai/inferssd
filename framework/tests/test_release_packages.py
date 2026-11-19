@@ -337,15 +337,12 @@ def test_every_published_package_is_a_release_of_main():
     for job in ("build", "sign", "check"):
         assert windows["jobs"][job]["strategy"]["matrix"]["backend"] == every
     assert "inputs.backends" in windows["concurrency"]["group"]
-    # Only a release's or a manual run's CUDA build takes the organization's larger runner: pull
-    # requests, which anyone can open, never do, and signing and checking stay on the standard one.
+    # The CUDA build takes the organization's larger runner; signing and checking stay on the
+    # standard one.
     build_on = windows["jobs"]["build"]["runs-on"]
-    assert "'release-packaging-runner-windows'" in build_on and "'windows-2025'" in build_on
-    assert "matrix.backend == 'cuda'" in build_on
-    assert (
-        "inputs.release_tag" in build_on and "github.event_name == 'workflow_dispatch'" in build_on
+    assert build_on == (
+        "${{ matrix.backend == 'cuda' && 'release-packaging-runner-windows' || 'windows-2025' }}"
     )
-    assert "pull_request" not in build_on
     assert (
         windows["jobs"]["sign"]["runs-on"] == windows["jobs"]["check"]["runs-on"] == "windows-2025"
     )
@@ -357,11 +354,13 @@ def test_every_published_package_is_a_release_of_main():
         if "install" in (s.get("name", "") + str(s.get("with", {}))).lower()
     ]
     assert installer and all(s["if"] == "matrix.backend == 'vulkan'" for s in installer)
-    # The package workflows build and check; only Release publishes.
+    # The package workflows build and check; only Release publishes. Packages are built only for a
+    # release and by hand: no pull request or merge builds one.
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
             (ROOT / f".github/workflows/package-{name}.yml").read_text(),
             Loader=yaml.BaseLoader,
         )
+        assert set(package_workflow["on"]) == {"workflow_call", "workflow_dispatch"}
         assert "publish" not in package_workflow["jobs"]
         assert "inputs" not in (package_workflow["on"]["workflow_dispatch"] or {})

@@ -84,9 +84,8 @@ Each release's installers pin their package lists to that same GitHub release. T
 from `main` follows the latest package list; explicit `INFERSSD_REF` or `INFERSSD_FROM_SOURCE`
 requests a source build.
 
-**Package macOS** also runs, building and checking without publishing, for pull requests that
-change how the package is built, after each merge to `main` that changes the engine, the framework
-or the packaging, and by hand on any branch. The publisher uploads to
+**Package macOS** also runs by hand on any branch, building and checking without publishing; run
+it for a change to how the package is built. Pull requests and merges to `main` build no package. The publisher uploads to
 `https://cdn.wici.ai/apps/inferssd/`, checks the served bytes before updating the list, and
 refuses a list older than the one already published.
 
