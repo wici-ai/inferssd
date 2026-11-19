@@ -71,6 +71,12 @@ The release's notes list the pull requests merged since the last release, by the
 release with highlights of its own has a section in [CHANGELOG.md](../CHANGELOG.md), which comes
 first.
 
+With `github_release` off, a run builds, checks and signs the same packages and points the package
+lists at them, which the installers from `main` and the desktop app follow, but makes no GitHub
+release and no tag, so no notes or pinned installers are published. The CDN then holds the
+version, and a release built again at the same commit would be refused there: the next GitHub
+release needs a newer commit on `main`.
+
 Each release's installers pin their package lists to that same GitHub release. The installer
 from `main` follows the latest package list; explicit `INFERSSD_REF` or `INFERSSD_FROM_SOURCE`
 requests a source build.

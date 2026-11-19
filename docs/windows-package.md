@@ -56,8 +56,10 @@ workflows at that commit with the release's tag, which is the version (see
 [the macOS package](macos-package.md#releases)). After both platforms' checks
 pass, its release job prepares one GitHub release containing the three archives (macOS, Windows
 Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, updates the latest package
-lists, and only then publishes the complete release, which tags the commit. There is no separate
-Windows-only version or prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
+lists, and only then publishes the complete release, which tags the commit. With `github_release`
+off, the same signed packages only update the package lists, with no GitHub release or tag (see
+[the macOS package](macos-package.md#releases)). There is no separate Windows-only version or
+prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
 
 A release's Windows installer pins its default package URLs to that release's
 `latest-windows-vulkan.json` and `latest-windows-cuda.json`; it cannot silently install a newer
