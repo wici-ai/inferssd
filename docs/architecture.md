@@ -50,7 +50,7 @@ Prompt batching lets tokens share weight access. The launch strategy sets the na
 
 ## Modules
 
-The runtime extends the bundled llama.cpp snapshot. Its integration points are listed in [upstream patches](development/upstream-patches.md).
+The runtime extends the llama.cpp snapshot bundled under `engine/`: commit `8884f83` in the history of `main`, which imports upstream llama.cpp `f42e29fdf1`. [NOTICE](../NOTICE) lists its attribution and the code ported from other sources. InferSSD does not move the snapshot to a newer llama.cpp as a whole. It ports each upstream change it needs on its own, and the commit that ports it names the upstream commit, so `git log --grep=<upstream commit>` finds it. `git diff 8884f83:<path> HEAD:engine/<path>` shows how a bundled file differs from the snapshot.
 
 | Layer | Directory | Owns |
 | --- | --- | --- |
