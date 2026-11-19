@@ -1,8 +1,9 @@
 name: CI
 
+# Pull requests, and by hand on any branch. A merge does not run it again: main takes only squash
+# merges of pull requests that are up to date with it, so a merge's commit is the code its pull
+# request's checks ran on.
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
   workflow_dispatch:
