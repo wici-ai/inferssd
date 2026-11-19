@@ -195,9 +195,9 @@ def test_released_windows_packages_are_signed_before_their_check():
     assert sign["needs"] == "build" and sign["environment"] == "windows-signing"
     assert sign["if"] == "inputs.release_tag"
     uploads = [s for s in sign["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
+    # Each backend's signing replaces that backend's built package with the signed one.
     assert {s["with"]["name"] for s in uploads if s["with"].get("overwrite") == "true"} == {
-        "package-windows-x64-vulkan",
-        "package-windows-x64-cuda",
+        "package-windows-x64-${{ matrix.backend }}",
     }
     assert set(jobs["check"]["needs"]) == {"build", "sign"}
 
@@ -270,50 +270,81 @@ def test_every_published_package_is_a_release_of_main():
     assert inputs["github_release"]["type"] == "boolean"
     assert inputs["github_release"]["default"] == "true"
     jobs = workflow["jobs"]
-    for name in ("macos", "windows"):
-        assert jobs[name]["uses"] == f"./.github/workflows/package-{name}.yml"
-        assert jobs[name]["with"] == {
-            "source_ref": "${{ needs.validate.outputs.revision }}",
-            "release_tag": "${{ needs.validate.outputs.tag }}",
-        }
+    release_with = {
+        "source_ref": "${{ needs.validate.outputs.revision }}",
+        "release_tag": "${{ needs.validate.outputs.tag }}",
+    }
+    assert jobs["macos"]["uses"] == "./.github/workflows/package-macos.yml"
+    assert jobs["macos"]["with"] == release_with
+    # Each Windows package in a call of its own, so one does not wait for the other.
+    for backend in ("vulkan", "cuda"):
+        call = jobs[f"windows-{backend}"]
+        assert call["uses"] == "./.github/workflows/package-windows.yml"
+        assert call["with"] == {**release_with, "backends": f'["{backend}"]'}
     # Every secret the Windows package workflow reads is declared, required and passed by name: a
     # reusable workflow's job reads an environment secret only when its caller passes it, and an
     # unpassed one is an empty string, which once left the signing job without its credential.
     windows_text = (ROOT / ".github/workflows/package-windows.yml").read_text()
-    declared = yaml.load(windows_text, Loader=yaml.BaseLoader)["on"]["workflow_call"]["secrets"]
+    windows = yaml.load(windows_text, Loader=yaml.BaseLoader)
+    declared = windows["on"]["workflow_call"]["secrets"]
     assert set(re.findall(r"secrets\.([A-Z_]+)", windows_text)) == set(declared)
     signing = {"ES_USERNAME", "ES_PASSWORD", "ES_CREDENTIAL_ID", "ES_TOTP_SECRET"}
     assert set(declared) == {"APP_VERSIONING_TOKEN"} | signing
     assert all(entry["required"] == "true" for entry in declared.values())
-    assert jobs["windows"]["secrets"] == {name: f"${{{{ secrets.{name} }}}}" for name in declared}
-    assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
+    for backend in ("vulkan", "cuda"):
+        assert jobs[f"windows-{backend}"]["secrets"] == {
+            name: f"${{{{ secrets.{name} }}}}" for name in declared
+        }
     choice = next(s["run"] for s in jobs["validate"]["steps"] if s.get("id") == "version")
     assert "refs/heads/main" in choice
     assert "--date=format-local:%y%m%d HEAD).$(git rev-list --count HEAD)" in choice
-    preparation = next(
-        s["run"] for s in jobs["release"]["steps"] if "Prepare both" in s.get("name", "")
-    )
+    # A version that is already a tag stops the run before anything is built or published.
+    assert 'git rev-parse -q --verify "refs/tags/$tag"' in choice
+    # Each package reaches the CDN and its package list once its own package checks pass, not
+    # when the slowest does.
+    published = {
+        "publish-macos": ("macos", "package-macos", "dist/macos"),
+        "publish-windows-vulkan": (
+            "windows-vulkan",
+            "package-windows-x64-vulkan",
+            "dist/windows-vulkan",
+        ),
+        "publish-windows-cuda": ("windows-cuda", "package-windows-x64-cuda", "dist/windows-cuda"),
+    }
+    for job, (package, artifact, dist) in published.items():
+        assert set(jobs[job]["needs"]) == {"validate", package}
+        steps = jobs[job]["steps"]
+        assert any(s.get("with", {}).get("name") == artifact for s in steps)
+        run = next(s["run"] for s in steps if "Publish the" in s.get("name", ""))
+        assert run.rstrip().endswith(f"scripts/publish-package.py {dist}")
+    # The GitHub release comes last, once every package is published, and only when asked for.
+    release = jobs["release"]
+    assert release["if"] == "inputs.github_release"
+    assert set(release["needs"]) == {"validate", *(p for p, _, _ in published.values()), *published}
+    preparation = next(s["run"] for s in release["steps"] if "Prepare both" in s.get("name", ""))
     assert "--signed-install-ps1 dist/install-windows/install.ps1" in preparation
     publication = next(
-        s["run"] for s in jobs["release"]["steps"] if "Publish the release" in s.get("name", "")
+        s["run"] for s in release["steps"] if "Publish the release" in s.get("name", "")
     )
-    assert "scripts/publish-package.py dist/macos" in publication
-    assert "scripts/publish-package.py dist/windows-vulkan\n" in publication
-    assert "scripts/publish-package.py dist/windows-cuda" in publication
     assert "--draft --target" in publication and "--draft=false --latest" in publication
     assert "its release and assets will not be replaced" in publication
-    # Without the GitHub release, the same packages reach the lists, after the same version check
-    # and before any release is drafted; nothing else is published.
-    packages_only = publication.index('if [ "$GITHUB_RELEASE" != true ]; then')
-    drafted = publication.index("--draft --target")
-    assert publication.index("will not be replaced") < packages_only < drafted
-    only = publication[packages_only : publication.index("fi", packages_only)]
-    for name in ("macos", "windows-vulkan", "windows-cuda"):
-        assert f"scripts/publish-package.py dist/{name}" in only
-    assert "gh release" not in only and "exit 0" in only
-    assert jobs["release"]["env"]["GITHUB_RELEASE"] == "${{ inputs.github_release }}"
-    notes = next(s for s in jobs["release"]["steps"] if "release notes" in s.get("name", ""))
-    assert notes["if"] == "inputs.github_release"
+    assert "publish-package.py" not in yaml.dump(release)
+    # The Windows package workflow packages the backends it is given, each signed on its own, one
+    # signing at a time; the Vulkan package's signing also signs the pinned installer, once a run.
+    backends = windows["on"]["workflow_call"]["inputs"]["backends"]
+    assert backends["required"] == "false" and backends["default"] == '["vulkan", "cuda"]'
+    every = """${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}"""
+    for job in ("build", "sign", "check"):
+        assert windows["jobs"][job]["strategy"]["matrix"]["backend"] == every
+    assert "inputs.backends" in windows["concurrency"]["group"]
+    sign = windows["jobs"]["sign"]
+    assert sign["concurrency"] == {"group": "windows-signing", "cancel-in-progress": "false"}
+    installer = [
+        s
+        for s in sign["steps"]
+        if "install" in (s.get("name", "") + str(s.get("with", {}))).lower()
+    ]
+    assert installer and all(s["if"] == "matrix.backend == 'vulkan'" for s in installer)
     # The package workflows build and check; only Release publishes.
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
