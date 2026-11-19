@@ -15,8 +15,8 @@ an installer from a release builds that release from source, as before. So does 
 ## What it is
 
 One archive, `inferssd-<version>-macos-arm64.tar.gz`, about 30 MB, 80 MB unpacked, named by the
-[version](engine-resources.md) of the release it belongs to. A package built outside a release,
-by a pull request or a merge to `main`, is named by its build label instead and is never published:
+build's [version](engine-resources.md), `<yymmdd>.<build>` (`inferssd-261119.301-macos-arm64`). A
+package built outside a release, by a pull request or a merge to `main`, is never published:
 
 ```text
 inferssd-<version>-macos-arm64/
@@ -57,13 +57,13 @@ replaced by a stub that fails, and profiles the machine.
 ## Releases
 
 Every published package is a release's. **Actions > Release**, run by hand on `main`, releases
-its head as the next version: `patch` (the default) raises the last release's third number,
-`minor` or `major` another. It calls **Package macOS** and **Package Windows** at that commit,
-with the release's tag, so each package reports the version and is named by it. macOS builds on
+its head as its version, `<yymmdd>.<build>`: the commit's day (UTC) and `main`'s commit count, as
+every build is named. It calls **Package macOS** and **Package Windows** at that commit, with the
+release's tag, which is the version, and each package is checked against it. macOS builds on
 macOS 15 and checks on macOS 15 and 26; Windows also checks installation without developer
 tools, and signs (see [the Windows package](windows-package.md)). Only after both platforms pass
 does the release job attach the archives, manifests and pinned installers to the GitHub release
-`vX.Y.Z`, which tags the commit when it is published, and point the package lists at the
+named by the version, which tags the commit when it is published, and point the package lists at the
 archives with `scripts/publish-package.py`, which publishes nothing but a release's package.
 `APP_VERSIONING_TOKEN` is required.
 
@@ -93,20 +93,20 @@ The installer reads `https://appapi.wici.ai/versioning/inferssd/config/latest-ma
 ```json
 {
   "schema": "inferssd-package 1",
-  "name": "inferssd-0.1.5-macos-arm64",
-  "version": "0.1.5",
-  "tag": "v0.1.5",
-  "build": 289,
+  "name": "inferssd-261119.301-macos-arm64",
+  "version": "261119.301",
+  "tag": "261119.301",
+  "build": 301,
   "revision": "…",
-  "date": "2026-11-18",
+  "date": "2026-11-19",
   "branch": "main",
-  "label": "261118.289.1a2b3c4",
+  "label": "261119.301.61a66d5",
   "platform": "darwin-arm64",
   "minimum_macos": "15.0",
-  "file": "inferssd-0.1.5-macos-arm64.tar.gz",
+  "file": "inferssd-261119.301-macos-arm64.tar.gz",
   "size": 27751636,
   "sha256": "…",
-  "url": "https://cdn.wici.ai/apps/inferssd/inferssd-0.1.5-macos-arm64.tar.gz"
+  "url": "https://cdn.wici.ai/apps/inferssd/inferssd-261119.301-macos-arm64.tar.gz"
 }
 ```
 

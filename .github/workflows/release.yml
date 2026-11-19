@@ -1,22 +1,17 @@
 name: Release
 
-# Releases main as the next version, vX.Y.Z: the checked macOS and Windows (Vulkan and CUDA)
-# packages of one commit, signed, published as one GitHub release, which tags the commit, and named
-# by the installers' package lists, which the desktop app follows. Every published package is a
-# release's. See docs/macos-package.md and docs/windows-package.md.
+# Releases main's head as its version, <yymmdd>.<build> (261119.300): the checked macOS and Windows
+# (Vulkan and CUDA) packages of one commit, signed, published as one GitHub release, which tags the
+# commit with the version, and named by the installers' package lists, which the desktop app
+# follows. Every published package is a release's. See docs/macos-package.md and
+# docs/windows-package.md.
 on:
   workflow_dispatch:
-    inputs:
-      bump:
-        description: The part of the last release's version to raise (patch for most releases)
-        type: choice
-        options: [patch, minor, major]
-        default: patch
 
 permissions:
   contents: read
 
-# One release at a time, so each takes the version after the one before it.
+# One release at a time.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -35,27 +30,21 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Choose the next version
+      - name: Name the version
         id: version
         shell: bash
-        env:
-          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             echo '::error::A release is made from main.'
             exit 1
           fi
-          previous=$(git tag --list 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n 1)
-          IFS=. read -r major minor patch <<< "${previous#v}"
-          case "$BUMP" in
-            major) tag="v$((major + 1)).0.0" ;;
-            minor) tag="v$major.$((minor + 1)).0" ;;
-            patch) tag="v$major.$minor.$((patch + 1))" ;;
-            *) echo "::error::Unknown bump: $BUMP"; exit 1 ;;
-          esac
           revision=$(git rev-parse HEAD)
-          git merge-base --is-ancestor "$previous" HEAD || { echo "::error::$previous is not in main's history."; exit 1; }
+          # The commit's day (UTC) and main's commit count, as scripts/engine-resources.py names
+          # every build; the release's tag is the version.
+          tag="$(TZ=UTC git show -s --format=%cd --date=format-local:%y%m%d HEAD).$(git rev-list --count HEAD)"
+          # The release before it: the nearest tag in main's history, of either form.
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --match '[0-9][0-9][0-9][0-9][0-9][0-9].[0-9]*' HEAD)
           if [ "$(git rev-parse "$previous^{commit}")" = "$revision" ]; then
             echo "::error::main has not changed since $previous."
             exit 1

@@ -10,7 +10,7 @@ on:
         required: true
         type: string
       release_tag:
-        description: The release's tag, vX.Y.Z, which gives the package its version and name
+        description: The release's tag, its version <yymmdd>.<build>, which the package is checked against
         required: true
         type: string
   # A pull request builds the package when it changes how it is built; a change to main that reaches it

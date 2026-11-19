@@ -3,7 +3,7 @@
 
 [Back to README](../README.md)
 
-Every platform uses `wici-ai/inferssd`. Numbered releases share one version and tagged commit across platforms. Use the
+Every platform uses `wici-ai/inferssd`. A release has one version, `<yymmdd>.<build>`, and one tagged commit across platforms. Use the
 [one-command installation](#one-command-installation), or build manually for
 **[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** / **[Linux / AMD](#linux--amd)** /
 **[Windows](#windows)** and [prepare a launch](#prepare-a-launch).
@@ -27,7 +27,7 @@ On Windows, in PowerShell:
 irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
 ```
 
-A numbered release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
+A release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
 packages from the same tagged commit. Its installers download that version without developer
 tools on Apple Silicon macOS 15 or later and Windows 10 or 11 x64. Linux still builds from source.
 The installer on `main` installs the latest published package:
@@ -42,7 +42,7 @@ or require Git, Python, Visual Studio or a Vulkan SDK. On a machine with an NVID
 driver is at least the CUDA package's minimum it installs the CUDA package; otherwise the
 Vulkan package, which also runs on the CPU, and it says when a newer NVIDIA driver would give
 CUDA. Its package lists are `latest-windows-cuda.json` and `latest-windows-vulkan.json` under
-`https://appapi.wici.ai/versioning/inferssd/config/` on `main`; a numbered release's installer
+`https://appapi.wici.ai/versioning/inferssd/config/` on `main`; a release's installer
 pins its own release manifests instead.
 `INFERSSD_PACKAGES` can select another list. A missing package list reports an error rather
 than silently starting a source build.
