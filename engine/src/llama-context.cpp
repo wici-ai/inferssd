@@ -2644,7 +2644,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
 
-                // a prompt whose own graph does not fit: the batch split again with a smaller ubatch
+                // a prompt whose own graph does not fit: the batch split again with a smaller ubatch. Before submit
+                // every memory type restores its metadata exactly, so this holds on every model; the removal above
+                // runs only after a submit (or a failed restore), when the states may already be written.
                 if (status == GGML_STATUS_ALLOC_FAILED && restored && n_tokens_prev == 0 && prefill_refit()) {
                     refit = true;
                     break;
