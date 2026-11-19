@@ -11,10 +11,10 @@ class snapshot;
 }
 namespace cpu {
 // Copy settings/debug before starting any thread; the read ring has eight
-// expert slots. The resolver and writer remain borrowed until sink destruction.
+// expert slots. The layout and writer remain borrowed until sink destruction.
 [[nodiscard]] GGML_BACKEND_API ssd_cpu_sink * create_configured(
     const settings::snapshot * settings, const runtime_services * services,
-    ssd_cpu_sink_resolver resolver, void * userdata, char * error, size_t error_size) noexcept;
+    const ssd_expert_layout * layout, char * error, size_t error_size) noexcept;
 
 // With no sink, apply the same context settings to the early graph's ledger.
 [[nodiscard]] GGML_BACKEND_API bool cache_make_room_configured(

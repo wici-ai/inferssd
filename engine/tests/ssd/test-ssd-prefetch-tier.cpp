@@ -17,19 +17,15 @@ std::vector<ssd::platform::cpu_list> tier_placements; // set_thread_cpus, in cal
 int tier_context = 0;
 void * tier_create(uint64_t, char *, size_t) { return &tier_context; }
 void tier_destroy(void *) {}
+int tier_declare(void *, const ssd_expert_layout *, char *, size_t) { return 0; }
 int tier_begin(void *, uint64_t, uint64_t, int, char *, size_t) { return 0; }
-int tier_prepare(void *, const ssd_vram_request *, int count, int, int, int * slots, char *, size_t) {
-    std::fill(slots, slots + count, -1);
-    return 0;
-}
-int tier_launch(void *, const void *, size_t, float, float, char *, size_t) { return 0; }
 int tier_admit(void *, const ssd_vram_request *, const void *, const void *, const void *, int, char *, size_t) { return 0; }
 int tier_finish(void *, float *, size_t, char *, size_t) { return 0; }
 int tier_cancel(void *, char *, size_t) { return 0; }
 void tier_held(void *, int32_t layer, const int32_t * experts, int count, uint8_t * out) {
     for (int i = 0; i < count; ++i) { out[i] = tier_holds.count({ layer, experts[i] }) != 0; }
 }
-int no_slots(void *, const ssd_vram_request *, int count, const ssd_vram_expert_format *, int * slots, char *, size_t) {
+int no_slots(void *, const ssd_vram_request *, int count, int * slots, char *, size_t) {
     std::fill(slots, slots + count, -1); return 0;
 }
 int refuse(void *, char * e, size_t n) { std::snprintf(e, n, "not served by this tier"); return 1; }
@@ -42,12 +38,12 @@ int tier_place(void *, const int * cpus, int count, char *, size_t) {
 // holds the experts the test names and serves none; the extensions the sink binds are inert, and the ones this
 // fixture leaves off (grouped prefill, deferred uploads, locations, settings, transport) refuse or are never called.
 const ssd::gpu::provider_v1 * stand_in_provider() {
-    static const ssd_vram_tier_api api = { 2, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_begin,
-        tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
+    static const ssd_vram_tier_api api = { 3, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_declare,
+        tier_begin, tier_admit, tier_finish, tier_cancel };
     static const ssd_vram_residency_api residency = { 3, sizeof(ssd_vram_residency_api), tier_held };
-    static const ssd_vram_format_api format = { 3, sizeof(ssd_vram_format_api), no_slots,
+    static const ssd_vram_format_api format = { 4, sizeof(ssd_vram_format_api), no_slots,
         [](void *, const void *, size_t, const ssd_vram_activation *, char *, size_t) { return 0; } };
-    static const ssd_vram_prefill_api prefill = { 11, sizeof(ssd_vram_prefill_api), no_slots,
+    static const ssd_vram_prefill_api prefill = { 12, sizeof(ssd_vram_prefill_api), no_slots,
         [](void *) { return 0; },
         [](void *, const void *, size_t, const int32_t *, const float *, int, int, const ssd_vram_prefill_transient *,
            int, const ssd_vram_prefill_launch *, char * e, size_t n) { return refuse(nullptr, e, n); },
@@ -59,9 +55,9 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
         [](void *, const int32_t *, int, char *, size_t) { return 0; },
         [](void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; },
         [](void *, int32_t, char *, size_t) { return 0; } };
-    static const ssd_vram_elastic_api elastic = { 6, sizeof(ssd_vram_elastic_api),
+    static const ssd_vram_elastic_api elastic = { 7, sizeof(ssd_vram_elastic_api),
         [](void *, int, char *, size_t) { return 0; }, [](void *, int, char *, size_t) { return 0; },
-        [](void *, const ssd_vram_request *, const ssd_vram_expert_format *, char *, size_t) { return 0; },
+        [](void *, char *, size_t) { return 0; },
         [](void *, int * slots, char *, size_t) { *slots = 0; return 0; },
         [](void *, const ssd_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
             *copied = 0; return 0; } };

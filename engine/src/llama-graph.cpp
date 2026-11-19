@@ -2070,9 +2070,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const auto & execution = adapted.execution;
 
         auto descriptor = std::make_unique<llama_ssd_cpu_sink_node>();
-        descriptor->up = llama_ssd_cpu_sink_metadata(up_exps);
-        descriptor->gate = llama_ssd_cpu_sink_metadata(gate_exps);
-        descriptor->down = llama_ssd_cpu_sink_metadata(down_exps);
         descriptor->cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         descriptor->runtime = cpu_sink_runtime;
         descriptor->situ_beta = hparams.situ_beta;
