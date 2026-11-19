@@ -2535,6 +2535,7 @@ struct ssd_cpu_sink {
                 << ",\"read_completions\":" << current.read_completions << ",\"pending_reads\":" << current.pending_reads
                 << ",\"demand_bytes\":" << current.demand_bytes << ",\"cache_hit_bytes\":" << current.cache_hit_bytes
                 << ",\"cache_hits\":" << current.cache_hits << ",\"cache_misses\":" << current.cache_misses
+                << ",\"gpu_device\":" << (configuration.has_gpu ? configuration.gpu_device : -1)
                 << ",\"vram_hits\":" << vram.hits << ",\"wall_us\":" << current.total_us
                 << ",\"wait_io_us\":" << current.wait_io_us << ",\"compute_us\":" << current.compute_us
                 << ",\"compute_thread_cpu_us\":" << current.compute_cpu_us << ",\"io_thread_cpu_us\":" << current.io_cpu_us

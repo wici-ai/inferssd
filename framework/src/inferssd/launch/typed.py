@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import ntpath
 import posixpath
 import re
@@ -78,6 +79,35 @@ class LaunchSpec:
     prompt_cache: Optional[str] = None
     # The IPv4 address the server listens on; see listen_host.
     host: str = LOOPBACK
+    main_gpu: Optional[int] = None
+    split_mode: Optional[str] = None
+    tensor_split: Optional[str] = None
+
+
+def gpu_arguments(spec: LaunchSpec) -> list[str]:
+    if spec.split_mode not in (None, "none", "layer"):
+        raise ValueError("--split-mode must be none or layer")
+    if spec.tensor_split is not None:
+        if spec.split_mode == "none" or spec.main_gpu is not None:
+            raise ValueError("--tensor-split requires layer mode")
+        try:
+            ratios = [float(part) for part in spec.tensor_split.split(",")]
+        except ValueError as exc:
+            raise ValueError("--tensor-split needs comma-separated GPU proportions") from exc
+        if not all(math.isfinite(x) and x >= 0 for x in ratios) or not any(ratios):
+            raise ValueError(
+                "--tensor-split needs finite nonnegative proportions with a positive sum"
+            )
+        return ["--split-mode", "layer", "--tensor-split", spec.tensor_split]
+    if spec.main_gpu is not None:
+        if spec.main_gpu < 0 or spec.split_mode == "layer":
+            raise ValueError(
+                "--main-gpu needs a nonnegative visible GPU index in single-device mode"
+            )
+        return ["--split-mode", "none", "--main-gpu", str(spec.main_gpu)]
+    if spec.split_mode is not None:
+        return ["--split-mode", spec.split_mode]
+    return []
 
 
 def listen_host(text: str) -> str:
@@ -239,6 +269,7 @@ def _resolve(
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
     listen_host(spec.host)
+    placement = gpu_arguments(spec)
     threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
@@ -629,7 +660,7 @@ def _resolve(
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
-    command = [binary, "-m", model]
+    command = [binary, "-m", model, *placement]
     if settings is not None and telemetry is not None:
         command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in () if ordinary else value.entries:

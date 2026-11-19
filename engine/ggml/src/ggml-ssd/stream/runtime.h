@@ -3,6 +3,7 @@
 #include "ggml-backend.h"
 #include "../runtime-services.h"
 #include <mutex>
+#include <map>
 
 namespace ssd { namespace stream {
 // One request/context owner; the scheduler borrows the table and this object.
@@ -11,9 +12,11 @@ class runtime {
 public:
     explicit runtime(const runtime_services & services) : services_(services) {}
     void attach(ggml_backend_sched_t scheduler);
+    void bind(ggml_backend_t backend, const runtime_services & services) { devices_[backend] = &services; }
 private:
     static const ggml_backend_sched_ssd_hooks hooks_;
     const runtime_services & services_;
+    std::map<ggml_backend_t, const runtime_services *> devices_;
     std::mutex mutex_;
     ggml_backend_sched_ssd_copy_stats stats_{};
     int phase_ = 0;

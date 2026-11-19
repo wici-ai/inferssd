@@ -19,6 +19,8 @@ LLAMA_API struct llama_ssd_options * llama_ssd_options_create(
     const char * settings_file, const struct llama_ssd_override * overrides,
     size_t count, const char * telemetry_file, char * error, size_t error_size);
 LLAMA_API void llama_ssd_options_free(struct llama_ssd_options * options);
+// Whether the launch will construct a routed expert executor (also accepts NULL).
+LLAMA_API bool llama_ssd_options_has_experts(const struct llama_ssd_options * options);
 // Startup guard, including callers which did not request SSD execution.
 LLAMA_API bool llama_ssd_check_environment(char * error, size_t error_size);
 

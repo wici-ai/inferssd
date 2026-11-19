@@ -365,7 +365,7 @@ private:
     bool cpu_sink_decode_active = false;
     bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
-    std::unique_ptr<llama_ssd_cpu_sink_runtime> cpu_sink_runtime;
+    std::unique_ptr<llama_ssd_executor_group> cpu_sink_runtime;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

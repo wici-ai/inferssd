@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -330,6 +331,64 @@ struct llama_ssd_cpu_sink_runtime {
     }
 };
 
+// Each executor owns the expert layout and caches for the layers placed on its device.
+// Host allocations are admitted once, through the shared process arbiter.
+struct llama_ssd_executor_group {
+    using routed_layer = ssd::store::expert_layout::routed_layer;
+    std::vector<std::unique_ptr<llama_ssd_cpu_sink_runtime>> executors;
+    std::vector<llama_ssd_cpu_sink_runtime *> by_layer;
+
+    void add(uint64_t epoch, const std::vector<routed_layer> & routed, const ssd::settings::snapshot & settings,
+            const ssd::runtime_services & services, const ssd::store::source_view & sources) {
+        auto executor = std::make_unique<llama_ssd_cpu_sink_runtime>(epoch, routed, settings, services, sources);
+        if (!executors.empty()) {
+            const auto & first = *primary().layout.abi();
+            const auto & next = *executor->layout.abi();
+            if (first.latent != next.latent || first.hidden != next.hidden || first.experts != next.experts) {
+                throw std::runtime_error("routed expert dimensions differ across devices");
+            }
+        }
+        if (size_t(routed.back().id) >= by_layer.size()) { by_layer.resize(size_t(routed.back().id) + 1); }
+        for (const auto & layer : routed) { by_layer[layer.id] = executor.get(); }
+        executors.emplace_back(std::move(executor));
+    }
+
+    llama_ssd_cpu_sink_runtime & primary() const { return *executors.front(); }
+
+    bool can_prefetch_after(int layer) const {
+        return executors.size() == 1 ||
+            (layer >= 0 && size_t(layer + 1) < by_layer.size() && by_layer[layer] == by_layer[layer + 1]);
+    }
+
+    bool has_cache() const { return primary().cache_budget || primary().vram_budget; }
+
+    void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
+        for (auto & executor : executors) { executor->begin(registry, token, decode, seq); }
+    }
+
+    void begin_request() {
+        for (auto & executor : executors) { executor->begin_request(); }
+    }
+
+    bool phase_complete(bool decode) {
+        for (auto & executor : executors) { if (!executor->phase_complete(decode)) { return false; } }
+        return true;
+    }
+
+    bool preload(std::string & error) {
+        for (auto & executor : executors) { if (!executor->preload(error)) { return false; } }
+        return true;
+    }
+
+    void reserve_tier(ggml_backend_reg_t registry, int experts_used) {
+        for (auto & executor : executors) { executor->reserve_tier(registry, experts_used); }
+    }
+
+    void prepare_graph(ggml_backend_reg_t registry) {
+        for (auto & executor : executors) { executor->prepare_graph(registry); }
+    }
+};
+
 // One call of the executor per node: the CPU backend's ggml threads are its
 // compute participants. ith 0 opens it and runs the layer; the call closes on
 // every exit, after all nth - 1 others joined.
@@ -437,6 +496,9 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     if (node.prefill && runtime.services.events) {
         const auto published = runtime.services.events->event("ssd.prefill.layer",
             "{\"layer\":" + std::to_string(node.layer) + ",\"n_tokens\":" + std::to_string(ntokens) +
+            ",\"gpu_device\":" + std::to_string(runtime.services.gpu ? runtime.services.gpu_device : -1) +
+            ",\"gpu_routes\":" + std::to_string(grouped_stats.gpu_routes + grouped_stats.gpu_transient_routes +
+                grouped_stats.gpu_ssd_transient_routes) +
             ",\"read_bytes\":" + std::to_string(grouped_stats.ssd_bytes) + "}");
         if (!published) { GGML_ABORT("prefill telemetry failed after layer drain: %s", published.error.c_str()); }
     }

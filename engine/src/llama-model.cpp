@@ -3525,7 +3525,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     // calculate the split points
     bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
-    std::vector<float> splits(n_devices());
+    std::vector<double> splits(n_devices());
     if (all_zero) {
         // default split, by free memory
         for (size_t i = 0; i < n_devices(); ++i) {
@@ -3547,7 +3547,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     }
 
     // sum and normalize the splits to get the split points
-    float split_sum = 0.0f;
+    double split_sum = 0.0;
     for (size_t i = 0; i < n_devices(); ++i) {
         split_sum += splits[i];
         splits[i] = split_sum;

@@ -141,10 +141,26 @@ def ready_app(tmp_path, monkeypatch):
 def test_serve_reuses_owned_launch_and_policy(ready_app, monkeypatch):
     launch = Mock(return_value=0)
     monkeypatch.setattr(command.typed_command, "run", launch)
-    assert main(["serve", "-m", str(ready_app), "--port", "8181"]) == 0
+    assert (
+        main(
+            [
+                "serve",
+                "-m",
+                str(ready_app),
+                "--port",
+                "8181",
+                "--split-mode",
+                "layer",
+                "--tensor-split",
+                "1,2",
+            ]
+        )
+        == 0
+    )
     args = launch.call_args.args[0]
     assert args.execute and args.model == ready_app
     assert args.port == 8181 and args.host == "127.0.0.1"
+    assert args.split_mode == "layer" and args.tensor_split == "1,2"
     policy = json.loads(args.runtime_policy.read_text())
     assert policy["memory_budget_bytes"] == 48 << 30
     assert "host_reserve_bytes" not in policy and "runtime_seconds" not in policy

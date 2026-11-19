@@ -206,6 +206,10 @@ llama_context::llama_context(
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
+                (model.split_mode() == LLAMA_SPLIT_MODE_ROW && model.n_devices() > 1)) {
+            throw std::runtime_error("SSD experts support single-device and layer split modes");
+        }
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
                 llama_ssd::expert_activation::unsupported) {
             throw std::runtime_error("SSD CPU experts do not support this model architecture");
@@ -314,20 +318,31 @@ llama_context::llama_context(
         backends.emplace_back(backend_cpu);
 
         if (ssd_runtime) {
-            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get(), model.split_mode()); }
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here
-                std::vector<ssd::store::expert_layout::routed_layer> routed;
+                using layers = std::vector<ssd::store::expert_layout::routed_layer>;
+                std::vector<std::pair<const ssd::runtime_services *, layers>> groups;
+                const auto epoch = ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed);
                 for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                     const auto & layer = model.layers[il];
                     if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                        routed.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
+                        const auto * target = &ssd_runtime->services_for(model.dev_layer(il));
+                        auto group = std::find_if(groups.begin(), groups.end(),
+                            [target](const auto & item) { return item.first == target; });
+                        if (group == groups.end()) {
+                            groups.emplace_back(target, layers{});
+                            group = std::prev(groups.end());
+                        }
+                        group->second.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
                     }
                 }
-                cpu_sink_runtime = std::make_unique<llama_ssd_cpu_sink_runtime>(
-                    ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-                    routed, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                if (groups.empty()) { throw std::runtime_error("the model has no routed expert layers"); }
+                cpu_sink_runtime = std::make_unique<llama_ssd_executor_group>();
+                for (const auto & group : groups) {
+                    cpu_sink_runtime->add(epoch, group.second, ssd_runtime->settings, *group.first, ssd_runtime->sources);
+                }
             }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
@@ -338,6 +353,11 @@ llama_context::llama_context(
             }
             if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
                 throw std::runtime_error("cannot configure the context host budget");
+            }
+            for (auto & entry : ssd_runtime->additional_devices) {
+                if (!api->cache_make_room(nullptr, &ssd_runtime->settings, &entry.second.services, 0, 0)) {
+                    throw std::runtime_error("cannot configure host budget for the additional GPU");
+                }
             }
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
@@ -401,7 +421,7 @@ llama_context::llama_context(
                 if (!cpu_sink_runtime) {
                     return allocate();
                 }
-                auto granted = cpu_sink_runtime->take_room(host_bytes, device_bytes);
+                auto granted = cpu_sink_runtime->primary().take_room(host_bytes, device_bytes);
                 if (!granted) {
                     LLAMA_LOG_ERROR("%s: no room for more KV cache: %s\n", __func__, granted.error.c_str());
                     return false;
@@ -496,7 +516,7 @@ llama_context::llama_context(
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
         // request's path.
-        if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
+        if (cpu_sink_runtime && cpu_sink_runtime->has_cache() && backend_cpu) {
             cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
                 int(model.hparams.n_expert_used));
         }
@@ -1086,12 +1106,12 @@ void llama_context::synchronize() {
 }
 
 bool llama_context::host_reserve(size_t bytes) {
-    return !cpu_sink_runtime || cpu_sink_runtime->make_room(bytes);
+    return !cpu_sink_runtime || cpu_sink_runtime->primary().make_room(bytes);
 }
 
 ssd::result<ssd::host::allocation_ticket> llama_context::host_take(size_t bytes) {
     if (!cpu_sink_runtime) { return {}; }
-    return cpu_sink_runtime->take_room(bytes);
+    return cpu_sink_runtime->primary().take_room(bytes);
 }
 
 void llama_context::host_note_memory_change() noexcept {
@@ -1103,7 +1123,7 @@ void llama_context::host_note_memory_change() noexcept {
 bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens) {
     const int64_t transition_start_us = ggml_time_us();
     auto complete_vram_phase = [&](bool decode) {
-        return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
+        return !cpu_sink_runtime || !cpu_sink_runtime->primary().vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
     // One line per request phase with the copies of the weights homed on the drive: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
@@ -2409,7 +2429,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active && n_tokens_all == 1;
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
-        (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+        cpu_sink_runtime->has_cache();
 
     if (output_all) {
         // require that all tokens are output
@@ -2476,7 +2496,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // A decode step that outgrows the reserve takes the larger buffers the way a prefill does:
     // the VRAM tier yields blocks on demand while they are allocated and grows back afterwards.
     const bool reserve_grow_phase = (reserve_grown || sched_need_reserve) && cpu_sink_cache_batch_decode && cpu_sink_runtime &&
-        (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+        cpu_sink_runtime->has_cache();
     if (!reserve_with_tier(cpu_sink_non_decode_phase || reserve_grow_phase, reserve_grow_phase,
             cells_grow ? n_tokens_all : 0)) {
         LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after scheduler reserve\n", __func__);
@@ -2578,7 +2598,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     previous, sched_reserve_n_outputs, ubatch.n_tokens);
 
                 const bool tier_phase = cpu_sink_runtime &&
-                    (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+                    cpu_sink_runtime->has_cache();
                 if (!reserve_with_tier(tier_phase, cpu_sink_cache_batch_decode)) {
                     LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after output reserve grew\n", __func__);
                     return -1;
@@ -3154,7 +3174,7 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     }
     const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
         [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
-    auto room = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
+    auto room = cpu_sink_runtime->primary().take_room(host_bytes, device_bytes, pages);
     if (!room) {
         LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, room.error.c_str());
         ggml_backend_sched_reset(sched.get());
@@ -3256,7 +3276,7 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
 }
 
 bool llama_context::ssd_preload() {
-    if (!cpu_sink_runtime || !(cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget)) {
+    if (!cpu_sink_runtime || !cpu_sink_runtime->has_cache()) {
         return true;
     }
     // The load ends as a request's prefill does: in the decode phase, the graph reserved for one token. The caches
@@ -3355,7 +3375,7 @@ ggml_status llama_context::graph_compute(
             return GGML_STATUS_FAILED;
         }
         // Decode runs on the pool's threads that the machine's other work leaves a CPU each; the others wait.
-        if (!batched) { n_threads = cpu_sink_runtime->decode_threads(n_threads); }
+        if (!batched) { n_threads = cpu_sink_runtime->primary().decode_threads(n_threads); }
     }
 
     // set the number of threads for all the backends

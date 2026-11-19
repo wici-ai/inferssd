@@ -22,7 +22,7 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_ssd_cpu_sink_node;
-struct llama_ssd_cpu_sink_runtime;
+struct llama_ssd_executor_group;
 
 struct llama_memory_context_i;
 
@@ -673,7 +673,7 @@ struct llm_graph_params {
     bool cpu_sink_decode = false;
     bool cpu_sink_prefill = false;
     bool cpu_sink_prefill_hint = false; // a sink prefill predicts each next layer's routes (prefill.lookahead)
-    llama_ssd_cpu_sink_runtime * cpu_sink_runtime = nullptr;
+    llama_ssd_executor_group * cpu_sink_runtime = nullptr;
 
     llm_graph_cb cb;
 
@@ -878,7 +878,7 @@ struct llm_graph_context {
     const bool cpu_sink_decode;
     const bool cpu_sink_prefill;
     const bool cpu_sink_prefill_hint;
-    llama_ssd_cpu_sink_runtime * const cpu_sink_runtime;
+    llama_ssd_executor_group * const cpu_sink_runtime;
     // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink, a decode
     // token's for its prefetch, every token's of a sink prefill for its read-ahead.
     ggml_tensor * cpu_sink_prefetch_hint = nullptr;

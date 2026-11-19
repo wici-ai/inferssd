@@ -1647,7 +1647,7 @@ ggml_tensor * llm_graph_context::build_moe_prefetch_hint(
 llama_expert_gating_func_type gating_op,
              int64_t   n_expert,
                  int   il) {
-    if (!cpu_sink_runtime || !next_gate_inp || !(cpu_sink_prefill ? cpu_sink_prefill_hint : n_tokens == 1)) {
+    if (!cpu_sink_runtime || !next_gate_inp || !cpu_sink_runtime->can_prefetch_after(il) || !(cpu_sink_prefill ? cpu_sink_prefill_hint : n_tokens == 1)) {
         return nullptr;
     }
     // a router that reads the stream as it is has no norm of its own
@@ -2071,7 +2071,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         auto descriptor = std::make_unique<llama_ssd_cpu_sink_node>();
         descriptor->cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
-        descriptor->runtime = cpu_sink_runtime;
+        descriptor->runtime = cpu_sink_runtime->by_layer.at(il);
         descriptor->situ_beta = hparams.situ_beta;
         descriptor->situ_linear_beta = hparams.situ_linear_beta;
         switch (execution.activation) {

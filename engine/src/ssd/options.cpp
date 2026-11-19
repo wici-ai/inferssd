@@ -100,6 +100,10 @@ llama_ssd_options * llama_ssd_options_create(const char * file,
 
 void llama_ssd_options_free(llama_ssd_options * options) { delete options; }
 
+bool llama_ssd_options_has_experts(const llama_ssd_options * options) {
+    return options && !options->settings.sources()->empty();
+}
+
 bool llama_ssd_check_environment(char * error, size_t size) {
     error_text(error, size, "");
     try {
@@ -164,7 +168,7 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
     services.gpu_reserve_bytes = static_cast<size_t>(*reserve_mib) * mib;
 }
 
-void llama_ssd_context::attach_backend(ggml_backend_t backend) {
+void llama_ssd_context::attach_backend(ggml_backend_t backend, llama_split_mode mode) {
     if (!sources.resolve) { return; }
     const auto registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend));
     const auto get = reinterpret_cast<ssd::gpu::get_provider_v1>(
@@ -172,7 +176,6 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     // A backend without the provider (the CPU) has no GPU tier: a GPU there runs
     // the dense layers, and the CPU sink every routed expert.
     if (!get) { return; }
-    if (services.gpu) { throw std::runtime_error("one GPU expert executor per context is supported"); }
     const auto * provider = get();
     if (!provider || provider->version != 2 || provider->size != sizeof(*provider) ||
             !provider->device_is_unified || !provider->device_ordinal || !provider->attach_services || !provider->stream) {
@@ -189,37 +192,65 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
     // This device of the backend has no expert executor (the graph lane needs host memory it can read).
     if (device < 0 && !transport) { return; }
     if (device < 0) { throw std::runtime_error("SSD GPU device is unavailable"); }
-    services.gpu = provider;
-    services.gpu_device = device;
+    auto * bound = &services;
+    auto * owned_transport = &gpu_transport;
+    if (services.gpu) {
+        if (mode != LLAMA_SPLIT_MODE_LAYER || provider != services.gpu || !transport ||
+                provider->device_is_unified(device) || provider->device_is_unified(services.gpu_device)) {
+            throw std::runtime_error("multiple SSD expert executors require discrete GPUs of one backend and layer split");
+        }
+        auto & binding = additional_devices[ggml_backend_get_device(backend)];
+        auto registered = host_owner->make_client();
+        if (!registered) { throw std::runtime_error(registered.error); }
+        binding.host = std::move(registered.value);
+        binding.services = services;
+        binding.services.host = binding.host.get();
+        binding.services.gpu_transport = nullptr;
+        bound = &binding.services;
+        owned_transport = &binding.transport;
+    }
+    bound->gpu = provider;
+    bound->gpu_device = device;
     char error[512] {};
     if (transport) {
-        gpu_transport = std::unique_ptr<void, llama_ssd_source_delete>(
-            transport->create(&services, device, error, sizeof(error)),
+        *owned_transport = std::unique_ptr<void, llama_ssd_source_delete>(
+            transport->create(bound, device, error, sizeof(error)),
             llama_ssd_source_delete{transport->destroy});
-        if (!gpu_transport) { throw std::runtime_error(error[0] ? error : "cannot create context GPU transport"); }
-        services.gpu_transport = gpu_transport.get();
+        if (!*owned_transport) { throw std::runtime_error(error[0] ? error : "cannot create context GPU transport"); }
+        bound->gpu_transport = owned_transport->get();
     }
-    if (!provider->attach_services(backend, &services, error, sizeof(error))) {
+    if (!provider->attach_services(backend, bound, error, sizeof(error))) {
         throw std::runtime_error(error[0] ? error : "cannot attach context GPU transport");
     }
+    stream.bind(backend, *bound);
 }
 
-void llama_ssd_context::prepare_dense(const llama_model & model) {
-    if (!services.gpu || !gpu_transport) { return; }
+const ssd::runtime_services & llama_ssd_context::services_for(ggml_backend_dev_t dev) const {
+    const auto found = additional_devices.find(dev);
+    return found != additional_devices.end() ? found->second.services : services;
+}
+
+static void prepare_device_dense(const llama_model & model, const ssd::runtime_services & services) {
+    if (!services.gpu_transport) { return; }
     size_t tensors = 0, bytes = 0;
     for (const auto & named : model.tensors_by_name) {
         const auto * tensor = named.second;
         if (ggml_n_dims(tensor) <= 2 && model.file_mapped(tensor) &&
-                services.gpu->transport->dense_has(gpu_transport.get(), tensor->name, ggml_nbytes(tensor), nullptr)) {
+                services.gpu->transport->dense_has(services.gpu_transport, tensor->name, ggml_nbytes(tensor), nullptr)) {
             ++tensors;
         }
     }
-    if (tensors && !services.gpu->transport->dense_prepare(gpu_transport.get(), &bytes)) {
+    if (tensors && !services.gpu->transport->dense_prepare(services.gpu_transport, &bytes)) {
         throw std::runtime_error("cannot reserve the context dense weight staging buffers");
     }
-    if (events) {
-        const auto published = events->event("ssd.stream.prepare",
+    if (services.events) {
+        const auto published = services.events->event("ssd.stream.prepare",
             "{\"dense_tensors\":" + std::to_string(tensors) + ",\"pinned_bytes\":" + std::to_string(bytes) + "}");
         if (!published) { throw std::runtime_error(published.error); }
     }
+}
+
+void llama_ssd_context::prepare_dense(const llama_model & model) {
+    prepare_device_dense(model, services);
+    for (const auto & entry : additional_devices) { prepare_device_dense(model, entry.second.services); }
 }

@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <stdexcept>
 
 std::string common_ssd_option_name(const char * key) {
@@ -26,6 +27,24 @@ void common_ssd_prepare(common_params & params) {
         overrides.data(), overrides.size(), params.ssd_telemetry_file.c_str(), error, sizeof(error));
     if (!options) { throw std::invalid_argument(error); }
     params.ssd_options = std::shared_ptr<llama_ssd_options>(options, llama_ssd_options_free);
+    if (llama_ssd_options_has_experts(options) &&
+            std::any_of(std::begin(params.tensor_split), std::end(params.tensor_split), [](float w) { return w > 0; })) {
+        // Device lists end in a null sentinel. An automatic list is assembled from the visible GPUs.
+        size_t count = 0;
+        if (!params.devices.empty()) {
+            count = params.devices.size() - 1;
+        } else {
+            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                const auto type = ggml_backend_dev_type(ggml_backend_dev_get(i));
+                if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) { ++count; }
+            }
+        }
+        for (size_t i = count; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] > 0) {
+                throw std::invalid_argument("tensor split assigns layers to an unavailable GPU");
+            }
+        }
+    }
 }
 
 void common_ssd_print_schema() {

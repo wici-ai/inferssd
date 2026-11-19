@@ -40,16 +40,19 @@ bool runtime::publish(const char * name, uint64_t bytes, uint64_t read_us, uint6
 
 bool runtime::copy_dense(ggml_backend_t backend, const ggml_tensor * source, ggml_tensor * destination,
         const ggml_tensor * next, uint64_t wait_us) noexcept {
-    const auto * gpu = services_.gpu;
-    if (!gpu || !services_.gpu_transport || gpu->device_ordinal(backend) != services_.gpu_device) { return false; }
+    const auto entry = devices_.find(backend);
+    if (entry == devices_.end()) { return false; }
+    const runtime_services & device = *entry->second;
+    const auto * gpu = device.gpu;
+    if (!device.gpu_transport) { return false; }
     bool hit = false;
     const int64_t start = ggml_time_us();
-    const bool copied = gpu->transport->dense_copy(services_.gpu_transport, source->name,
+    const bool copied = gpu->transport->dense_copy(device.gpu_transport, source->name,
         destination->data, ggml_nbytes(destination), gpu->stream(backend), &hit);
     const uint64_t elapsed = uint64_t(ggml_time_us() - start);
     if (!copied) { return false; }
     // Retain the original single-weight lookahead and its transport ordering.
-    if (next && !gpu->transport->dense_read_ahead(services_.gpu_transport, next->name, ggml_nbytes(next))) {
+    if (next && !gpu->transport->dense_read_ahead(device.gpu_transport, next->name, ggml_nbytes(next))) {
         return false;
     }
     std::lock_guard<std::mutex> lock(mutex_);

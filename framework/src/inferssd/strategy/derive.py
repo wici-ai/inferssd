@@ -557,7 +557,7 @@ def link_rates(
     if len(present) != 1:
         if not present:
             return {}, f"no {names} GPU is usable now"
-        return {}, f"{len(present)} {names} GPUs are usable and the engine drives one of them"
+        return {}, f"{len(present)} {names} GPUs are usable; link rates are per device"
     gpu = next((row for row in characteristics["gpus"] if row["uuid"] == present[0].uuid), None)
     if gpu is None:
         return {}, f"the GPU {present[0].uuid} was not measured"
