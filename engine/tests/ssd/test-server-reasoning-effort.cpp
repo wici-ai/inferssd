@@ -4,7 +4,8 @@
 // where the template cannot; an effort on the ladder minimal < low < medium < high < xhigh < max (ultra and
 // persistent above it) takes the template's highest that does not exceed it, else its least; a template with no such
 // efforts thinks as it does by default, as do "on" and any other word. The Responses and Anthropic routes reach the
-// same field. Runs the server's own request steps on fixtures and on the repository's templates; no model is loaded.
+// same field; an Anthropic request that names no thinking does not think. Runs the server's own request steps on
+// fixtures and on the repository's templates; no model is loaded.
 #include "server-chat.h"
 #include "server-common.h"
 #include "chat.h"
@@ -183,18 +184,21 @@ static void test_responses() {
     require(string_ends_with(f.responses_prompt("xhigh"), "<|assistant|>high<think>"), "reasoning.effort \"xhigh\" must run as high");
 }
 
-// Anthropic's thinking and output_config.effort reach the same field; a request naming no thinking runs as the
-// template does by default.
+// Anthropic's thinking and output_config.effort reach the same field. As in Anthropic's API, a request thinks only
+// when it asks to: no thinking is thinking off, whatever its output_config says, which is how Claude Code turns
+// thinking off for a model it does not know.
 static void test_anthropic() {
     const fixture f(graded_template);
-    const std::string by_default = f.anthropic_prompt(nullptr, nullptr);
-    require(string_ends_with(by_default, "<|assistant|>high<think>"), "no thinking must run as the template's default");
-    require(f.anthropic_prompt(nullptr, "low") == by_default, "an effort without thinking must not change the template's default");
+    require(string_ends_with(f.anthropic_prompt(nullptr, nullptr), "<|assistant|>chat"), "no thinking must turn thinking off");
+    require(string_ends_with(f.anthropic_prompt(nullptr, "high"), "<|assistant|>chat"), "no thinking at an effort must turn thinking off");
     require(string_ends_with(f.anthropic_prompt("disabled", "high"), "<|assistant|>chat"), "thinking disabled must turn thinking off");
-    require(f.anthropic_prompt("adaptive", nullptr) == by_default, "adaptive thinking with no effort must run as the default");
+    require(string_ends_with(f.anthropic_prompt("adaptive", nullptr), "<|assistant|>high<think>"), "adaptive thinking with no effort must run as the default");
     require(string_ends_with(f.anthropic_prompt("adaptive", "xhigh"), "<|assistant|>high<think>"), "adaptive at xhigh must run as high");
     require(string_ends_with(f.anthropic_prompt("enabled", "low"), "<|assistant|>low<think>"), "enabled at low must run as low");
     require(string_ends_with(f.anthropic_prompt("adaptive", "max"), "<|assistant|>max<think>"), "adaptive at max must run as max");
+    // A template that cannot turn thinking off thinks at its least.
+    const fixture always(always_template);
+    require(string_ends_with(always.anthropic_prompt(nullptr, nullptr), "<|assistant|>low<think>"), "no thinking must take the least effort where thinking cannot be off");
 }
 
 // The repository's templates of the models InferSSD runs offer what the mapping assumes.
