@@ -2,12 +2,18 @@ name: CUDA
 
 # Compile-only validation without a GPU. It runs whenever a pull request changes the
 # engine or the build configuration and does not establish GPU runtime correctness.
-# Pull requests, and by hand on any branch. A merge does not run it again: main takes only squash
-# merges of pull requests that are up to date with it, so a merge's commit is the code its pull
-# request's checks ran on.
+# Pull requests, merges to main with the same changes, and by hand on any branch. A pull request
+# need not be up to date with main to merge; the run on main checks each merge's commit.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "engine/**"
+      - CMakeLists.txt
+      - CMakePresets.json
+      - .github/workflows/cuda.yml
+  push:
+    branches: [main]
     paths:
       - "engine/**"
       - CMakeLists.txt
@@ -18,8 +24,9 @@ on:
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run; every run on main completes.
 concurrency:
-  group: cuda-${{ github.workflow }}-${{ github.ref }}
+  group: cuda-${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
