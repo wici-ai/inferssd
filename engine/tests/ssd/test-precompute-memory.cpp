@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "llama-context.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsv4.h"
@@ -209,8 +210,31 @@ static void recurrent_and_hybrid_undo(llama_model & model) {
     }
 }
 
+// The refit's ubatch search, whatever probe it ends on: the graph left reserved is the one of the size it returns.
+// 48040 tokens with 25856 fitting ends on a refused probe (26112), as DeepSeek-V4.1 did on a 48 GB Mac, so 25856 is
+// reserved again; 35418 with 18432 fitting ends on 18432 itself. A refused second reserve selects nothing.
+static void refit_search_holds_selected() {
+    struct search_case { uint32_t target, fits; bool again; uint32_t expect; const char * name; };
+    for (const auto & c : {search_case{48040, 25856, true, 25856, "ends refused"},
+                           search_case{35418, 18432, true, 18432, "ends accepted"},
+                           search_case{48040, 25856, false, 0, "second reserve refused"}}) {
+        uint32_t held = 0, last = 0;
+        bool reserved_fits = false;
+        const uint32_t got = llama_prefill_ubatch_search(c.target, 1, [&](uint32_t n) {
+            bool ok = n <= c.fits && !(n == c.fits && reserved_fits && !c.again);
+            reserved_fits = reserved_fits || (ok && n == c.fits);
+            held = ok ? n : 0;
+            last = n;
+            return ok;
+        });
+        require_named(got == c.expect, c.name, "search selected another size");
+        require_named(got == 0 || (held == got && last == got), c.name, "the graph held is not the selected size's");
+    }
+}
+
 int main() {
     cells_partial_insert_oom();
+    refit_search_holds_selected();
     llama_model model(llama_model_default_params());
     model.hparams = {};
     model.arch = LLM_ARCH_LLAMA;
@@ -340,5 +364,5 @@ int main() {
         require(raw.get_swa()->seq_pos_max(0) == 1, "prepare exception leaked simulated metadata");
     }
     recurrent_and_hybrid_undo(model);
-    std::puts("PRECOMPUTE_METADATA_PASS: purge/ext/shared indexes, OOM capture/partial inserts, compound raw, prepare exception, submit boundary, recurrent and hybrid");
+    std::puts("PRECOMPUTE_METADATA_PASS: purge/ext/shared indexes, OOM capture/partial inserts, compound raw, prepare exception, submit boundary, recurrent and hybrid, refit search");
 }

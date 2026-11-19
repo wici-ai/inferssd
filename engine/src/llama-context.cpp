@@ -3286,20 +3286,26 @@ uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, cons
     const uint32_t step = std::min<uint32_t>(std::max<uint32_t>(256, granularity), std::max<uint32_t>(1, target / 2));
     // the largest size in (0, target) that reserve accepts, and the smallest it refused
     uint32_t lo = 0, found = 0, failed = target;
+    // whether the last reserve was the one of found: a refused probe after it left no graph
+    bool holds_found = false;
     while (failed > lo + step) {
         uint32_t probe = lo + (failed - lo) / 2;
         probe = std::max(lo + step, probe - probe % step);
         if (probe >= failed) { break; }
-        if (reserve(probe)) {
+        holds_found = reserve(probe);
+        if (holds_found) {
             lo = found = probe;
         } else {
             failed = probe;
         }
     }
-    if (!found && failed > 1 && reserve(1)) {
+    if (found) {
+        return holds_found || reserve(found) ? found : 0;
+    }
+    if (failed > 1 && reserve(1)) {
         return 1;
     }
-    return found;
+    return 0;
 }
 
 llm_graph_params llama_context::graph_params(

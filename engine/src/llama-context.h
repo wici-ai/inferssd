@@ -44,7 +44,8 @@ struct llama_dense_stream_meter {
 // The ubatch of a request's prefill graph when a graph of the request's own size, target, does not fit (graphs sized
 // to the request).  Every pass of a smaller ubatch reads its layers' experts again, so the search takes the largest
 // size that fits: binary, in steps of the granularity, at least 256 tokens and at most half the target, and ending
-// with one token.  reserve(n): reserve the graph of n tokens.  Returns the selected ubatch, 0 if none fits.
+// with one token.  reserve(n): reserve the graph of n tokens.  Returns the selected ubatch, 0 if none fits.  Each
+// reserve replaces the graph the previous one left, so on return the graph reserved is the one of the size returned.
 uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::function<bool(uint32_t)> & reserve);
 
 struct llama_context {
