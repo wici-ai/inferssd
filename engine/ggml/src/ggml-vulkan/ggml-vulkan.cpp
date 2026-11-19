@@ -14328,11 +14328,21 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
-    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
-
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    // On a UMA device a buffer the host can see is memory the CPU reads: copy from it once the queued work is done, as
+    // a synchronous read does. A copy on the GPU would add a transfer and a barrier to the submission for every read.
+    if ((buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && ctx->device->uma) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        ggml_vk_synchronize(ctx);
+        memcpy(data, (const uint8_t *) buf->ptr + src_offset, size);
+        return;
+    }
+
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
     bool ret = ggml_vk_buffer_read_async(compute_ctx, buf, src_offset, data, size);
 
     // If that failed, copy synchronously through a staging buffer
