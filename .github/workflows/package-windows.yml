@@ -83,7 +83,12 @@ jobs:
       fail-fast: false
       matrix:
         backend: ${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}
-    runs-on: windows-2025
+    # The CUDA package, the longest build by far, builds on the organization's larger runner for a
+    # release and a run by hand. Pull requests and main pushes, which anyone can start, build on the
+    # standard runner.
+    runs-on: >-
+      ${{ matrix.backend == 'cuda' && (inputs.release_tag || github.event_name == 'workflow_dispatch')
+      && 'release-packaging-runner-windows' || 'windows-2025' }}
     timeout-minutes: 240
     env:
       CUDA_REDIST: 12.9.1
@@ -124,6 +129,16 @@ jobs:
         if: matrix.backend == 'cuda'
         shell: pwsh
         run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda')
+      # As many CUDA compiles at once as the machine's cores and memory allow: one takes up to about
+      # 3 GiB. The Vulkan build keeps its two.
+      - name: Size the build to the machine
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          $gib = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+          $jobs = if ('${{ matrix.backend }}' -eq 'cuda') { [math]::Max(1, [math]::Min($cores, [math]::Floor($gib / 3))) } else { 2 }
+          "BUILD_JOBS=$jobs" >> $env:GITHUB_ENV
+          Write-Host "$cores logical processors, $gib GiB of memory: $jobs build jobs"
       - name: Build the relocatable engine package
         shell: cmd
         env:
@@ -134,7 +149,7 @@ jobs:
           if defined VULKAN_SDK set "PATH=%VULKAN_SDK%\Bin;%PATH%"
           if defined CUDA_PATH set "PATH=%CUDA_PATH%\bin;%PATH%"
           set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Backend ${{ matrix.backend }} -OutputDirectory dist -Jobs ${{ matrix.backend == 'cuda' && 4 || 2 }}
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Backend ${{ matrix.backend }} -OutputDirectory dist -Jobs %BUILD_JOBS%
           if errorlevel 1 exit /b 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
