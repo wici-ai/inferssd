@@ -24,7 +24,6 @@ from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cache_directory, read_resources
 from inferssd.launch.typed import (
     BATCH,
-    CONTEXT,
     LOOPBACK,
     PROFILES,
     LaunchSpec,
@@ -86,7 +85,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--context",
         type=int,
         help="-c (default: the largest multiple of 8192, up to the model's trained context, "
-        f"that memory holds when full; up to {CONTEXT} for a RAM-only model)",
+        "that memory holds when full)",
     )
     launch.add_argument(
         "--batch",
@@ -223,7 +222,6 @@ def run(args: argparse.Namespace) -> int:
             platform=args.platform,
             directory=str(claim.directory),
             memory=policy.memory_budget_bytes,
-            reserve=policy.host_reserve_bytes or 0,
         ),
         observe=adapter,
         emit=emit,

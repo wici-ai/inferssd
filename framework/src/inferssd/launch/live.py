@@ -19,7 +19,6 @@ from pathlib import Path
 from typing import Optional, Protocol
 
 from inferssd.engine import model as engine_model
-from inferssd.launch import ram
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
 from inferssd.launch.types import Fact, LaunchInput, Reply
@@ -45,11 +44,9 @@ def cpu_count(value: str) -> str:
 
 
 def model_facts(binary: str, path: str, run: engine_model.Run) -> object:
-    """The model_facts fact of the model PATH as the server BINARY would load it: its RAM facts
-    for an ordinary model, else its expert model's facts (inferssd.strategy.inputs)."""
+    """The model_facts fact of the model PATH as the server BINARY would load it
+    (inferssd.strategy.inputs)."""
     model = engine_model.query(binary, path, run)
-    if model["architecture"] == ram.ARCHITECTURE:
-        return ram.facts(model)
     return strategy_inputs.model_facts_json(strategy_inputs.facts_from_engine(model))
 
 

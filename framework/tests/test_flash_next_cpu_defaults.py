@@ -4,7 +4,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_ram_launch import resolved
+from test_dense_launch import resolved
 from test_strategy_inputs import Q8_0, moe
 from test_typed_launch import model_file, setup
 

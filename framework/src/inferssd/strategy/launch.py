@@ -111,4 +111,8 @@ def plan(
         "dropped": list(applied.dropped),
         "notes": list(strategy.notes),
     }
-    return Planned(applied.settings, applied.threads, arguments, receipt, one_pass=True)
+    # One pass a prompt saves the weight reads a pass makes: a model with routed experts reads the
+    # experts each pass routes to; one without them reads none of its weights a pass.
+    return Planned(
+        applied.settings, applied.threads, arguments, receipt, one_pass=model.experts is not None
+    )

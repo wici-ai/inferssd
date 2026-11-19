@@ -163,6 +163,16 @@ def moe(arch, *, layers, experts, used, latent, hidden, gate, up, down, first=0)
     return tensors, kv
 
 
+def dense(arch, *, layers=2, width=256, kind=Q4_K):
+    """Tensors and KV of a model without routed experts: token embeddings, then layers of a norm
+    and two KIND matrices."""
+    tensors = [("token_embd.weight", (width, 64), Q8_0)]
+    for layer in range(layers):
+        tensors.append((f"blk.{layer}.attn_norm.weight", (width,), F32))
+        tensors += [(f"blk.{layer}.{n}.weight", (width, width), kind) for n in ("attn_q", "ffn_up")]
+    return tensors, {"general.architecture": arch}
+
+
 def deepseek_like():
     """DeepSeek-V4.1-Flash's routed layout: 40 MoE layers after 3 dense ones, 384 MXFP4 experts."""
     return moe(
@@ -198,63 +208,67 @@ def test_the_engines_facts_of_the_split_toy_model():
     # What the engine prints (its test keeps this file), read as the strategy reads it.
     facts = facts_from_engine(engine_model.validate(json.loads(ENGINE_FIXTURE.read_text())))
     assert facts.paths == ("<dir>/toy-00001-of-00002.gguf", "<dir>/toy-00002-of-00002.gguf")
-    assert (facts.architecture, facts.layers, facts.experts, facts.experts_used) == (
+    experts = facts.experts
+    assert experts is not None
+    assert (facts.architecture, experts.layers, experts.count, experts.used) == (
         "qwen3moe",
         2,
         4,
         2,
     )
     # Layer 0 is Q8_0 throughout; layer 1 has Q4_0 up and gate. The NextN block is not there.
-    assert facts.up == Role("up", (("Q4_0", 1, 1152), ("Q8_0", 1, 2176)), 32, 64)
-    assert facts.down.formats == (("Q8_0", 2, 2176),)
-    assert (facts.down.rows, facts.down.cols) == (64, 32)
-    assert facts.expert_bytes == 3 * 2176 and facts.expert_read_bytes >= facts.expert_bytes
-    assert facts.format_bytes == (("Q8_0", 4 * 2176 * 4), ("Q4_0", 2 * 1152 * 4))
+    assert experts.up == Role("up", (("Q4_0", 1, 1152), ("Q8_0", 1, 2176)), 32, 64)
+    assert experts.down.formats == (("Q8_0", 2, 2176),)
+    assert (experts.down.rows, experts.down.cols) == (64, 32)
+    assert experts.expert_bytes == 3 * 2176 and experts.expert_read_bytes >= experts.expert_bytes
+    assert experts.format_bytes == (("Q8_0", 4 * 2176 * 4), ("Q4_0", 2 * 1152 * 4))
     assert facts.dense_bytes == 64 * 16 * 4 + 64 * 64 * 4
+    # The layers' one other tensor is layer 0's attention query; the token embeddings are outside
+    # the layers.
+    assert facts.layer_format_bytes == (("F32", 64 * 64 * 4),)
+    assert facts.cpu_format == "Q8_0"
     assert model_facts_from(model_facts_json(facts)) == facts
 
 
 def test_deepseek_like_facts():
     facts = facts_of(*deepseek_like())
     assert facts.paths == ("/models/model.gguf",)
-    assert (facts.architecture, facts.layers, facts.experts, facts.experts_used) == (
+    experts = facts.experts
+    assert experts is not None
+    assert (facts.architecture, experts.layers, experts.count, experts.used) == (
         "deepseek41",
         40,
         384,
         6,
     )
-    assert [(r.name, r.format, r.rows, r.cols) for r in facts.roles] == [
+    assert [(r.name, r.format, r.rows, r.cols) for r in experts.roles] == [
         ("gate", "MXFP4", 2304, 5120),
         ("up", "MXFP4", 2304, 5120),
         ("down", "MXFP4", 5120, 2304),
     ]
     role = 5120 * 2304 // 32 * 17
-    assert [r.slice_bytes() for r in facts.roles] == [role] * 3 == [6266880] * 3
-    assert [r.bits_per_weight() for r in facts.roles] == [4.25] * 3
+    assert [r.slice_bytes() for r in experts.roles] == [role] * 3 == [6266880] * 3
+    assert [r.bits_per_weight() for r in experts.roles] == [4.25] * 3
     # Page-aligned tensors of whole-page slices read exactly their bytes.
-    assert facts.expert_bytes == facts.expert_read_bytes == 3 * role
+    assert experts.expert_bytes == experts.expert_read_bytes == 3 * role
     assert facts.dense_bytes == 5120 * 1024 // 32 * 34 + 5120 * 4 + 40 * 5120 * 4
-    assert facts.format_bytes == (("MXFP4", 40 * 3 * 384 * role),)
-    assert facts.dominant_format == "MXFP4"
+    assert experts.format_bytes == (("MXFP4", 40 * 3 * 384 * role),)
+    assert experts.dominant_format == facts.cpu_format == "MXFP4"
 
 
 def test_muse_like_facts_and_dominant_format():
-    facts = facts_of(*muse_like())
-    assert (facts.architecture, facts.layers, facts.experts, facts.experts_used) == (
-        "muse-spark",
-        62,
-        256,
-        8,
-    )
-    assert [(r.format, r.slice_bytes()) for r in facts.roles] == [
+    experts = facts_of(*muse_like()).experts
+    assert experts is not None
+    assert (experts.layers, experts.count, experts.used) == (62, 256, 8)
+    assert [(r.format, r.slice_bytes()) for r in experts.roles] == [
         ("Q4_K", 9437184),
         ("Q4_K", 9437184),
         ("Q5_K", 11534336),
     ]
-    assert facts.expert_read_bytes == 2 * 9437184 + 11534336
+    assert experts.expert_read_bytes == 2 * 9437184 + 11534336
     # Gate and up together hold more bytes than down.
-    assert facts.format_bytes[0] == ("Q4_K", 62 * 2 * 256 * 9437184)
-    assert facts.dominant_format == "Q4_K"
+    assert experts.format_bytes[0] == ("Q4_K", 62 * 2 * 256 * 9437184)
+    assert experts.dominant_format == "Q4_K"
 
 
 def test_mixed_formats_rank_by_layers():
@@ -262,22 +276,33 @@ def test_mixed_formats_rank_by_layers():
     tensors, kv = moe(
         "toy", layers=3, experts=2, used=1, latent=256, hidden=256, gate=Q4_K, up=Q4_K, down=downs
     )
-    facts = facts_of(tensors, kv, alignment=32)
-    assert facts.down.formats == (("Q6_K", 2, 256 * 210), ("Q5_K", 1, 256 * 176))
-    assert facts.down.format == "Q6_K"
-    assert facts.down.slice_bytes() == 256 * 210
-    assert facts.down.slice_bytes("Q5_K") == 256 * 176
+    experts = facts_of(tensors, kv, alignment=32).experts
+    assert experts is not None
+    assert experts.down.formats == (("Q6_K", 2, 256 * 210), ("Q5_K", 1, 256 * 176))
+    assert experts.down.format == "Q6_K"
+    assert experts.down.slice_bytes() == 256 * 210
+    assert experts.down.slice_bytes("Q5_K") == 256 * 176
     with pytest.raises(KeyError, match="take no Q8_0"):
-        facts.down.slice_bytes("Q8_0")
-    assert facts.experts_used == 1
+        experts.down.slice_bytes("Q8_0")
+    assert experts.used == 1
     # Slices of 36-54 KiB at 32-byte offsets each read whole pages around them.
-    assert facts.expert_bytes == 2 * 256 * 144 + 256 * 210
-    assert facts.expert_read_bytes > facts.expert_bytes
-    assert facts.expert_read_bytes % PAGE == 0
+    assert experts.expert_bytes == 2 * 256 * 144 + 256 * 210
+    assert experts.expert_read_bytes > experts.expert_bytes
+    assert experts.expert_read_bytes % PAGE == 0
 
 
-def test_a_model_without_routed_experts_has_no_expert_facts():
-    with pytest.raises(ValueError, match="no routed expert tensors"):
+def test_a_model_without_routed_experts_is_its_dense_weights():
+    facts = facts_of(*dense("toy"))
+    assert facts.experts is None
+    assert facts.dense_bytes == 256 * 64 // 32 * 34 + 2 * (256 * 4 + 2 * 256 * 256 // 256 * 144)
+    # The token embeddings are a lookup outside the layers: the CPU computes the layers' Q4_K.
+    assert facts.layer_format_bytes == (("Q4_K", 2 * 2 * 256 * 144), ("F32", 2 * 256 * 4))
+    assert facts.cpu_format == "Q4_K"
+    assert model_facts_from(model_facts_json(facts)) == facts
+
+
+def test_a_model_without_layers_is_refused():
+    with pytest.raises(ValueError, match="no layer tensors"):
         facts_of([("w", (32, 32), Q8_0)], {"general.architecture": "toy"})
 
 
