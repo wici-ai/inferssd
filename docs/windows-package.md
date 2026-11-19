@@ -53,10 +53,14 @@ the macOS package. Published bytes are immutable.
 Every published package is a release's. **Actions > Release**, run by hand on `main`, takes
 main's head's version, `<yymmdd>.<build>`, and calls the reusable Windows and macOS package
 workflows at that commit with the release's tag, which is the version (see
-[the macOS package](macos-package.md#releases)). After both platforms' checks
-pass, its release job prepares one GitHub release containing the three archives (macOS, Windows
-Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, updates the latest package
-lists, and only then publishes the complete release, which tags the commit. With `github_release`
+[the macOS package](macos-package.md#releases)). It calls this workflow once per backend
+(`backends`), so each Windows package is built, signed, checked and published on its own: the
+Vulkan package reaches its package list while the CUDA one still builds. One package is signed at
+a time; a file both packages carry, signed with the first, comes from the signed-file store for the
+second, and the Vulkan package's signing also signs the pinned `install.ps1`. Once all three
+packages are published, its release job prepares one GitHub release containing the three archives
+(macOS, Windows Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, and
+publishes it, which tags the commit. With `github_release`
 off, the same signed packages only update the package lists, with no GitHub release or tag (see
 [the macOS package](macos-package.md#releases)). There is no separate Windows-only version or
 prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
@@ -67,9 +71,9 @@ version. The asset preparation step rejects packages with a different version, t
 revision, build, label or checksum. Existing published releases are never overwritten. A draft
 remains private until all assets and every package list are ready.
 
-**Package Windows** also runs, building and checking without signing or publishing, for pull
-requests that change how the packages are built, after each merge to `main` that changes the
-engine, the framework or the packaging, and by hand on any branch, producing
+**Package Windows** also runs by hand on any branch, building and checking without signing or
+publishing; run it for a change to how the packages are built. Pull requests and merges to `main`
+build no package. A run produces
 `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions artifacts. GitHub's runner has
 no GPU, so the CUDA package's check also shows that it starts without an NVIDIA driver.
 
