@@ -317,32 +317,23 @@ llama_context::llama_context(
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
-                std::vector<int32_t> routed_layers;
+                // the routed layers (up, gate and down experts each) and their expert layout, described once here
+                std::vector<ssd::store::expert_layout::routed_layer> routed;
                 for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
                     const auto & layer = model.layers[il];
                     if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                        routed_layers.push_back(int32_t(il));
+                        routed.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
                     }
                 }
-                cpu_sink_runtime = std::make_unique<llama_ssd_cpu_sink_runtime>(model.hparams.n_layer,
+                cpu_sink_runtime = std::make_unique<llama_ssd_cpu_sink_runtime>(
                     ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-                    int64_t(model.hparams.n_expert), routed_layers, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
-                // every routed layer's expert shapes: what resolves a layer other than the running one's experts (the
-                // next layer's decode prefetch and prefill read-ahead, the load's preload)
-                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
-                    const auto & layer = model.layers[il];
-                    for (const ggml_tensor * experts : {layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps}) {
-                        if (experts) {
-                            cpu_sink_runtime->expert_shapes[ggml_get_name(experts)] = {experts->nb[2], experts->ne[2]};
-                        }
-                    }
-                }
+                    routed, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
             }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
                 ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
             const auto * api = get_api ? get_api() : nullptr;
-            if (!ssd::cpu::valid(api) || api->source_size() != sizeof(ssd_cpu_sink_source)) {
+            if (!ssd::cpu::valid(api)) {
                 throw std::runtime_error("CPU backend has no compatible SSD executor table");
             }
             if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
@@ -504,10 +495,10 @@ llama_context::llama_context(
 
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
-        // request's path. Every routed layer, for each layer's expert format (a model may quantize layers differently).
+        // request's path.
         if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
             cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
-                routed_experts(), int(model.hparams.n_expert_used));
+                int(model.hparams.n_expert_used));
         }
 
         if (!cparams.flash_attn) {
@@ -3264,17 +3255,6 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
     return line;
 }
 
-// up, gate and down of every routed layer, in layer order
-std::vector<const ggml_tensor *> llama_context::routed_experts() const {
-    std::vector<const ggml_tensor *> experts;
-    for (const auto & layer : model.layers) {
-        if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-            experts.insert(experts.end(), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps });
-        }
-    }
-    return experts;
-}
-
 bool llama_context::ssd_preload() {
     if (!cpu_sink_runtime || !(cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget)) {
         return true;
@@ -3290,7 +3270,7 @@ bool llama_context::ssd_preload() {
     }
     synchronize();
     std::string error;
-    if (!cpu_sink_runtime->preload(routed_experts(), error)) {
+    if (!cpu_sink_runtime->preload(error)) {
         LLAMA_LOG_WARN("%s: SSD expert preload failed: %s\n", __func__, error.c_str());
         return false;
     }

@@ -55,7 +55,7 @@ def runtime_record(cpus=range(61), gpus=((X86_GPU, 30 << 30, 0),)):
 
 def strategic(tmp_path, **runtime_options):
     """The typed-launch fixture, recorded on the x86 machine with its characteristics."""
-    inputs, spec, host, adapter, out, _ = setup(tmp_path)
+    inputs, spec, host, adapter, out = setup(tmp_path)
     host.update(
         machine_characteristics=X86,
         runtime_facts=runtime_record(**runtime_options),
@@ -253,9 +253,6 @@ def render_golden(case, strategy):
             return Reply(case["settings"])
         if name == "mkdir":
             return Reply()
-        if name == "gguf_alias":
-            files.add(case["alias"])
-            return Reply(case["alias"])
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
@@ -316,7 +313,7 @@ def test_goldens_without_a_strategy_ask_nothing_new(name):
 
 
 def recorded(host):
-    return RecordedArtifacts(LaunchInput("", ()), host, run=None, replace=None, python="")
+    return RecordedArtifacts(LaunchInput("", ()), host)
 
 
 def test_recorded_engine_gpu_backends():
@@ -391,9 +388,6 @@ def test_live_strategy_facts(tmp_path):
     adapter = LiveArtifacts(
         LaunchInput("", (("PATH", "/bin"),)),
         host=None,
-        run=None,
-        replace=None,
-        python="",
         machine="CHARACTERISTICS",
         strategy_host=host,
     )
@@ -408,7 +402,7 @@ def test_live_strategy_facts(tmp_path):
         "memory_budget_bytes": None,
     }
     assert adapter(Fact("model_drive_key", (str(model),))).value == nvme_key()
-    plain = LiveArtifacts(LaunchInput("", ()), host=None, run=None, replace=None, python="")
+    plain = LiveArtifacts(LaunchInput("", ()), host=None)
     assert plain(Fact("machine_characteristics")).value is None
 
 
@@ -582,7 +576,7 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
 
 
 def launch_arguments(tmp_path, *extra):
-    inputs, spec, host, _, out, _ = setup(tmp_path)
+    inputs, spec, host, _, out = setup(tmp_path)
     contract = tmp_path / "policy.json"
     contract.write_text(json.dumps(asdict(policy(tmp_path, "linux"))))
     host.update(runtime_facts=runtime_record(), model_drive_key=X86_DRIVE)

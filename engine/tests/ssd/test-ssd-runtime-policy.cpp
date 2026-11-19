@@ -39,10 +39,12 @@ static void learning_contract() {
 }
 
 static void prefetch_contract() {
-    auto p = plan_prefetch(4, 5, 5, 2, false);
+    // the next routed layer (5) and the layer the hint names
+    auto p = plan_prefetch(5, 5, 5, 2, false);
     check(p.hinted && p.layer == 5 && p.ranks == 2 && p.open_gate, "prefetch preserves prefix rank order and idle gate");
-    check(plan_prefetch(4, 5, 5, 0, true).ranks == 0, "depth0 records hints but schedules no reads");
-    check(!plan_prefetch(4, 6, 5, 2, true).hinted, "mismatched hints do not schedule a later layer");
+    check(plan_prefetch(5, 5, 5, 0, true).ranks == 0, "depth0 records hints but schedules no reads");
+    check(!plan_prefetch(5, 6, 5, 2, true).hinted, "mismatched hints do not schedule a later layer");
+    check(!plan_prefetch(-1, -1, 5, 2, true).hinted, "after the last routed layer nothing is hinted");
     auto rank = plan_prefetch_rank(7, false, true, 0, 2);
     check(!rank.novel && rank.request && !rank.skipped, "cached candidate still reaches executor reservation and skip feedback");
     rank = plan_prefetch_rank(7, true, false, 0, 2);

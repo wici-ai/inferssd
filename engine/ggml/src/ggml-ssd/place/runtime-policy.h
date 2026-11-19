@@ -197,9 +197,9 @@ inline lock_plan plan_locks(const ssd_place_table & table, size_t ring_slots,
 }
 
 struct prefetch_plan { int layer, ranks; bool hinted, open_gate; };
-inline prefetch_plan plan_prefetch(int layer, int hint_layer, int hint_n, int topk, bool demand_reads) {
-    const bool hinted = hint_n && hint_layer == layer + 1;
-    return {layer + 1, hinted ? std::min(topk, hint_n) : 0, hinted, !demand_reads};
+inline prefetch_plan plan_prefetch(int next_layer, int hint_layer, int hint_n, int topk, bool demand_reads) {
+    const bool hinted = hint_n && next_layer >= 0 && hint_layer == next_layer;
+    return {next_layer, hinted ? std::min(topk, hint_n) : 0, hinted, !demand_reads};
 }
 // How likely the next layer selects a novel expert of a hint rank: the share of the rank's novel experts it selected,
 // by the rule of succession (no evidence: one half).

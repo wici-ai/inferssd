@@ -5,7 +5,7 @@
     "additionalProperties": false,
     "properties": {
         "expert.source": {
-            "description": "Expert index source paths in declared order",
+            "description": "Expert sources in declared order: the model's GGUF files, expert packs or alias indexes",
             "kind": "paths",
             "unit": "path",
             "producer": "plan",

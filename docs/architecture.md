@@ -22,7 +22,7 @@ flowchart LR
 
 ## Expert sources and caching
 
-Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
+Source indexes locate expert byte ranges in the model's GGUF files, a matching v1 expert pack, or an alias index of other files. The engine indexes GGUF files from their headers with ggml's own reader, without copying the payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
 The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, or ROCm for an AMD GPU, the GPU cache tier joins it. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes the routed experts on the CPU, but for a prompt's heavy experts on a GPU that shares host memory ([the GPU lane](#the-gpu-lane)). Device and source validation remains necessary for the selected configuration.
 
@@ -54,7 +54,7 @@ The runtime extends the bundled llama.cpp snapshot. Its integration points are l
 
 | Layer | Directory | Owns |
 | --- | --- | --- |
-| Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes and explicit pack/alias parsing |
+| Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes (GGUF headers, packs, alias indexes) and the expert layout: each routed layer's format and every expert role's place, described once at load for every executor |
 | Core | `engine/ggml/src/ggml-ssd/io` | One read ring per OS (io_uring through system calls, IoRing, reader threads), an instance per reader; portable pread |
 | Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
 | Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |

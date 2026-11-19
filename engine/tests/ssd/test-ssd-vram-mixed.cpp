@@ -4,9 +4,11 @@
 // MXFP4/MXFP4 and layer 2 Q4_K/Q5_K. Slots are the larger expert's; both layers' residents share the one pool, an
 // eviction gives a slot to an expert of the other format, a deferred upload copies its own layer's roles while a layer
 // of the other format is prepared, and a host job is copied as its layer lays it out; each layer's rows match its
-// experts computed on the CPU. Declarations that change and calls that differ from theirs are refused.
+// experts computed on the CPU. A second declaration, a layer the layout does not have and roles named by other bytes
+// than the layout's are refused.
 #include "gpu-services.h"
 #include "vram-tier.cpp"
+#include "declared-layout.h"
 #include <cmath>
 #include <cstring>
 #include <random>
@@ -35,20 +37,22 @@ constexpr int latent = 256, hidden = 256, experts = 8;
 const int32_t layer_ids[2] = { 1, 2 };
 // the model's layers' types (run sets them)
 int32_t up_types[2] = {}, down_types[2] = {};
-size_t role_bytes(int layer, int role) {
+// a role's payload (the layout's bytes) and its bytes as a slot pads it
+size_t payload(int layer, int role) {
     const ggml_type type = ggml_type(role == 2 ? down_types[layer - 1] : up_types[layer - 1]);
-    return (ggml_row_size(type, role == 2 ? hidden : latent) * size_t(role == 2 ? latent : hidden) + 4095) & ~size_t(4095);
+    return ggml_row_size(type, role == 2 ? hidden : latent) * size_t(role == 2 ? latent : hidden);
 }
+size_t role_bytes(int layer, int role) { return (payload(layer, role) + 4095) & ~size_t(4095); }
 size_t expert_bytes(int layer) { return role_bytes(layer, 0) + role_bytes(layer, 1) + role_bytes(layer, 2); }
-// the declaration every call makes, with the types of the call's layer
-ssd_vram_expert_format declared(int layer) {
-    return { latent, hidden, up_types[layer - 1], up_types[layer - 1], down_types[layer - 1], experts, 2, layer_ids, up_types,
-        up_types, down_types };
+// the layout the tier is declared, with the layers' types of the run
+declared_layout layout() {
+    return declared_layout(latent, hidden, experts, { { up_types[0], up_types[0], down_types[0] },
+        { up_types[1], up_types[1], down_types[1] } }, { layer_ids[0], layer_ids[1] });
 }
 ssd_vram_request key(int layer, int expert) {
     ssd_vram_request r = {}; r.layer = layer; r.expert = expert; r.weight = .5f;
     uint64_t offset = (uint64_t(layer) * experts + uint64_t(expert)) << 20;
-    for (int i = 0; i < 3; ++i) { r.role[i] = { 1, 2, uint64_t(1) << 32, offset, role_bytes(layer, i), 3, 4, 5, 6 }; offset += role_bytes(layer, i); }
+    for (int i = 0; i < 3; ++i) { r.role[i] = { 1, 2, uint64_t(1) << 32, offset, payload(layer, i), 3, 4, 5, 6 }; offset += role_bytes(layer, i); }
     return r;
 }
 
@@ -136,8 +140,7 @@ std::vector<int> layer_step(tier & t, const store & s, int layer, int token, con
     std::vector<ssd_vram_request> r;
     for (int e : ids) { r.push_back(key(layer, e)); }
     std::vector<int> slots(ids.size(), -1);
-    const auto f = declared(layer);
-    t.prepare_format(r.data(), int(r.size()), &f, slots.data());
+    t.prepare_format(r.data(), int(r.size()), slots.data());
     const auto x = input(layer, token);
     t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
     for (size_t j = 0; j < ids.size(); ++j) {
@@ -153,13 +156,12 @@ std::vector<int> layer_step(tier & t, const store & s, int layer, int token, con
     compare(s, layer, ids, hits, x, rows, what);
     return slots;
 }
-// A refused call through the C ABI: its error names `wanted`, and the tier is released.
-void refused(tier & t, int layer, const ssd_vram_expert_format & f, const char * wanted) {
-    const auto r = key(layer, 0);
+// A refused request through the C ABI: its error names `wanted`, and the tier is released.
+void refused(tier & t, const ssd_vram_request & r, const char * wanted) {
     int slot = -1;
     char error[512] = {};
     t.begin(77, 1, true);
-    require(format_prepare(&t, &r, 1, &f, &slot, error, sizeof(error)) != 0 && std::strstr(error, wanted),
+    require(format_prepare(&t, &r, 1, &slot, error, sizeof(error)) != 0 && std::strstr(error, wanted),
         std::string("not refused with \"") + wanted + "\": " + error);
     require(!t.table && !t.arena && t.blocks.empty(), "a refusal left the tier's storage");
 }
@@ -171,10 +173,12 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
     const size_t larger = expert_bytes(2);
     require(larger > expert_bytes(1), "the fixture's second layer must have the larger expert");
     tier t(3 * larger, inputs.tier_policy()); // three slots, one pool for both layers
+    const auto declared = layout();
+    t.declare(declared.c);
     struct cleanup { ~cleanup() { open_gate(); } } cleanup_on_error; // before the tier waits for a held upload
     t.deferred_hook = upload_gate;
 
-    // Token 1: the declaration gives two formats and slots of the larger expert; every request is an admission.
+    // Token 1: the layout gives two formats and slots of the larger expert; every request is an admission.
     t.begin(41, 1, true);
     layer_step(t, s, 1, 1, { 0, 1 }, "first admissions");
     require(t.formats.size() == 2 && t.stride == larger && t.table && t.table->slots.size() == 3,
@@ -217,7 +221,7 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
     require(copy_started(), "the deferred upload did not start");
     const int target = t.table->admissions[0];
     layer_step(t, s, 1, 7, { 0 }, "a layer 1 hit while a layer 2 upload is in flight");
-    require(t.now().down_type == down_types[0], "the tier did not select layer 1's format");
+    require(t.now().type[2] == down_types[0], "the tier did not select layer 1's format");
     open_gate();
     {
         ssd_vram_request collected[4] = {};
@@ -242,8 +246,7 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
         t.begin(41, 9, true);
         const auto r = key(2, 3);
         int slot = -1;
-        const auto f = declared(2);
-        t.prepare_format(&r, 1, &f, &slot);
+        t.prepare_format(&r, 1, &slot);
         require(slot < 0, "the host job's expert is already resident");
         const auto x = input(2, 9);
         t.launch_activation(x.data(), x.size() * sizeof(float), &swiglu);
@@ -262,19 +265,21 @@ void run(fixture_inputs & inputs, ggml_type first_layer) {
     }
     t.release();
 
-    // Refusals. A later call whose declaration differs, a call whose types differ from its layer's declaration, a
-    // geometry that differs from the first call's.
+    // Refusals: a second declaration, a layer the layout does not have, a role named by its padded bytes.
     {
         tier u(3 * larger, inputs.tier_policy());
+        u.declare(declared.c);
+        char error[512] = {};
+        require(api_declare(&u, &declared.c, error, sizeof(error)) != 0 && std::strstr(error, "declared twice"),
+            std::string("a second declaration was not refused: ") + error);
         u.begin(77, 1, true);
         layer_step(u, s, 1, 1, { 0 }, "a declared layer");
-        const int32_t uniform_down[2] = { down_types[0], down_types[0] };
-        auto changed = declared(1); changed.layer_down_types = uniform_down;
-        refused(u, 1, changed, "VRAM expert format changed");
-        auto wrong = declared(2); wrong.down_type = GGML_TYPE_Q4_K;
-        refused(u, 2, wrong, "differs from its declaration");
-        auto wider = declared(1); wider.hidden = 2 * hidden;
-        refused(u, 1, wider, "geometry changed");
+        auto other = key(1, 0);
+        other.layer = 3;
+        refused(u, other, "is not a routed layer of the layout");
+        auto padded = key(1, 0);
+        padded.role[2].bytes = role_bytes(1, 2);
+        if (padded.role[2].bytes != payload(1, 2)) { refused(u, padded, "role bytes are not the layout's"); }
     }
     std::printf("SSD_VRAM_MIXED_MODEL_PASS layer1=%s/%s layer2=%s/%s stride=%zu layer1_expert=%zu layer2_expert=%zu\n",
         ggml_type_name(ggml_type(up_types[0])), ggml_type_name(ggml_type(down_types[0])),

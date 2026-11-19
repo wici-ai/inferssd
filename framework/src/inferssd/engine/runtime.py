@@ -6,7 +6,6 @@ Darwin executes static M1 launches. Online adaptive Mac M2 remains deferred.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Optional
@@ -19,8 +18,7 @@ from inferssd.launch.live import Host, LiveArtifacts
 from inferssd.launch.machine import MachineSource
 from inferssd.launch.machine import characteristics as machine_characteristics
 from inferssd.launch.prepare import prepare
-from inferssd.launch.recorded import run_indexer
-from inferssd.launch.resources import cache_directory, probe_paths, server_binary
+from inferssd.launch.resources import probe_paths, server_binary
 from inferssd.launch.typed import (
     LOOPBACK,
     LaunchSpec,
@@ -92,11 +90,7 @@ class Runtime:
         adapter = LiveArtifacts(
             inputs,
             host=self.host,
-            run=run_indexer,
-            replace=os.replace,
-            python=sys.executable,
             machine=self.characteristics(specification),
-            index_cache=cache_directory(dict(inputs.environment)) / "expert-index",
         )
         value = prepare(
             inputs,

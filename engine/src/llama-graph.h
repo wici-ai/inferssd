@@ -12,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <functional>
+#include <limits>
 #include <map>
 
 struct ggml_cgraph;
@@ -62,6 +63,17 @@ enum llm_norm_type {
     LLM_NORM_RMS,
     LLM_NORM_GROUP,
 };
+
+// The selected expert scores can be much smaller than the F16 floor in
+// DeepSeek-V4.1. Preserve its Gate.forward denominator without changing the
+// historical zero guard used by other architectures.
+inline ggml_tensor * llm_moe_weights_denominator(
+        ggml_context * ctx, ggml_tensor * weights_sum, llm_arch arch) {
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        return ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f);
+    }
+    return ggml_clamp(ctx, weights_sum, 6.103515625e-5f, std::numeric_limits<float>::infinity());
+}
 
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {

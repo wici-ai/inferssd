@@ -2,6 +2,7 @@
 #pragma once
 #include <stddef.h>
 #include <stdint.h>
+#include "../store/expert-layout.h"
 #ifdef __cplusplus
 #include "../platform/file.h"
 #endif
@@ -36,21 +37,16 @@ static inline ssd_vram_source ssd_vram_source_identity(const ssd::platform::file
 }
 #endif
 struct ssd_vram_tier_api {
-    uint32_t version; // 2
+    uint32_t version; // 3
     uint32_t size;
     void * (*create)(uint64_t budget_bytes, char * error, size_t error_size);
     void (*destroy)(void * context);
+    // Once, right after the context is made: the routed experts it serves, the CPU owner's expert layout, borrowed
+    // for the context's lifetime. The tier keeps each of its formats (and what each layer has) and makes their
+    // engines; a format it cannot hold or compute fails here, named.
+    int (*declare)(void * context, const struct ssd_expert_layout * layout, char * error, size_t error_size);
     int (*begin)(void * context, uint64_t epoch, uint64_t token, int decode,
                  char * error, size_t error_size);
-    // Retired implicit-format slot: returns an error and drains the context.
-    // Use the explicit-format extension to prepare expert geometry.
-    int (*prepare)(void * context, const struct ssd_vram_request * requests,
-                   int count, int latent, int hidden, int * slots,
-                   char * error, size_t error_size);
-    // Retired implicit-format slot: returns an error and drains the context.
-    // Field order and signature remain reserved for private transport ABI 2.
-    int (*launch)(void * context, const void * input_q8k, size_t input_bytes,
-                  float beta, float linear_beta, char * error, size_t error_size);
     // A RAM cache source may be borrowed until finish/cancel when borrow=1;
     // the caller pins its slot for this entire batch. Ring sources use borrow=0
     // and must be completely copied before return so I/O may reuse the ring.
@@ -64,7 +60,6 @@ struct ssd_vram_tier_api {
                   char * error, size_t error_size);
     int (*cancel)(void * context, char * error, size_t error_size);
 };
-// Optional extension, separate from transport ABI 2.
 // held (version 3): which of `count` experts of `layer` the tier holds now (out[i] 1 or 0): a slot has its bytes,
 // or is reserved for a deferred upload of them that the layer's next prepare collects first, so that prepare would
 // pin it as a hit. A seed counts from its publication: a prefill's planned seeds when the decode phase completes the
@@ -75,13 +70,9 @@ struct ssd_vram_residency_api {
     uint32_t version, size;   // 3
     void (*held)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
 };
-// Optional explicit-format extension, separate from transport ABI 2. The ABI 2
-// prepare/launch entries remain the Kimi-K3 Q3_K/SiTU path. For any other expert
-// format the CPU owner calls prepare (with the tensor geometry) instead of ABI 2
-// prepare and launch (with the activation) instead of ABI 2 launch; admit,
-// finish, cancel, begin and the residency ABI are shared. The declaration (the
-// geometry, the layer list and each layer's types) must stay the same for the
-// lifetime of a context; up_type, gate_type and down_type are the call's layer's.
+// The decode extension: prepare names a layer's selected experts (requests of one routed layer, whose format is the
+// declared layout's) and launch runs them with the activation; admit, finish, cancel, begin and the residency ABI
+// are shared.
 enum ssd_vram_activation_kind {
     SSD_VRAM_ACTIVATION_SITU         = 0, // same values as ssd_cpu_sink_activation_kind
     SSD_VRAM_ACTIVATION_SWIGLU_CLAMP = 1,
@@ -91,25 +82,10 @@ struct ssd_vram_activation {
     int32_t kind;
     float situ_beta, situ_linear_beta, swiglu_limit;
 };
-struct ssd_vram_expert_format {
-    int32_t latent, hidden;   // up/gate columns and rows
-    int32_t up_type;          // ggml_type of up of the call's layer
-    int32_t gate_type;        // ggml_type of gate of the call's layer (a quantization may give it another than up's)
-    int32_t down_type;        // ggml_type of down of the call's layer
-    int32_t n_experts;        // routed experts per layer (tensor ne[2])
-    int32_t n_layers;         // entries in layers
-    const int32_t * layers;   // model layer IDs, allocation priority order
-    // Format API 3, prefill API 11, elastic API 6: each listed layer's up, gate and down types, entry for entry with
-    // layers, or all three null when every layer has up_type, gate_type and down_type. Every layer has latent, hidden
-    // and n_experts.
-    const int32_t * layer_up_types;
-    const int32_t * layer_gate_types;
-    const int32_t * layer_down_types;
-};
 struct ssd_vram_format_api {
-    uint32_t version, size;   // 3
-    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
-                   const struct ssd_vram_expert_format * format, int * slots,
+    uint32_t version, size;   // 4
+    // requests: at most 16 experts of one routed layer.
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count, int * slots,
                    char * error, size_t error_size);
     // input is the layer's f32 input row (latent floats).
     int (*launch)(void * context, const void * input, size_t input_bytes,
@@ -215,18 +191,16 @@ struct ssd_vram_prefill_launch {
 // transient from page-locked memory (the read ring registered through the host API) is a DMA copy that overlaps
 // the computation of another. Version 7 adds the lane (which engine a format's passes run on, for any format the
 // decode engine serves), the launch options (the per-expert post norm, in place) and the in-place chains' stats.
-// Version 8 takes the per-layer types of ssd_vram_expert_format; the lane is the prepared layer's. Version 9: every
-// pass's input rows are f32 (the lane's f32_input field is gone).
+// Version 8 takes the per-layer types; the lane is the prepared layer's. Version 9: every pass's input rows are f32
+// (the lane's f32_input field is gone). Version 12: the formats are the declared layout's.
 // Cold seeds start with zero decode heat and are therefore the
 // first victims unless decode reuses them; the path never evicts an existing
 // decode resident.
 struct ssd_vram_prefill_api {
-    uint32_t version, size;   // 11
-    // requests contains the distinct expert union for one layer. slots receives
-    // -1 for CPU work or an opaque resident slot for GPU work. The tier must
-    // already hold the same explicit format from an earlier decode phase.
-    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count,
-                   const struct ssd_vram_expert_format * format, int * slots,
+    uint32_t version, size;   // 12
+    // requests contains the distinct expert union for one routed layer. slots receives
+    // -1 for CPU work or an opaque resident slot for GPU work.
+    int (*prepare)(void * context, const struct ssd_vram_request * requests, int count, int * slots,
                    char * error, size_t error_size);
     // route_request_index is token-major [ntokens][nslots] and indexes requests;
     // -1 skips a route. input contains ntokens rows separated by input_stride.
@@ -252,7 +226,7 @@ struct ssd_vram_prefill_api {
     int (*admit_cold)(void * context, const struct ssd_vram_request * request,
                       const void * up, const void * gate, const void * down,
                       int * admitted, char * error, size_t error_size);
-    // The format's lane, after prepare (which initializes the format on a cold prefill). Read-only.
+    // The prepared layer's format's lane. Read-only.
     void (*lane)(void * context, struct ssd_vram_prefill_lane * lane);
     // Version 10, the seeds of a prefill the CPU sink runs: empty slots filled with the experts it routes most.
     // seed_routes gives the routes of each request of the next prepare's union (index-aligned with its requests); that
@@ -266,7 +240,7 @@ struct ssd_vram_prefill_api {
                      char * error, size_t error_size);
     int (*seed_wait)(void * context, int32_t request_index, char * error, size_t error_size);
 };
-// Optional deferred-upload extension (deferred and async uploads on in the tier and its CPU owner). admit replaces ABI 2 admit for a borrowed RAM source, but the upload may outlive finish:
+// Optional deferred-upload extension (deferred and async uploads on in the tier and its CPU owner). admit replaces the tier's admit for a borrowed RAM source, but the upload may outlive finish:
 // when *queued is 1 the caller keeps that source unchanged and leased until collect returns the request, and the
 // reserved GPU slot is never evicted meanwhile. collect runs outside prepare..finish and without a live residency
 // lease, except with SSD_VRAM_COLLECT_IF_IDLE. It waits for the in-flight uploads of wait_layer (>= 0) or as named
@@ -296,16 +270,14 @@ struct ssd_vram_deferred_api {
 // reserve; phase_complete(true) runs only after the decode graph is reserved
 // and grows best-effort into currently free device memory.
 struct ssd_vram_elastic_api {
-    uint32_t version, size;   // 6 (preload)
+    uint32_t version, size;   // 7 (the declared layout)
     int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
     // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
     int (*reserve_accumulate)(void * context, int tokens, char * error, size_t error_size);
     // At load, after the context reserved its worst-case graph and the RAM cache published its demand: on unified
     // memory the tier takes its storage and grows into what the host-memory ledger leaves, so that no request waits
     // for the page population; the next decode adopts it. A discrete GPU keeps its arena where it is and returns.
-    // The request gives the role bytes (one expert of a routed layer), format the geometry.
-    int (*reserve)(void * context, const struct ssd_vram_request * request,
-                   const struct ssd_vram_expert_format * format, char * error, size_t error_size);
+    int (*reserve)(void * context, char * error, size_t error_size);
     // At load, after the load's passes, before any request: preload_slots grows a tier made at load into the card if
     // its memory has settled, then gives in *slots how many slots no entry holds. preload copies one expert no
     // request has named (request: its key and role bytes) from host memory into one of them, preloaded: any lookup

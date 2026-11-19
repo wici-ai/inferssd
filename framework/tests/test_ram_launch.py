@@ -20,7 +20,7 @@ from inferssd.source.header import Header, Tensor
 
 
 def gemma(tmp_path, platform, backends):
-    inputs, spec, host, adapter, out, indexed = setup(tmp_path, platform)
+    inputs, spec, host, adapter, out = setup(tmp_path, platform)
     write_gguf(
         spec.model,
         [("token_embd.weight", (32, 32), F32), ("per_layer_token_embd.weight", (64, 32), F32)],
@@ -44,7 +44,7 @@ def gemma(tmp_path, platform, backends):
         "clusters": [{"kind": "performance", "cpus": [0]}, {"kind": "efficiency", "cpus": [1]}],
     }
     inputs = replace(inputs, profile="")
-    return inputs, replace(spec, strategy=True), host, adapter, out, indexed
+    return inputs, replace(spec, strategy=True), host, adapter, out
 
 
 def resolved(inputs, spec, adapter, out, platform, memory=8 << 30, reserve=0):
@@ -77,16 +77,16 @@ def resolved(inputs, spec, adapter, out, platform, memory=8 << 30, reserve=0):
 def test_same_ram_profile_uses_existing_native_backends(
     tmp_path, platform, backends, mapping, layers, locked, weights
 ):
-    inputs, spec, _, adapter, out, indexed = gemma(tmp_path, platform, backends)
+    inputs, spec, _, adapter, out = gemma(tmp_path, platform, backends)
     result = resolved(inputs, spec, adapter, out, platform)
-    assert result.code == 0 and indexed == []
+    assert result.code == 0
     argv = list(result.argv)
     assert mapping in argv and ("--mlock" in argv) == locked and "--no-repack" in argv
     assert argv[argv.index("-ngl") + 1] == layers
     assert "--defer-experts" not in argv
     assert not any(x.startswith("--ssd-") for x in argv)
     assert not (out / "settings.ssd").exists() and not (out / "artifacts").exists()
-    assert not {"machine_characteristics", "gguf_alias", "model_drive_key"} & {
+    assert not {"machine_characteristics", "model_drive_key"} & {
         fact.name for fact in result.observations
     }
     receipt = json.loads(result.outputs[-1].text)
@@ -112,7 +112,7 @@ def test_ram_launch_admits_by_the_budget_and_sizes_the_context_by_available_memo
 ):
     # The model's memory is required, so too little available now refuses nothing short of
     # the budget: the system pages other memory out. It only takes a smaller context.
-    inputs, spec, host, adapter, out, _ = gemma(tmp_path, platform, [])
+    inputs, spec, host, adapter, out = gemma(tmp_path, platform, [])
     host["runtime_facts"]["available_bytes"] = available
     result = resolved(inputs, spec, adapter, out, platform)
     assert result.code == 0
@@ -121,7 +121,7 @@ def test_ram_launch_admits_by_the_budget_and_sizes_the_context_by_available_memo
 
 
 def test_ram_launch_respects_the_policy_reserve_and_budget(tmp_path):
-    inputs, spec, host, adapter, out, indexed = gemma(tmp_path, "windows", [])
+    inputs, spec, host, adapter, out = gemma(tmp_path, "windows", [])
     host["runtime_facts"]["available_bytes"] = 4 << 30
     with pytest.raises(ValueError, match="keeps 3.00 GiB free; available 4.00 GiB"):
         resolved(inputs, spec, adapter, out, "windows", reserve=3 << 30)
@@ -130,11 +130,11 @@ def test_ram_launch_respects_the_policy_reserve_and_budget(tmp_path):
         resolved(inputs, spec, adapter, out, "windows", reserve=1)
     with pytest.raises(ValueError, match="memory budget of 1.00 GiB"):
         resolved(inputs, spec, adapter, out, "windows", memory=1 << 30)
-    assert not indexed and list(out.iterdir()) == []
+    assert list(out.iterdir()) == []
 
 
 def test_ram_launch_steps_an_unset_context_down_to_what_fits(tmp_path):
-    inputs, spec, _, adapter, out, _ = gemma(tmp_path, "darwin", [])
+    inputs, spec, _, adapter, out = gemma(tmp_path, "darwin", [])
     # 768 bytes of KV a token (3 layers, 256 bytes each): 24576 tokens fit beside the workspace.
     memory = ram.WORKSPACE_BYTES + (20 << 20)
     result = resolved(inputs, spec, adapter, out, "darwin", memory=memory)
@@ -145,7 +145,7 @@ def test_ram_launch_steps_an_unset_context_down_to_what_fits(tmp_path):
 
 
 def test_ram_launch_refuses_a_given_context_that_does_not_fit(tmp_path):
-    inputs, spec, _, adapter, out, _ = gemma(tmp_path, "darwin", [])
+    inputs, spec, _, adapter, out = gemma(tmp_path, "darwin", [])
     with pytest.raises(ValueError, match="RAM-only model"):
         resolved(
             inputs,
@@ -175,7 +175,7 @@ def test_ram_launch_refuses_a_given_context_that_does_not_fit(tmp_path):
     ],
 )
 def test_ram_capacity_options_cannot_be_overridden_behind_the_fit_check(tmp_path, extra):
-    inputs, spec, _, adapter, out, _ = gemma(tmp_path, "windows", [])
+    inputs, spec, _, adapter, out = gemma(tmp_path, "windows", [])
     with pytest.raises(ValueError, match="RAM profile owns|explicit typed launch"):
         resolved(replace(inputs, extra=extra), spec, adapter, out, "windows")
 
@@ -184,7 +184,7 @@ def test_ram_capacity_options_cannot_be_overridden_behind_the_fit_check(tmp_path
     "variable", ["LLAMA_ARG_SWA_FULL", "LLAMA_ARG_SPEC_DRAFT_MODEL", "LLAMA_ARG_MMPROJ"]
 )
 def test_ram_fit_cannot_be_bypassed_by_native_environment_defaults(tmp_path, variable):
-    inputs, spec, _, adapter, out, _ = gemma(tmp_path, "windows", [])
+    inputs, spec, _, adapter, out = gemma(tmp_path, "windows", [])
     inputs = replace(inputs, environment=inputs.environment + ((variable, "1"),))
     with pytest.raises(ValueError, match="unbudgeted model or KV"):
         resolved(inputs, spec, adapter, out, "windows")
@@ -192,7 +192,7 @@ def test_ram_fit_cannot_be_bypassed_by_native_environment_defaults(tmp_path, var
 
 @pytest.mark.parametrize("platform", ["windows", "darwin"])
 def test_ram_cpu_defaults_to_fast_cluster_without_ssd_measurements(tmp_path, platform):
-    inputs, spec, host, adapter, out, _ = gemma(tmp_path, platform, [])
+    inputs, spec, host, adapter, out = gemma(tmp_path, platform, [])
     fast = [0, 1, 10, 11, 12, 13]
     host["runtime_facts"]["cpus"] = list(range(16))
     host["cpu_topology"]["clusters"] = [{"kind": "performance", "cpus": fast}]
@@ -208,7 +208,7 @@ def test_ram_cpu_defaults_to_fast_cluster_without_ssd_measurements(tmp_path, pla
 
 
 def test_ram_cpu_uses_only_allowed_fast_cpus_and_preserves_explicit_threads(tmp_path):
-    inputs, spec, host, adapter, out, _ = gemma(tmp_path, "windows", [])
+    inputs, spec, host, adapter, out = gemma(tmp_path, "windows", [])
     host["runtime_facts"]["cpus"] = [1, 2, 3]
     host["cpu_topology"]["clusters"] = [{"kind": "performance", "cpus": [0, 1]}]
     result = resolved(inputs, spec, adapter, out, "windows")
@@ -222,7 +222,7 @@ def test_ram_cpu_uses_only_allowed_fast_cpus_and_preserves_explicit_threads(tmp_
 
 
 def test_ram_model_skips_ssd_machine_calibration(tmp_path, monkeypatch):
-    inputs, spec, _, _, out, _ = gemma(tmp_path, "windows", [])
+    inputs, spec, _, _, out = gemma(tmp_path, "windows", [])
     monkeypatch.setattr(
         runtime, "machine_characteristics", lambda *_: pytest.fail("SSD calibration")
     )

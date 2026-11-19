@@ -117,9 +117,51 @@ def signed_powershell(signed: Path, pinned: str) -> bytes:
     return data
 
 
+def credited_changes(changes: str, repository: str) -> str:
+    """GitHub's list of merged pull requests, each line as "title (#N)" without its author, then
+    one Contributors section naming every author of the release once, in order of first appearance,
+    in place of GitHub's New Contributors section. A line in another form stays as it is."""
+    entry = re.compile(
+        r"\* (?P<title>.+) by @(?P<author>[A-Za-z0-9-]+(?:\[bot\])?) in "
+        rf"https://github\.com/{re.escape(repository)}/pull/(?P<number>[0-9]+)"
+    )
+    authors: list[str] = []
+    kept: list[str] = []
+    newcomers = False
+    for line in changes.strip().splitlines():
+        if line.startswith("## "):
+            newcomers = line.strip() == "## New Contributors"
+            if newcomers:
+                continue
+        elif newcomers:
+            if line.startswith("**Full Changelog**"):
+                newcomers = False
+            else:
+                continue
+        match = entry.fullmatch(line.strip())
+        if match is None:
+            kept.append(line)
+            continue
+        kept.append(f"* {match['title']} (#{match['number']})")
+        author = match["author"]
+        if not author.endswith("[bot]") and author not in authors:
+            authors.append(author)
+    if authors:
+        credit = ["## Contributors", "", ", ".join(f"@{author}" for author in authors)]
+        footer = next(
+            (i for i, line in enumerate(kept) if line.startswith("**Full Changelog**")),
+            len(kept),
+        )
+        while footer > 0 and not kept[footer - 1].strip():
+            footer -= 1
+        kept[footer:footer] = ["", *credit]
+    return "\n".join(kept).strip()
+
+
 def release_notes(root: Path, tag: str, repository: str, changes: str) -> str:
     """A release's notes: its highlights when CHANGELOG.md has a section for it, how to install
-    it, then the changes since the last release (GitHub's list of the pull requests merged)."""
+    it, then the changes since the last release (GitHub's list of the pull requests merged) and
+    who made them."""
     base = release_base(tag, repository)
     heading = f"## {tag[1:]} "
     highlights: list[str] = []
@@ -144,7 +186,11 @@ irm {base}/install.ps1 | iex
 ```
 
 Run the same command to upgrade. Downloaded models are preserved."""
-    parts = ("\n".join(highlights).strip(), install, changes.strip())
+    parts = (
+        "\n".join(highlights).strip(),
+        install,
+        credited_changes(changes, repository),
+    )
     return "\n\n".join(part for part in parts if part) + "\n"
 
 
@@ -218,20 +264,26 @@ def main() -> None:
         type=Path,
         help="only write the release's notes here, from --changes (with --tag and --repository)",
     )
-    parser.add_argument("--changes", type=Path, help="the changes since the last release")
+    parser.add_argument(
+        "--changes", type=Path, help="the changes since the last release"
+    )
     parser.add_argument(
         "--pinned-install-ps1",
         type=Path,
         help="only write the release's pinned install.ps1 here, for signing (with --tag and --repository)",
     )
     for suffix in PACKAGES:
-        parser.add_argument("--" + suffix, type=Path, help=f"the checked {suffix} package")
+        parser.add_argument(
+            "--" + suffix, type=Path, help=f"the checked {suffix} package"
+        )
     parser.add_argument("--output", type=Path)
     parser.add_argument("--tag", required=True)
     parser.add_argument("--revision")
     parser.add_argument("--repository", required=True)
     parser.add_argument(
-        "--signed-install-ps1", type=Path, help="the signed copy of the pinned install.ps1"
+        "--signed-install-ps1",
+        type=Path,
+        help="the signed copy of the pinned install.ps1",
     )
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
@@ -239,7 +291,12 @@ def main() -> None:
         if args.changes is None:
             parser.error("--release-notes needs --changes")
         args.release_notes.write_text(
-            release_notes(root, args.tag, args.repository, args.changes.read_text(encoding="utf-8")),
+            release_notes(
+                root,
+                args.tag,
+                args.repository,
+                args.changes.read_text(encoding="utf-8"),
+            ),
             encoding="utf-8",
         )
         return
@@ -251,7 +308,8 @@ def main() -> None:
         return
     missing = [
         "--" + name.replace("_", "-")
-        for name in [suffix.replace("-", "_") for suffix in PACKAGES] + ["output", "revision"]
+        for name in [suffix.replace("-", "_") for suffix in PACKAGES]
+        + ["output", "revision"]
         if getattr(args, name) is None
     ]
     if missing:

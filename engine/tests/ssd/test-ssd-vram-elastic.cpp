@@ -283,14 +283,13 @@ int main() {
     // grows into the card at the first phase boundary after a prefill pass's memory settled, or at the first decode
     // token (phase_complete); a byte budget leaves the arena to its first decode.
     if (!unified) {
-        const size_t mx = 36864;
+        const size_t mx = 36864; // one 256 x 256 Q4_K role: whole pages
         ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
-        const int32_t layers[] = {1,2};
-        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),64,2,layers};
+        const auto f = declared_layout::uniform(256,256,64,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,{1,2});
         for (bool settle : {true, false}) {
             tier t(tier::automatic_budget, inputs.tier_policy());
-            t.reserve(r,f);
+            t.declare(f.c);t.reserve();
             require(t.has_storage() && t.table && t.growth_deferred && t.grow_events==0 && t.slot_locations.size()==16 &&
                     t.adopt_next_decode, "a discrete GPU's automatic tier did not take one block at load");
             t.begin(22,0,false);
@@ -315,7 +314,7 @@ int main() {
         // experts no request has named into its empty slots, preloaded (vram-slot-table.h), one slot an expert.
         {
             tier t(tier::automatic_budget, inputs.tier_policy());
-            t.reserve(r,f);
+            t.declare(f.c);t.reserve();
             t.observe_settle();t.observe_settle();
             const size_t empty=t.preload_slots();
             require(!t.growth_deferred && t.grow_events==1 && empty==t.slot_locations.size() && empty>16,
@@ -340,7 +339,7 @@ int main() {
         // releases those the decode never selected, which keep their experts.
         {
             tier t(tier::automatic_budget, inputs.tier_policy());
-            t.reserve(r,f);
+            t.declare(f.c);t.reserve();
             t.observe_settle();t.observe_settle();
             require(t.preload_slots()>16,"the tier did not grow into the card before its preload");
             ssd_vram_request used=r;used.expert=5;
@@ -390,14 +389,13 @@ int main() {
         }
     }
     {
-        const size_t mx = 36864; // one 256 x 256 MXFP4 role, padded to 4 KiB
+        const size_t mx = 36864; // one 256 x 256 Q4_K role: whole pages
         ssd_vram_request r = {};r.layer=1;r.weight=1;
         for (int i = 0; i < 3; ++i) r.role[i].bytes = mx;
-        const int32_t layers[] = {1,2};
-        const ssd_vram_expert_format f = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,2,layers};
+        const auto f = declared_layout::uniform(256,256,8,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,{1,2});
         {
             tier t(10*3*mx, inputs.tier_policy());
-            t.reserve(r,f);
+            t.declare(f.c);t.reserve();
             if (!unified) {
                 require(!t.has_storage() && !t.table,"a discrete GPU took its tier's storage at load");
             } else {
@@ -437,12 +435,11 @@ int main() {
         // (what a layer leaves rolls forward), the prompt's most-routed experts first, an expert already resident
         // skipped.
         if (unified) {
-            const int32_t three[] = {1,2,3};
-            const ssd_vram_expert_format f3 = {256,256,int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),int32_t(GGML_TYPE_MXFP4),8,3,three};
+            const auto f3 = declared_layout::uniform(256,256,8,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,GGML_TYPE_Q4_K,{1,2,3});
             inputs.set("tier.max_slots", "16");
             tier q(10*3*mx, inputs.tier_policy());
             inputs.set("tier.max_slots", "53");
-            q.reserve(r,f3);
+            q.declare(f3.c);q.reserve();
             require(q.has_storage() && q.table->slots.size()==16,"the quota test's tier has another size");
             ssd_vram_request resident=r;resident.layer=3;resident.expert=0;
             const int held=q.table->reserve_cold_prefill(resident);

@@ -93,10 +93,11 @@ struct lane {
     int latent = 0, hidden = 0;
     ggml_type up_type = GGML_TYPE_COUNT, gate_type = GGML_TYPE_COUNT, down_type = GGML_TYPE_COUNT;  // the prepared layer's
     bool format_known = false, usable = false;
-    // Every format the layers declare (ssd_vram_expert_format), with the device's answer. A pass's working memory
-    // holds copies of the largest expert of those it runs, whichever layer comes next.
+    // Every format of the declared layout, with the device's answer, and each layer's (layer_format, by layer ID). A
+    // pass's working memory holds copies of the largest expert of those it runs, whichever layer comes next.
     struct known_format { ggml_type up, gate, down; bool usable; std::set<std::pair<int, size_t>> warmed = {}; };
     std::vector<known_format> formats;
+    std::vector<int> layer_format;
     size_t largest_expert = 0;
     bool pass_ready = false;  // this pass's working memory is there (reserve_pass): else every expert stays on the CPU
     int pass_tokens = 0;      // the tokens it was reserved for
@@ -175,23 +176,32 @@ struct lane {
     char * host_of(const ggml_tensor * tensor) const {
         return static_cast<char *>(work) + (static_cast<const char *>(tensor->data) - work_base);
     }
-    // The declared formats, each learned once, and the prepared layer's: whether the device runs it.
-    void learn_format(const ssd_vram_expert_format & f) {
-        if (!format_known || f.latent != latent || f.hidden != hidden) { formats.clear(); largest_expert = 0; }
-        latent = f.latent; hidden = f.hidden;
-        format_known = true;
-        const bool listed = f.layer_up_types && f.layer_gate_types && f.layer_down_types && f.layers;
-        for (int i = 0; listed && i < f.n_layers; ++i) {
-            learn(ggml_type(f.layer_up_types[i]), ggml_type(f.layer_gate_types[i]), ggml_type(f.layer_down_types[i]));
+    // The declared layout: its formats, each with the device's answer, and which layer has which.
+    void declare(const ssd_expert_layout & layout) {
+        if (format_known) { throw std::runtime_error("the GPU lane's expert layout is declared twice"); }
+        latent = layout.latent; hidden = layout.hidden;
+        for (int k = 0; k < layout.n_formats; ++k) {
+            const auto & f = layout.formats[k].role;
+            learn(ggml_type(f[SSD_EXPERT_UP].type), ggml_type(f[SSD_EXPERT_GATE].type), ggml_type(f[SSD_EXPERT_DOWN].type));
         }
-        const known_format & now = learn(ggml_type(f.up_type), ggml_type(f.gate_type), ggml_type(f.down_type));
+        for (int i = 0; i < layout.n_layers; ++i) {
+            const int32_t id = layout.layers[i].id;
+            if (id < 0 || id >= SSD_VRAM_MAX_LAYERS) { throw std::runtime_error("invalid GPU lane expert layer"); }
+            if (size_t(id) >= layer_format.size()) { layer_format.resize(size_t(id) + 1, -1); }
+            layer_format[size_t(id)] = layout.layers[i].format;
+        }
+        format_known = true;
+    }
+    // The prepared layer's format: whether the device runs it.
+    void select(int32_t layer) {
+        const int k = layer >= 0 && size_t(layer) < layer_format.size() ? layer_format[size_t(layer)] : -1;
+        if (k < 0) { throw std::runtime_error("the GPU lane has no expert format for layer " + std::to_string(layer)); }
+        const known_format & now = formats[size_t(k)];
         up_type = now.up; gate_type = now.gate; down_type = now.down; usable = now.usable;
     }
-    // Whether the device can run a format at all, from its own answer about the chain's operations.
-    const known_format & learn(ggml_type up_type_, ggml_type gate_type_, ggml_type down_type_) {
-        for (const auto & known : formats) {
-            if (known.up == up_type_ && known.gate == gate_type_ && known.down == down_type_) { return known; }
-        }
+    // Whether the device can run a format at all, from its own answer about the chain's operations: the layout's
+    // formats in their order.
+    void learn(ggml_type up_type_, ggml_type gate_type_, ggml_type down_type_) {
         known_format known = { up_type_, gate_type_, down_type_, false };
         const auto whole = [&](ggml_type type, int columns) {
             return int(type) >= 0 && int(type) < int(GGML_TYPE_COUNT) && ggml_blck_size(type) > 0 && columns % ggml_blck_size(type) == 0;
@@ -216,7 +226,6 @@ struct lane {
         }
         formats.push_back(known);
         if (known.usable) { largest_expert = std::max(largest_expert, expert_bytes(up_type_, gate_type_, down_type_)); }
-        return formats.back();
     }
     // The fused operation where the device has it, else the same math from plain operations.
     ggml_tensor * activate(ggml_context * ctx, ggml_tensor * gate, ggml_tensor * up) const {
@@ -523,17 +532,20 @@ void * create_lane(const settings::snapshot *, const runtime_services * services
 void * tier_create(uint64_t, char * error, size_t error_size) { report(error, error_size, "the GPU lane starts from settings"); return nullptr; }
 void tier_destroy(void * context) { delete self(context); }
 int tier_begin(void *, uint64_t, uint64_t, int, char *, size_t) { return 0; }
-int tier_prepare(void *, const ssd_vram_request *, int, int, int, int *, char * error, size_t error_size) { report(error, error_size, "retired"); return 1; }
-int tier_launch(void *, const void *, size_t, float, float, char * error, size_t error_size) { report(error, error_size, "retired"); return 1; }
+int tier_declare(void * context, const ssd_expert_layout * layout, char * error, size_t error_size) {
+    try { self(context)->declare(ssd::store::checked_layout(layout)); return 0; }
+    catch (const std::exception & e) { report(error, error_size, e.what()); return 1; }
+}
 int tier_admit(void *, const ssd_vram_request *, const void *, const void *, const void *, int, char *, size_t) { return 0; }
 int tier_finish(void *, float *, size_t, char *, size_t) { return 0; }
 int tier_cancel(void * context, char *, size_t) { self(context)->drain(); self(context)->experts.clear(); return 0; }
-const ssd_vram_tier_api tier_table = { 2, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_begin, tier_prepare, tier_launch, tier_admit, tier_finish, tier_cancel };
+const ssd_vram_tier_api tier_table = { 3, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_declare, tier_begin, tier_admit, tier_finish, tier_cancel };
 
-int prefill_prepare(void * context, const ssd_vram_request *, int count, const ssd_vram_expert_format * format, int * slots, char *, size_t) {
+int prefill_prepare(void * context, const ssd_vram_request * requests, int count, int * slots, char * error, size_t error_size) {
     std::fill(slots, slots + count, -1);
-    self(context)->learn_format(*format);
-    return 0;
+    if (!count) { return 0; }
+    try { self(context)->select(requests[0].layer); return 0; }
+    catch (const std::exception & e) { report(error, error_size, e.what()); return 1; }
 }
 // The prepared layer's format runs here and its experts fit the pass's working memory; else the layer stays on the CPU.
 int prefill_transient_available(void * context) {
@@ -563,7 +575,7 @@ void prefill_lane_info(void * context, ssd_vram_prefill_lane * out) {
 int prefill_seed_routes(void *, const int32_t *, int, char *, size_t) { return 0; }
 int prefill_seed_host(void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; }
 int prefill_seed_wait(void *, int32_t, char *, size_t) { return 0; }
-const ssd_vram_prefill_api prefill_table = { 11, sizeof(ssd_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
+const ssd_vram_prefill_api prefill_table = { 12, sizeof(ssd_vram_prefill_api), prefill_prepare, prefill_transient_available, prefill_launch,
     prefill_finish, tier_cancel, prefill_cold_active, prefill_admit_cold, prefill_lane_info,
     prefill_seed_routes, prefill_seed_host, prefill_seed_wait };
 
@@ -575,17 +587,15 @@ int elastic_reserve_accumulate(void * context, int tokens, char *, size_t) {
     self(context)->reserve_pass(tokens);
     return 0;
 }
-int elastic_reserve(void * context, const ssd_vram_request *, const ssd_vram_expert_format * format, char *, size_t) {
-    self(context)->learn_format(*format);
-    return 0;
-}
+// The formats are the declared layout's: nothing to take at load.
+int elastic_reserve(void *, char *, size_t) { return 0; }
 // The graph lane keeps no expert of its own: nothing to preload.
 int elastic_preload_slots(void *, int * slots, char *, size_t) { *slots = 0; return 0; }
 int elastic_preload(void *, const ssd_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
     *copied = 0;
     return 0;
 }
-const ssd_vram_elastic_api elastic_table = { 6, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+const ssd_vram_elastic_api elastic_table = { 7, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
     elastic_reserve, elastic_preload_slots, elastic_preload };
 
 int host_available(void *) { return 0; }

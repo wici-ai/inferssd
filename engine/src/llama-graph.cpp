@@ -1892,8 +1892,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         ggml_tensor * weights_sum = ggml_sum_rows(ctx0, weights); // [1, n_tokens]
         cb(weights_sum, "ffn_moe_weights_sum", il);
 
-        // Avoid division by zero, clamp to smallest number representable by F16
-        weights_sum = ggml_clamp(ctx0, weights_sum, 6.103515625e-5, INFINITY);
+        weights_sum = llm_moe_weights_denominator(ctx0, weights_sum, arch);
         cb(weights_sum, "ffn_moe_weights_sum_clamped", il);
 
         weights = ggml_div(ctx0, weights, weights_sum); // [n_expert_used, n_tokens]
@@ -2071,9 +2070,6 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         const auto & execution = adapted.execution;
 
         auto descriptor = std::make_unique<llama_ssd_cpu_sink_node>();
-        descriptor->up = llama_ssd_cpu_sink_metadata(up_exps);
-        descriptor->gate = llama_ssd_cpu_sink_metadata(gate_exps);
-        descriptor->down = llama_ssd_cpu_sink_metadata(down_exps);
         descriptor->cpu_reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
         descriptor->runtime = cpu_sink_runtime;
         descriptor->situ_beta = hparams.situ_beta;
