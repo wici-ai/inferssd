@@ -9574,7 +9574,7 @@ kernel void kernel_mul_mm(
         const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
 
         auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
-        auto tBv = tensor(ptrB + loop_k + rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
+        auto tBv = tensor(ptrB + loop_k + (uint64_t) rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
 
         mm.run(tBv, tAv, cT);
 
