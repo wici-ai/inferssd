@@ -25,6 +25,10 @@ phase-scoped reclaimer has freed device memory. The helper does not own a failed
 handle, publishes a handle only on success, and uses the existing callback's
 quiescence and lifetime rules. It changes neither the cache budget nor the reserve;
 other errors and recovery without progress still return to the caller's error path.
+On a single CUDA device with an expert cache, a held graph reservation creates the
+handle if a dense matrix multiply selects cuBLAS, while the cache can still
+release blocks. The CUB sort workspace size query retries an allocation failure
+only after the reclaimer frees memory, before submitting any sort.
 A CUDA graph that cannot be instantiated or launched for want of device memory
 runs its step without the graph and tells the same reclaimer, so that the VRAM
 tier gives a block back at its next quiescent token boundary before the graph is
@@ -84,7 +88,7 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/include/ggml-backend.h` | 46 | 0 |
 | `ggml/include/ggml-cuda.h` | 35 | 0 |
 | `ggml/include/ggml-rpc.h` | 2 | 2 |
-| `ggml/include/ggml.h` | 158 | 1 |
+| `ggml/include/ggml.h` | 161 | 1 |
 | `ggml/src/CMakeLists.txt` | 2 | 0 |
 | `ggml/src/ggml-alloc.c` | 38 | 2 |
 | `ggml/src/ggml-backend-impl.h` | 5 | 0 |
@@ -92,33 +96,37 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-backend.cpp` | 415 | 37 |
 | `ggml/src/ggml-blas/ggml-blas.cpp` | 1 | 0 |
 | `ggml/src/ggml-cann/ggml-cann.cpp` | 1 | 0 |
-| `ggml/src/ggml-common.h` | 1 | 0 |
+| `ggml/src/ggml-common.h` | 19 | 0 |
 | `ggml/src/ggml-cpu/CMakeLists.txt` | 6 | 0 |
-| `ggml/src/ggml-cpu/arch/arm/quants.c` | 0 | 1 |
-| `ggml/src/ggml-cpu/arch/x86/quants.c` | 138 | 7 |
-| `ggml/src/ggml-cpu/ggml-cpu.c` | 3711 | 3650 |
-| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 302 | 6 |
-| `ggml/src/ggml-cpu/ops.cpp` | 751 | 12 |
+| `ggml/src/ggml-cpu/arch-fallback.h` | 6 | 0 |
+| `ggml/src/ggml-cpu/arch/arm/quants.c` | 78 | 1 |
+| `ggml/src/ggml-cpu/arch/x86/quants.c` | 220 | 7 |
+| `ggml/src/ggml-cpu/ggml-cpu.c` | 3714 | 3647 |
+| `ggml/src/ggml-cpu/ggml-cpu.cpp` | 311 | 6 |
+| `ggml/src/ggml-cpu/ops.cpp` | 760 | 12 |
 | `ggml/src/ggml-cpu/ops.h` | 6 | 0 |
-| `ggml/src/ggml-cpu/quants.c` | 1 | 0 |
-| `ggml/src/ggml-cpu/quants.h` | 7 | 0 |
-| `ggml/src/ggml-cpu/unary-ops.cpp` | 271 | 1 |
+| `ggml/src/ggml-cpu/quants.c` | 53 | 0 |
+| `ggml/src/ggml-cpu/quants.h` | 10 | 0 |
+| `ggml/src/ggml-cpu/unary-ops.cpp` | 273 | 2 |
 | `ggml/src/ggml-cpu/unary-ops.h` | 3 | 0 |
-| `ggml/src/ggml-cuda/CMakeLists.txt` | 11 | 0 |
-| `ggml/src/ggml-cuda/argsort.cu` | 93 | 71 |
-| `ggml/src/ggml-cuda/argsort.cuh` | 6 | 0 |
+| `ggml/src/ggml-cuda/CMakeLists.txt` | 13 | 0 |
+| `ggml/src/ggml-cuda/argsort.cu` | 101 | 70 |
+| `ggml/src/ggml-cuda/argsort.cuh` | 7 | 0 |
 | `ggml/src/ggml-cuda/binbcast.cu` | 12 | 2 |
-| `ggml/src/ggml-cuda/common.cuh` | 167 | 9 |
+| `ggml/src/ggml-cuda/common.cuh` | 204 | 13 |
 | `ggml/src/ggml-cuda/concat.cu` | 69 | 46 |
+| `ggml/src/ggml-cuda/convert.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/cpy.cu` | 1 | 1 |
+| `ggml/src/ggml-cuda/dequantize.cuh` | 20 | 0 |
 | `ggml/src/ggml-cuda/fattn-common.cuh` | 35 | 7 |
 | `ggml/src/ggml-cuda/fattn.cu` | 10 | 0 |
 | `ggml/src/ggml-cuda/fattn.cuh` | 3 | 0 |
-| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1775 | 138 |
-| `ggml/src/ggml-cuda/mmq.cu` | 54 | 3 |
-| `ggml/src/ggml-cuda/mmq.cuh` | 28 | 10 |
+| `ggml/src/ggml-cuda/getrows.cu` | 4 | 0 |
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | 1923 | 134 |
+| `ggml/src/ggml-cuda/mmq.cu` | 58 | 3 |
+| `ggml/src/ggml-cuda/mmq.cuh` | 136 | 10 |
 | `ggml/src/ggml-cuda/mmvf.cu` | 22 | 0 |
-| `ggml/src/ggml-cuda/mmvq.cu` | 284 | 40 |
+| `ggml/src/ggml-cuda/mmvq.cu` | 293 | 40 |
 | `ggml/src/ggml-cuda/mmvq.cuh` | 12 | 0 |
 | `ggml/src/ggml-cuda/norm.cu` | 15 | 0 |
 | `ggml/src/ggml-cuda/quantize.cu` | 238 | 21 |
@@ -126,46 +134,53 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `ggml/src/ggml-cuda/rope.cu` | 93 | 59 |
 | `ggml/src/ggml-cuda/set-rows.cu` | 65 | 4 |
 | `ggml/src/ggml-cuda/ssm-conv.cu` | 11 | 3 |
+| `ggml/src/ggml-cuda/template-instances/generate_cu_files.py` | 1 | 0 |
 | `ggml/src/ggml-cuda/top-k.cu` | 250 | 0 |
 | `ggml/src/ggml-cuda/top-k.cuh` | 9 | 0 |
 | `ggml/src/ggml-cuda/unary.cu` | 377 | 0 |
 | `ggml/src/ggml-cuda/unary.cuh` | 16 | 0 |
-| `ggml/src/ggml-cuda/vecdotq.cuh` | 2 | 1 |
+| `ggml/src/ggml-cuda/vecdotq.cuh` | 63 | 1 |
+| `ggml/src/ggml-cuda/vendors/hip.h` | 35 | 0 |
 | `ggml/src/ggml-hexagon/ggml-hexagon.cpp` | 1 | 0 |
+| `ggml/src/ggml-hip/CMakeLists.txt` | 12 | 0 |
+| `ggml/src/ggml-impl.h` | 15 | 0 |
 | `ggml/src/ggml-metal/CMakeLists.txt` | 2 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-device.cpp` | 12 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-device.cpp` | 17 | 2 |
 | `ggml/src/ggml-metal/ggml-metal-device.h` | 16 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-device.m` | 167 | 5 |
-| `ggml/src/ggml-metal/ggml-metal-impl.h` | 47 | 0 |
-| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 136 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-impl.h` | 49 | 0 |
+| `ggml/src/ggml-metal/ggml-metal-ops.cpp` | 144 | 0 |
 | `ggml/src/ggml-metal/ggml-metal-ops.h` | 3 | 0 |
 | `ggml/src/ggml-metal/ggml-metal.cpp` | 125 | 0 |
-| `ggml/src/ggml-metal/ggml-metal.metal` | 133 | 0 |
+| `ggml/src/ggml-metal/ggml-metal.metal` | 168 | 16 |
 | `ggml/src/ggml-opencl/ggml-opencl.cpp` | 1 | 0 |
 | `ggml/src/ggml-openvino/ggml-openvino.cpp` | 1 | 0 |
-| `ggml/src/ggml-quants.c` | 5 | 0 |
+| `ggml/src/ggml-quants.c` | 103 | 0 |
+| `ggml/src/ggml-quants.h` | 4 | 0 |
 | `ggml/src/ggml-rpc/ggml-rpc.cpp` | 1 | 0 |
 | `ggml/src/ggml-sycl/ggml-sycl.cpp` | 1 | 0 |
 | `ggml/src/ggml-virtgpu/ggml-backend.cpp` | 1 | 0 |
 | `ggml/src/ggml-vulkan/CMakeLists.txt` | 2 | 0 |
-| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 442 | 28 |
-| `ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp` | 1 | 1 |
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | 449 | 29 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/copy_to_quant.comp` | 5 | 2 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/rope_funcs.glsl` | 36 | 28 |
+| `ggml/src/ggml-vulkan/vulkan-shaders/rope_params.glsl` | 1 | 0 |
 | `ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp` | 8 | 0 |
 | `ggml/src/ggml-webgpu/ggml-webgpu.cpp` | 1 | 0 |
 | `ggml/src/ggml-zdnn/ggml-zdnn.cpp` | 1 | 0 |
 | `ggml/src/ggml-zendnn/ggml-zendnn.cpp` | 1 | 0 |
-| `ggml/src/ggml.c` | 374 | 8 |
+| `ggml/src/ggml.c` | 391 | 8 |
 | `ggml/src/gguf.cpp` | 7 | 0 |
 | `include/llama.h` | 88 | 1 |
 | `src/CMakeLists.txt` | 20 | 0 |
-| `src/llama-arch.cpp` | 168 | 2 |
-| `src/llama-arch.h` | 109 | 2 |
-| `src/llama-context.cpp` | 1638 | 194 |
+| `src/llama-arch.cpp` | 171 | 2 |
+| `src/llama-arch.h` | 111 | 2 |
+| `src/llama-context.cpp` | 1646 | 194 |
 | `src/llama-context.h` | 127 | 2 |
 | `src/llama-cparams.h` | 9 | 0 |
 | `src/llama-ext.h` | 16 | 0 |
-| `src/llama-graph.cpp` | 765 | 50 |
-| `src/llama-graph.h` | 170 | 5 |
+| `src/llama-graph.cpp` | 763 | 52 |
+| `src/llama-graph.h` | 182 | 5 |
 | `src/llama-hparams.cpp` | 25 | 0 |
 | `src/llama-hparams.h` | 78 | 3 |
 | `src/llama-impl.h` | 35 | 0 |
@@ -182,11 +197,11 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `src/llama-memory.h` | 96 | 0 |
 | `src/llama-mmap.cpp` | 299 | 10 |
 | `src/llama-mmap.h` | 16 | 0 |
-| `src/llama-model-loader.cpp` | 185 | 11 |
+| `src/llama-model-loader.cpp` | 187 | 11 |
 | `src/llama-model-loader.h` | 45 | 0 |
 | `src/llama-model-saver.cpp` | 9 | 3 |
-| `src/llama-model.cpp` | 1211 | 260 |
-| `src/llama-model.h` | 108 | 0 |
+| `src/llama-model.cpp` | 1260 | 260 |
+| `src/llama-model.h` | 110 | 0 |
 | `src/llama-quant.cpp` | 23 | 2 |
 | `src/llama-sampler.cpp` | 1 | 0 |
 | `src/llama-vocab.cpp` | 67 | 8 |
@@ -213,5 +228,5 @@ InferSSD and upstream documentation, which is not bundled, are not counted.
 | `tools/server/server.cpp` | 1 | 0 |
 | `tools/server/tests/utils.py` | 2 | 2 |
 
-Total: 20151 added, 6253 removed across 163 upstream paths.
+Total: 21184 added, 6300 removed across 174 upstream paths.
 <!-- END UPSTREAM INVENTORY -->

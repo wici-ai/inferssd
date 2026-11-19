@@ -1321,6 +1321,24 @@ static int ggml_cuda_oom_reclaimer_invoke(int device, size_t requested_bytes, si
     return result;
 }
 
+#ifdef GGML_CUDA_USE_CUB
+// A CUB scratch-size query can itself report OOM before the graph has run.
+bool ggml_cuda_reclaim_cub_query_oom() {
+    if (ggml_backend_cuda_get_device_count() != 1) {
+        return false;
+    }
+    (void) cudaGetLastError();
+    size_t freed = 0;
+    const int device = ggml_cuda_get_device();
+    if (ggml_cuda_oom_reclaimer_invoke(device, 0, &freed) <= 0 || freed == 0) {
+        return false;
+    }
+    GGML_LOG_WARN("%s: device %d reclaimed %.2f MiB for CUB workspace query\n",
+            __func__, device, freed / 1024.0 / 1024.0);
+    return true;
+}
+#endif
+
 // cuBLAS's handle creation owns opaque device allocations, so those allocations cannot
 // use our cudaMalloc wrapper. Retry allocation failures only, after the existing
 // phase-scoped reclaimer has actually returned memory. No estimate or fixed reserve
@@ -3395,8 +3413,12 @@ static size_t ggml_cuda_op_mul_mat_pool_size(
 
 // the most that ggml_cuda_mul_mat takes from the memory pool
 static size_t ggml_cuda_mul_mat_pool_size(
-        const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+        const ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst,
+        bool * needs_cublas = nullptr) {
     const ggml_cuda_mul_mat_kernel kernel = ggml_cuda_mul_mat_select(ctx, src0, src1, dst);
+    if (needs_cublas && (kernel == GGML_CUDA_MUL_MAT_OP_CUBLAS || kernel == GGML_CUDA_MUL_MAT_BATCHED_CUBLAS)) {
+        *needs_cublas = true;
+    }
     switch (kernel) {
         case GGML_CUDA_MUL_MAT_VEC_F16_CPU:
             return ggml_cuda_pool_alloc_size(src0->ne[0]*sizeof(half));
@@ -6010,12 +6032,12 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
 // The most that computing `node` takes from the memory pool, worked out from the kernels the op would run.
 // The ops left out take no pool memory, or a few KiB for small reductions.
-static size_t ggml_cuda_op_pool_size(ggml_backend_cuda_context & ctx, ggml_tensor * node) {
+static size_t ggml_cuda_op_pool_size(ggml_backend_cuda_context & ctx, ggml_tensor * node, bool & needs_cublas) {
     switch (node->op) {
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_pool_size(ctx, node);
         case GGML_OP_MUL_MAT:
-            return ggml_cuda_mul_mat_pool_size(ctx, node->src[0], node->src[1], node);
+            return ggml_cuda_mul_mat_pool_size(ctx, node->src[0], node->src[1], node, &needs_cublas);
         case GGML_OP_MUL_MAT_ID:
             return ggml_cuda_mul_mat_id_pool_size(ctx, node);
         case GGML_OP_ARGSORT:
@@ -6037,10 +6059,11 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
 
     // the ops release what they take from the pool when they return, so it must hold the largest op
     size_t size = 0;
+    bool needs_cublas = false;
     const ggml_tensor * largest = nullptr;
     for (int g = 0; g < n_graphs; ++g) {
         for (int i = 0; i < graphs[g]->n_nodes; ++i) {
-            const size_t node_size = ggml_cuda_op_pool_size(*cuda_ctx, graphs[g]->nodes[i]);
+            const size_t node_size = ggml_cuda_op_pool_size(*cuda_ctx, graphs[g]->nodes[i], needs_cublas);
             if (node_size > size) {
                 size    = node_size;
                 largest = graphs[g]->nodes[i];
@@ -6075,6 +6098,27 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
         }
     }
 #endif // USE_CUDA_GRAPH
+#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+    // On a single CUDA device the dense prefill graph uses this context's handle.
+    // Create it while the SSD tier can still return blocks to the allocator.
+    if (needs_cublas && cuda_ctx->pool_hold && !cuda_ctx->cublas_handles[cuda_ctx->device] &&
+            ggml_backend_cuda_get_device_count() == 1) {
+        auto & entry = g_cuda_oom_reclaimers[cuda_ctx->device];
+        bool registered;
+        {
+            std::lock_guard<std::mutex> lock(entry.mutex);
+            registered = entry.callback != nullptr;
+        }
+        if (registered) {
+            const auto status = cuda_ctx->ensure_cublas_handle(cuda_ctx->device);
+            if (status != CUBLAS_STATUS_SUCCESS) {
+                GGML_LOG_ERROR("%s: cuBLAS handle reserve failed: %s\n", __func__, cublas_get_error_str(status));
+                return false;
+            }
+            GGML_LOG_INFO("%s: device %d prepared cuBLAS handle for prefill\n", __func__, cuda_ctx->device);
+        }
+    }
+#endif
     return true;
 }
 

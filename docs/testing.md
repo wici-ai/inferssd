@@ -116,6 +116,15 @@ cmake --build build-linux-cuda --target test-ssd-cublas-retry
 build-linux-cuda/bin/test-ssd-cublas-retry
 ```
 
+On one visible NVIDIA GPU, the shared-library fixture below checks when a real
+graph first creates its cuBLAS handle. It covers a custom matvec, a failed
+reservation with no reclaim progress, a successful retry and handle reuse.
+
+```sh
+cmake --build build-linux-cuda --target test-ssd-cublas-reserve
+build-linux-cuda/bin/test-ssd-cublas-reserve
+```
+
 ## Device failures
 
 Device failures are not allowlisted. Record each one with its full test name,
