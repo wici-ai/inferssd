@@ -7,6 +7,13 @@ name: Release
 # docs/windows-package.md.
 on:
   workflow_dispatch:
+    inputs:
+      github_release:
+        description: >-
+          Publish the GitHub release, which tags the commit. Off, the same signed packages reach
+          only the CDN and its package lists, which the installers on main and the desktop app read.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -86,6 +93,7 @@ jobs:
       TAG: ${{ needs.validate.outputs.tag }}
       PREVIOUS: ${{ needs.validate.outputs.previous }}
       RELEASE_REVISION: ${{ needs.validate.outputs.revision }}
+      GITHUB_RELEASE: ${{ inputs.github_release }}
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
@@ -120,6 +128,7 @@ jobs:
       - name: Write the release notes
         # The changes are the pull requests merged since the last release, by their titles. A
         # release with highlights of its own has a section in CHANGELOG.md, which comes first.
+        if: inputs.github_release
         run: |
           gh api "repos/$GH_REPO/releases/generate-notes" -f tag_name="$TAG" \
             -f target_commitish="$RELEASE_REVISION" -f previous_tag_name="$PREVIOUS" --jq .body > changes.md
@@ -135,6 +144,14 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1 || gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
             echo "$TAG already exists; its release and assets will not be replaced." >&2
             exit 1
+          fi
+          if [ "$GITHUB_RELEASE" != true ]; then
+            # The packages and their lists only: no GitHub release, no tag, no notes or pinned installers.
+            python3 scripts/publish-package.py dist/macos
+            python3 scripts/publish-package.py dist/windows-vulkan
+            python3 scripts/publish-package.py dist/windows-cuda
+            echo "Published $TAG ($RELEASE_REVISION) to the package lists, without a GitHub release."
+            exit 0
           fi
           created=no
           cleanup() {

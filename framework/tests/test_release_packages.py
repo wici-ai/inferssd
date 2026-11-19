@@ -264,8 +264,11 @@ def test_every_published_package_is_a_release_of_main():
         (ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader
     )
     assert set(workflow["on"]) == {"workflow_dispatch"}
-    # The version is main's head's own, so a run takes no input.
-    assert not workflow["on"]["workflow_dispatch"]
+    # The version is main's head's own: a run's one input says whether a GitHub release is made.
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"github_release"}
+    assert inputs["github_release"]["type"] == "boolean"
+    assert inputs["github_release"]["default"] == "true"
     jobs = workflow["jobs"]
     for name in ("macos", "windows"):
         assert jobs[name]["uses"] == f"./.github/workflows/package-{name}.yml"
@@ -299,6 +302,18 @@ def test_every_published_package_is_a_release_of_main():
     assert "scripts/publish-package.py dist/windows-cuda" in publication
     assert "--draft --target" in publication and "--draft=false --latest" in publication
     assert "its release and assets will not be replaced" in publication
+    # Without the GitHub release, the same packages reach the lists, after the same version check
+    # and before any release is drafted; nothing else is published.
+    packages_only = publication.index('if [ "$GITHUB_RELEASE" != true ]; then')
+    drafted = publication.index("--draft --target")
+    assert publication.index("will not be replaced") < packages_only < drafted
+    only = publication[packages_only : publication.index("fi", packages_only)]
+    for name in ("macos", "windows-vulkan", "windows-cuda"):
+        assert f"scripts/publish-package.py dist/{name}" in only
+    assert "gh release" not in only and "exit 0" in only
+    assert jobs["release"]["env"]["GITHUB_RELEASE"] == "${{ inputs.github_release }}"
+    notes = next(s for s in jobs["release"]["steps"] if "release notes" in s.get("name", ""))
+    assert notes["if"] == "inputs.github_release"
     # The package workflows build and check; only Release publishes.
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
