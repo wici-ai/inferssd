@@ -570,14 +570,23 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
-    // Handle Anthropic-specific thinking param
-    if (body.contains("thinking")) {
-        json thinking = json_value(body, "thinking", json::object());
-        std::string thinking_type = json_value(thinking, "type", std::string());
-        if (thinking_type == "enabled") {
-            int budget_tokens = json_value(thinking, "budget_tokens", 10000);
-            oai_body["thinking_budget_tokens"] = budget_tokens;
-        }
+    // Anthropic's thinking becomes reasoning_effort, which is fitted to what the chat template offers, as on every
+    // route: "enabled" or "adaptive" thinks at output_config.effort where it names one, else as the template does by
+    // default ("on"); "disabled", or no thinking at all, is "none", as in Anthropic's API, where a request thinks only
+    // when it asks to. Claude Code turns thinking off that way for a model it does not know, keeping
+    // output_config.effort. A budget stays a budget.
+    const json thinking = json_value(body, "thinking", json::object());
+    const std::string thinking_type = thinking.is_object() ? json_value(thinking, "type", std::string()) : std::string();
+    if (thinking_type == "enabled") {
+        int budget_tokens = json_value(thinking, "budget_tokens", 10000);
+        oai_body["thinking_budget_tokens"] = budget_tokens;
+    }
+    if (thinking_type.empty() || thinking_type == "disabled") {
+        oai_body["reasoning_effort"] = "none";
+    } else if (thinking_type == "enabled" || thinking_type == "adaptive") {
+        const json output_config = json_value(body, "output_config", json::object());
+        const std::string effort = output_config.is_object() ? json_value(output_config, "effort", std::string()) : std::string();
+        oai_body["reasoning_effort"] = effort.empty() ? "on" : effort;
     }
 
     // Handle Anthropic-specific metadata param
