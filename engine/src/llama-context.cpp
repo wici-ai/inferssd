@@ -3124,6 +3124,16 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+// Whether the scheduler runs node on the CPU or a CPU accelerator (BLAS).
+static bool llama_sched_runs_on_host(ggml_backend_sched_t sched, ggml_tensor * node) {
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, node);
+    if (!backend) {
+        return false;
+    }
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+    return type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+
 bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted) {
     if (!cpu_sink_runtime) {
         if (admitted) { admitted(); }
@@ -3141,6 +3151,39 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     }
     std::vector<size_t> required(backend_ptrs.size(), 0);
     if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
+    // A GPU backend refuses an op whose tensors outgrow what its kernels address, and the scheduler runs it on the
+    // CPU: for a long prompt in one ubatch, minutes a layer. So a prompt's graph runs on the GPU what the decode graph
+    // runs there; one that would not is refused as one that gets no memory, and the batch is split again
+    // (prefill_refit) into ubatches whose ops stay where decode runs them.
+    if (!prefill) {
+        std::unordered_set<std::string> gpu, host;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->name[0] != '\0') {
+                (llama_sched_runs_on_host(sched.get(), node) ? host : gpu).insert(node->name);
+            }
+        }
+        for (const auto & name : host) {
+            gpu.erase(name);
+        }
+        decode_gpu_nodes = std::move(gpu);
+    } else if (!decode_gpu_nodes.empty()) {
+        int moved = 0;
+        const char * first = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (node->name[0] != '\0' && decode_gpu_nodes.count(node->name) && llama_sched_runs_on_host(sched.get(), node)) {
+                first = first ? first : node->name;
+                ++moved;
+            }
+        }
+        if (moved) {
+            LLAMA_LOG_WARN("%s: the prompt graph would run %d nodes on the CPU that decode runs on the GPU, the first %s\n",
+                __func__, moved, first);
+            ggml_backend_sched_reset(sched.get());
+            return false;
+        }
+    }
     uint64_t host_bytes = 0, device_bytes = 0;
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         // Query AFTER the probe: it can have released chunks even when the

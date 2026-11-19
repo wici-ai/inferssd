@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -351,6 +352,9 @@ private:
     uint32_t cpu_prefill_configured_ubatch = 0;
     uint32_t cpu_prefill_selected_ubatch = 0;
     uint32_t cpu_prefill_graph_granularity = 1;
+    // The names of the decode graph's nodes the scheduler runs on a GPU, and nowhere else: a prompt's graph has to run
+    // them on the GPU as well (reserve_compute_graph).
+    std::unordered_set<std::string> decode_gpu_nodes;
     // A prefill phase's graph not yet reserved: its first ubatch reserves it (process_ubatch), over this horizon, for
     // a prompt of this many tokens.
     bool cpu_prefill_reserve_pending = false;
