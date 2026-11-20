@@ -383,11 +383,12 @@ bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * ite
         item.bytes = items[i].bytes;
         item.device = items[i].device;
         item.start = items[i].start;
-        // bytes in a registered file's mapping: read from the drive where its slots can be had
+        // bytes in a registered file's mapping, inside the file: read from the drive where its slots can be had
         const char * at = static_cast<const char *>(item.host);
         for (size_t f = 0; f < owner.files.size(); ++f) {
             const auto & file = owner.files[f];
-            if (at >= file.base && at + item.bytes <= file.base + file.bytes && stage_allocate(owner, file.align)) {
+            if (at >= file.base && at + item.bytes <= file.base + file.bytes &&
+                    uint64_t(at - file.base) + item.bytes <= file.size && stage_allocate(owner, file.align)) {
                 item.file = int(f);
                 item.file_offset = uint64_t(at - file.base);
                 s.drive = true;
@@ -488,12 +489,9 @@ bool stream_files_impl(transport_owner & owner, const ssd::gpu::stream_file * fi
         file.fd = files[i].fd;
         // a file the drive reads around the page cache, at a granule the slots' payload is a multiple of
         if (file.fd < 0 || !ssd::platform::is_direct(file.fd) || !ssd::platform::file_size(file.fd, file.size) ||
-                (file.align = ssd::platform::direct_alignment(file.fd)) == 0 || drive_chunk % file.align != 0 ||
-                file.size < file.bytes) {
-            std::fprintf(stderr, "[ssd.transport] file %zu: not read from the drive (fd %d, direct %d, size %llu of "
-                         "%llu mapped, granule %zu)\n", i, file.fd, file.fd >= 0 && ssd::platform::is_direct(file.fd),
-                         static_cast<unsigned long long>(file.size), static_cast<unsigned long long>(file.bytes),
-                         file.align);
+                (file.align = ssd::platform::direct_alignment(file.fd)) == 0 || drive_chunk % file.align != 0) {
+            std::fprintf(stderr, "[ssd.transport] file %zu: not read from the drive (fd %d, direct %d, granule %zu)\n",
+                         i, file.fd, file.fd >= 0 && ssd::platform::is_direct(file.fd), file.align);
             if (file.fd >= 0) ssd::platform::close_fd(file.fd);
             continue;
         }
