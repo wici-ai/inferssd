@@ -8,6 +8,7 @@
 #include "ssd/model-adapter.h"
 #include "ssd/host-gather.h"
 #include "ssd/dense-homes.h"
+#include "ggml-ssd/platform/file.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -321,6 +322,22 @@ llama_context::llama_context(
             // A model without routed experts streams the layers it keeps in host memory to the GPU; one with them
             // keeps the scheduler's own rule for any weight there, as before.
             ssd_runtime->stream.set_streaming(model.hparams.n_expert == 0);
+            // the model files its homed layers are mapped from: a streamed layer without a pinned copy is read from
+            // the drive, around the page cache
+            const llama_dense_homes * homes = model.dense_homes();
+            if (homes && ssd_runtime->services.gpu_transport && !homes->files().empty()) {
+                std::vector<ssd::gpu::stream_file> files;
+                for (const auto & file : homes->files()) {
+                    std::string error;
+                    const int fd = ssd::platform::open_direct(file.path.c_str(), &error);
+                    if (fd < 0) {
+                        LLAMA_LOG_WARN("%s: %s reads through its mapping: %s\n", __func__, file.path.c_str(), error.c_str());
+                        continue;
+                    }
+                    files.push_back({file.base, uint64_t(file.bytes), fd});
+                }
+                (void) ssd_runtime->stream.stream_files(files.data(), files.size());
+            }
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here

@@ -1,20 +1,30 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "ggml-ssd/gpu/transport.h"
+#include "ggml-ssd/host/arbiter.h"
+#include "ggml-ssd/io/read-ring.h"
+#include "ggml-ssd/platform/file.h"
 #include "ggml-cuda.h"
 #include "gpu-runtime.h"
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
 [[noreturn]] void fatal(const char * reason) noexcept {
     std::fprintf(stderr, "[ssd.transport] cannot drain owned work: %s\n", reason); std::abort();
 }
+
+// A drive read brings in at most this many bytes of a weight, into one of this many pinned slots: as many reads are
+// in flight while the earlier ones cross the bus.
+constexpr size_t drive_chunk = size_t(16) << 20;
+constexpr size_t drive_slots = 8;
 
 // The streamed weights of a context's graphs: each graph copies its items into their places in a device ring, in the
 // order the graph uses them, on a copy stream of their own. A position counts the uses across graphs (a pass of the
@@ -24,6 +34,11 @@ namespace {
 // position order, a split's work reading only its own items). A use waits on the compute stream for its item's copy.
 // Copies run as far ahead as the released places allow: through the rest of the graph and into the next one's first
 // items, while the compute stream works on the weights resident in the device.
+//
+// An item whose bytes are in a registered file's mapping (a layer without a pinned copy) is read from the drive
+// instead, the page cache bypassed: the drive worker reads its positions in order, in chunks, into pinned slots, and
+// copies each chunk into the item's place as it arrives; a use of such a position waits for the worker's copy. A read
+// that fails fails the use: the mapping is not read instead.
 struct stream_item_state {
     std::string name;
     const void * host = nullptr;
@@ -33,6 +48,9 @@ struct stream_item_state {
     cudaEvent_t ready = nullptr;    // its last copy
     cudaEvent_t released = nullptr; // the last work that reads its place, queued
     int64_t used = -1;              // the position of its last use
+    int file = -1;                  // the registered file it is read from, -1 for an item in host memory
+    uint64_t file_offset = 0;
+    int64_t copied = -1;            // a drive item: the position the worker copied last
 };
 
 struct stream_state {
@@ -40,18 +58,50 @@ struct stream_state {
     uint64_t ring_bytes = 0, pass_bytes = 0;
     cudaStream_t copy = nullptr;
     int64_t used = 0;          // the next position to use
-    int64_t issued = 0;        // the next position to copy
+    int64_t issued = 0;        // the next position to copy from host memory
     int64_t released = -1;     // every position up to it released
     std::vector<int64_t> released_at; // each item's last released position
+    bool drive = false;        // an item is read from the drive
+};
+
+// a model file the context maps, readable around the page cache
+struct drive_file {
+    const char * base = nullptr;
+    uint64_t bytes = 0;
+    int fd = -1;
+    uint64_t size = 0;
+    size_t align = 0;
+};
+
+// Pinned slots the drive reads land in, cut from one block at the granule direct reads need, with the read ring that
+// fills them. A slot's event records its last copy into the device.
+struct drive_stage {
+    struct slot { char * host = nullptr; cudaEvent_t done = nullptr; bool copying = false; bool reading = false; };
+    void * block = nullptr;
+    std::vector<slot> slots;
+    size_t slot_bytes = 0;
+    std::unique_ptr<ssd::io::read_ring> ring;
+    bool failed = false; // could not be had: not asked for again
 };
 
 struct transport_owner {
     int device;
+    ssd::host::context_client * host;
     std::mutex mutex;
+    std::condition_variable changed; // a release, a drive copy done, a new plan, the end
     std::atomic<bool> closed{false};
     stream_state stream;
-    explicit transport_owner(int ordinal) : device(ordinal) {}
+    std::vector<drive_file> files;
+    drive_stage stage;               // the drive worker's alone while it copies
+    std::thread worker;
+    bool stop = false;
+    bool busy = false;               // the drive worker copies a position
+    bool failed = false;             // a drive read failed: the plan's uses fail
+    int64_t drive_next = 0;          // the next position the drive worker considers
+    transport_owner(const ssd::runtime_services & services, int ordinal) : device(ordinal), host(services.host) {}
 };
+
+uint64_t align_up(uint64_t value, uint64_t a) { return (value + a - 1) / a * a; }
 
 uint64_t virtual_start(const stream_state & s, int64_t position) {
     const size_t n = s.items.size();
@@ -71,6 +121,183 @@ int64_t overwritten(const stream_state & s, int64_t position) {
     return -1;
 }
 
+// the slots and their ring, admitted by the host budget and touched inside its reservation
+bool stage_allocate(transport_owner & owner, size_t align) {
+    drive_stage & st = owner.stage;
+    if (st.block) return true;
+    if (st.failed || !owner.host) return false;
+    const size_t slot_bytes = size_t(align_up(drive_chunk + 2 * align, align));
+    const size_t bytes = slot_bytes * drive_slots + align;
+    auto ticket = owner.host->take(bytes);
+    if (!ticket) { st.failed = true; return false; }
+    (void) ggml_cuda_admit_host_alloc(bytes); // unified memory: the reserve first, as for device memory
+    if (cudaHostAlloc(&st.block, bytes, cudaHostAllocDefault) != cudaSuccess) {
+        st.block = nullptr;
+        st.failed = true;
+        return false;
+    }
+    char * first = static_cast<char *>(st.block) + (align - reinterpret_cast<uintptr_t>(st.block) % align) % align;
+    st.slots.resize(drive_slots);
+    for (size_t i = 0; i < drive_slots; ++i) {
+        st.slots[i].host = first + i * slot_bytes;
+        if (cudaEventCreateWithFlags(&st.slots[i].done, cudaEventDisableTiming) != cudaSuccess) {
+            st.failed = true;
+            return false;
+        }
+    }
+    st.ring.reset(new ssd::io::read_ring);
+    if (!st.ring->init(unsigned(drive_slots), false)) {
+        st.ring.reset();
+        st.failed = true;
+        return false;
+    }
+    std::memset(first, 0, slot_bytes * drive_slots);
+    st.slot_bytes = slot_bytes;
+    ticket.value.commit();
+    return true;
+}
+
+void stage_release(transport_owner & owner) noexcept {
+    drive_stage & st = owner.stage;
+    const bool allocated = st.block != nullptr;
+    if (st.ring && !st.ring->drain(nullptr, [](void *, const ssd::io::completion &) {})) fatal("drive reads");
+    st.ring.reset();
+    for (auto & slot : st.slots) {
+        if (slot.copying && cudaEventSynchronize(slot.done) != cudaSuccess) fatal("drive copy");
+        if (slot.done && cudaEventDestroy(slot.done) != cudaSuccess) fatal("drive stage release");
+    }
+    st.slots.clear();
+    if (st.block && cudaFreeHost(st.block) != cudaSuccess) fatal("drive stage release");
+    st.block = nullptr;
+    if (allocated && owner.host) (void) owner.host->note_known_memory_change();
+}
+
+// Reads `bytes` at `offset` of `file` into `device` on the copy stream, after the copy stream waits for `wait`
+// (the release of the place it overwrites), and records `ready` after the last chunk: the worker's, unlocked.
+bool drive_copy(transport_owner & owner, cudaStream_t copy, cudaEvent_t wait, const drive_file & file,
+        uint64_t offset, size_t bytes, char * device, cudaEvent_t ready) {
+    drive_stage & st = owner.stage;
+    if (wait && cudaStreamWaitEvent(copy, wait, 0) != cudaSuccess) return false;
+    const uint64_t first = offset / file.align * file.align;
+    const uint64_t end = offset + bytes;
+    const size_t payload = st.slot_bytes - file.align; // a chunk's aligned read never exceeds its slot
+    const size_t n_chunks = size_t((end - first + payload - 1) / payload);
+    std::vector<size_t> chunk_of(st.slots.size(), SIZE_MAX);
+    size_t issued = 0, done = 0, in_flight = 0;
+    bool ok = true;
+    while (done < n_chunks && ok) {
+        unsigned queued = 0;
+        for (size_t i = 0; i < st.slots.size() && issued < n_chunks && ok; ++i) {
+            auto & slot = st.slots[i];
+            if (slot.reading) continue;
+            if (slot.copying) {
+                if (cudaEventSynchronize(slot.done) != cudaSuccess) { ok = false; break; }
+                slot.copying = false;
+            }
+            const uint64_t at = first + uint64_t(issued) * payload;
+            const uint64_t length = align_up(std::min<uint64_t>(at + payload, end) - at, file.align);
+            if (!st.ring->queue({file.fd, at, size_t(length)}, slot.host, i, false)) { ok = false; break; }
+            slot.reading = true;
+            chunk_of[i] = issued++;
+            ++queued;
+            ++in_flight;
+        }
+        if (queued && !st.ring->submit(queued)) ok = false;
+        if (!ok || in_flight == 0) break;
+        ssd::io::completion c{};
+        for (;;) {
+            const auto popped = st.ring->pop(c);
+            if (!popped) { ok = false; break; }
+            if (popped.value) break;
+            if (!st.ring->wait()) { ok = false; break; }
+        }
+        if (!ok) break;
+        --in_flight;
+        const size_t i = size_t(c.user_data);
+        if (i >= st.slots.size() || chunk_of[i] == SIZE_MAX) { ok = false; break; }
+        auto & slot = st.slots[i];
+        slot.reading = false;
+        const uint64_t at = first + uint64_t(chunk_of[i]) * payload;
+        const uint64_t from = std::max(at, offset), to = std::min(at + payload, end);
+        // a short read is a failure unless the file ends past the bytes the item needs
+        if (c.res < 0 || at + uint64_t(c.res) < to) { ok = false; break; }
+        if (cudaMemcpyAsync(device + (from - offset), slot.host + (from - at), size_t(to - from),
+                    cudaMemcpyHostToDevice, copy) != cudaSuccess ||
+                cudaEventRecord(slot.done, copy) != cudaSuccess) {
+            ok = false;
+            break;
+        }
+        slot.copying = true;
+        ++done;
+    }
+    if (!ok) {
+        // every read reaped before a slot is reused: none lands later
+        if (!st.ring->drain(nullptr, [](void *, const ssd::io::completion &) {})) fatal("drive reads");
+        for (auto & slot : st.slots) slot.reading = false;
+        return false;
+    }
+    return cudaEventRecord(ready, copy) == cudaSuccess;
+}
+
+// Under the lock: whether the drive worker can copy its next position, skipping the positions in host memory: no
+// more than a pass ahead of the uses, its place released.
+bool drive_due(transport_owner & owner) {
+    stream_state & s = owner.stream;
+    const int64_t n = int64_t(s.items.size());
+    if (!s.drive || owner.failed || n == 0) return false;
+    if (owner.drive_next < s.used) owner.drive_next = s.used;
+    while (owner.drive_next < s.used + n) {
+        if (s.items[size_t(owner.drive_next % n)].file < 0) { ++owner.drive_next; continue; }
+        return overwritten(s, owner.drive_next) <= s.released;
+    }
+    return false;
+}
+
+void drive_worker(transport_owner & owner) {
+    if (cudaSetDevice(owner.device) != cudaSuccess) {
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        owner.failed = true;
+        owner.changed.notify_all();
+        return;
+    }
+    std::unique_lock<std::mutex> lock(owner.mutex);
+    for (;;) {
+        owner.changed.wait(lock, [&] { return owner.stop || drive_due(owner); });
+        if (owner.stop) return;
+        stream_state & s = owner.stream;
+        const int64_t n = int64_t(s.items.size());
+        const int64_t position = owner.drive_next;
+        auto & item = s.items[size_t(position % n)];
+        const int64_t before = overwritten(s, position);
+        cudaEvent_t wait = before >= 0 ? s.items[size_t(before % n)].released : nullptr;
+        const drive_file file = owner.files[size_t(item.file)];
+        const uint64_t offset = item.file_offset;
+        const size_t bytes = item.bytes;
+        char * device = static_cast<char *>(item.device);
+        cudaEvent_t ready = item.ready;
+        cudaStream_t copy = s.copy;
+        owner.busy = true;
+        lock.unlock();
+        const bool ok = drive_copy(owner, copy, wait, file, offset, bytes, device, ready);
+        lock.lock();
+        owner.busy = false;
+        if (ok) {
+            item.copied = position;
+            owner.drive_next = position + 1;
+        } else {
+            std::fprintf(stderr, "[ssd.transport] drive read of %s (%zu bytes at %llu) failed\n", item.name.c_str(),
+                         bytes, static_cast<unsigned long long>(offset));
+            owner.failed = true;
+        }
+        owner.changed.notify_all();
+    }
+}
+
+// Under the lock: the drive worker copies nothing until the next plan or position (the lock held from here on).
+void drive_hold(std::unique_lock<std::mutex> & lock, transport_owner & owner) {
+    owner.changed.wait(lock, [&] { return !owner.busy; });
+}
+
 // finishes every copy and keeps none; the places may still be read by queued work: a later copy waits for that work
 // through the release of the positions before it, which the ring's reset leaves to a barrier
 bool stream_drop(stream_state & s) noexcept {
@@ -85,6 +312,7 @@ bool stream_drop(stream_state & s) noexcept {
     s.used = s.issued = 0;
     s.released = -1;
     s.ring_bytes = s.pass_bytes = 0;
+    s.drive = false;
     return ok;
 }
 
@@ -92,6 +320,10 @@ bool stream_issue(stream_state & s) {
     const int64_t position = s.issued;
     const size_t n = s.items.size();
     auto & item = s.items[size_t(position % int64_t(n))];
+    if (item.file >= 0) { // the drive worker's
+        ++s.issued;
+        return true;
+    }
     const int64_t before = overwritten(s, position);
     if (before > s.released) return false; // the place is still to be read
     if (before >= 0 && cudaStreamWaitEvent(s.copy, s.items[size_t(before % int64_t(n))].released, 0) != cudaSuccess) {
@@ -105,17 +337,19 @@ bool stream_issue(stream_state & s) {
     return true;
 }
 
-// copies every position whose place is released, no further than a pass ahead of the uses
+// copies every position in host memory whose place is released, no further than a pass ahead of the uses
 void stream_ahead(stream_state & s) {
     const int64_t n = int64_t(s.items.size());
-    while (s.issued < s.used + n && overwritten(s, s.issued) <= s.released) {
+    while (s.issued < s.used + n) {
+        const bool drive = s.items[size_t(s.issued % n)].file >= 0;
+        if (!drive && overwritten(s, s.issued) > s.released) break;
         if (!stream_issue(s)) return;
     }
 }
 
 bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * items, size_t n, uint64_t ring_bytes,
         uint64_t pass_bytes, cudaStream_t stream) {
-    std::lock_guard<std::mutex> lock(owner.mutex);
+    std::unique_lock<std::mutex> lock(owner.mutex);
     if (owner.closed || cudaSetDevice(owner.device) != cudaSuccess) return false;
     stream_state & s = owner.stream;
     bool same = n == s.items.size() && ring_bytes == s.ring_bytes && pass_bytes == s.pass_bytes;
@@ -125,7 +359,10 @@ bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * ite
             a.device == items[i].device && a.start == items[i].start;
     }
     if (same) return true;
+    drive_hold(lock, owner);
     if (!stream_drop(s)) fatal("stream copies");
+    owner.failed = false;
+    owner.drive_next = 0;
     if (n == 0) return true;
     if (!s.copy && cudaStreamCreateWithFlags(&s.copy, cudaStreamNonBlocking) != cudaSuccess) {
         s.copy = nullptr;
@@ -146,6 +383,17 @@ bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * ite
         item.bytes = items[i].bytes;
         item.device = items[i].device;
         item.start = items[i].start;
+        // bytes in a registered file's mapping: read from the drive where its slots can be had
+        const char * at = static_cast<const char *>(item.host);
+        for (size_t f = 0; f < owner.files.size(); ++f) {
+            const auto & file = owner.files[f];
+            if (at >= file.base && at + item.bytes <= file.base + file.bytes && stage_allocate(owner, file.align)) {
+                item.file = int(f);
+                item.file_offset = uint64_t(at - file.base);
+                s.drive = true;
+                break;
+            }
+        }
         if (cudaEventCreateWithFlags(&item.ready, cudaEventDisableTiming) != cudaSuccess ||
                 cudaEventCreateWithFlags(&item.released, cudaEventDisableTiming) != cudaSuccess) {
             if (!stream_drop(s)) fatal("stream copies");
@@ -154,11 +402,12 @@ bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * ite
     }
     s.ring_bytes = ring_bytes;
     s.pass_bytes = pass_bytes;
+    owner.changed.notify_all();
     return true;
 }
 
 bool stream_use_impl(transport_owner & owner, size_t index, void * stream_ptr, bool * ahead) {
-    std::lock_guard<std::mutex> lock(owner.mutex);
+    std::unique_lock<std::mutex> lock(owner.mutex);
     if (owner.closed || cudaSetDevice(owner.device) != cudaSuccess) return false;
     stream_state & s = owner.stream;
     const int64_t n = int64_t(s.items.size());
@@ -167,6 +416,7 @@ bool stream_use_impl(transport_owner & owner, size_t index, void * stream_ptr, b
     // a use out of the plan's order (a graph that stopped early): the copies made ahead are dropped, and the next
     // ones wait for every use queued so far
     if (s.used % n != int64_t(index)) {
+        drive_hold(lock, owner);
         if (cudaStreamSynchronize(s.copy) != cudaSuccess) return false;
         cudaEvent_t & barrier = s.items[index].released;
         if (cudaEventRecord(barrier, stream) != cudaSuccess || cudaStreamWaitEvent(s.copy, barrier, 0) != cudaSuccess) {
@@ -176,17 +426,26 @@ bool stream_use_impl(transport_owner & owner, size_t index, void * stream_ptr, b
         s.used = s.issued = position;
         s.released = position - 1;
         for (auto & at : s.released_at) at = -1;
+        owner.drive_next = position;
     }
     const int64_t position = s.used;
-    if (ahead) *ahead = s.issued > position;
-    while (s.issued <= position) {
-        if (!stream_issue(s)) return false;
-    }
     auto & item = s.items[index];
+    if (item.file >= 0) {
+        if (ahead) *ahead = item.copied == position;
+        owner.changed.notify_all();
+        owner.changed.wait(lock, [&] { return item.copied == position || owner.failed || owner.closed; });
+        if (item.copied != position) return false;
+    } else {
+        if (ahead) *ahead = s.issued > position;
+        while (s.issued <= position) {
+            if (!stream_issue(s)) return false;
+        }
+    }
     if (cudaStreamWaitEvent(stream, item.ready, 0) != cudaSuccess) return false;
     item.used = position;
     s.used = position + 1;
     stream_ahead(s);
+    owner.changed.notify_all();
     return true;
 }
 
@@ -204,19 +463,48 @@ bool stream_release_impl(transport_owner & owner, size_t index, void * stream_pt
         ++s.released;
     }
     stream_ahead(s);
+    owner.changed.notify_all();
+    return true;
+}
+
+bool stream_files_impl(transport_owner & owner, const ssd::gpu::stream_file * files, size_t n) {
+    std::unique_lock<std::mutex> lock(owner.mutex);
+    for (size_t i = 0; i < n; ++i) {
+        drive_file file;
+        file.base = static_cast<const char *>(files[i].base);
+        file.bytes = files[i].bytes;
+        file.fd = files[i].fd;
+        // a file the drive reads around the page cache, at a granule the slots' payload is a multiple of
+        if (file.fd < 0 || !ssd::platform::is_direct(file.fd) || !ssd::platform::file_size(file.fd, file.size) ||
+                (file.align = ssd::platform::direct_alignment(file.fd)) == 0 || drive_chunk % file.align != 0 ||
+                file.size < file.bytes) {
+            if (file.fd >= 0) ssd::platform::close_fd(file.fd);
+            continue;
+        }
+        owner.files.push_back(file);
+    }
     return true;
 }
 
 void quiesce(void * value) noexcept {
     if (!value) return;
     auto & owner = *static_cast<transport_owner *>(value);
+    {
+        std::lock_guard<std::mutex> lock(owner.mutex);
+        if (owner.closed) return;
+        owner.closed = true;
+        owner.stop = true;
+        owner.changed.notify_all();
+    }
+    if (owner.worker.joinable()) owner.worker.join();
     std::lock_guard<std::mutex> lock(owner.mutex);
-    if (owner.closed) return;
-    owner.closed = true;
     if (cudaSetDevice(owner.device) != cudaSuccess) fatal("device selection");
     if (!stream_drop(owner.stream)) fatal("stream copies");
+    stage_release(owner);
     if (owner.stream.copy && cudaStreamDestroy(owner.stream.copy) != cudaSuccess) fatal("stream release");
     owner.stream.copy = nullptr;
+    for (auto & file : owner.files) ssd::platform::close_fd(file.fd);
+    owner.files.clear();
 }
 void destroy(void * value) noexcept {
     if (!value) return;
@@ -226,7 +514,9 @@ void destroy(void * value) noexcept {
 void * create(const ssd::runtime_services * services, int device, char * error, size_t size) noexcept {
     try {
         if (!services || device < 0) throw std::runtime_error("invalid context transport services");
-        return new transport_owner(device);
+        auto * owner = new transport_owner(*services, device);
+        owner->worker = std::thread(drive_worker, std::ref(*owner));
+        return owner;
     } catch (const std::exception & failure) {
         if (error && size) std::snprintf(error, size, "%s", failure.what());
         return nullptr;
@@ -254,9 +544,17 @@ bool stream_release(void * p, size_t index, void * stream) noexcept {
     try { return stream_release_impl(*static_cast<transport_owner *>(p), index, stream); }
     catch (...) { quiesce(p); return false; }
 }
+bool stream_files(void * p, const ssd::gpu::stream_file * files, size_t n) noexcept {
+    if (!p || (n && !files)) {
+        for (size_t i = 0; files && i < n; ++i) ssd::platform::close_fd(files[i].fd);
+        return false;
+    }
+    try { return stream_files_impl(*static_cast<transport_owner *>(p), files, n); }
+    catch (...) { quiesce(p); return false; }
+}
 } // namespace
 extern "C" const ssd::gpu::transport_v2 * ggml_backend_cuda_ssd_transport_v2() {
-    static const ssd::gpu::transport_v2 api{2, sizeof(ssd::gpu::transport_v2), sizeof(ssd::runtime_services),
-        create, quiesce, destroy, stream_plan, stream_use, stream_release};
+    static const ssd::gpu::transport_v2 api{3, sizeof(ssd::gpu::transport_v2), sizeof(ssd::runtime_services),
+        create, quiesce, destroy, stream_plan, stream_use, stream_release, stream_files};
     return &api;
 }

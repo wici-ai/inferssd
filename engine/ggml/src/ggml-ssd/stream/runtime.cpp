@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "runtime.h"
 #include "../gpu/provider.h"
+#include "../platform/file.h"
 #include <algorithm>
 
 namespace ssd { namespace stream {
@@ -30,6 +31,14 @@ void runtime::attach(ggml_backend_sched_t scheduler) {
 
 uint64_t runtime::ring_bytes() const {
     return ring_ ? ggml_backend_buffer_get_size(ring_) : 0;
+}
+
+bool runtime::stream_files(const gpu::stream_file * files, size_t n) noexcept {
+    if (!services_.gpu || !services_.gpu_transport) {
+        for (size_t i = 0; i < n; ++i) { platform::close_fd(files[i].fd); }
+        return false;
+    }
+    return services_.gpu->transport->stream_files(services_.gpu_transport, files, n);
 }
 
 void runtime::release_ring() noexcept {

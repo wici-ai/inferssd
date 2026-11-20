@@ -180,10 +180,10 @@ void llama_ssd_context::attach_backend(ggml_backend_t backend) {
         throw std::runtime_error("GPU backend has no compatible SSD provider table");
     }
     const auto * transport = provider->transport;
-    if (transport && (transport->version != 2 || transport->size != sizeof(*transport) ||
+    if (transport && (transport->version != 3 || transport->size != sizeof(*transport) ||
             transport->runtime_services_size != sizeof(services) || !transport->create ||
             !transport->quiesce || !transport->destroy || !transport->stream_plan || !transport->stream_use ||
-            !transport->stream_release)) {
+            !transport->stream_release || !transport->stream_files)) {
         throw std::runtime_error("GPU backend has no compatible context transport table");
     }
     // Without routed experts a GPU that has no transport adds nothing: the backend's own rules place the weights.

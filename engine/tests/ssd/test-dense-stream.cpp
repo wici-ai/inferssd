@@ -3,7 +3,9 @@
 // (a plain CPU buffer and the GPU's pinned host buffer, one through a reshape) whose products the GPU runs, their
 // copies in a device ring smaller than a graph's weights. Each product equals the one of the same weights in device
 // memory, at 1 and 64 tokens, graph after graph, and after a graph with other weights changes the plan; every copy
-// after the first graph's first is issued ahead of its use.
+// after the first graph's first is issued ahead of its use. Matrices in a mapped file the transport reads around the
+// page cache (their offsets 32-byte aligned, as in a GGUF) give the same products; once the file is cut short, the
+// graph fails rather than read the mapping.
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
@@ -21,6 +23,13 @@
 
 #if defined(__linux__)
 #include "ggml-cuda.h"
+#include "ggml-ssd/platform/file.h"
+
+#include <cerrno>
+#include <cstdlib>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace {
 
@@ -45,8 +54,37 @@ copy_delta copies_since(ggml_backend_sched_t sched, const ggml_backend_sched_ssd
 }
 
 // out = the sum of w[i] x (the last w seen as [K, M/2, 2] against x repeated twice) and r x, r in device memory
+// a temporary file, removed with the object
+struct temp_file {
+    std::string path;
+    int fd = -1;
+    temp_file() {
+        const char * tmp = std::getenv("TMPDIR");
+        std::string pattern = std::string(tmp && *tmp ? tmp : "/tmp") + "/inferssd-dense-stream-XXXXXX";
+        std::vector<char> buf(pattern.begin(), pattern.end());
+        buf.push_back('\0');
+        fd = mkstemp(buf.data());
+        require(fd >= 0, "mkstemp failed");
+        path = buf.data();
+    }
+    ~temp_file() {
+        if (fd >= 0) {
+            close(fd);
+        }
+        unlink(path.c_str());
+    }
+    void write(const void * data, size_t bytes, uint64_t offset) const {
+        const uint8_t * p = static_cast<const uint8_t *>(data);
+        for (size_t done = 0; done < bytes;) {
+            const ssize_t n = pwrite(fd, p + done, bytes - done, off_t(offset + done));
+            require(n > 0 || errno == EINTR, "pwrite failed");
+            done += n > 0 ? size_t(n) : 0;
+        }
+    }
+};
+
 std::vector<float> run_graph(ggml_backend_sched_t sched, const std::vector<ggml_tensor *> & w, ggml_tensor * r,
-                             int n_tokens, const std::vector<float> & x_data) {
+                             int n_tokens, const std::vector<float> & x_data, ggml_status * status = nullptr) {
     ggml_init_params params = { ggml_tensor_overhead() * 64 + ggml_graph_overhead(), nullptr, true };
     ggml_context * ctx = ggml_init(params);
     ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, K, n_tokens);
@@ -66,7 +104,15 @@ std::vector<float> run_graph(ggml_backend_sched_t sched, const std::vector<ggml_
     ggml_backend_sched_reset(sched);
     require(ggml_backend_sched_alloc_graph(sched, gf), "graph allocation failed");
     ggml_backend_tensor_set(x, x_data.data(), 0, sizeof(float) * K * n_tokens);
-    require(ggml_backend_sched_graph_compute(sched, gf) == GGML_STATUS_SUCCESS, "graph compute failed");
+    const ggml_status computed = ggml_backend_sched_graph_compute(sched, gf);
+    if (status) {
+        *status = computed;
+        ggml_backend_sched_synchronize(sched);
+        ggml_backend_sched_reset(sched);
+        ggml_free(ctx);
+        return {};
+    }
+    require(computed == GGML_STATUS_SUCCESS, "graph compute failed");
     std::vector<float> result(size_t(M) * n_tokens);
     ggml_backend_tensor_get(out, result.data(), 0, sizeof(float) * result.size());
     ggml_free(ctx);
@@ -183,7 +229,65 @@ void run() {
         require(std::memcmp(all_got.data(), all_ref.data(), sizeof(float) * all_got.size()) == 0,
                 "the streamed weights' product differs after the plan changed back");
     }
+    // the same matrices in a mapped file, as a GGUF holds them (32-byte aligned, none on a page boundary), read from
+    // the drive: the file registered with the transport, then cut short
+    temp_file data;
+    std::vector<uint64_t> offset(n_host);
+    uint64_t cursor = 4096 + 96;
+    for (int i = 0; i < n_host; ++i) {
+        offset[i] = cursor;
+        data.write(q[i].data(), nbytes, cursor);
+        cursor += (nbytes + 32 + 31) / 32 * 32;
+    }
+    require(fsync(data.fd) == 0, "fsync failed");
+    const size_t map_bytes = size_t(cursor);
+    void * map = mmap(nullptr, map_bytes, PROT_READ, MAP_SHARED, data.fd, 0);
+    require(map != MAP_FAILED, "mmap failed");
+    ggml_backend_buffer_t mapped = ggml_backend_cpu_buffer_from_ptr(map, map_bytes);
+    ggml_backend_buffer_set_usage(mapped, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    ggml_context * file_ctx = ggml_init(wparams);
+    std::vector<ggml_tensor *> filed(n_host);
+    for (int i = 0; i < n_host; ++i) {
+        filed[i] = ggml_new_tensor_2d(file_ctx, GGML_TYPE_Q8_0, K, M);
+        ggml_format_name(filed[i], "blk.%d.attn_k.weight", i);
+        require(ggml_backend_tensor_alloc(mapped, filed[i], (char *) map + offset[i]) == GGML_STATUS_SUCCESS, "alloc");
+    }
+    std::string error;
+    const int direct = ssd::platform::open_direct(data.path.c_str(), &error);
+    require(direct >= 0, "the test file has no direct reads: " + error);
+    const ssd::gpu::stream_file file = { map, map_bytes, direct };
+    require(runtime->stream.stream_files(&file, 1), "the transport refused the file");
+    for (int n_tokens : { 1, 64 }) {
+        std::vector<float> x(size_t(K) * n_tokens);
+        for (float & v : x) {
+            v = normal(rng);
+        }
+        const std::vector<float> ref = run_graph(sched, ref_w, r, n_tokens, x);
+        for (int pass = 0; pass < 2; ++pass) {
+            ggml_backend_sched_ssd_copy_stats before = {};
+            ggml_backend_sched_ssd_copy_stats_get(sched, &before);
+            const std::vector<float> got = run_graph(sched, filed, r, n_tokens, x);
+            const copy_delta d = copies_since(sched, before);
+            require(std::memcmp(got.data(), ref.data(), sizeof(float) * got.size()) == 0,
+                    "the product of the weights read from the drive differs at " + std::to_string(n_tokens) +
+                    " tokens, graph " + std::to_string(pass));
+            require(d.tensors == n_host && d.bytes == n_host * nbytes, "drive copies " + std::to_string(d.tensors));
+            std::printf("drive tokens=%d graph=%d copies=%llu ahead=%llu\n", n_tokens, pass,
+                        (unsigned long long) d.tensors, (unsigned long long) d.ahead);
+        }
+    }
+    // the file cut inside the last matrix: its read comes back short, and the graph fails
+    require(ftruncate(data.fd, off_t(offset[n_host - 1] + nbytes / 2)) == 0, "truncate failed");
+    {
+        std::vector<float> x(size_t(K) * 1, 1.0f);
+        ggml_status status = GGML_STATUS_SUCCESS;
+        (void) run_graph(sched, filed, r, 1, x, &status);
+        require(status != GGML_STATUS_SUCCESS, "a short drive read was accepted or read from the mapping");
+    }
     scheduler.reset();
+    ggml_backend_buffer_free(mapped);
+    ggml_free(file_ctx);
+    munmap(map, map_bytes);
     ggml_backend_buffer_free(plain_buf);
     ggml_backend_buffer_free(pinned_buf);
     ggml_backend_buffer_free(dev_buf);

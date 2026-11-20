@@ -25,6 +25,9 @@ public:
     uint64_t ring_bytes() const;
     // frees the ring (the graphs split before must not run again): a graph with streamed weights takes a new one
     void release_ring() noexcept;
+    // the model files the context maps, with descriptors that read around the page cache (the transport owns them):
+    // a streamed weight in a mapping is read from the drive; false when there is no GPU transport (closed then)
+    bool stream_files(const gpu::stream_file * files, size_t n) noexcept;
 private:
     // The ring holds this many of the largest streamed weights: copies run ahead of their use by about as many
     // weights while the device works on the layers it keeps.
