@@ -2580,7 +2580,7 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
-    for (short t = 0; t < args.ne22; t++) {
+    for (int t = 0; t < args.ne22; t++) {
         float s_k = 0.0f;
 
         if (G == 1) {
@@ -2698,7 +2698,7 @@ kernel void kernel_gated_delta_net_impl(
     device const float * b_ptr  = (device const float *) (b) + (i23*args.ne22*args.ne21 + i21);
     device const float * g_ptr  = (device const float *) (g) + (i23*args.ne22*args.ne21 + i21)*G;
 
-    for (short t = 0; t < args.ne22; t++) {
+    for (int t = 0; t < args.ne22; t++) {
         device const T * qt_ptr = (device const T *) (q_ptr);
         device const T * kt_ptr = (device const T *) (k_ptr);
         device const T * gt_ptr = (device const T *) (g_ptr);
