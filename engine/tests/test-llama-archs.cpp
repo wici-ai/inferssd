@@ -948,7 +948,7 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
 
     int failures = 0;
     for (ggml_backend_dev_t device : devices)
-    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35MOE, LLM_ARCH_DEEPSEEK41 }) {
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35MOE, LLM_ARCH_DEEPSEEK41, LLM_ARCH_QWEN4EXP }) {
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
@@ -1041,6 +1041,23 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
             }
             LOG_INF("%s: %s: trimmed: %s\n", __func__, name, ud.trims > 0 ? "yes" : "no");
             ok = ok && (ud.trims > 0) == grows;
+            const std::vector<float> logits_trimmed = decode_range(grown.get(), tokens, n0, n0 + 1);
+            llama_context_ptr small = make_ctx(1);
+            decode_range(small.get(), tokens, 0, n0);
+            const bool same_trimmed = logits_trimmed == decode_range(small.get(), tokens, n0, n0 + 1);
+            LOG_INF("%s: %s: trimmed vs never grown: %s\n", __func__, name, same_trimmed ? "identical" : "DIFFERENT");
+            ok = ok && same_trimmed;
+        } else {
+            // a memory that cannot drop part of a sequence (a recurrent state) starts over: a request of n0 tokens
+            // gives back the cells past 8192, and the cache decodes them as one that never grew
+            llama_memory_clear(llama_get_memory(grown.get()), true);
+            ud.trims = 0;
+            if (!llama_ssd_prefill_phase(grown.get(), true, n0, n0)) {
+                throw std::runtime_error("failed to begin a request");
+            }
+            LOG_INF("%s: %s: trimmed: %s\n", __func__, name, ud.trims > 0 ? "yes" : "no");
+            ok = ok && (ud.trims > 0) == grows;
+            decode_range(grown.get(), tokens, 0, n0);
             const std::vector<float> logits_trimmed = decode_range(grown.get(), tokens, n0, n0 + 1);
             llama_context_ptr small = make_ctx(1);
             decode_range(small.get(), tokens, 0, n0);
