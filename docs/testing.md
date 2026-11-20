@@ -77,9 +77,9 @@ comparison.
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU
 backend, and linked backends (`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`).
-The GPU SSD transport (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda` and
-`linux-rocm` presets) reads through the same read ring as the CPU sink, so no build needs
-liburing: on Linux the ring submits io_uring requests through system calls. System-ggml and runtime backend-plugin variants remain
+The GPU SSD build (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda` and
+`linux-rocm` presets) needs no liburing either: on Linux the read ring submits io_uring
+requests through system calls. System-ggml and runtime backend-plugin variants remain
 outside this store's supported build boundary. Every OS runs configured experts
 through the store and the CPU sink. The OFF configuration is retained for explicit legacy
 comparison, not as a runtime fallback. `ssd_source_index` checks the store end to
