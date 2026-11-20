@@ -172,75 +172,21 @@ void stage_release(transport_owner & owner) noexcept {
     if (allocated && owner.host) (void) owner.host->note_known_memory_change();
 }
 
-// Reads `bytes` at `offset` of `file` into `device` on the copy stream, after the copy stream waits for `wait`
-// (the release of the place it overwrites), and records `ready` after the last chunk: the worker's, unlocked.
-bool drive_copy(transport_owner & owner, cudaStream_t copy, cudaEvent_t wait, const drive_file & file,
-        uint64_t offset, size_t bytes, char * device, cudaEvent_t ready) {
-    drive_stage & st = owner.stage;
-    if (wait && cudaStreamWaitEvent(copy, wait, 0) != cudaSuccess) return false;
-    const uint64_t first = offset / file.align * file.align;
-    const uint64_t end = offset + bytes;
-    const size_t payload = st.slot_bytes - file.align; // a chunk's aligned read never exceeds its slot
-    const size_t n_chunks = size_t((end - first + payload - 1) / payload);
-    std::vector<size_t> chunk_of(st.slots.size(), SIZE_MAX);
-    size_t issued = 0, done = 0, in_flight = 0;
-    bool ok = true;
-    while (done < n_chunks && ok) {
-        unsigned queued = 0;
-        for (size_t i = 0; i < st.slots.size() && issued < n_chunks && ok; ++i) {
-            auto & slot = st.slots[i];
-            if (slot.reading) continue;
-            if (slot.copying) {
-                if (cudaEventSynchronize(slot.done) != cudaSuccess) { ok = false; break; }
-                slot.copying = false;
-            }
-            const uint64_t at = first + uint64_t(issued) * payload;
-            const uint64_t length = align_up(std::min<uint64_t>(at + payload, end) - at, file.align);
-            if (!st.ring->queue({file.fd, at, size_t(length)}, slot.host, i, false)) { ok = false; break; }
-            slot.reading = true;
-            chunk_of[i] = issued++;
-            ++queued;
-            ++in_flight;
-        }
-        if (queued && !st.ring->submit(queued)) ok = false;
-        if (!ok || in_flight == 0) break;
-        ssd::io::completion c{};
-        for (;;) {
-            const auto popped = st.ring->pop(c);
-            if (!popped) { ok = false; break; }
-            if (popped.value) break;
-            if (!st.ring->wait()) { ok = false; break; }
-        }
-        if (!ok) break;
-        --in_flight;
-        const size_t i = size_t(c.user_data);
-        if (i >= st.slots.size() || chunk_of[i] == SIZE_MAX) { ok = false; break; }
-        auto & slot = st.slots[i];
-        slot.reading = false;
-        const uint64_t at = first + uint64_t(chunk_of[i]) * payload;
-        const uint64_t from = std::max(at, offset), to = std::min(at + payload, end);
-        // a short read is a failure unless the file ends past the bytes the item needs
-        if (c.res < 0 || at + uint64_t(c.res) < to) { ok = false; break; }
-        if (cudaMemcpyAsync(device + (from - offset), slot.host + (from - at), size_t(to - from),
-                    cudaMemcpyHostToDevice, copy) != cudaSuccess ||
-                cudaEventRecord(slot.done, copy) != cudaSuccess) {
-            ok = false;
-            break;
-        }
-        slot.copying = true;
-        ++done;
-    }
-    if (!ok) {
-        // every read reaped before a slot is reused: none lands later
-        if (!st.ring->drain(nullptr, [](void *, const ssd::io::completion &) {})) fatal("drive reads");
-        for (auto & slot : st.slots) slot.reading = false;
-        return false;
-    }
-    return cudaEventRecord(ready, copy) == cudaSuccess;
-}
+// One position the drive worker copies: its item's bytes in chunks of at most a slot's payload, read in order of
+// position as slots come free and copied into the item's place as each arrives, after the copy stream waits for
+// the release of the place it overwrites.
+struct drive_job {
+    int64_t position = 0;
+    size_t index = 0;
+    drive_file file;
+    uint64_t offset = 0, first = 0, end = 0;
+    char * device = nullptr;
+    cudaEvent_t wait = nullptr, ready = nullptr;
+    size_t n_chunks = 0, issued = 0, done = 0;
+};
 
-// Under the lock: whether the drive worker can copy its next position, skipping the positions in host memory: no
-// more than a pass ahead of the uses, its place released.
+// Under the lock: the next position the drive worker can copy, skipping the positions in host memory: no more than a
+// pass ahead of the uses, its place released; false when there is none yet.
 bool drive_due(transport_owner & owner) {
     stream_state & s = owner.stream;
     const int64_t n = int64_t(s.items.size());
@@ -253,6 +199,10 @@ bool drive_due(transport_owner & owner) {
     return false;
 }
 
+
+// The drive worker: up to a slot's worth of positions in flight, in order, their chunks read as slots come free so
+// that the drive has several reads at once; a position's last chunk copied, its ready event recorded and its use let
+// through. A read that fails fails the plan's uses.
 void drive_worker(transport_owner & owner) {
     if (cudaSetDevice(owner.device) != cudaSuccess) {
         std::lock_guard<std::mutex> lock(owner.mutex);
@@ -260,35 +210,135 @@ void drive_worker(transport_owner & owner) {
         owner.changed.notify_all();
         return;
     }
+    drive_stage & st = owner.stage;
+    std::vector<drive_job> jobs;                 // in position order
+    std::vector<std::pair<int64_t, size_t>> slot_chunk; // a reading slot's position and chunk
     std::unique_lock<std::mutex> lock(owner.mutex);
+    cudaStream_t copy = nullptr;
     for (;;) {
-        owner.changed.wait(lock, [&] { return owner.stop || drive_due(owner); });
+        // positions to start, in order; none while a failure stands (the next plan clears it)
+        if (jobs.empty()) {
+            owner.changed.wait(lock, [&] { return owner.stop || drive_due(owner); });
+        }
         if (owner.stop) return;
         stream_state & s = owner.stream;
-        const int64_t n = int64_t(s.items.size());
-        const int64_t position = owner.drive_next;
-        auto & item = s.items[size_t(position % n)];
-        const int64_t before = overwritten(s, position);
-        cudaEvent_t wait = before >= 0 ? s.items[size_t(before % n)].released : nullptr;
-        const drive_file file = owner.files[size_t(item.file)];
-        const uint64_t offset = item.file_offset;
-        const size_t bytes = item.bytes;
-        char * device = static_cast<char *>(item.device);
-        cudaEvent_t ready = item.ready;
-        cudaStream_t copy = s.copy;
-        owner.busy = true;
+        copy = s.copy;
+        while (!owner.failed && jobs.size() < st.slots.size() && drive_due(owner)) {
+            const int64_t n = int64_t(s.items.size());
+            drive_job job;
+            job.position = owner.drive_next++;
+            job.index = size_t(job.position % n);
+            const auto & item = s.items[job.index];
+            const int64_t before = overwritten(s, job.position);
+            job.wait = before >= 0 ? s.items[size_t(before % n)].released : nullptr;
+            job.ready = item.ready;
+            job.file = owner.files[size_t(item.file)];
+            job.offset = item.file_offset;
+            job.first = job.offset / job.file.align * job.file.align;
+            job.end = job.offset + item.bytes;
+            job.device = static_cast<char *>(item.device);
+            const size_t payload = st.slot_bytes - job.file.align;
+            job.n_chunks = size_t((job.end - job.first + payload - 1) / payload);
+            jobs.push_back(job);
+        }
+        owner.busy = !jobs.empty();
+        if (jobs.empty()) continue;
         lock.unlock();
-        const bool ok = drive_copy(owner, copy, wait, file, offset, bytes, device, ready);
+        if (slot_chunk.size() != st.slots.size()) slot_chunk.assign(st.slots.size(), {-1, 0});
+        bool ok = true;
+        // the waits of the positions started, in order, before any of their copies
+        for (auto & job : jobs) {
+            if (job.wait && job.issued == 0 && job.done == 0) {
+                if (cudaStreamWaitEvent(copy, job.wait, 0) != cudaSuccess) ok = false;
+                job.wait = nullptr;
+            }
+        }
+        // reads into the free slots, the earliest positions first
+        unsigned queued = 0;
+        for (auto & job : jobs) {
+            const size_t payload = st.slot_bytes - job.file.align;
+            for (size_t i = 0; ok && i < st.slots.size() && job.issued < job.n_chunks; ++i) {
+                auto & slot = st.slots[i];
+                if (slot.reading) continue;
+                if (slot.copying) {
+                    if (cudaEventSynchronize(slot.done) != cudaSuccess) { ok = false; break; }
+                    slot.copying = false;
+                }
+                const uint64_t at = job.first + uint64_t(job.issued) * payload;
+                const uint64_t length = align_up(std::min<uint64_t>(at + payload, job.end) - at, job.file.align);
+                if (!st.ring->queue({job.file.fd, at, size_t(length)}, slot.host, i, false)) { ok = false; break; }
+                slot.reading = true;
+                slot_chunk[i] = {job.position, job.issued++};
+                ++queued;
+            }
+        }
+        if (ok && queued && !st.ring->submit(queued)) ok = false;
+        // one read back: its chunk copied into its place
+        bool reading = false;
+        for (const auto & slot : st.slots) reading = reading || slot.reading;
+        if (ok && reading) {
+            ssd::io::completion c{};
+            for (;;) {
+                const auto popped = st.ring->pop(c);
+                if (!popped) { ok = false; break; }
+                if (popped.value) break;
+                if (!st.ring->wait()) { ok = false; break; }
+            }
+            const size_t i = size_t(c.user_data);
+            drive_job * job = nullptr;
+            if (ok && i < st.slots.size()) {
+                for (auto & j : jobs) if (j.position == slot_chunk[i].first) job = &j;
+            }
+            if (ok && job) {
+                auto & slot = st.slots[i];
+                slot.reading = false;
+                const size_t payload = st.slot_bytes - job->file.align;
+                const uint64_t at = job->first + uint64_t(slot_chunk[i].second) * payload;
+                const uint64_t from = std::max(at, job->offset), to = std::min(at + payload, job->end);
+                // a short read is a failure unless the file ends past the bytes the item needs
+                if (c.res < 0 || at + uint64_t(c.res) < to ||
+                        cudaMemcpyAsync(job->device + (from - job->offset), slot.host + (from - at), size_t(to - from),
+                                        cudaMemcpyHostToDevice, copy) != cudaSuccess ||
+                        cudaEventRecord(slot.done, copy) != cudaSuccess) {
+                    ok = false;
+                } else {
+                    slot.copying = true;
+                    ++job->done;
+                }
+            } else if (ok) {
+                ok = false;
+            }
+        }
+        // the positions whose every chunk was copied: ready
+        std::vector<int64_t> finished;
+        for (auto & job : jobs) {
+            if (ok && job.done == job.n_chunks) {
+                if (cudaEventRecord(job.ready, copy) != cudaSuccess) { ok = false; break; }
+                finished.push_back(job.position);
+            }
+        }
+        if (!ok) {
+            // every read reaped before a slot is reused: none lands later
+            if (!st.ring->drain(nullptr, [](void *, const ssd::io::completion &) {})) fatal("drive reads");
+            for (auto & slot : st.slots) slot.reading = false;
+        }
         lock.lock();
-        owner.busy = false;
-        if (ok) {
-            item.copied = position;
-            owner.drive_next = position + 1;
-        } else {
-            std::fprintf(stderr, "[ssd.transport] drive read of %s (%zu bytes at %llu) failed\n", item.name.c_str(),
-                         bytes, static_cast<unsigned long long>(offset));
+        stream_state & now = owner.stream;
+        for (int64_t position : finished) {
+            for (size_t k = 0; k < jobs.size(); ++k) {
+                if (jobs[k].position != position) continue;
+                now.items[jobs[k].index].copied = position;
+                jobs.erase(jobs.begin() + long(k));
+                break;
+            }
+        }
+        if (!ok) {
+            std::fprintf(stderr, "[ssd.transport] a drive read of %zu positions from %lld failed\n", jobs.size(),
+                         jobs.empty() ? -1LL : static_cast<long long>(jobs.front().position));
+            jobs.clear();
             owner.failed = true;
         }
+        owner.busy = !jobs.empty();
         owner.changed.notify_all();
     }
 }
