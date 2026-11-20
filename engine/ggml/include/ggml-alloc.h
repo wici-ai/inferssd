@@ -57,7 +57,8 @@ GGML_API void ggml_gallocr_set_auto_reserve(ggml_gallocr_t galloc, bool enabled)
 // call with a worst-case graph to avoid buffer reallocations
 // not strictly required for single buffer usage: ggml_gallocr_alloc_graph will reallocate the buffers automatically if needed
 // returns false if the buffer allocation failed
-// ggml_gallocr_resrve_n_size writes the buffer sizes per galloc buffer that would be allocated by ggml_gallocr_reserve_n to sizes
+// ggml_gallocr_resrve_n_size writes the buffer sizes per galloc buffer that would be allocated by ggml_gallocr_reserve_n to sizes;
+// a buffer that several buffer ids share (one buffer type) has its size at the first of them and 0 at the others
 GGML_API bool ggml_gallocr_reserve(ggml_gallocr_t galloc, struct ggml_cgraph * graph);
 GGML_API void ggml_gallocr_reserve_n_size(
     ggml_gallocr_t galloc,

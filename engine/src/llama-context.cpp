@@ -9,6 +9,7 @@
 #include "ssd/model-adapter.h"
 #include "ssd/host-gather.h"
 #include "ssd/dense-homes.h"
+#include "ggml-ssd/gpu/shared-memory.h"
 #include "ggml-ssd/platform/file.h"
 #include "llama-io.h"
 #include "llama-memory.h"
@@ -698,14 +699,6 @@ static std::map<ggml_backend_buffer_type_t, size_t> llama_memory_size(const llam
     return sizes;
 }
 
-// Whether a device's memory is the host's DRAM (Apple silicon, a GPU that shares the host's memory).
-static bool llama_dev_shares_host_memory(ggml_backend_dev_t dev) {
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto * shares = reg ? (bool (*)(ggml_backend_dev_t))
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ssd_dev_shares_host_memory") : nullptr;
-    return shares && shares(dev);
-}
-
 uint32_t llama_context::fit_context(const llama_memory_params & params_mem) const {
     constexpr uint32_t step = 8192;
     const uint32_t n_train = model.hparams.n_ctx_train;
@@ -722,7 +715,8 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
         return 0;
     }
     // The room the expert caches would otherwise take: host memory (with a device's that is the host's) as the host
-    // arbiter measures it, a discrete device's free memory less vram.reserve_mib.
+    // arbiter measures it, and each device's free memory less vram.reserve_mib. A device that shares the host's memory
+    // has that limit of its own as well (Metal: the working set it keeps resident).
     const auto measured = ssd_runtime->host->measure(0);
     if (!measured) {
         LLAMA_LOG_WARN("%s: cannot measure host memory: %s\n", __func__, measured.error.c_str());
@@ -739,18 +733,27 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
         const double at_small = small.count(buft) ? double(small.at(buft)) : 0.0;
         const double cell = (double(bytes) - at_small) / double(n_train - step);
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        term * t = &host;
-        if (dev && !ggml_backend_buft_is_host(buft) && !llama_dev_shares_host_memory(dev)) {
+        const bool device = dev && !ggml_backend_buft_is_host(buft);
+        const bool shared = device && ssd::gpu::shares_host_memory(dev);
+        std::vector<term *> terms;
+        if (!device || shared) {
+            terms.push_back(&host);
+        }
+        if (device) {
             auto inserted = devices.emplace(dev, term{});
-            t = &inserted.first->second;
             if (inserted.second) {
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(dev, &free, &total);
-                t->room = free > reserve ? double(free - reserve) : 0.0;
+                // a device that shares the host's memory and reports none has no limit beside the host's
+                inserted.first->second.room = shared && total == 0 ? HUGE_VAL :
+                    free > reserve ? double(free - reserve) : 0.0;
             }
+            terms.push_back(&inserted.first->second);
         }
-        t->fixed += at_small - cell*step;
-        t->cell  += cell;
+        for (term * t : terms) {
+            t->fixed += at_small - cell*step;
+            t->cell  += cell;
+        }
     }
     const auto fits = [&](uint32_t n) {
         const auto holds = [n](const term & t) { return t.fixed + t.cell*n <= t.room; };
@@ -3311,16 +3314,22 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         }
     }
     uint64_t host_bytes = 0, device_bytes = 0;
+    std::map<ggml_backend_dev_t, uint64_t> shared_bytes; // the growth on each device that shares the host's memory
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         // Query AFTER the probe: it can have released chunks even when the
         // replacement's total bytes fit inside the previous aggregate size.
         if (required[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
-            auto & bytes = ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes;
+            const bool host = ggml_backend_buft_is_host(backend_buft[i]);
+            auto & bytes = host ? host_bytes : device_bytes;
             if (required[i] > UINT64_MAX - bytes) {
                 ggml_backend_sched_reset(sched.get());
                 return false;
             }
             bytes += required[i];
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (!host && dev && ssd::gpu::shares_host_memory(dev)) {
+                shared_bytes[dev] += required[i];
+            }
         }
     }
     const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
@@ -3330,6 +3339,21 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, room.error.c_str());
         ggml_backend_sched_reset(sched.get());
         return false;
+    }
+    // A device that shares the host's memory has a limit of its own beside the host's: Metal keeps at most its
+    // recommended working set resident, and past it a command buffer fails when it runs, though the allocation went
+    // through. So the graph's growth on such a device fits what the device reports free, once the host's room is taken
+    // (where the GPU tier is on unified memory, it has given back its blocks by then); a graph that does not is
+    // refused as one that gets no memory. A discrete device's allocation fails by itself when the device is full.
+    for (const auto & [dev, bytes] : shared_bytes) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0 && bytes > free) {
+            LLAMA_LOG_ERROR("%s: %s refused: the graph needs %.1f MiB more of it, %.1f of %.1f MiB are free\n",
+                __func__, ggml_backend_dev_name(dev), bytes / 1048576.0, free / 1048576.0, total / 1048576.0);
+            ggml_backend_sched_reset(sched.get());
+            return false;
+        }
     }
     // the room is taken, the pages the graph gathers among it: what reads them may start
     if (admitted) { admitted(); }
