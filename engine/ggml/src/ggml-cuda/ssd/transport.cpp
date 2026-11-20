@@ -402,6 +402,18 @@ bool stream_plan_impl(transport_owner & owner, const ssd::gpu::stream_item * ite
     }
     s.ring_bytes = ring_bytes;
     s.pass_bytes = pass_bytes;
+    size_t mapped = 0, drive = 0;
+    for (const auto & item : s.items) {
+        const char * at = static_cast<const char *>(item.host);
+        for (const auto & file : owner.files) {
+            if (at >= file.base && at + item.bytes <= file.base + file.bytes) { ++mapped; break; }
+        }
+        drive += item.file >= 0 ? 1 : 0;
+    }
+    if (mapped != drive) {
+        std::fprintf(stderr, "[ssd.transport] %zu of %zu streamed weights in a mapped file read through the mapping: "
+                     "no pinned slots for drive reads\n", mapped - drive, mapped);
+    }
     owner.changed.notify_all();
     return true;
 }
@@ -478,6 +490,10 @@ bool stream_files_impl(transport_owner & owner, const ssd::gpu::stream_file * fi
         if (file.fd < 0 || !ssd::platform::is_direct(file.fd) || !ssd::platform::file_size(file.fd, file.size) ||
                 (file.align = ssd::platform::direct_alignment(file.fd)) == 0 || drive_chunk % file.align != 0 ||
                 file.size < file.bytes) {
+            std::fprintf(stderr, "[ssd.transport] file %zu: not read from the drive (fd %d, direct %d, size %llu of "
+                         "%llu mapped, granule %zu)\n", i, file.fd, file.fd >= 0 && ssd::platform::is_direct(file.fd),
+                         static_cast<unsigned long long>(file.size), static_cast<unsigned long long>(file.bytes),
+                         file.align);
             if (file.fd >= 0) ssd::platform::close_fd(file.fd);
             continue;
         }
