@@ -793,6 +793,8 @@ struct ggml_backend_sched {
     struct ggml_cgraph * prepared_graph;
     uint64_t prepared_uid;
     bool prepared_reserved;
+    // the first pre-allocated tensor the last split could not place: no backend of its buffer runs its op
+    const struct ggml_tensor * unplaceable;
 
     int n_backends;
 
@@ -953,9 +955,13 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     }
 
     if (tensor->buffer || (tensor->view_src && tensor->view_src->buffer)) {
-        // since the tensor is pre-allocated, it cannot be moved to another backend
-        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
-        GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+        // since the tensor is pre-allocated, it cannot be moved to another backend: the graph cannot be placed as it
+        // is. The split stops there and its caller refuses the graph, as one that gets no memory (a backend refuses an
+        // op whose tensors outgrow what its kernels address, and the same graph over fewer tokens may run)
+        if (sched->unplaceable == NULL) {
+            sched->unplaceable = tensor;
+        }
+        return -1;
     }
 
     // graph input
@@ -1169,10 +1175,12 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
     }
 }
 
-// assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
-void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+// assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend; stops after
+// the first pass when a pre-allocated tensor cannot be placed (sched->unplaceable)
+static void ggml_backend_sched_split_graph_impl(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     sched->prepared_graph = nullptr;
     sched->prepared_reserved = false;
+    sched->unplaceable = NULL;
     // reset splits
     sched->n_splits = 0;
     sched->n_graph_inputs = 0;
@@ -1216,6 +1224,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
 #endif
         }
+    }
+    if (sched->unplaceable != NULL) {
+        return;
     }
 
     // pass 2: expand current backend assignments
@@ -1719,6 +1730,30 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
 }
 
+// Whether the last split placed every tensor; when it did not, the graph is refused: the scheduler is reset and the
+// call that split it fails.
+static bool ggml_backend_sched_placed(ggml_backend_sched_t sched) {
+    const struct ggml_tensor * tensor = sched->unplaceable;
+    if (tensor == NULL) {
+        return true;
+    }
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    GGML_LOG_WARN("%s: pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s): the graph is refused\n",
+        __func__, tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+    ggml_backend_sched_reset(sched);
+    return false;
+}
+
+// A caller that has no failure to return cannot run a graph it cannot place.
+void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    ggml_backend_sched_split_graph_impl(sched, graph);
+    if (sched->unplaceable != NULL) {
+        const struct ggml_tensor * tensor = sched->unplaceable;
+        ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+        GGML_ABORT("pre-allocated tensor (%s) in a buffer (%s) that cannot run the operation (%s)", tensor->name, ggml_backend_buffer_name(buffer), ggml_op_name(tensor->op));
+    }
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -2180,7 +2215,10 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
     GGML_ASSERT(sched);
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
     ggml_backend_sched_synchronize(sched);
-    ggml_backend_sched_split_graph(sched, measure_graph);
+    ggml_backend_sched_split_graph_impl(sched, measure_graph);
+    if (!ggml_backend_sched_placed(sched)) {
+        return false;
+    }
     const bool ok = ggml_gallocr_reserve_n(sched->galloc, &sched->graph,
         sched->node_backend_ids, sched->leaf_backend_ids) && ggml_backend_sched_reserve_backend_scratch(sched);
     ggml_backend_sched_reset(sched);
@@ -2200,7 +2238,10 @@ bool ggml_backend_sched_prepare_graph(ggml_backend_sched_t sched, struct ggml_cg
     // Copies are selected before the sole split and stay fixed through compute.
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
-    ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_split_graph_impl(sched, graph);
+    if (!ggml_backend_sched_placed(sched)) {
+        return false;
+    }
     ggml_gallocr_reserve_n_size(sched->galloc, &sched->graph,
         sched->node_backend_ids, sched->leaf_backend_ids, sizes);
     sched->prepared_graph = graph;
@@ -2255,7 +2296,10 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->cur_copy = sched->next_copy;
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
 
-    ggml_backend_sched_split_graph(sched, graph);
+    ggml_backend_sched_split_graph_impl(sched, graph);
+    if (!ggml_backend_sched_placed(sched)) {
+        return false;
+    }
 
     if (!ggml_backend_sched_alloc_splits(sched)) {
         return false;

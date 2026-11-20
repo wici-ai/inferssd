@@ -3154,11 +3154,13 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         }
     }
     std::vector<size_t> required(backend_ptrs.size(), 0);
+    // A GPU backend refuses an op whose tensors outgrow what its kernels address. Where the op writes into that GPU's
+    // own buffer (a state cache), it cannot move: the scheduler cannot place the graph, and the graph is refused here.
     if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
-    // A GPU backend refuses an op whose tensors outgrow what its kernels address, and the scheduler runs it on the
-    // CPU: for a long prompt in one ubatch, minutes a layer. So a prompt's graph runs on the GPU what the decode graph
-    // runs there; one that would not is refused as one that gets no memory, and the batch is split again
-    // (prefill_refit) into ubatches whose ops stay where decode runs them.
+    // Elsewhere the scheduler runs such an op on the CPU: for a long prompt in one ubatch, minutes a layer. So a
+    // prompt's graph runs on the GPU what the decode graph runs there; one that would not is refused as well. A graph
+    // refused either way is one that gets no memory: the batch is split again (prefill_refit) into ubatches whose ops
+    // stay where decode runs them.
     if (!prefill) {
         std::unordered_set<std::string> gpu, host;
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
