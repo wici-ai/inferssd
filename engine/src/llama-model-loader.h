@@ -105,6 +105,11 @@ struct llama_model_loader {
     // Set by load_tensors while expert loading is deferred for an SSD executor: the
     // routed-expert tensors take the plain CPU buffer type, an ordinary mmap.
     bool map_deferred_experts = false;
+    // Set for a model whose SSD context homes the layers' matrices (llama_model_params::ssd_homes): a repeating
+    // layer's matrix (a weight of a matrix product) that a discrete GPU whose backend streams would hold takes the
+    // plain CPU buffer type instead, the mapped GGUF under mmap; homed_matrices lists each with its layer.
+    bool home_layer_matrices = false;
+    std::vector<std::pair<int, ggml_tensor *>> homed_matrices;
     bool no_alloc;
 
     llama_files files;

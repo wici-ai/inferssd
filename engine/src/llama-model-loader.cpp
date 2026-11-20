@@ -1,5 +1,6 @@
 #include "llama-model-loader.h"
 #include "ssd/model-source.h"
+#include "ssd/dense-homes.h"
 
 #include "ggml-alloc.h"
 #include "ggml.h"
@@ -1101,6 +1102,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     ggml_op weight_op = GGML_OP_NONE;   // the op the tensor table gives the weight (buft_for_tensor)
+    bool homed = false;                 // a layer's matrix homed in host memory (home_layer_matrices)
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
@@ -1254,6 +1256,14 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
+            // a layer's matrix that a discrete GPU whose backend streams would hold: its home is host memory, the
+            // SSD context moves it into the GPU while the GPU's memory holds it (llama_dense_homes)
+            ggml_backend_dev_t layer_dev = ggml_backend_buft_get_device(buft);
+            if (home_layer_matrices && info.layer == LLM_TENSOR_LAYER_REPEATING && op == GGML_OP_MUL_MAT &&
+                    ggml_n_dims(t_meta) <= 2 && !ggml_backend_buft_is_host(buft) && llama_ssd_device_streams(layer_dev)) {
+                buft = ggml_backend_cpu_buffer_type();
+                homed = true;
+            }
         }
 
         // avoid using a host buffer when using mmap
@@ -1314,6 +1324,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (homed) {
+            homed_matrices.emplace_back(tn.bid, ret);
+        }
         return ret;
     }
 
@@ -1348,6 +1361,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     ggml_set_name(tensor, ggml_get_name(cur));
     if (weight_op == GGML_OP_MUL_MAT) {
         mul_mat_weights.insert(tensor);
+    }
+    if (homed) {
+        homed_matrices.emplace_back(tn.bid, tensor);
     }
 
     if (duplicated) {

@@ -11,9 +11,11 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model.h"
+#include "../src/ssd/dense-homes.h"
 #include "../src/llama-model-saver.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cinttypes>
 #include <cstdio>
@@ -1113,10 +1115,11 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
             }
         }
         const bool on_cpu = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
-        // the model, its layers' matrices homed in buft when there is one
-        const auto load = [&](ggml_backend_buffer_type_t buft, const char * pattern) {
+        // the model, its layers' matrices homed in buft when there is one, or homed for the SSD context to place
+        const auto load = [&](ggml_backend_buffer_type_t buft, const char * pattern, bool ssd_homes = false) {
             llama_model_params model_params = llama_model_default_params();
             model_params.progress_callback = silent_model_load_progress;
+            model_params.ssd_homes = ssd_homes;
             // the CPU as a CPU-only server has it: no device list, the context's own CPU backend running the graph
             std::vector<ggml_backend_dev_t> devs = { device, nullptr };
             model_params.devices = on_cpu ? nullptr : devs.data();
@@ -1135,8 +1138,9 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
         const std::vector<llama_token> tokens = get_tokens(n_prompt + n_next, n_vocab, seed);
 
         // a request as the server makes it: its prompt between the phase's begin and the prefill's end, then its
-        // next tokens one at a time
-        const auto run = [&](const llama_model * m, const llama_ssd_options * ssd) {
+        // next tokens one at a time; placed: after the context is made, before its first batch
+        const auto run = [&](const llama_model * m, const llama_ssd_options * ssd,
+                             const std::function<void()> & placed = {}) {
             llama_context_params ctx_params = llama_context_default_params();
             ctx_params.n_ctx           = n_ctx;
             ctx_params.n_batch         = 256;
@@ -1149,6 +1153,9 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
             llama_context_ptr lctx(llama_init_from_model(const_cast<llama_model *>(m), ctx_params));
             if (!lctx) {
                 throw std::runtime_error("failed to create llama context");
+            }
+            if (placed) {
+                placed();
             }
             if (!llama_ssd_prefill_phase(lctx.get(), true, n_prompt, n_prompt)) {
                 throw std::runtime_error("failed to begin a request");
@@ -1180,6 +1187,29 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
             ggml_backend_buffer_type_t pinned = ggml_backend_dev_host_buffer_type(device);
             if (pinned) {
                 check("matrices streamed from pinned memory", run(load(pinned, layer).get(), options.get()));
+            }
+            // the layers' matrices homed for the SSD context: the GPU holds every layer its memory has room for (all
+            // of them here), and streams the ones it gives back
+            llama_model_ptr homed = load(nullptr, nullptr, true);
+            llama_dense_homes * homes = homed->dense_homes();
+            if (llama_ssd_device_streams(device)) {
+                if (!homes || homes->held_bytes() != 0 || homes->streamed_bytes() == 0) {
+                    throw std::runtime_error("the layers' matrices were not homed in host memory");
+                }
+                check("matrices homed and held", run(homed.get(), options.get(), [&] {
+                    if (homes->streamed_bytes() != 0) {
+                        throw std::runtime_error("the GPU did not hold every layer");
+                    }
+                }));
+                check("one layer given back", run(homed.get(), options.get(), [&] { homes->give_back(1); }));
+                check("every layer given back", run(homed.get(), options.get(), [&] {
+                    homes->give_back(SIZE_MAX);
+                    if (homes->held_bytes() != 0) {
+                        throw std::runtime_error("a layer was not given back");
+                    }
+                }));
+            } else if (homes) {
+                throw std::runtime_error("layers homed for a GPU that does not stream");
             }
         }
     }

@@ -309,6 +309,12 @@ private:
     // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
     // SSD experts, whose KV cache allocates its cells as they are used).
     uint32_t fit_context(const llama_memory_params & params_mem) const;
+
+    // The layers' matrices the model homes in host memory (llama_dense_homes) with an SSD context on a GPU that
+    // streams: the GPU holds those its memory has room for once the graph is reserved, ahead of the expert caches, and
+    // gives layers back when the KV cache grows past what the expert caches can give (they stream from then on).
+    void hold_dense_layers();
+    bool give_dense_layers(size_t bytes);
     // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
     uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos

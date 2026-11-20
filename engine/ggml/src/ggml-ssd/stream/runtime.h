@@ -17,7 +17,16 @@ public:
     runtime(const runtime &) = delete;
     runtime & operator=(const runtime &) = delete;
     void attach(ggml_backend_sched_t scheduler);
+    // the device bytes of the ring for streamed weights whose largest has `largest` bytes, at most
+    static uint64_t ring_bytes_for(uint64_t largest) { return ring_weights * largest; }
+    // the device bytes of the ring now
+    uint64_t ring_bytes() const;
+    // frees the ring (the graphs split before must not run again): a graph with streamed weights takes a new one
+    void release_ring() noexcept;
 private:
+    // The ring holds this many of the largest streamed weights: copies run ahead of their use by about as many
+    // weights while the device works on the layers it keeps.
+    static constexpr uint64_t ring_weights = 4;
     static const ggml_backend_sched_ssd_hooks hooks_;
     const runtime_services & services_;
     std::mutex mutex_;

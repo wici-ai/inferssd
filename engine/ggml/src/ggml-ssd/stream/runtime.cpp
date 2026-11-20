@@ -4,11 +4,6 @@
 #include <algorithm>
 
 namespace ssd { namespace stream {
-namespace {
-// The ring holds this many of the largest streamed weights: copies run ahead of their use by about as many weights
-// while the device works on the layers it keeps.
-constexpr uint64_t ring_weights = 4;
-}
 
 const ggml_backend_sched_ssd_hooks runtime::hooks_{
     2, sizeof(ggml_backend_sched_ssd_hooks),
@@ -31,6 +26,21 @@ runtime::~runtime() {
 
 void runtime::attach(ggml_backend_sched_t scheduler) {
     ggml_backend_sched_set_ssd_runtime(scheduler, &hooks_, this);
+}
+
+uint64_t runtime::ring_bytes() const {
+    return ring_ ? ggml_backend_buffer_get_size(ring_) : 0;
+}
+
+void runtime::release_ring() noexcept {
+    if (!ring_) { return; }
+    if (services_.gpu && services_.gpu_transport) {
+        (void) services_.gpu->transport->stream_plan(services_.gpu_transport, nullptr, 0, 0, 0, nullptr);
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    items_.clear();
+    ggml_backend_buffer_free(ring_); // freeing device memory waits for the work that reads it
+    ring_ = nullptr;
 }
 
 bool runtime::stream_home(const ggml_tensor * tensor) const noexcept {
