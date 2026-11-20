@@ -1782,6 +1782,64 @@ static void test_responses_system_messages() {
     }
 }
 
+// Claude Code puts system messages in the conversation too, such as its system reminders after the user's message.
+// They are converted as CC Switch converts Claude requests for models that take no system message mid-conversation:
+// the leading one stays, a later one becomes a user message where it stands, and one between an assistant's tool
+// calls and their results moves right after the results.
+static void test_anthropic_system_messages() {
+    LOG_DBG("%s\n", __func__);
+
+    const auto convert = [](const json & messages) {
+        return server_chat_convert_anthropic_to_oai(json{
+                   { "model", "test-model" },
+                   { "max_tokens", 64 },
+                   { "system", json::array({ { { "type", "text" }, { "text", "You are a Claude agent." } } }) },
+                   { "messages", messages } })
+            .at("messages");
+    };
+    json turn1 = json::array({
+        { { "role", "user" }, { "content", json::array({ { { "type", "text" }, { "text", "hi" } } }) } },
+        { { "role", "system" }, { "content", "<system-reminder>env</system-reminder>" } },
+    });
+    const json msgs1 = convert(turn1);
+    assert_equals((size_t)3, msgs1.size());
+    assert_equals(std::string("system"), msgs1[0].at("role").get<std::string>());
+    assert_equals(std::string("user"), msgs1[2].at("role").get<std::string>());
+    assert_equals(std::string("<system-reminder>env</system-reminder>"), msgs1[2].at("content").get<std::string>());
+
+    // tool calls stay next to their results, and an empty system message is dropped
+    json turn2 = turn1;
+    turn2.push_back({ { "role", "assistant" }, { "content", json::array({
+        { { "type", "tool_use" }, { "id", "a" }, { "name", "f" }, { "input", json::object() } },
+        { { "type", "tool_use" }, { "id", "b" }, { "name", "f" }, { "input", json::object() } } }) } });
+    turn2.push_back({ { "role", "system" }, { "content", "between" } });
+    turn2.push_back({ { "role", "user" }, { "content", json::array({
+        { { "type", "tool_result" }, { "tool_use_id", "a" }, { "content", "1" } },
+        { { "type", "tool_result" }, { "tool_use_id", "b" }, { "content", "2" } } }) } });
+    turn2.push_back({ { "role", "system" }, { "content", "" } });
+    turn2.push_back({ { "role", "user" }, { "content", "next" } });
+    const json msgs2 = convert(turn2);
+    assert_equals((size_t)8, msgs2.size());
+    for (size_t i = 0; i < msgs1.size(); i++) {
+        assert_equals(msgs1[i].dump(), msgs2[i].dump());
+    }
+    const std::vector<std::string> roles = { "system", "user", "user", "assistant", "tool", "tool", "user", "user" };
+    for (size_t i = 0; i < roles.size(); i++) {
+        assert_equals(roles[i], msgs2[i].at("role").get<std::string>());
+    }
+    assert_equals(std::string("between"), msgs2[6].at("content").get<std::string>());
+
+    for (const char * path : { "models/templates/Qwen-Qwen3.8-Flash-Next.jinja", "models/templates/bartowski-Qwen3.8-Flash-Next.jinja",
+                               "models/templates/unsloth-Qwen3.8-Flash-Next.jinja", "models/templates/unsloth-Qwen3.6-35B-A3B.jinja" }) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs inputs;
+        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs1);
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        assert_equals(true, prompt.find("<|im_start|>user\nhi<|im_end|>\n<|im_start|>user\n<system-reminder>env</system-reminder><|im_end|>\n") !=
+                                std::string::npos);
+    }
+}
+
 static void test_muse_spark_peg_parsers(bool detailed_debug) {
     // Exercise prompt rendering as well as output parsing: the old capability
     // detector cannot discover these features through Muse's Jinja macros.
@@ -5041,6 +5099,7 @@ int main(int argc, char ** argv) {
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_responses_system_messages();
+        test_anthropic_system_messages();
         test_reka_edge_common_path();
         test_template_reasoning();
         test_template_output_peg_parsers(detailed_debug);

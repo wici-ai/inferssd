@@ -496,6 +496,59 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     }
 }
 
+// Claude Code puts system messages in the conversation too, such as its system reminders after the user's message.
+// Chat templates often take one system message at the start and raise on the others or drop them. As CC Switch
+// converts Claude requests for models that take no system message mid-conversation
+// (demote_mid_conversation_system_messages): the leading ones stay, a later one becomes a user message where it
+// stands, so the request stays append-only across turns, and one between an assistant's tool calls and their
+// results moves right after the results. An empty one is dropped.
+static void anthropic_demote_mid_conversation_system_messages(json & messages) {
+    const auto is_role = [](const json & message, const char * role) {
+        return json_value(message, "role", std::string()) == role;
+    };
+    size_t leading = 0;
+    while (leading < messages.size() && is_role(messages[leading], "system")) {
+        leading++;
+    }
+    bool later = false;
+    for (size_t i = leading; i < messages.size() && !later; i++) {
+        later = is_role(messages[i], "system");
+    }
+    if (!later) {
+        return;
+    }
+
+    json out = json::array();
+    for (size_t i = 0; i < leading; i++) {
+        out.push_back(std::move(messages[i]));
+    }
+    std::vector<json> deferred;
+    for (size_t i = leading; i < messages.size(); i++) {
+        json & message = messages[i];
+        if (is_role(message, "system")) {
+            const json content = json_value(message, "content", json());
+            const bool empty   = content.is_null() || (content.is_string() && content.get<std::string>().empty()) ||
+                               (content.is_array() && content.empty());
+            if (!empty) {
+                message["role"] = "user";
+                deferred.push_back(std::move(message));
+            }
+            continue;
+        }
+        if (!is_role(message, "tool")) {
+            for (auto & d : deferred) {
+                out.push_back(std::move(d));
+            }
+            deferred.clear();
+        }
+        out.push_back(std::move(message));
+    }
+    for (auto & d : deferred) {
+        out.push_back(std::move(d));
+    }
+    messages = std::move(out);
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
@@ -646,6 +699,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    anthropic_demote_mid_conversation_system_messages(oai_messages);
     oai_body["messages"] = oai_messages;
 
     // Convert tools
