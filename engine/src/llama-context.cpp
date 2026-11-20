@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-node-name.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -3277,12 +3278,13 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     // Elsewhere the scheduler runs such an op on the CPU: for a long prompt in one ubatch, minutes a layer. So a
     // prompt's graph runs on the GPU what the decode graph runs there; one that would not is refused as well. A graph
     // refused either way is one that gets no memory: the batch is split again (prefill_refit) into ubatches whose ops
-    // stay where decode runs them.
+    // stay where decode runs them. A node is the same op in both graphs by the name the model gave it; ggml's names
+    // for unnamed nodes are their positions, which in the other graph are other ops.
     if (!prefill) {
         std::unordered_set<std::string> gpu, host;
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node->name[0] != '\0') {
+            if (llama_node_name_is_given(node->name)) {
                 (llama_sched_runs_on_host(sched.get(), node) ? host : gpu).insert(node->name);
             }
         }
@@ -3295,7 +3297,8 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         const char * first = nullptr;
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
             ggml_tensor * node = ggml_graph_node(graph, i);
-            if (node->name[0] != '\0' && decode_gpu_nodes.count(node->name) && llama_sched_runs_on_host(sched.get(), node)) {
+            if (llama_node_name_is_given(node->name) && decode_gpu_nodes.count(node->name) &&
+                    llama_sched_runs_on_host(sched.get(), node)) {
                 first = first ? first : node->name;
                 ++moved;
             }
