@@ -38,6 +38,7 @@ MODEL_OPTIONS = frozenset(
 PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
+    "kimi-k3": None,
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
     "gemma4": None,  # Ordinary RAM inference; no expert index or SSD executor.
@@ -46,6 +47,7 @@ PROFILES: dict[str, Optional[str]] = {
 ARCHITECTURES = {
     "deepseek41": "dsv",
     "muse-spark": "muse",
+    "kimi-k3": "kimi-k3",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
     "gemma4": "gemma4",
@@ -656,14 +658,17 @@ def _resolve(
                 "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
                 literal(item, platform),
             ]
+    # K3's non-expert weights alone can exceed a single GPU. Fit those layers before
+    # the SSD tier takes its share of the remaining memory.
+    fit_layers = profile == "kimi-k3" and bool(gpu_backends)
     command += [
         "--no-mmap" if ordinary and weights == ram.COPIED else "--mmap",
         "--no-repack",
         "--fit",
-        "off",
+        "on" if fit_layers else "off",
         "--no-warmup",
         "-ngl",
-        "0" if ordinary and not gpu_backends else "99",
+        "auto" if fit_layers else "0" if ordinary and not gpu_backends else "99",
         "-c",
         str(context),
         "-b",

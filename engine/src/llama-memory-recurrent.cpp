@@ -114,11 +114,18 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        ggml_backend_buffer_t buf = hparams.no_alloc ? ggml_backend_buft_alloc_buffer(buft, 0) :
+            ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for rs cache");
         }
-        ggml_backend_buffer_clear(buf, 0);
+        if (hparams.no_alloc) {
+            for (auto * t = ggml_get_first_tensor(ctx.get()); t; t = ggml_get_next_tensor(ctx.get(), t)) {
+                t->buffer = buf;
+            }
+        } else {
+            ggml_backend_buffer_clear(buf, 0);
+        }
         LLAMA_LOG_INFO("%s: %10s RS buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
@@ -382,8 +389,10 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
     std::map<ggml_backend_buffer_type_t, size_t> ret;
-    for (const auto & [_, buf] : ctxs_bufs) {
-        ret[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    for (const auto & [ctx, buf] : ctxs_bufs) {
+        auto * buft = ggml_backend_buffer_get_type(buf.get());
+        ret[buft] += hparams.no_alloc ? ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) :
+            ggml_backend_buffer_get_size(buf.get());
     }
     return ret;
 }

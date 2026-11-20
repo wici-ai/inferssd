@@ -1750,6 +1750,23 @@ static void test_muse_spark_peg_parsers(bool detailed_debug) {
             assert_equals(true, prompt.find(expected) != std::string::npos);
         }
     }
+    // K3 GGUFs use XTML control tokens around ordinary text tag names.
+    {
+        const std::string tmpl =
+            R"({% for m in messages %}<|open|>message role="{{ m.role }}"<|sep|>{{ m.content }}<|close|>message<|sep|><|end_of_msg|>{% endfor %})"
+            R"({% if add_generation_prompt %}<|open|>message role="assistant"<|sep|>{% if enable_thinking %}<|open|>think<|sep|>{% else %}<|open|>response<|sep|>{% endif %}{% endif %})";
+        common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, tmpl));
+        for (bool thinking : {false, true}) {
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params.enable_thinking = thinking;
+                tc.params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+                tc.input = thinking ? "Calculate.<|close|>think<|sep|><|open|>response<|sep|>" : "";
+                tc.input += "5<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>";
+                tc.expect = simple_assist_msg("5", thinking ? "Calculate." : "");
+            }, detailed_debug);
+        }
+    }
+
     // Muse Spark format tests
     {
         auto tst = peg_tester("models/templates/muse-spark.jinja", detailed_debug);

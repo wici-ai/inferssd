@@ -2056,10 +2056,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         GGML_ASSERT(n_tokens >= 1);
 
         const auto requirements = llama_ssd::describe_experts(arch, hparams, il);
+        const auto expected_gate = requirements.activation == llama_ssd::expert_activation::situ ? LLM_FFN_SITU : LLM_FFN_SILU;
         const llama_ssd::expert_inputs inputs = {
             backend_cpu != nullptr, cpu_sink_runtime != nullptr, up_exps, gate_exps, down_exps,
             gate_up_exps, gate_up_exps_b, gate_inp_b, up_exps_b, gate_exps_b, down_exps_b,
-            up_exps_s, gate_exps_s, down_exps_s, n_embd, n_tokens, type_op == LLM_FFN_SILU,
+            up_exps_s, gate_exps_s, down_exps_s, n_embd, n_tokens, type_op == expected_gate,
             cpu_sink_prefill, weight_before_ffn, loras && !loras->empty(),
             post_exp_norm, post_exp_norm_eps, w_scale};
         const auto adapted = llama_ssd::validate_experts(requirements, inputs);
@@ -2082,6 +2083,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             case llama_ssd::expert_activation::swiglu:
                 descriptor->activation =
                     ssd_cpu_sink_activation { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+                break;
+            case llama_ssd::expert_activation::situ:
+                descriptor->activation = { SSD_CPU_SINK_ACTIVATION_SITU, hparams.situ_beta, hparams.situ_linear_beta, 0.0f };
                 break;
             case llama_ssd::expert_activation::unsupported:
                 GGML_ABORT("invalid accepted SSD expert activation");

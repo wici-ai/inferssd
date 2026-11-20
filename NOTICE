@@ -27,6 +27,11 @@ source tree.
    the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
    The ggml authors. MIT (engine/LICENSE).
 
+   Kimi K3 text model support in engine/src/models/kimi-k3.cpp adapts the
+   Kimi K3 graph from ggml-org/llama.cpp (pull request 26185), under the
+   same MIT license. Its cross-layer residual and recurrent attention
+   normalization follow upstream revision 9581154.
+
    The stable CPU softplus formula in engine/ggml/src/ggml-cpu/unary-ops.cpp
    follows ggml-org/llama.cpp revision 9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e
    under the same MIT license, using log1pf(expf(x)) to retain the negative
