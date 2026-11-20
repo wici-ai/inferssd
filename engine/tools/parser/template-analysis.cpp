@@ -390,8 +390,6 @@ static void analyze_template(const std::string & template_path) {
         LOG_ERR("%ssupports_tools:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_tools ? "true" : "false");
         LOG_ERR("%ssupports_tool_calls:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_tool_calls ? "true" : "false");
         LOG_ERR("%ssupports_system_role:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_system_role ? "true" : "false");
-        LOG_ERR("%ssupports_system_role_multiple:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_system_role_multiple ? "true" : "false");
-        LOG_ERR("%ssupports_system_role_late:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_system_role_late ? "true" : "false");
         LOG_ERR("%ssupports_parallel_tool_calls:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_parallel_tool_calls ? "true" : "false");
         LOG_ERR("%ssupports_typed_content:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_typed_content ? "true" : "false");
         LOG_ERR("%ssupports_string_content:%s %s\n", ANSI_BLUE, ANSI_RESET, caps.supports_string_content ? "true" : "false");

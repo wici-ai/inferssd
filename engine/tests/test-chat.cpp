@@ -1703,78 +1703,82 @@ static void test_convert_responses_to_chatcmpl() {
     }
 }
 
-// Codex sends several developer messages at the start of a conversation and another one after the user's
-// environment context. Templates that take one system message at the start, or system messages only at the start,
-// raise on that ("System message must be at the beginning."): the leading ones are merged into one and a later one
-// is rendered as a user message where it stands.
-static void test_system_message_placement() {
+// Codex sends its instructions and several developer messages at the start, another developer message at the start
+// of a later turn, and now and then one inside a tool-call loop. They are converted as CC Switch's Codex proxy
+// converts them for Chat Completions: the leading ones become one system message, a later one that a user message
+// follows becomes a user message where it stands, and any other later one joins the first system message.
+static void test_responses_system_messages() {
     LOG_DBG("%s\n", __func__);
 
-    json input = json::parse(R"({
-        "input": [
-            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Base instructions."}]},
-            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "App context."}]},
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>cwd</environment_context>"}]},
-            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<time_context>today</time_context>"}]},
-            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "who are you"}]}
-        ],
-        "model": "test-model"
-    })");
-    const json msgs = server_chat_convert_responses_to_chatcmpl(input).at("messages");
-
-    struct case_t {
-        const char * path;
-        bool         multiple;
-        bool         late;
+    const auto message = [](const char * role, const char * text) {
+        return json{ { "type", "message" }, { "role", role },
+                     { "content", json::array({ { { "type", role == std::string("assistant") ? "output_text" : "input_text" },
+                                                  { "text", text } } }) } };
     };
-    for (const auto & c : std::vector<case_t>{
-             { "models/templates/Qwen-Qwen3.8-Flash-Next.jinja",      false, false },
-             { "models/templates/bartowski-Qwen3.8-Flash-Next.jinja", false, false },
-             { "models/templates/unsloth-Qwen3.8-Flash-Next.jinja",   true,  false },
-             { "models/templates/Qwen3.5-4B.jinja",                   false, false },
-         }) {
-        auto       tmpls = read_templates(c.path);
-        const auto caps  = common_chat_templates_get_caps(tmpls.get());
-        assert_equals(c.multiple, caps.at("supports_system_role_multiple"));
-        assert_equals(c.late, caps.at("supports_system_role_late"));
+    json turn1 = json::array({
+        { { "type", "message" }, { "role", "developer" }, { "content", json::array({
+            { { "type", "input_text" }, { "text", "App context." } }, { { "type", "input_text" }, { "text", "Skills." } } }) } },
+        message("developer", "  "),
+        message("user", "<environment_context>cwd</environment_context>"),
+        message("developer", "<time_context>today</time_context>"),
+        message("user", "who are you"),
+    });
+    const auto convert = [](const json & input) {
+        return server_chat_convert_responses_to_chatcmpl(
+                   json{ { "instructions", "Base instructions." }, { "input", input }, { "model", "test-model" } })
+            .at("messages");
+    };
 
+    const json msgs1 = convert(turn1);
+    assert_equals((size_t)4, msgs1.size());
+    assert_equals(std::string("system"), msgs1[0].at("role").get<std::string>());
+    assert_equals(std::string("Base instructions.\n\nApp context.\n\nSkills."), msgs1[0].at("content").get<std::string>());
+    assert_equals(std::string("user"), msgs1[2].at("role").get<std::string>());
+    assert_equals(std::string("<time_context>today</time_context>"), msgs1[2].at("content").get<std::string>());
+
+    // a later turn opened by a developer message: the earlier request stays a prefix
+    json turn2 = turn1;
+    turn2.push_back(message("assistant", "I am Codex."));
+    turn2.push_back(message("developer", "Permissions: read-only"));
+    turn2.push_back(message("user", "list files"));
+    const json msgs2 = convert(turn2);
+    assert_equals((size_t)7, msgs2.size());
+    for (size_t i = 0; i < msgs1.size(); i++) {
+        assert_equals(msgs1[i].dump(), msgs2[i].dump());
+    }
+    assert_equals(std::string("user"), msgs2[5].at("role").get<std::string>());
+    assert_equals(std::string("Permissions: read-only"), msgs2[5].at("content").get<std::string>());
+
+    // a developer notice inside a tool-call loop joins the first system message, so the loop stays one turn
+    json turn3 = turn2;
+    turn3.push_back({ { "type", "function_call" }, { "call_id", "call_1" }, { "name", "shell" }, { "arguments", "{}" } });
+    turn3.push_back({ { "type", "function_call_output" }, { "call_id", "call_1" }, { "output", "a.txt" } });
+    turn3.push_back(message("developer", "<image_resize_notice>resized</image_resize_notice>"));
+    turn3.push_back(message("assistant", "One file."));
+    const json msgs3 = convert(turn3);
+    assert_equals((size_t)10, msgs3.size());
+    assert_equals(std::string("Base instructions.\n\nApp context.\n\nSkills.\n\n<image_resize_notice>resized</image_resize_notice>"),
+                  msgs3[0].at("content").get<std::string>());
+    assert_equals(std::string("tool"), msgs3[8].at("role").get<std::string>());
+    assert_equals(std::string("assistant"), msgs3[9].at("role").get<std::string>());
+
+    // templates that take one system message at the start render the first turn; Qwen3.6's dropped the third
+    // leading developer message and the later one
+    for (const char * path : { "models/templates/Qwen-Qwen3.8-Flash-Next.jinja", "models/templates/bartowski-Qwen3.8-Flash-Next.jinja",
+                               "models/templates/unsloth-Qwen3.8-Flash-Next.jinja", "models/templates/Qwen3.5-4B.jinja",
+                               "models/templates/unsloth-Qwen3.6-35B-A3B.jinja" }) {
+        auto tmpls = read_templates(path);
         common_chat_templates_inputs inputs;
-        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs);
+        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs1);
         const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
-
-        const size_t system   = prompt.find("<|im_start|>system\n");
-        const size_t leading  = prompt.find("Base instructions.\nApp context.<|im_end|>\n");
+        const size_t leading  = prompt.find("Base instructions.\n\nApp context.\n\nSkills.<|im_end|>\n");
         const size_t env      = prompt.find("<|im_start|>user\n<environment_context>cwd</environment_context><|im_end|>\n");
         const size_t time     = prompt.find("<|im_start|>user\n<time_context>today</time_context><|im_end|>\n");
         const size_t question = prompt.find("<|im_start|>user\nwho are you<|im_end|>\n");
-        assert_equals(true, system == 0 && leading != std::string::npos && leading < env && env != std::string::npos &&
-                                env < time && time != std::string::npos && time < question &&
-                                question != std::string::npos);
-        assert_equals(std::string::npos, prompt.find("<|im_start|>system", system + 1));
-    }
-
-    // a template that renders system messages anywhere gets them as they are
-    for (const char * path : { "models/templates/unsloth-Qwen3.6-35B-A3B.jinja", "models/templates/google-gemma-4-31B-it.jinja",
-                               "models/templates/deepseek-ai-DeepSeek-V4.1.jinja" }) {
-        auto       tmpls = read_templates(path);
-        const auto caps  = common_chat_templates_get_caps(tmpls.get());
-        assert_equals(true, caps.at("supports_system_role_multiple"));
-        assert_equals(true, caps.at("supports_system_role_late"));
-    }
-
-    // Mistral Small 3.2 counts a system message as a turn when it checks for alternating roles: it renders one
-    // between two user messages (the Codex case) and refuses one after an assistant message, so later ones stay
-    {
-        auto       tmpls = read_templates("models/templates/Mistral-Small-3.2-24B-Instruct-2506.jinja");
-        const auto caps  = common_chat_templates_get_caps(tmpls.get());
-        assert_equals(false, caps.at("supports_system_role_multiple"));
-        assert_equals(true, caps.at("supports_system_role_late"));
-
-        common_chat_templates_inputs inputs;
-        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs);
-        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
-        assert_equals(true, prompt.find("[SYSTEM_PROMPT]Base instructions.\nApp context.[/SYSTEM_PROMPT]") != std::string::npos);
-        assert_equals(true, prompt.find("[SYSTEM_PROMPT]<time_context>today</time_context>[/SYSTEM_PROMPT]") != std::string::npos);
+        assert_equals((size_t)0, prompt.find("<|im_start|>system\n"));
+        assert_equals(std::string::npos, prompt.find("<|im_start|>system", 1));
+        assert_equals(true, leading != std::string::npos && leading < env && env != std::string::npos && env < time &&
+                                time != std::string::npos && time < question && question != std::string::npos);
     }
 }
 
@@ -5036,7 +5040,7 @@ int main(int argc, char ** argv) {
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
-        test_system_message_placement();
+        test_responses_system_messages();
         test_reka_edge_common_path();
         test_template_reasoning();
         test_template_output_peg_parsers(detailed_debug);
