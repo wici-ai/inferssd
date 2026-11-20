@@ -784,10 +784,16 @@ void llama_context::hold_dense_layers() {
     // the ring was cut for every matrix streamed: a new one for those that still stream
     ssd_runtime->stream.release_ring();
     ggml_backend_dev_memory(homes->device(), &free, &total);
+    const size_t pinned_before = homes->pinned_bytes();
     const size_t held = homes->hold(free > keep ? free - keep : 0);
-    LLAMA_LOG_INFO("%s: %s holds %.2f GiB of the layers' matrices, %.2f GiB stream (%.2f GiB free, %.2f GiB kept)\n",
-            __func__, ggml_backend_dev_name(homes->device()), homes->held_bytes() / 1073741824.0,
-            homes->streamed_bytes() / 1073741824.0, free / 1073741824.0, keep / 1073741824.0);
+    if (homes->pinned_bytes() != pinned_before && ssd_runtime->host) {
+        (void) ssd_runtime->host->note_known_memory_change(); // the held layers' pinned copies went
+    }
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s holds %.2f GiB of the layers' matrices, %.2f GiB stream (%.2f GiB of them pinned; "
+            "%.2f GiB free, %.2f GiB kept)\n", __func__, ggml_backend_dev_name(homes->device()),
+            homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0, free / 1073741824.0, keep / 1073741824.0);
     // the graph reserved before read the matrices in host memory and placed their copies in the ring just freed
     if (gf_res_prev) { gf_res_prev->reset(); }
     sched_need_reserve = true;
@@ -807,13 +813,39 @@ bool llama_context::give_dense_layers(size_t bytes) {
     if (!given) {
         return false;
     }
-    LLAMA_LOG_INFO("%s: %s gave back %.2f GiB of the layers' matrices for %.2f MiB: %.2f GiB held, %.2f GiB stream\n",
-            __func__, ggml_backend_dev_name(homes->device()), given / 1073741824.0, bytes / 1048576.0,
-            homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0);
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s gave back %.2f GiB of the layers' matrices for %.2f MiB: %.2f GiB held, %.2f GiB stream "
+            "(%.2f GiB of them pinned)\n", __func__, ggml_backend_dev_name(homes->device()), given / 1073741824.0,
+            bytes / 1048576.0, homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0);
     // the graphs split before read the given-back matrices in the device
     if (gf_res_prev) { gf_res_prev->reset(); }
     sched_need_reserve = true;
     return true;
+}
+
+void llama_context::pin_dense_layers() {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || !ssd_runtime || !ssd_runtime->host || !ssd_runtime->services.gpu_transport) {
+        return;
+    }
+    size_t pinned = 0;
+    for (size_t bytes = homes->next_pin_bytes(); bytes; bytes = homes->next_pin_bytes()) {
+        auto ticket = ssd_runtime->host->take(bytes);
+        if (!ticket) {
+            break;
+        }
+        if (!homes->pin_next()) {
+            ticket.value.cancel();
+            break;
+        }
+        ticket.value.commit();
+        pinned += bytes;
+    }
+    // the graphs split before stream the matrices from where they were
+    if (pinned && gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 uint32_t llama_context::memory_n_pos() const {

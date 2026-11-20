@@ -12,9 +12,11 @@
 bool llama_ssd_device_streams(ggml_backend_dev_t dev);
 
 // The layers' matrices of a model whose SSD context homes them (llama_model_params::ssd_homes). Each lives in host
-// memory, where the model loaded it; a GPU holds a copy of as many layers as its memory allows, and the context streams
-// the others to it for each graph (ggml_backend_sched_ssd_hooks). Every token uses every layer, so the layers come
-// before the expert caches; the KV cache of the context comes before both as it grows.
+// memory, where the model loaded it (the mapped GGUF); a GPU holds a copy of as many layers as its memory allows, and
+// the context streams the others to it for each graph (ggml_backend_sched_ssd_hooks), from a copy in the GPU's pinned
+// host memory where the host's budget has room for one (a pinned copy crosses the bus at its full rate, a mapped or
+// plain one at about 60% of it). Every token uses every layer, so the layers come before the expert caches; the KV cache
+// of the context comes before both as it grows.
 //
 // The layers held are spread over the model: any count of them is a prefix of one order, the layer indices in
 // bit-reversed order, so that a streamed layer sits between held ones and its copy overlaps their work. A held layer's
@@ -42,10 +44,17 @@ public:
     size_t streamed_bytes() const;
     // the device bytes the next layer to hold takes, 0 when the device holds every layer
     size_t next_bytes() const;
+    // the host bytes of the streamed layers' pinned copies, and those the next copy takes (0: every streamed layer has
+    // one, or the GPU has no pinned host memory)
+    size_t pinned_bytes() const;
+    size_t next_pin_bytes() const;
 
     // holds the next layers in order while their copies fit in `budget` bytes of the device's memory: the bytes held
-    // anew. The work queued on the device must not read the matrices meanwhile.
+    // anew; a layer held gives up its pinned copy. The work queued on the device must not read the matrices meanwhile.
     size_t hold(size_t budget);
+    // a pinned copy of the next streamed layer without one, the last in order first (the last to be held again): false
+    // when there is none or it cannot be had
+    bool pin_next();
     // gives back held layers, the last held first, until `bytes` of device memory are free again: the bytes given
     // back. The work queued on the device must be complete.
     size_t give_back(size_t bytes);
@@ -60,7 +69,8 @@ private:
         int il = -1;
         std::vector<matrix> matrices;
         size_t host_bytes = 0;
-        ggml_backend_buffer_t copy = nullptr; // the device copy while held
+        ggml_backend_buffer_t copy = nullptr;   // the device copy while held
+        ggml_backend_buffer_t pinned = nullptr; // the pinned host copy it streams from
     };
     ggml_backend_dev_t dev = nullptr;
     std::vector<layer> layers;     // by layer index
@@ -68,4 +78,6 @@ private:
     size_t n_held = 0;             // a prefix of order
 
     size_t device_bytes(const layer & l) const;
+    size_t pin_bytes(const layer & l) const;
+    layer * next_to_pin();
 };

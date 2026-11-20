@@ -315,6 +315,8 @@ private:
     // gives layers back when the KV cache grows past what the expert caches can give (they stream from then on).
     void hold_dense_layers();
     bool give_dense_layers(size_t bytes);
+    // the streamed layers' pinned host copies, as far as the context's host budget has room
+    void pin_dense_layers();
     // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
     uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos
