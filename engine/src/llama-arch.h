@@ -141,7 +141,7 @@ enum llm_arch {
     LLM_ARCH_LLAMA_EMBED,
     LLM_ARCH_MAINCODER,
     LLM_ARCH_KIMI_LINEAR,
-    // 129 is reserved for the retired K3 architecture.
+    LLM_ARCH_KIMI_K3 = 129,
     // 130 is reserved for the retired draft architecture.
     LLM_ARCH_UNKNOWN = 131,
 };
@@ -663,6 +663,13 @@ enum llm_tensor {
     LLM_TENSOR_ENGRAM_WKV,
     LLM_TENSOR_ENGRAM_GATE,
     LLM_TENSOR_FFN_EXP_PROBS_B_VL,
+    LLM_TENSOR_SSM_G,
+    LLM_TENSOR_ATTN_RES_SCORE,
+    LLM_TENSOR_FFN_RES_SCORE,
+    LLM_TENSOR_OUTPUT_RES_SCORE,
+    LLM_TENSOR_FFN_ROUTED_DOWN,
+    LLM_TENSOR_FFN_ROUTED_UP,
+    LLM_TENSOR_FFN_ROUTED_NORM,
 };
 
 enum llm_tensor_layer {
