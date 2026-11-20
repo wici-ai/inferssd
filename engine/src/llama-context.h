@@ -28,7 +28,7 @@ struct llama_memory_i;
 struct llama_memory_context_i;
 struct llama_memory_params;
 
-// The copies of the weights homed on the drive in one phase of a request (the [dense_stream] line): the prefill from
+// The copies of the streamed weights in one phase of a request (the [dense_stream] line): the prefill from
 // the request's start to its end, the decode from there to the request's end.  begin when the phase starts, add the
 // tokens of each ubatch, end when it ends with the scheduler's counters then.  end returns the line, without a
 // newline, and nothing for a phase that copied no such weight.

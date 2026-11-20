@@ -346,7 +346,6 @@ llama_context::llama_context(
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
-            ssd_runtime->prepare_dense(model);
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -1109,7 +1108,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     auto complete_vram_phase = [&](bool decode) {
         return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
-    // One line per request phase with the copies of the weights homed on the drive: a request's start ends the
+    // One line per request phase with the copies of the streamed weights: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
         ggml_backend_sched_ssd_copy_stats now = {};
@@ -3297,12 +3296,11 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
     if (phase == nullptr || tensors == 0) {
         return {};
     }
-    char line[320];
+    char line[256];
     snprintf(line, sizeof(line), "[dense_stream] phase=%s tokens=%" PRIu64 " tensors=%" PRIu64 " bytes=%" PRIu64
-        " read_us=%" PRIu64 " first_us=%" PRIu64 " wait_us=%" PRIu64 " readahead=%" PRIu64 " fallbacks=%" PRIu64,
+        " issue_us=%" PRIu64 " ahead=%" PRIu64,
         phase, tokens, tensors, now.dense_bytes - start.dense_bytes, now.dense_read_us - start.dense_read_us,
-        now.dense_first_us - start.dense_first_us, now.dense_wait_us - start.dense_wait_us,
-        now.dense_readahead - start.dense_readahead, now.dense_fallbacks - start.dense_fallbacks);
+        now.dense_readahead - start.dense_readahead);
     return line;
 }
 

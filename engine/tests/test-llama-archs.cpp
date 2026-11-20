@@ -1083,13 +1083,17 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
         throw std::runtime_error(std::string("failed to create SSD options: ") + error);
     }
 
-    // the CPU, and every GPU with the model and its cache on it
-    std::vector<ggml_backend_dev_t> devices = { ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU) };
+    // every GPU with the model and its cache on it; the CPU where there is none (with a GPU the SSD context runs the
+    // layers on it, wherever the model keeps their weights)
+    std::vector<ggml_backend_dev_t> devices;
     for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
         ggml_backend_dev_t dev = ggml_backend_dev_get(i);
         if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
             devices.push_back(dev);
         }
+    }
+    if (devices.empty()) {
+        devices.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
     }
 
     int failures = 0;
@@ -1108,23 +1112,31 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
                 gguf_add_tensor(gguf_ctx.get(), &t);
             }
         }
-        llama_model_params model_params = llama_model_default_params();
-        model_params.progress_callback = silent_model_load_progress;
-        // the CPU as a CPU-only server has it: no device list, the context's own CPU backend running the graph
-        std::vector<ggml_backend_dev_t> devs = { device, nullptr };
-        model_params.devices = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? nullptr : devs.data();
-        model_params.n_gpu_layers = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU ? 0 : 999;
-        size_t tmp = seed;
-        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
-        if (!model) {
-            throw std::runtime_error("failed to create llama model");
-        }
+        const bool on_cpu = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // the model, its layers' matrices homed in buft when there is one
+        const auto load = [&](ggml_backend_buffer_type_t buft, const char * pattern) {
+            llama_model_params model_params = llama_model_default_params();
+            model_params.progress_callback = silent_model_load_progress;
+            // the CPU as a CPU-only server has it: no device list, the context's own CPU backend running the graph
+            std::vector<ggml_backend_dev_t> devs = { device, nullptr };
+            model_params.devices = on_cpu ? nullptr : devs.data();
+            model_params.n_gpu_layers = on_cpu ? 0 : 999;
+            const llama_model_tensor_buft_override homes[] = { { pattern, buft }, { nullptr, nullptr } };
+            model_params.tensor_buft_overrides = buft ? homes : nullptr;
+            size_t tmp = seed;
+            llama_model_ptr loaded(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+            if (!loaded) {
+                throw std::runtime_error("failed to create llama model");
+            }
+            return loaded;
+        };
+        llama_model_ptr model = load(nullptr, nullptr);
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
         const std::vector<llama_token> tokens = get_tokens(n_prompt + n_next, n_vocab, seed);
 
         // a request as the server makes it: its prompt between the phase's begin and the prefill's end, then its
         // next tokens one at a time
-        const auto run = [&](const llama_ssd_options * ssd) {
+        const auto run = [&](const llama_model * m, const llama_ssd_options * ssd) {
             llama_context_params ctx_params = llama_context_default_params();
             ctx_params.n_ctx           = n_ctx;
             ctx_params.n_batch         = 256;
@@ -1134,7 +1146,7 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
             ctx_params.n_threads       = 4;
             ctx_params.n_threads_batch = 4;
             ctx_params.ssd_options     = ssd;
-            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            llama_context_ptr lctx(llama_init_from_model(const_cast<llama_model *>(m), ctx_params));
             if (!lctx) {
                 throw std::runtime_error("failed to create llama context");
             }
@@ -1151,12 +1163,25 @@ static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
             }
             return logits;
         };
-        const std::vector<float> plain = run(nullptr);
-        const std::vector<float> ssd = run(options.get());
-        const bool ok = plain == ssd;
-        printf("%s: llama on %s: SSD context vs none: %s (nmse %.3g)\n", __func__, ggml_backend_dev_name(device),
-                ok ? "identical" : "DIFFERENT", nmse(plain, ssd));
-        failures += ok ? 0 : 1;
+        const std::vector<float> plain = run(model.get(), nullptr);
+        const auto check = [&](const char * what, const std::vector<float> & got) {
+            const bool ok = plain == got;
+            printf("%s: llama on %s: %s vs no SSD context: %s (nmse %.3g)\n", __func__, ggml_backend_dev_name(device),
+                    what, ok ? "identical" : "DIFFERENT", nmse(plain, got));
+            failures += ok ? 0 : 1;
+        };
+        check("SSD context", run(model.get(), options.get()));
+        if (!on_cpu) {
+            // the second layer's matrices in host memory, plain and pinned: the GPU runs their products, their
+            // bytes streamed in for each graph, and gives the logits it gives with them in its memory
+            const char * layer = "blk\\.1\\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_down|ffn_up)\\.weight";
+            check("matrices streamed from host memory",
+                    run(load(ggml_backend_cpu_buffer_type(), layer).get(), options.get()));
+            ggml_backend_buffer_type_t pinned = ggml_backend_dev_host_buffer_type(device);
+            if (pinned) {
+                check("matrices streamed from pinned memory", run(load(pinned, layer).get(), options.get()));
+            }
+        }
     }
 
     llama_log_set(ud.callback, ud.user_data);
