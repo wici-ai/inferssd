@@ -850,8 +850,10 @@ void llama_context::pin_dense_layers() {
         return;
     }
     size_t pinned = 0;
+    // a pinned copy grows as a cache does (a layer without one streams from the drive): within the host budget less
+    // its headroom, the expert caches giving room for it
     for (size_t bytes = homes->next_pin_bytes(); bytes; bytes = homes->next_pin_bytes()) {
-        auto ticket = ssd_runtime->host->take(bytes);
+        auto ticket = ssd_runtime->host->take(bytes, 0, ssd::host::requester::ram_cache);
         if (!ticket) {
             break;
         }
