@@ -17,6 +17,8 @@ public:
     runtime(const runtime &) = delete;
     runtime & operator=(const runtime &) = delete;
     void attach(ggml_backend_sched_t scheduler);
+    // whether the weights in host memory stream to the GPU (the default) or keep the scheduler's own rule
+    void set_streaming(bool streaming) noexcept { streaming_ = streaming; }
     // the device bytes of the ring for streamed weights whose largest has `largest` bytes, at most
     static uint64_t ring_bytes_for(uint64_t largest) { return ring_weights * largest; }
     // the device bytes of the ring now
@@ -32,6 +34,7 @@ private:
     std::mutex mutex_;
     ggml_backend_sched_ssd_copy_stats stats_{};
     int phase_ = 0;
+    bool streaming_ = true;
     ggml_backend_buffer_t ring_ = nullptr;
     std::vector<gpu::stream_item> items_;
     bool stream_home(const ggml_tensor *) const noexcept;

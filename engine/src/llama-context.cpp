@@ -318,6 +318,9 @@ llama_context::llama_context(
 
         if (ssd_runtime) {
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            // A model without routed experts streams the layers it keeps in host memory to the GPU; one with them
+            // keeps the scheduler's own rule for any weight there, as before.
+            ssd_runtime->stream.set_streaming(model.hparams.n_expert == 0);
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here

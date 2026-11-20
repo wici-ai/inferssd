@@ -44,7 +44,7 @@ void runtime::release_ring() noexcept {
 }
 
 bool runtime::stream_home(const ggml_tensor * tensor) const noexcept {
-    return tensor && services_.gpu && services_.gpu_transport;
+    return streaming_ && tensor && services_.gpu && services_.gpu_transport;
 }
 
 // The copies in a ring of a few of the largest weights, each at the same place in every graph: a graph's copies follow

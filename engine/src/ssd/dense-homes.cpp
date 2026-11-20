@@ -167,6 +167,9 @@ bool llama_dense_homes::pin_next() {
         m.tensor->buffer = pinned;
         m.tensor->data = base + offset;
         offset += GGML_PAD(ggml_nbytes(m.tensor), align);
+        if (drop_pages) {
+            drop_pages(m.host_data, ggml_nbytes(m.tensor));
+        }
     }
     l->pinned = pinned;
     return true;
@@ -236,6 +239,11 @@ size_t llama_dense_homes::hold(size_t budget) {
         if (l.pinned) {
             ggml_backend_buffer_free(l.pinned);
             l.pinned = nullptr;
+        }
+        if (drop_pages) {
+            for (const auto & m : l.matrices) {
+                drop_pages(m.host_data, ggml_nbytes(m.tensor));
+            }
         }
         l.copy = copy;
         held += bytes;

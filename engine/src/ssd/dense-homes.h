@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <vector>
 
 // Whether a GPU's backend streams the weights a context keeps in host memory to it (the SSD provider's transport):
@@ -31,6 +32,9 @@ public:
 
     // a matrix of layer il in host memory, whose layer runs on dev
     void add(int il, ggml_backend_dev_t dev, ggml_tensor * matrix);
+    // drops the file pages behind host bytes of the model's mapping (nothing for other memory): a layer's mapped pages
+    // go once a device or pinned copy holds its matrices, read from the file again if it streams from them later
+    void set_drop_pages(std::function<void(const void *, size_t)> drop) { drop_pages = std::move(drop); }
     // the order the layers are held in, once every matrix is added
     void finish();
 
@@ -76,6 +80,7 @@ private:
     std::vector<layer> layers;     // by layer index
     std::vector<size_t> order;     // indices into layers, the order they are held in
     size_t n_held = 0;             // a prefix of order
+    std::function<void(const void *, size_t)> drop_pages;
 
     size_t device_bytes(const layer & l) const;
     size_t pin_bytes(const layer & l) const;

@@ -8978,6 +8978,16 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             bytes += ggml_nbytes(matrix);
         }
         homes->finish();
+        homes->set_drop_pages([this](const void * data, size_t bytes) {
+            for (const auto & mapping : pimpl->mappings) {
+                const auto * base = static_cast<const uint8_t *>(mapping->addr());
+                const auto * at = static_cast<const uint8_t *>(data);
+                if (at >= base && at + bytes <= base + mapping->size()) {
+                    (void) mapping->dontneed_fragment(size_t(at - base), size_t(at - base) + bytes);
+                    return;
+                }
+            }
+        });
         LLAMA_LOG_INFO("%s: %zu layer matrices (%.2f GiB) homed in host memory for the SSD context to place\n",
                 __func__, ml.homed_matrices.size(), bytes / 1024.0 / 1024.0 / 1024.0);
         pimpl->dense_homes = std::move(homes);
