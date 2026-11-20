@@ -1703,6 +1703,81 @@ static void test_convert_responses_to_chatcmpl() {
     }
 }
 
+// Codex sends several developer messages at the start of a conversation and another one after the user's
+// environment context. Templates that take one system message at the start, or system messages only at the start,
+// raise on that ("System message must be at the beginning."): the leading ones are merged into one and a later one
+// is rendered as a user message where it stands.
+static void test_system_message_placement() {
+    LOG_DBG("%s\n", __func__);
+
+    json input = json::parse(R"({
+        "input": [
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Base instructions."}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "App context."}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "<environment_context>cwd</environment_context>"}]},
+            {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "<time_context>today</time_context>"}]},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "who are you"}]}
+        ],
+        "model": "test-model"
+    })");
+    const json msgs = server_chat_convert_responses_to_chatcmpl(input).at("messages");
+
+    struct case_t {
+        const char * path;
+        bool         multiple;
+        bool         late;
+    };
+    for (const auto & c : std::vector<case_t>{
+             { "models/templates/Qwen-Qwen3.8-Flash-Next.jinja",      false, false },
+             { "models/templates/bartowski-Qwen3.8-Flash-Next.jinja", false, false },
+             { "models/templates/unsloth-Qwen3.8-Flash-Next.jinja",   true,  false },
+             { "models/templates/Qwen3.5-4B.jinja",                   false, false },
+         }) {
+        auto       tmpls = read_templates(c.path);
+        const auto caps  = common_chat_templates_get_caps(tmpls.get());
+        assert_equals(c.multiple, caps.at("supports_system_role_multiple"));
+        assert_equals(c.late, caps.at("supports_system_role_late"));
+
+        common_chat_templates_inputs inputs;
+        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs);
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+
+        const size_t system   = prompt.find("<|im_start|>system\n");
+        const size_t leading  = prompt.find("Base instructions.\nApp context.<|im_end|>\n");
+        const size_t env      = prompt.find("<|im_start|>user\n<environment_context>cwd</environment_context><|im_end|>\n");
+        const size_t time     = prompt.find("<|im_start|>user\n<time_context>today</time_context><|im_end|>\n");
+        const size_t question = prompt.find("<|im_start|>user\nwho are you<|im_end|>\n");
+        assert_equals(true, system == 0 && leading != std::string::npos && leading < env && env != std::string::npos &&
+                                env < time && time != std::string::npos && time < question &&
+                                question != std::string::npos);
+        assert_equals(std::string::npos, prompt.find("<|im_start|>system", system + 1));
+    }
+
+    // a template that renders system messages anywhere gets them as they are
+    for (const char * path : { "models/templates/unsloth-Qwen3.6-35B-A3B.jinja", "models/templates/google-gemma-4-31B-it.jinja",
+                               "models/templates/deepseek-ai-DeepSeek-V4.1.jinja" }) {
+        auto       tmpls = read_templates(path);
+        const auto caps  = common_chat_templates_get_caps(tmpls.get());
+        assert_equals(true, caps.at("supports_system_role_multiple"));
+        assert_equals(true, caps.at("supports_system_role_late"));
+    }
+
+    // Mistral Small 3.2 counts a system message as a turn when it checks for alternating roles: it renders one
+    // between two user messages (the Codex case) and refuses one after an assistant message, so later ones stay
+    {
+        auto       tmpls = read_templates("models/templates/Mistral-Small-3.2-24B-Instruct-2506.jinja");
+        const auto caps  = common_chat_templates_get_caps(tmpls.get());
+        assert_equals(false, caps.at("supports_system_role_multiple"));
+        assert_equals(true, caps.at("supports_system_role_late"));
+
+        common_chat_templates_inputs inputs;
+        inputs.messages          = common_chat_msgs_parse_oaicompat(msgs);
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        assert_equals(true, prompt.find("[SYSTEM_PROMPT]Base instructions.\nApp context.[/SYSTEM_PROMPT]") != std::string::npos);
+        assert_equals(true, prompt.find("[SYSTEM_PROMPT]<time_context>today</time_context>[/SYSTEM_PROMPT]") != std::string::npos);
+    }
+}
+
 static void test_muse_spark_peg_parsers(bool detailed_debug) {
     // Exercise prompt rendering as well as output parsing: the old capability
     // detector cannot discover these features through Muse's Jinja macros.
@@ -4961,6 +5036,7 @@ int main(int argc, char ** argv) {
         test_tools_oaicompat_json_conversion();
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
+        test_system_message_placement();
         test_reka_edge_common_path();
         test_template_reasoning();
         test_template_output_peg_parsers(detailed_debug);

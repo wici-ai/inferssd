@@ -11,6 +11,8 @@ struct caps {
     bool supports_tools = true;
     bool supports_tool_calls = true;
     bool supports_system_role = true;
+    bool supports_system_role_multiple = true; // more than one system message at the start
+    bool supports_system_role_late = true;     // a system message after a user or assistant message
     bool supports_parallel_tool_calls = true;
     bool supports_preserve_reasoning = false; // support assistant message with reasoning_content
 

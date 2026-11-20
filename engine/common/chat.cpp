@@ -1813,6 +1813,99 @@ static void system_message_not_supported(json & messages) {
     }
 }
 
+static bool is_system_message(const json & message) {
+    const auto role = message.value("role", std::string());
+    return role == "system" || role == "developer";
+}
+
+static bool is_empty_content(const json & content) {
+    return content.is_null() || ((content.is_string() || content.is_array()) && content.empty());
+}
+
+// a message content (a string, typed parts or null) as typed parts
+static json content_as_parts(const json & content) {
+    if (content.is_array()) {
+        return content;
+    }
+    if (is_empty_content(content)) {
+        return json::array();
+    }
+    return json::array({ json{ { "type", "text" }, { "text", content } } });
+}
+
+// the text of a content that holds only text (a string, text parts or null)
+static std::optional<std::string> content_text(const json & content) {
+    if (content.is_null()) {
+        return std::string();
+    }
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return std::nullopt;
+    }
+    std::string text;
+    for (const auto & part : content) {
+        if (part.value("type", std::string()) != "text") {
+            return std::nullopt;
+        }
+        text += part.value("text", std::string());
+    }
+    return text;
+}
+
+// a template that takes one system message at the start: the leading ones become one, their texts joined by a
+// newline as the templates that merge them themselves do. Text stays one string or one text part, since some
+// templates read only the first part of a system message.
+static void merge_leading_system_messages(json & messages) {
+    size_t n = 0;
+    while (n < messages.size() && is_system_message(messages[n])) {
+        n++;
+    }
+    if (n < 2) {
+        return;
+    }
+    LOG_DBG("Merging %zu leading system messages into one\n", n);
+    json & content = messages[0]["content"];
+    for (size_t i = 1; i < n; i++) {
+        const json next = messages[i].value("content", json());
+        if (is_empty_content(next)) {
+            continue;
+        }
+        const auto text      = content_text(content);
+        const auto next_text = content_text(next);
+        if (text && next_text) {
+            const std::string joined = text->empty() ? *next_text : *text + "\n" + *next_text;
+            content = content.is_array() || (content.is_null() && next.is_array()) ?
+                          json::array({ json{ { "type", "text" }, { "text", joined } } }) :
+                          json(joined);
+        } else {
+            json parts = content_as_parts(content);
+            parts.push_back({ { "type", "text" }, { "text", "\n" } });
+            for (const auto & part : content_as_parts(next)) {
+                parts.push_back(part);
+            }
+            content = std::move(parts);
+        }
+    }
+    messages.erase(messages.begin() + 1, messages.begin() + n);
+}
+
+// a template that takes system messages only at the start: a later one becomes a user message where it stands, so
+// the conversation keeps its order and the prompt before that message stays the same
+static void late_system_messages_to_user(json & messages) {
+    size_t i = 0;
+    while (i < messages.size() && is_system_message(messages[i])) {
+        i++;
+    }
+    for (; i < messages.size(); i++) {
+        if (is_system_message(messages[i])) {
+            LOG_DBG("Rendering the system message at %zu as a user message\n", i);
+            messages[i]["role"] = "user";
+        }
+    }
+}
+
 static void requires_non_null_content(json & messages) {
     GGML_ASSERT(messages.is_array());
     for (auto & message : messages) {
@@ -2110,6 +2203,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
 
     if (!tmpl.original_caps().supports_system_role) {
         workaround::system_message_not_supported(params.messages);
+    }
+
+    if (!tmpl.original_caps().supports_system_role_multiple) {
+        workaround::merge_leading_system_messages(params.messages);
+    }
+
+    if (!tmpl.original_caps().supports_system_role_late) {
+        workaround::late_system_messages_to_user(params.messages);
     }
 
     if (tmpl.original_caps().supports_tool_calls) {

@@ -73,6 +73,8 @@ std::map<std::string, bool> caps::to_map() const {
         {"supports_tool_calls", supports_tool_calls},
         {"supports_parallel_tool_calls", supports_parallel_tool_calls},
         {"supports_system_role", supports_system_role},
+        {"supports_system_role_multiple", supports_system_role_multiple},
+        {"supports_system_role_late", supports_system_role_late},
         {"supports_preserve_reasoning", supports_preserve_reasoning},
         {"supports_object_arguments", supports_object_arguments},
     };
@@ -157,6 +159,33 @@ caps caps_get(jinja::program & prog) {
             }
         }
     );
+
+    JJ_DEBUG("%s\n", ">>> Running capability check: where system messages may stand");
+
+    // case: system messages beyond one at the start. Some templates raise on a second system message, or on
+    // one after the conversation started ("System message must be at the beginning."), while clients such as
+    // Codex send several at the start and more later. A template counts as refusing them only when it renders
+    // the conversation without them; it refuses a later one only when it raises both after an assistant message
+    // and between two user messages (templates that check alternating roles count a system message as a turn).
+    {
+        const json system    = { { "role", "system" }, { "content", "System message" } };
+        const json user      = { { "role", "user" }, { "content", "User message" } };
+        const json assistant = { { "role", "assistant" }, { "content", "Assistant message" } };
+        const auto renders   = [&](const json & messages) {
+            bool ok = false;
+            caps_try_execute(
+                prog,
+                [&]() { return messages; },
+                [&]() { return json(nullptr); },
+                [&](bool success, value &, value &) { ok = success; });
+            return ok;
+        };
+        if (renders(json::array({ system, user, assistant, user }))) {
+            result.supports_system_role_multiple = renders(json::array({ system, system, user, assistant, user }));
+            result.supports_system_role_late     = renders(json::array({ system, user, assistant, system, user })) ||
+                                                   renders(json::array({ system, user, system, user }));
+        }
+    }
 
     JJ_DEBUG("%s\n", ">>> Running capability check: single tool with object arguments support");
 
