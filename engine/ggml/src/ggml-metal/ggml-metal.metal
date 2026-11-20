@@ -9456,6 +9456,7 @@ kernel void kernel_diag_f32(
 
 constant bool FC_mul_mm_bc_inp [[function_constant(FC_MUL_MM + 0)]];
 constant bool FC_mul_mm_bc_out [[function_constant(FC_MUL_MM + 1)]];
+constant bool FC_mul_mm_bc_k   [[function_constant(FC_MUL_MM + 2)]];
 
 // each block_q contains 16*nl weights
 #ifdef GGML_METAL_HAS_TENSOR
@@ -9506,20 +9507,29 @@ kernel void kernel_mul_mm(
     // tA wraps threadgroup memory
     auto tA = tensor(sa, dextents<int32_t, 2>(N_MM_NK_TOTAL, NRA));
 
-    // tB wraps device memory directly
+    // tB wraps device memory directly, from the first src1 row of this tile. Its offset is taken once in 64 bits,
+    // so the int32 byte offset of a slice of it stays below one row of K.
     device T1 * ptrB = (device T1 *)(srcB + args.nb12*i12 + args.nb13*i13);
     const int strideB = args.nb11 / sizeof(T1);
-    auto tB = tensor(ptrB, dextents<int32_t, 2>(K, N), array<int, 2>({1, strideB}));
+    auto tB = tensor(ptrB + (uint64_t) rb * strideB, dextents<int32_t, 2>(K, N - rb), array<int, 2>({1, strideB}));
 
-    // Configure matmul operation
-    // note: K is dynamic_extent (clamped to the valid range in PHASE 2), since a static
-    //       N_MM_NK_TOTAL K tile would read src1 out of bounds when K % N_MM_NK_TOTAL != 0
+    // Configure matmul operations
+    // note: a full K tile runs with the static N_MM_NK_TOTAL K extent. A last partial tile (K % N_MM_NK_TOTAL != 0,
+    //       FC_mul_mm_bc_k) runs with a dynamic K extent clamped to the valid range, since the static extent would
+    //       read src1 out of bounds there. The dynamic op is compiled out when K is a multiple of N_MM_NK_TOTAL,
+    //       because having it in the kernel slows every tile.
     // ref: https://github.com/ggml-org/llama.cpp/pull/27064
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            NRB, NRA, N_MM_NK_TOTAL, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
             NRB, NRA, static_cast<int>(dynamic_extent), false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
-        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm;
+        execution_simdgroups<N_MM_SIMD_GROUP_X * N_MM_SIMD_GROUP_Y>> mm_k;
 
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
 
@@ -9569,14 +9579,21 @@ kernel void kernel_mul_mm(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // === PHASE 2: Tensor matmul ===
-        // Clamp the K extent of both operand tensors to the remaining valid K range so
-        // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
-        const int kExt = min(N_MM_NK_TOTAL, K - loop_k);
+        if (FC_mul_mm_bc_k && loop_k + N_MM_NK_TOTAL > K) {
+            // Clamp the K extent of both operand tensors to the remaining valid K range so
+            // the dynamic-K op never reads past the K extent of src1 (or the staged A tile).
+            const int kExt = K - loop_k;
 
-        auto tAv = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
-        auto tBv = tensor(ptrB + loop_k + (uint64_t) rb * strideB, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
+            auto tAk = tensor(sa, dextents<int32_t, 2>(kExt, NRA), array<int, 2>({1, N_MM_NK_TOTAL}));
+            auto tBk = tensor(ptrB + (uint64_t) rb * strideB + loop_k, dextents<int32_t, 2>(kExt, N - rb), array<int, 2>({1, strideB}));
 
-        mm.run(tBv, tAv, cT);
+            mm_k.run(tBk, tAk, cT);
+        } else {
+            auto mA = tA.slice(0, 0);
+            auto mB = tB.slice(loop_k, 0);
+
+            mm.run(mB, mA, cT);
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
