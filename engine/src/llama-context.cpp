@@ -766,17 +766,24 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
 
 void llama_context::hold_dense_layers() {
     llama_dense_homes * homes = model.dense_homes();
-    if (!homes || homes->empty() || !ssd_runtime || !ssd_runtime->services.gpu_transport) {
+    if (!homes || homes->empty() || !homes->next_bytes() || !ssd_runtime || !ssd_runtime->services.gpu_transport) {
         return;
     }
-    // the ring the reserve took for every matrix streamed: a new one for those that still stream
-    ssd_runtime->stream.release_ring();
-    size_t free = 0, total = 0;
-    ggml_backend_dev_memory(homes->device(), &free, &total);
     // what the GPU keeps free beside them: the settings' reserve, the ring the streamed matrices land in, and the
-    // backend's work memory for a product of the largest matrix (a copy of it at 16 bits where it runs through BLAS)
+    // backend's work memory for a product of the largest matrix (a copy of it at 16 bits where it runs through BLAS);
+    // the ring now is part of what is free for them
     const size_t keep = ssd_runtime->services.gpu_reserve_bytes +
         ssd::stream::runtime::ring_bytes_for(homes->largest()) + homes->largest_f16();
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(homes->device(), &free, &total);
+    free += ssd_runtime->stream.ring_bytes();
+    if (free < keep || free - keep < homes->next_bytes()) {
+        return;
+    }
+    if (sched) { ggml_backend_sched_synchronize(sched.get()); }
+    // the ring was cut for every matrix streamed: a new one for those that still stream
+    ssd_runtime->stream.release_ring();
+    ggml_backend_dev_memory(homes->device(), &free, &total);
     const size_t held = homes->hold(free > keep ? free - keep : 0);
     LLAMA_LOG_INFO("%s: %s holds %.2f GiB of the layers' matrices, %.2f GiB stream (%.2f GiB free, %.2f GiB kept)\n",
             __func__, ggml_backend_dev_name(homes->device()), homes->held_bytes() / 1073741824.0,
@@ -1204,6 +1211,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             LLAMA_LOG_ERROR("%s: no memory for the KV cache of %u more tokens\n", __func__, prefill_tokens);
             return false;
         }
+        // the cells past the prompt gave their memory back: the GPU holds again the layers it has room for
+        hold_dense_layers();
     }
     // Graphs reserved before were sized for the cache's old cells. A prompt's own graph is reserved from the cache as it
     // is now (actual-shape prefill), and the decode graph again as the prompt ends; otherwise decode() reserves them.

@@ -107,6 +107,10 @@ size_t llama_dense_homes::streamed_bytes() const {
     return bytes;
 }
 
+size_t llama_dense_homes::next_bytes() const {
+    return n_held < order.size() ? device_bytes(layers[order[n_held]]) : 0;
+}
+
 size_t llama_dense_homes::device_bytes(const layer & l) const {
     ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
     const size_t align = ggml_backend_buft_get_alignment(buft);

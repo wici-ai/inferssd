@@ -40,6 +40,8 @@ public:
     // the bytes the device holds and those it streams
     size_t held_bytes() const;
     size_t streamed_bytes() const;
+    // the device bytes the next layer to hold takes, 0 when the device holds every layer
+    size_t next_bytes() const;
 
     // holds the next layers in order while their copies fit in `budget` bytes of the device's memory: the bytes held
     // anew. The work queued on the device must not read the matrices meanwhile.
