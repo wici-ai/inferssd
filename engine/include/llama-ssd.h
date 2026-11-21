@@ -26,12 +26,13 @@ LLAMA_API bool llama_ssd_check_environment(char * error, size_t error_size);
 // buffer is left empty; callers can first query with (NULL, 0).
 LLAMA_API size_t llama_ssd_schema_json(char * output, size_t output_size);
 
-// The facts of the model PATH names (a GGUF file, or a split model's first shard), as the engine would load it, from
-// its files' headers alone: no weight is read and no backend starts. One JSON object goes to WRITE: its files, the
+// The facts of the model the N_PATHS PATHS name, as the engine would load it, from its files' headers alone: no weight
+// is read and no backend starts. PATHS[0] is a GGUF file or a split model's first shard and the rest are its extra
+// shards, as llama_model_load_from_splits takes them (--shard/--ple). One JSON object goes to WRITE: its files, the
 // metadata of the model and its architecture, every tensor it loads (type, shape, file, offset, bytes) and, for a
 // model with routed experts, their layout. False leaves WRITE uncalled and says why in ERROR.
-LLAMA_API bool llama_ssd_model_facts(const char * path, void (*write)(const char * text, size_t size, void * user),
-    void * user, char * error, size_t error_size);
+LLAMA_API bool llama_ssd_model_facts(const char * const * paths, size_t n_paths,
+    void (*write)(const char * text, size_t size, void * user), void * user, char * error, size_t error_size);
 
 // Request lifecycle transition; counts are tokens after prompt-cache reuse.
 // Failure is reported without allowing C++ exceptions across the C boundary.

@@ -78,11 +78,14 @@ static uint64_t offset_in(const std::string & file, const char * name) {
     return gguf_get_data_offset(gguf.get()) + gguf_get_tensor_offset(gguf.get(), id);
 }
 
-static json facts(const std::string & path, std::string * error = nullptr) {
+// The facts of the model PATH with its extra SHARDS (--shard/--ple).
+static json facts(const std::string & path, std::string * error = nullptr, const std::vector<std::string> & shards = {}) {
+    std::vector<const char *> paths = { path.c_str() };
+    for (const auto & shard : shards) { paths.push_back(shard.c_str()); }
     std::string text;
     char message[1024];
     const auto append = [](const char * data, size_t size, void * user) { static_cast<std::string *>(user)->append(data, size); };
-    if (!llama_ssd_model_facts(path.c_str(), append, &text, message, sizeof message)) {
+    if (!llama_ssd_model_facts(paths.data(), paths.size(), append, &text, message, sizeof message)) {
         require(error != nullptr, std::string("model facts failed: ") + message);
         *error = message;
         return nullptr;
@@ -188,6 +191,46 @@ static void split_model(const std::filesystem::path & directory, const std::stri
     contract(model, fixture);
 }
 
+// A split model whose last shard holds only the per-layer embedding table, kept elsewhere under another name (as
+// ISTA-DASLab's DeepSeek-V4.1 GGUFs keep their Engram table): with the table given as an extra shard the facts list it
+// among the files the model loads from and its tensor in it; without it the missing shard is named.
+static void ple_table_elsewhere(const std::filesystem::path & directory) {
+    const std::vector<tensor> first = {
+        { "token_embd.weight", GGML_TYPE_F32, { 64, 16, 1 } },
+        { "blk.0.ffn_up_exps.weight", GGML_TYPE_Q8_0, { 64, 32, 4 } },
+        { "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q8_0, { 64, 32, 4 } },
+        { "blk.0.ffn_down_exps.weight", GGML_TYPE_Q8_0, { 32, 64, 4 } },
+    };
+    const std::vector<tensor> second = {
+        { "blk.1.ffn_up_exps.weight", GGML_TYPE_Q8_0, { 64, 32, 4 } },
+        { "blk.1.ffn_gate_exps.weight", GGML_TYPE_Q8_0, { 64, 32, 4 } },
+        { "blk.1.ffn_down_exps.weight", GGML_TYPE_Q8_0, { 32, 64, 4 } },
+    };
+    const int32_t total = int32_t(first.size() + second.size() + 1);
+    std::filesystem::create_directories(directory / "model");
+    std::filesystem::create_directories(directory / "tables");
+    const std::string a = write(directory / "model" / "ple-00001-of-00003.gguf", first, true, 0, 3, total);
+    const std::string b = write(directory / "model" / "ple-00002-of-00003.gguf", second, false, 1, 3, total);
+    // the table keeps the numbering of the shard it stands for, which an extra shard's numbering does not need
+    const std::string table = write(directory / "tables" / "engram-table.gguf",
+        { { "per_layer_token_embd.weight", GGML_TYPE_Q8_0, { 64, 96, 1 } } }, false, 2, 3, total);
+
+    const json model = facts(a, nullptr, { table });
+    require(model["files"] == json::array({ a, b, table }), "files with the table: " + model["files"].dump());
+    bool found = false;
+    for (const auto & t : model["tensors"]) {
+        if (t["name"] == "per_layer_token_embd.weight") {
+            found = t["file"] == 2 && t["offset"] == offset_in(table, "per_layer_token_embd.weight");
+        }
+    }
+    require(found && model["tensors"].size() == size_t(total), "the table's tensor: " + model["tensors"].dump());
+    require(model["experts"]["layers"] == json::parse("[[0, 0], [1, 0]]"), "layers: " + model["experts"]["layers"].dump());
+
+    std::string error;
+    require(facts(a, &error).is_null() && error.find("ple-00003-of-00003.gguf") != std::string::npos,
+        "the missing table shard without the table: " + error);
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) {
         std::fprintf(stderr, "usage: %s FIXTURE\n", argv[0]);
@@ -200,6 +243,7 @@ int main(int argc, char ** argv) {
     int status = 0;
     try {
         split_model(directory, argv[1]);
+        ple_table_elsewhere(directory);
 
         // Without routed experts the layout is null; a file that is not there says so.
         const std::string dense = write(directory / "dense.gguf", { { "token_embd.weight", GGML_TYPE_F32, { 64, 16, 1 } } },

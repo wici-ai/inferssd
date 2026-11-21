@@ -545,6 +545,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse the first time to get -hf option (used for remote preset)
     parse_cli_args();
 
+    // the model's facts take its extra shards from the arguments and the environment, so they are answered once
+    // both are read, before anything is downloaded
+    if (!params.ssd_model_facts.empty()) {
+        exit(common_ssd_print_model_facts(params.ssd_model_facts, params.model.shards) ? 0 : 1);
+    }
+
     // TODO: Remove later
     try {
         hf_cache::migrate_old_cache_to_hf_cache(params.hf_token, params.offline);
@@ -920,7 +926,8 @@ static void common_params_answer_query(int argc, char ** argv) {
         common_ssd_print_schema();
         exit(0);
     }
-    if (argc == 3 && arg == "--ssd-model-facts") {
+    // the model's extra shards may come from LLAMA_ARG_SHARD, which the parser reads
+    if (argc == 3 && arg == "--ssd-model-facts" && !getenv("LLAMA_ARG_SHARD")) {
         exit(common_ssd_print_model_facts(argv[2]) ? 0 : 1);
     }
     if (argc == 2 && arg == "--version") {
@@ -1089,8 +1096,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         exit(0);
     }));
     add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
-        "print the facts of the GGUF model FNAME as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
-        [](common_params &, const std::string & value) { exit(common_ssd_print_model_facts(value) ? 0 : 1); }));
+        "print the facts of the GGUF model FNAME, with its --shard/--ple files, as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
+        [](common_params & p, const std::string & value) { p.ssd_model_facts = value; }));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",

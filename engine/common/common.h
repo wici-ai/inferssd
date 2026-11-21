@@ -436,6 +436,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
 struct common_params {
     bool ssd_enabled = false;
+    std::string ssd_model_facts; // --ssd-model-facts: print this model's facts once the arguments are parsed, and exit
     std::string ssd_settings_file;
     std::string ssd_telemetry_file;
     std::vector<std::pair<std::string, std::string>> ssd_overrides;
