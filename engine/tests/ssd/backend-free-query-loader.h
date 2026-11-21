@@ -4,5 +4,5 @@
 // Keep the real imported declarations intact, including on Windows DLL builds.
 // Only calls compiled into this test's parser are redirected.
 #include "ggml-backend.h"
-void inferssd_test_backend_load_all();
+[[noreturn]] void inferssd_test_backend_load_all();
 #define ggml_backend_load_all inferssd_test_backend_load_all

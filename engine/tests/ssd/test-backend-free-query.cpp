@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// Compile the real parser with its backend loader redirected to a tripwire.
+// The queries the parser answers before it loads backends (--ssd-schema, --ssd-model-facts, --version): the real
+// parser, compiled with its backend loader redirected to a tripwire.
 #include "arg.h"
 #include "common.h"
 #include "ggml-backend.h"
@@ -22,7 +23,7 @@ static void verify_exit() {
 void inferssd_test_backend_load_all() {
     loaded_backend = true;
     if (!expect_backend) {
-        std::fputs("schema query attempted to load compute backends\n", stderr);
+        std::fputs("the query attempted to load compute backends\n", stderr);
         std::exit(1);
     }
     // Control cases stop here: no real backend or model is needed for this test.
@@ -41,5 +42,5 @@ int main(int argc, char ** argv) {
     common_init();
     common_params params;
     common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER);
-    return 1; // Either the schema query or the tripwire must exit first.
+    return 1; // Either the query or the tripwire must exit first.
 }

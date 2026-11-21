@@ -133,27 +133,35 @@ add_test(NAME q2_0 COMMAND test-q2_0)
 set_property(TEST q2_0 PROPERTY LABELS unit)
 inferssd_ci_test(test-q2_0 q2_0)
 
-# Use the real argument parser with a forbidden backend loader, so this test
-# detects device initialization without needing a GPU on hosted runners.
-add_executable(test-ssd-schema-query ssd/test-schema-query.cpp ../common/arg.cpp)
-target_link_libraries(test-ssd-schema-query PRIVATE llama-common)
+# The queries answered before the parser loads backends (common_params_answer_query): the real parser, compiled here with
+# its backend loader turned into a tripwire, so the test needs no GPU. The parser's --license reads LICENSES, which
+# llama-common does not export from its DLL on Windows, so the test compiles its own copy.
+add_executable(test-ssd-backend-free-query ssd/test-backend-free-query.cpp ../common/arg.cpp ${CMAKE_BINARY_DIR}/license.cpp)
+target_link_libraries(test-ssd-backend-free-query PRIVATE llama-common)
 if (MSVC)
-    target_compile_options(test-ssd-schema-query PRIVATE
-        /FI${CMAKE_CURRENT_SOURCE_DIR}/ssd/schema-query-loader.h)
+    target_compile_options(test-ssd-backend-free-query PRIVATE
+        /FI${CMAKE_CURRENT_SOURCE_DIR}/ssd/backend-free-query-loader.h)
 else()
-    target_compile_options(test-ssd-schema-query PRIVATE
-        -include ${CMAKE_CURRENT_SOURCE_DIR}/ssd/schema-query-loader.h)
+    target_compile_options(test-ssd-backend-free-query PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/ssd/backend-free-query-loader.h)
 endif()
-add_test(NAME ssd_schema_query COMMAND test-ssd-schema-query --ssd-schema)
-set_tests_properties(ssd_schema_query PROPERTIES PASS_REGULAR_EXPRESSION "InferSSD settings v1")
-set_tests_properties(ssd_schema_query PROPERTIES
-    FAIL_REGULAR_EXPRESSION "schema query attempted;unexpected backend")
-add_test(NAME ssd_schema_option_value
-    COMMAND test-ssd-schema-query --expect-backend --model --ssd-schema)
-add_test(NAME ssd_schema_mixed_args
-    COMMAND test-ssd-schema-query --expect-backend --ssd-schema --help)
-inferssd_ci_test(test-ssd-schema-query
-    ssd_schema_query ssd_schema_option_value ssd_schema_mixed_args)
+set(query_absent_model ${CMAKE_CURRENT_BINARY_DIR}/absent.gguf)
+add_test(NAME ssd_query_schema COMMAND test-ssd-backend-free-query --ssd-schema)
+add_test(NAME ssd_query_schema_underscore COMMAND test-ssd-backend-free-query --ssd_schema)
+add_test(NAME ssd_query_model_facts COMMAND test-ssd-backend-free-query --ssd-model-facts ${query_absent_model})
+add_test(NAME ssd_query_version COMMAND test-ssd-backend-free-query --version)
+set_tests_properties(ssd_query_schema ssd_query_schema_underscore PROPERTIES PASS_REGULAR_EXPRESSION "InferSSD settings v1")
+set_tests_properties(ssd_query_model_facts PROPERTIES PASS_REGULAR_EXPRESSION "absent[.]gguf: ")
+set_tests_properties(ssd_query_version PROPERTIES PASS_REGULAR_EXPRESSION "built with ")
+set_tests_properties(ssd_query_schema ssd_query_schema_underscore ssd_query_model_facts ssd_query_version PROPERTIES
+    FAIL_REGULAR_EXPRESSION "attempted to load;unexpected backend")
+# with other arguments, the same options reach the parser, which loads the backends first
+add_test(NAME ssd_query_option_value COMMAND test-ssd-backend-free-query --expect-backend --model --ssd-schema)
+add_test(NAME ssd_query_mixed_args COMMAND test-ssd-backend-free-query --expect-backend --ssd-schema --help)
+add_test(NAME ssd_query_facts_mixed COMMAND test-ssd-backend-free-query --expect-backend --ssd-model-facts absent.gguf -v)
+inferssd_ci_test(test-ssd-backend-free-query
+    ssd_query_schema ssd_query_schema_underscore ssd_query_model_facts ssd_query_version
+    ssd_query_option_value ssd_query_mixed_args ssd_query_facts_mixed)
 
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
