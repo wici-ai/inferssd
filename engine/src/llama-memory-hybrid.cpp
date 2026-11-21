@@ -242,6 +242,24 @@ bool llama_memory_hybrid_context::next() {
     return true;
 }
 
+// apply() publishes the attention and the recurrent cache together, so the undo covers both
+bool llama_memory_hybrid_context::save_precompute() {
+    const bool attn = ctx_attn->save_precompute();
+    const bool recr = ctx_recr->save_precompute();
+    return attn && recr;
+}
+
+bool llama_memory_hybrid_context::restore_precompute() noexcept {
+    const bool recr = ctx_recr->restore_precompute();
+    const bool attn = ctx_attn->restore_precompute();
+    return attn && recr;
+}
+
+void llama_memory_hybrid_context::discard_precompute() noexcept {
+    ctx_attn->discard_precompute();
+    ctx_recr->discard_precompute();
+}
+
 bool llama_memory_hybrid_context::apply() {
     assert(!llama_memory_status_is_fail(status));
 

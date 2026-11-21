@@ -16,9 +16,10 @@ from test_strategy_inputs import (
     Q5_K,
     Q8_0,
     deepseek_like,
+    dense,
+    facts_of,
     moe,
     muse_like,
-    write_gguf,
 )
 
 from inferssd.configuration.settings import parse, render, schema
@@ -37,7 +38,7 @@ from inferssd.strategy.derive import (
     offered,
     prefill_threads,
 )
-from inferssd.strategy.inputs import GPUState, RuntimeFacts, model_facts
+from inferssd.strategy.inputs import GPUState, RuntimeFacts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
 X86 = "linux-x86-rtx5090.json"  # 61 uniform vCPUs, RTX 5090, virtual disk
@@ -59,8 +60,8 @@ def drive(characteristics):
 def models(tmp_path_factory):
     directory = tmp_path_factory.mktemp("models")
     return {
-        "dsv": model_facts(str(write_gguf(directory / "dsv.gguf", *deepseek_like()))),
-        "muse": model_facts(str(write_gguf(directory / "muse.gguf", *muse_like()))),
+        "dsv": facts_of(*deepseek_like(), path=str(directory / "dsv.gguf")),
+        "muse": facts_of(*muse_like(), path=str(directory / "muse.gguf")),
     }
 
 
@@ -124,7 +125,7 @@ def test_x86_uniform_machine_with_a_discrete_gpu(models):
 def test_cpu_line_units_at_an_exact_thread_count(models):
     """Mac, 10 threads measured: three 6266880-byte MXFP4 roles and 2 x 5120 x 2304 FLOP a token."""
     c = machine(MAC)
-    line, why = cpu_line(c, models["dsv"], 10)
+    line, why = cpu_line(c, models["dsv"].experts, 10)
     assert line is not None
     one = 3 * 6266880 / point(c, "MXFP4", 10, 1, "weight_Bps") * 1e6
     many = 3 * 2 * 5120 * 2304 * 512 / point(c, "MXFP4", 10, 512, "flops") * 1e6
@@ -136,7 +137,7 @@ def test_cpu_line_units_at_an_exact_thread_count(models):
 
 def test_cpu_line_mixes_role_formats(models):
     c = machine(MAC)
-    line, _ = cpu_line(c, models["muse"], 10)
+    line, _ = cpu_line(c, models["muse"].experts, 10)
     assert line is not None
     one = (2 * 9437184 / point(c, "Q4_K", 10, 1, "weight_Bps")) + (
         11534336 / point(c, "Q5_K", 10, 1, "weight_Bps")
@@ -170,7 +171,7 @@ def test_drive_rate_uses_measured_points_when_the_knee_exceeds_the_cap(
         dict(template, qd=qd, Bps=rate)
         for qd, rate in [(1, 3e9), (4, 6e9), (8, 5e9), (16, 7e9), (32, 9e9)]
     ]
-    rate, why = drive_rate(c, models["dsv"], drive(c))
+    rate, why = drive_rate(c, models["dsv"].experts, drive(c))
     assert rate == expected_rate
     assert f"4 MiB reads at QD {expected_qd}" in why
     assert f"up to QD {cap or 24}, capped below its knee QD 32" in why
@@ -184,7 +185,7 @@ def test_an_unreachable_knee_still_needs_a_positive_admissible_measurement(model
     storage["knee"] = [{"bytes": 4 << 20, "qd": 32}]
     template = next(row for row in storage["random_read"] if row["bytes"] == 4 << 20)
     storage["random_read"] = [dict(template, qd=16, Bps=0), dict(template, qd=32, Bps=9e9)]
-    rate, why = drive_rate(c, models["dsv"], drive(c))
+    rate, why = drive_rate(c, models["dsv"].experts, drive(c))
     assert rate is None and "no read rate of 4 MiB reads" in why
 
 
@@ -193,21 +194,21 @@ def test_a_point_without_flops_is_dropped(models):
     for row in c["compute"]["cpu"]:
         if row["format"] == "MXFP4" and row["threads"] == 10:
             del next(p for p in row["points"] if p["tokens"] == 512)["flops"]
-    line, why = cpu_line(c, models["dsv"], 10)
+    line, why = cpu_line(c, models["dsv"].experts, 10)
     # The 10-thread row keeps its 32-token point; 512 tokens come from no row at 10 threads.
     assert line is not None and "at 32 tokens" in why
 
 
 def test_cpu_line_interpolates_between_measured_thread_counts(models):
     c = machine(X86)
-    line, why = cpu_line(c, models["dsv"], 31)
+    line, why = cpu_line(c, models["dsv"].experts, 31)
     assert line is not None and "1- and 61-thread measurements" in why
     share = 30 / 60
     one_rate = point(c, "MXFP4", 1, 1, "weight_Bps")
     one_rate += share * (point(c, "MXFP4", 61, 1, "weight_Bps") - one_rate)
     assert line[0] + line[1] == pytest.approx(3 * 6266880 / one_rate * 1e6)
     # Beyond the measured counts the nearest one stands.
-    assert cpu_line(c, models["dsv"], 200)[0] == cpu_line(c, models["dsv"], 61)[0]
+    assert cpu_line(c, models["dsv"].experts, 200)[0] == cpu_line(c, models["dsv"].experts, 61)[0]
 
 
 @pytest.mark.parametrize("scale", [1000, 1 / 1000])
@@ -220,7 +221,7 @@ def test_cpu_line_keeps_both_terms_nonnegative(models, scale):
                 p["weight_Bps"] *= scale
     one = 3 * 6266880 / point(c, "MXFP4", 10, 1, "weight_Bps") * 1e6
     many = 3 * 2 * 5120 * 2304 * 512 / point(c, "MXFP4", 10, 512, "flops") * 1e6
-    line, _ = cpu_line(c, models["dsv"], 10)
+    line, _ = cpu_line(c, models["dsv"].experts, 10)
     if scale > 1:  # one token nearly free: the line runs through the origin
         assert line == pytest.approx((0.0, (one + 512 * many) / (1 + 512 * 512)))
     else:  # one token slower than 512: a flat line at the mean
@@ -532,7 +533,7 @@ def test_unmeasured_format_falls_back(models, tmp_path):
     tensors, kv = moe(
         "toy", layers=2, experts=4, used=2, latent=4096, hidden=1024, gate=Q3_K, up=Q3_K, down=Q3_K
     )
-    q3 = model_facts(str(write_gguf(tmp_path / "q3.gguf", tensors, kv)))
+    q3 = facts_of(tensors, kv, path=str(tmp_path / "q3.gguf"))
     c = machine(MAC)
     s = derive(c, q3, runtime(range(10)), "darwin", model_drive_key=drive(c))
     # Q3_K was not measured: every allowed CPU but one for both pools, and no CPU line.
@@ -713,8 +714,8 @@ def test_dense_only_shapes_do_not_reach_the_cpu_line(models, tmp_path):
     tensors, kv = moe(
         "toy", layers=1, experts=4, used=2, latent=4096, hidden=1024, gate=Q8_0, up=Q8_0, down=Q8_0
     )
-    facts = model_facts(str(write_gguf(tmp_path / "q8.gguf", tensors, kv)))
-    line, why = cpu_line(machine(X86), facts, 60)
+    facts = facts_of(tensors, kv, path=str(tmp_path / "q8.gguf"))
+    line, why = cpu_line(machine(X86), facts.experts, 60)
     assert line is not None and "latent 4096 hidden 1024" in why
 
 
@@ -739,7 +740,7 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
         up=experts,
         down=down,
     )
-    mixed = model_facts(str(write_gguf(tmp_path / "mixed.gguf", tensors, kv)))
+    mixed = facts_of(tensors, kv, path=str(tmp_path / "mixed.gguf"))
     c = machine(X86)
     gpu = GPUState(X86_GPU, 30 << 30, 0)
     s = derive(c, mixed, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))
@@ -788,7 +789,7 @@ def test_the_registry_decides_what_a_platform_derives(key, platform, expected):
 
 def test_windows_decode_goes_on_the_performance_cluster_when_it_streams_faster(models):
     c = copy.deepcopy(machine(WINDOWS))
-    name = models["dsv"].dominant_format.upper()
+    name = models["dsv"].cpu_format.upper()
     for row in c["compute"]["cpu"]:
         if row.get("cpus") == [0, 1, 2, 3] and row["format"].upper() == name:
             row["points"][0]["weight_Bps"] = 200e9
@@ -807,7 +808,7 @@ def test_windows_chooses_measured_eligible_pools_and_keeps_their_placement(
     c["cpu"]["clusters"][1]["cpus"] = [2, 3, 4, 5]
     for row in c["cpu"]["logical"]:
         row["cluster"] = int(row["id"] not in fast)
-    name = models["dsv"].dominant_format.upper()
+    name = models["dsv"].cpu_format.upper()
     template = next(row for row in c["compute"]["cpu"] if row["format"] == name)
     c["compute"]["cpu"] = [
         dict(
@@ -835,7 +836,7 @@ def test_windows_chooses_measured_eligible_pools_and_keeps_their_placement(
 
 def test_windows_selects_decode_and_batch_from_their_own_measurements(models):
     c = machine(WINDOWS)
-    name = models["dsv"].dominant_format.upper()
+    name = models["dsv"].cpu_format.upper()
     for row in c["compute"]["cpu"]:
         if row["format"] == name and row["threads"] == 1 and not row.get("cpus"):
             row["points"][0]["weight_Bps"] = 1e12
@@ -846,7 +847,7 @@ def test_windows_selects_decode_and_batch_from_their_own_measurements(models):
 @pytest.mark.parametrize("missing", ["one", "many"])
 def test_windows_without_complete_eligible_measurements_keeps_its_fallback(models, missing):
     c = machine(WINDOWS)
-    name = models["dsv"].dominant_format.upper()
+    name = models["dsv"].cpu_format.upper()
     for row in c["compute"]["cpu"]:
         if row["format"] == name and not row.get("cpus"):
             row["points"] = [p for p in row["points"] if (p["tokens"] == 1) == (missing == "many")]
@@ -868,3 +869,21 @@ def test_windows_without_complete_eligible_measurements_keeps_its_fallback(model
         f"all placement: I/O on CPU 7, decode {decode} and prefill 7 unpinned threads for the 8 "
         f"allowed CPUs 0-7; decode not on a cluster alone: {why}"
     )
+
+
+def test_a_dense_model_keeps_no_io_cpu_and_prices_no_expert(tmp_path):
+    c = machine(X86)
+    facts = facts_of(*dense("gemma4", kind=Q8_0), path=str(tmp_path / "dense.gguf"))
+    gpu = GPUState(X86_GPU, 30 << 30, 0)
+    s = derive(c, facts, runtime(range(61), [gpu]), "linux", model_drive_key=drive(c))
+    # No sink reads routed experts: prefill takes every CPU, and no CPU stays with I/O threads.
+    assert s.threads.batch == 61
+    assert s.settings["cpu.io_cpus"].value_text == '""'
+    assert "no routed experts to read" in s.settings["cpu.io_cpus"].reason
+    assert "place.costs" not in s.settings
+    assert "place.costs: omitted, the model has no routed experts to place" in s.notes
+    assert not any(note.startswith("prefill: the SSD sink") for note in s.notes)
+    # A pass reads none of its weights: the launch keeps its batch sizes.
+    assert any(note.startswith("prefill: the launch's batch sizes") for note in s.notes)
+    # Decode threads come from the layers' type, as an expert model's come from its experts'.
+    assert any("Q8_0" in note for note in s.notes if note.startswith("threads: decode"))

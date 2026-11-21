@@ -39,7 +39,6 @@ struct sink_vram {
     // ring is (B3: registered when a GPU lane copies from it).
     std::function<bool(int)> ram_slot_locked;
     bool ring_locked = false;
-    int prefill_latent = 0;
     std::vector<ssd_vram_prefill_transient> prefill_transient;
     std::vector<ssd::place::prefill_expert> prefill_policy_experts;
     ssd_vram_prefill_stats prefill_stats = {};
@@ -61,34 +60,10 @@ struct sink_vram {
     // process's are read when the sink starts, before ggml places any thread (Linux reads the calling thread's mask).
     ssd::platform::cpu_list thread_cpus, coordinator_cpus, process_cpus;
     bool placement_due = true;
-    // The routed layers as the tier is given them (ssd_vram_expert_format): their IDs in the cache's priority order
-    // and, once every one has the expert types recorded at load (record_expert_types), each one's types; without them
-    // a call's types stand for every layer.
-    struct layer_list {
-        std::vector<int32_t> ids, up_types, gate_types, down_types;
-        explicit layer_list(const sink_cache & cache) {
-            bool typed = true;
-            ids.reserve(cache.layers.size());
-            for (const auto & l : cache.layers) {
-                ids.push_back(l.id);
-                typed = typed && l.up_type >= 0 && l.gate_type >= 0 && l.down_type >= 0;
-            }
-            for (const auto & l : cache.layers) {
-                if (!typed) { break; }
-                up_types.push_back(l.up_type); gate_types.push_back(l.gate_type); down_types.push_back(l.down_type);
-            }
-        }
-        // the declaration with the call's layer's tensors
-        ssd_vram_expert_format format(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down,
-                int latent, int hidden) const {
-            const bool typed = !up_types.empty();
-            return { latent, hidden, int32_t(up->type), int32_t(gate->type), int32_t(down->type), int32_t(up->ne[2]),
-                int32_t(ids.size()), ids.data(), typed ? up_types.data() : nullptr, typed ? gate_types.data() : nullptr,
-                typed ? down_types.data() : nullptr };
-        }
-    };
-
-    void initialize(bool ready_first, const sink_configuration & configuration) {
+    // The routed layers the tier serves: the sink's layout, declared to the tier once it is made.
+    int routed_layers = 0, layer_experts = 0;
+    void initialize(bool ready_first, const sink_configuration & configuration, const ssd_expert_layout & layout) {
+        routed_layers = layout.n_layers; layer_experts = layout.experts;
         if (!ssd::platform::process_cpus(process_cpus)) { process_cpus.clear(); }
         uint64_t bytes = configuration.policy.vram_budget;
         if (!configuration.production) {
@@ -133,19 +108,19 @@ struct sink_vram {
         prefill_only = !configuration.gpu.residency;
         if (prefill_only) { async_upload = deferred_upload = false; }
         api = configuration.gpu.api;
-        if (!api || api->version != 2 || api->size != sizeof(*api) || !api->create || !api->destroy ||
-                !api->begin || !api->prepare || !api->launch || !api->admit || !api->finish || !api->cancel) {
+        if (!api || api->version != 3 || api->size != sizeof(*api) || !api->create || !api->destroy || !api->declare ||
+                !api->begin || !api->admit || !api->finish || !api->cancel) {
             throw std::runtime_error("GPU tier ABI mismatch");
         }
         if (configuration.gpu.format) {
             format = configuration.gpu.format;
-            if (!format || format->version != 3 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
+            if (!format || format->version != 4 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
                 throw std::runtime_error("GPU tier explicit-format ABI mismatch");
             }
         }
         if (prefill_enabled) {
             prefill_api = configuration.gpu.prefill;
-            if (!prefill_api || prefill_api->version != 11 || prefill_api->size != sizeof(*prefill_api) ||
+            if (!prefill_api || prefill_api->version != 12 || prefill_api->size != sizeof(*prefill_api) ||
                     !prefill_api->prepare || !prefill_api->transient_available || !prefill_api->launch ||
                     !prefill_api->finish || !prefill_api->cancel || !prefill_api->cold_admission_active ||
                     !prefill_api->admit_cold || !prefill_api->lane || !prefill_api->seed_routes ||
@@ -156,7 +131,7 @@ struct sink_vram {
         }
         if (configuration.gpu.elastic) {
             elastic = configuration.gpu.elastic;
-            if (!elastic || elastic->version != 6 || elastic->size != sizeof(*elastic) ||
+            if (!elastic || elastic->version != 7 || elastic->size != sizeof(*elastic) ||
                     !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve ||
                     !elastic->preload_slots || !elastic->preload) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
@@ -197,6 +172,10 @@ struct sink_vram {
             context = test_api->create(bytes, &configuration.policy.tier, error, sizeof(error));
         }
         if (!context) { throw std::runtime_error(std::string("GPU tier create: ") + error); }
+        if (api->declare(context, &layout, error, sizeof(error))) {
+            api->destroy(context); context = nullptr;
+            throw std::runtime_error(std::string("GPU tier: ") + error);
+        }
         if (configuration.gpu.policy) {
             policy_api = configuration.gpu.policy;
             if (!policy_api || policy_api->version != 5 || policy_api->size != sizeof(*policy_api) ||
@@ -279,20 +258,11 @@ struct sink_vram {
         char error[512] = {};
         check(elastic->reserve_accumulate(context, tokens, error, sizeof(error)), error);
     }
-    // At load (unified memory): the tier's storage before any request, for experts of this geometry, given with one
-    // layer's tensors (the request's layer). The role bytes are the tensors' per-expert strides, as the decode
-    // requests carry them; the key is not needed.
-    void reserve(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * down, const layer_list & layers) {
-        if (!context || !elastic || (!format && !prefill_only) || layers.ids.empty()) { return; }
-        const int layer = ssd::host::routed_layer(up);
-        if (layer < 0) { throw std::runtime_error("GPU tier reserve requires a canonical routed layer"); }
-        ssd_vram_request r = {};
-        r.layer = layer; r.weight = 1.0f;
-        const ggml_tensor * tensors[] = { up, gate, down };
-        for (int role = 0; role < 3; ++role) { r.role[role].bytes = tensors[role]->nb[2]; }
-        const ssd_vram_expert_format f = layers.format(up, gate, down, int32_t(up->ne[0]), int32_t(up->ne[1]));
+    // At load (unified memory): the tier's storage before any request, for the declared layout's experts.
+    void reserve() {
+        if (!context || !elastic || (!format && !prefill_only)) { return; }
         char error[512] = {};
-        check(elastic->reserve(context, &r, &f, error, sizeof(error)), error);
+        check(elastic->reserve(context, error, sizeof(error)), error);
     }
     // At load, after the load's passes (ssd_cpu_sink_preload): the slots no entry holds, a tier made at load having
     // grown into the card first if its memory settled; 0 without a tier.
@@ -323,16 +293,13 @@ struct sink_vram {
         char error[512] = {};
         check(elastic->phase_complete(context, decode ? 1 : 0, error, sizeof(error)), error);
     }
-    // Expert geometry is supplied through the explicit-format extension.
-    void prepare(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * gate,
-                 const ggml_tensor * down, int latent, int hidden, const layer_list & layers, sink_cache & cache,
-                 bool unweighted = false) {
+    // A decode run's experts of routed layer `layer`: the tier pins those it holds as hits.
+    void prepare(std::vector<sink_request> & source, int32_t layer, sink_cache & cache, bool unweighted = false) {
         hits = 0;
         if (!context || prefill_only) { return; }
         place_threads();
-        const int layer = ssd::host::routed_layer(up);
         if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > 16) {
-            throw std::runtime_error("GPU tier requires a canonical routed layer and <=16 slots");
+            throw std::runtime_error("GPU tier requires a routed layer and <=16 slots");
         }
         if (!format) {
             throw std::runtime_error("GPU tier lacks the explicit expert format ABI for these experts; no fallback");
@@ -352,11 +319,7 @@ struct sink_vram {
             }
         }
         char error[512] = {};
-        int result;
-        {
-            const ssd_vram_expert_format f = layers.format(up, gate, down, latent, hidden);
-            result = format->prepare(context, requests.data(), int(requests.size()), &f, slots.data(), error, sizeof(error));
-        }
+        const int result = format->prepare(context, requests.data(), int(requests.size()), slots.data(), error, sizeof(error));
         format_path = true;
         check(result, error);
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
@@ -470,10 +433,9 @@ struct sink_vram {
         release_ram_batch(cache);
         if (deferred_upload) { collect_deferred(cache, SSD_VRAM_COLLECT_NONE); }
     }
-    // The layer's grouped prefill on the tier: every format the tier has a lane for (it initializes the format on a cold
-    // prefill, its decode arena deferred to the first decode token).
-    int prepare_prefill(std::vector<sink_request> & source, const ggml_tensor * up, const ggml_tensor * gate,
-            const ggml_tensor * down, int latent, int hidden, const layer_list & layers, bool post_norm) {
+    // The layer's grouped prefill on the tier: every format the tier has a lane for (its decode arena may wait for the
+    // first decode token).
+    int prepare_prefill(std::vector<sink_request> & source, int32_t layer, bool post_norm) {
         hits = 0;
         prefill_plan.valid = false;
         learning.cpu_fit = {};
@@ -481,12 +443,10 @@ struct sink_vram {
         prefill_batched = prefill_in_place = false;
         if (!context || !prefill_enabled || source.empty()) { return 0; }
         place_threads();
-        const int layer = ssd::host::routed_layer(up);
-        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > static_cast<size_t>(up->ne[2])) {
-            throw std::runtime_error("GPU grouped prefill requires a canonical routed layer and a distinct expert union");
+        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > static_cast<size_t>(layer_experts)) {
+            throw std::runtime_error("GPU grouped prefill requires a routed layer and a distinct expert union");
         }
-        prefill_latent = latent;
-        if (!learning.window) { learning.window = std::max<size_t>(1, layers.ids.size()); }
+        if (!learning.window) { learning.window = std::max<size_t>(1, size_t(routed_layers)); }
         requests.resize(source.size()); slots.assign(source.size(), -1);
         for (size_t i = 0; i < source.size(); ++i) {
             auto & r = requests[i]; r.layer = layer; r.expert = source[i].id; r.weight = 1.0f;
@@ -496,7 +456,6 @@ struct sink_vram {
                                 k.mtime_s, k.mtime_ns, k.ctime_s, k.ctime_ns, k.inode_hi };
             }
         }
-        const ssd_vram_expert_format f = layers.format(up, gate, down, latent, hidden);
         char error[512] = {};
         // the pass's routes of each request, so that the prepare seeds the layer's empty slots with the experts the
         // pass routes most (ssd_vram_prefill_api v10)
@@ -505,8 +464,7 @@ struct sink_vram {
                 sizeof(error)), error);
         }
         prefill_seed_routes.clear();
-        check(prefill_api->prepare(context, requests.data(), int(requests.size()), &f,
-                slots.data(), error, sizeof(error)), error);
+        check(prefill_api->prepare(context, requests.data(), int(requests.size()), slots.data(), error, sizeof(error)), error);
         prefill_lane = {};
         prefill_api->lane(context, &prefill_lane);
         if (prefill_lane.engine == SSD_VRAM_PREFILL_ENGINE_NONE || (post_norm && !prefill_lane.post_norm)) {
@@ -755,13 +713,15 @@ struct sink_vram {
         ssd::place::observe_prefill_overhead(learning, cost, overhead, overhead_row_prior(table().locked_us_per_mb));
         const ssd_place_table t = table();
         std::fprintf(stderr,
-            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
+            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu gpu_samples=%zu gpu_host_samples=%zu "
+            "cpu_fixed_us=%.3f cpu_route_us=%.3f "
             "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
             "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_overhead_fixed_us=%.3f gpu_token_us=%.3f "
             "gpu_overhead_samples=%.0f gpu_overhead_min_tokens=%d gpu_overhead_max_tokens=%d cpu_one_us=%.1f "
             "predicted_us=%.1f measured_us=%.1f cpu_predicted_us=%.1f cpu_us=%.1f gpu_predicted_us=%.1f gpu_us=%.1f "
             "drive_predicted_us=%.1f drive_us=%.1f gpu_overhead_predicted_us=%.1f gpu_overhead_us=%.1f\n",
-            (unsigned long long) learning.calibrations, plan.ntokens, learning.samples.size(),
+            (unsigned long long) learning.calibrations, plan.ntokens, learning.cpu.items.size(),
+            learning.gpu.items.size(), learning.gpu_host.items.size(),
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
             cost.gpu_host_route_us, t.locked_us_per_mb > 0 ? 1e3 / t.locked_us_per_mb : 0.0,
             t.pageable_us_per_mb > 0 ? 1e3 / t.pageable_us_per_mb : 0.0, t.drive_us_per_mb > 0 ? 1e3 / t.drive_us_per_mb : 0.0,

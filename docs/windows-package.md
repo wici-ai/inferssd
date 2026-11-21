@@ -31,7 +31,8 @@ GPU's driver is new enough, else the Vulkan package. `inferssd --version --json`
 installed, in `capabilities.gpu_backends` (`["CUDA"]` or `["Vulkan"]`), so an updater reads that
 package's list, `latest-windows-cuda.json` or `latest-windows-vulkan.json`.
 
-An archive has one directory, `inferssd-<date.build.commit>-windows-x64-vulkan` (or `-cuda`),
+An archive has one directory, `inferssd-<version>-windows-x64-vulkan` (or `-cuda`), named by the
+build's version, `<yymmdd>.<build>` (a package built outside a release is never published),
 containing:
 
 - `bin/inferssd.exe`: a relocatable native console entry point, forwarding arguments, standard
@@ -49,32 +50,38 @@ the macOS package. Published bytes are immutable.
 
 ## Build and verify
 
-Every numbered `vX.Y.Z` release automatically calls the reusable Windows and macOS package
-workflows at the same tag commit. After both platforms' checks pass, the common **Release** job
-prepares one GitHub release containing the three archives (macOS, Windows Vulkan, Windows CUDA),
-their manifests and `install.sh`/`install.ps1`, updates the normal latest package feeds, and only
-then publishes the complete release. There is no
-separate Windows-only version or prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
+Every published package is a release's. **Actions > Release**, run by hand on `main`, takes
+main's head's version, `<yymmdd>.<build>`, and calls the reusable Windows and macOS package
+workflows at that commit with the release's tag, which is the version (see
+[the macOS package](macos-package.md#releases)). It calls this workflow once per backend
+(`backends`), so each Windows package is built, signed, checked and published on its own: the
+Vulkan package reaches its package list while the CUDA one still builds. One package is signed at
+a time; a file both packages carry, signed with the first, comes from the signed-file store for the
+second, and the Vulkan package's signing also signs the pinned `install.ps1`. Once all three
+packages are published, its release job prepares one GitHub release containing the three archives
+(macOS, Windows Vulkan, Windows CUDA), their manifests and `install.sh`/`install.ps1`, and
+publishes it, which tags the commit. With `github_release`
+off, the same signed packages only update the package lists, with no GitHub release or tag (see
+[the macOS package](macos-package.md#releases)). There is no separate Windows-only version or
+prerelease channel. Publishing requires `APP_VERSIONING_TOKEN`.
 
-The numbered Windows installer pins its default package URLs to that release's
+A release's Windows installer pins its default package URLs to that release's
 `latest-windows-vulkan.json` and `latest-windows-cuda.json`; it cannot silently install a newer
-rolling version. The asset preparation
-step rejects packages with a different version, revision, build, label or checksum. Existing
-published releases are never overwritten. A draft remains private until all assets and every
-normal package feed are ready.
+version. The asset preparation step rejects packages with a different version, tag, name,
+revision, build, label or checksum. Existing published releases are never overwritten. A draft
+remains private until all assets and every package list are ready.
 
-**Package Windows** runs for pull requests that change how the packages are built, after each
-merge to `main` that changes the engine, the framework or the packaging, and manually for
-validation, producing `package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions
-artifacts. GitHub's runner has no GPU, so the CUDA package's check also shows that it starts
-without an NVIDIA driver. Its optional manual publisher
-remains main-only; no manual Windows job is required for normal numbered releases.
+**Package Windows** also runs by hand on any branch, building and checking without signing or
+publishing; run it for a change to how the packages are built. Pull requests and merges to `main`
+build no package. A run produces
+`package-windows-x64-vulkan` and `package-windows-x64-cuda` Actions artifacts. GitHub's runner has
+no GPU, so the CUDA package's check also shows that it starts without an NVIDIA driver.
 
 For a local build, enter an x64 Visual Studio tools environment, install the Vulkan SDK, and run:
 
 ```powershell
 scripts/package-windows.ps1 -OutputDirectory dist
-scripts/check-package-windows.ps1 -Archive dist/inferssd-<label>-windows-x64-vulkan.zip
+scripts/check-package-windows.ps1 -Archive dist/inferssd-<version>-windows-x64-vulkan.zip
 ```
 
 For the CUDA package, install the CUDA toolkit instead (`scripts/install-cuda-redist.ps1` puts
@@ -84,7 +91,7 @@ for CUDA 12.9), and pass `-Backend cuda`; its archive ends in `-windows-x64-cuda
 
 The check extracts under a different path containing spaces and removes developer tools from
 PATH. It audits PE imports, loads the packaged Python's native dependencies, checks CLI/schema
-and CPU execution, exercises Gemma's RAM-admission contract, and starts/stops an owned local
+and CPU execution, and starts/stops an owned local
 HTTP fixture through the packaged Windows guardian/job runtime. It then installs the ZIP using
 the normal installer and verifies the installed command. No model weights are downloaded by
 these packaging checks, and they do not claim GPU/model quality or throughput validation.
@@ -98,18 +105,17 @@ file its vendor ships signed keeps that signature: Microsoft's Visual C++ runtim
 Software Foundation's Tcl/Tk, LunarG's Vulkan loader. Every other file is signed with WiCi AI's
 code-signing certificate: the engine's own binaries, and the third-party files their projects
 ship unsigned, such as python-build-standalone's CPython, the Hub client's extension modules and
-NVIDIA's CUDA runtime and cuBLAS redistributables. The pinned `install.ps1` of a numbered release
-is signed the same way.
+NVIDIA's CUDA runtime and cuBLAS redistributables. The pinned `install.ps1` of a release is
+signed the same way.
 
-Only runs that publish sign: numbered releases and the manual main-only publisher. Their **sign**
-job unpacks both packages, signs them in one pass through SSL.com eSigner
+Only releases sign. A release's **sign** job unpacks both packages, signs them in one pass through SSL.com eSigner
 (`scripts/package-windows-sign.ps1`, `scripts/sign-windows.ps1`), packs them again and updates
 their listings' size and SHA-256; the check then runs on those signed bytes, which are the ones
 published. Each newly signed file is also stored under the SHA-256 of its unsigned bytes, so a
 later release reuses it instead of signing it again: a release signs the files that changed,
 mostly the engine's own, and a third-party file again only when its pinned version changes.
 
-The job runs in the `windows-signing` environment, limited to `main` and version tags, which
+The job runs in the `windows-signing` environment, limited to `main`, which
 holds the eSigner credential (`ES_USERNAME`, `ES_PASSWORD`, `ES_CREDENTIAL_ID`, `ES_TOTP_SECRET`)
 and the variable `WINDOWS_SIGNING_THUMBPRINT`, the SHA-1 thumbprint every WiCi AI signature must
 come from; `APP_VERSIONING_TOKEN` stores the signed files.

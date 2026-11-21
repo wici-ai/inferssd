@@ -78,7 +78,8 @@ static inline float op_expm1(float x) {
 }
 
 static inline float op_softplus(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    // Preserve small positive results when expf(x) would round away in 1 + expf(x).
+    return (x > 20.0f) ? x : log1pf(expf(x));
 }
 
 static inline float op_floor(float x) {

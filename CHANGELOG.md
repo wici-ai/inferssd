@@ -1,5 +1,23 @@
 # Changelog
 
+Every release lists the pull requests merged since the one before it on its
+[GitHub release](https://github.com/wici-ai/inferssd/releases). This file keeps the highlights of
+the larger ones, which their release notes start with.
+
+## 0.1.5 - 2026-11-18
+
+This release adds a CUDA package for Windows and signs the Windows packages, runs the expert VRAM tier on AMD GPUs, loads more model files, and from now on every published package is a release with a version of its own.
+
+### Highlights
+
+- **Every package is a release:** the packages the installers and the desktop app update to are each a numbered release, published here and named by its version. `inferssd --version --json` reports the release's `tag`; any other build reports the next release's development version, such as `0.1.6.dev3`.
+- **CUDA on Windows:** a machine with an NVIDIA GPU gets a CUDA package, every other machine the Vulkan package; the installer picks by the GPU and its driver ([#164](https://github.com/wici-ai/inferssd/pull/164), [#171](https://github.com/wici-ai/inferssd/pull/171), [#173](https://github.com/wici-ai/inferssd/pull/173)). It also installs on Windows 10 and with older NVIDIA drivers ([#287](https://github.com/wici-ai/inferssd/pull/287)).
+- **Signed Windows packages:** every executable, library and PowerShell script in the Windows packages carries a valid, timestamped Authenticode signature, WiCi AI's or its vendor's, and so does the release's `install.ps1` ([#293](https://github.com/wici-ai/inferssd/pull/293)).
+- **AMD GPUs:** the expert VRAM tier runs on AMD GPUs through ROCm ([#297](https://github.com/wici-ai/inferssd/pull/297)).
+- **More model files:** unsloth's DeepSeek V4.1 GGUFs ([#286](https://github.com/wici-ai/inferssd/pull/286)), files that carry NextN blocks ([#294](https://github.com/wici-ai/inferssd/pull/294)), native Q2_0 expert tensors ([#292](https://github.com/wici-ai/inferssd/pull/292)) and routed experts whose gate has another type than up ([#303](https://github.com/wici-ai/inferssd/pull/303)).
+- **Prompts in one pass:** a prompt prefills in one pass on every platform, and the experts a layer is predicted to need are read while the one before it computes ([#202](https://github.com/wici-ai/inferssd/pull/202), [#183](https://github.com/wici-ai/inferssd/pull/183), [#187](https://github.com/wici-ai/inferssd/pull/187), [#201](https://github.com/wici-ai/inferssd/pull/201)).
+- **Memory as it is used:** the KV cache is allocated as the context fills ([#215](https://github.com/wici-ai/inferssd/pull/215), [#219](https://github.com/wici-ai/inferssd/pull/219), [#225](https://github.com/wici-ai/inferssd/pull/225)), the context defaults to 65,536 tokens within the model's trained one ([#205](https://github.com/wici-ai/inferssd/pull/205)), and GPU allocations are admitted against the device's free memory ([#165](https://github.com/wici-ai/inferssd/pull/165), [#243](https://github.com/wici-ai/inferssd/pull/243)).
+
 ## 0.1.4 - 2026-11-10
 
 This release adds Qwen3.8 Flash Next and Gemma 4 E4B, and publishes checked Mac and Windows packages together from the same tagged commit.

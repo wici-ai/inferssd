@@ -4,7 +4,7 @@
 #include "cpu-prefill.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
-#include "ggml-ssd/store/source.h"
+#include "ggml-ssd/store/expert-layout.h"
 
 #include <cerrno>
 #include <algorithm>
@@ -25,9 +25,6 @@
 struct llama_ssd_cpu_sink_runtime;
 
 struct llama_ssd_cpu_sink_node {
-    ggml_tensor up;
-    ggml_tensor gate;
-    ggml_tensor down;
     ggml_backend_reg_t cpu_reg;
     llama_ssd_cpu_sink_runtime * runtime;
     float situ_beta;
@@ -35,18 +32,18 @@ struct llama_ssd_cpu_sink_node {
     // SITU nodes keep the K3 entries (run, grouped prefill).
     // Other activations are decode-only through ssd_cpu_sink_run_activation.
     ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SITU, 0.0f, 0.0f, 0.0f };
-    int layer;
+    int layer; // a routed layer of the runtime's expert layout
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
     bool prefill = false;
 };
 
 struct llama_ssd_cpu_sink_runtime {
-    // Resolve the logical native range; the callback below aligns its physical I/O.
-    // resolve_raw_direct_shape(name, expert, logical bytes, n_experts, fd, logical offset, logical bytes)
     const ssd::settings::snapshot & settings;
     const ssd::runtime_services & services;
-    const ssd::store::source_view source;
+    // The routed experts, described once from the model's expert tensors and the source index; the sink and its GPU
+    // tier borrow it for the runtime's lifetime.
+    const ssd::store::expert_layout layout;
     std::mutex mutex;
     ssd_cpu_sink * sink = nullptr;
     llama_ssd_cpu_prefill_runtime prefill;
@@ -62,7 +59,6 @@ struct llama_ssd_cpu_sink_runtime {
     decltype(&ssd::cpu::cache_prefill_room_configured) cache_prefill_room = nullptr; // optional
     ggml_backend_reg_t cpu_reg = nullptr;
     const ssd::cpu::api_v2 * cpu_api = nullptr;
-    const llama_ssd_cpu_sink_node * active_node = nullptr;
     uint64_t calls = 0;
     uint64_t read_requests = 0;
     uint64_t read_bytes = 0;
@@ -74,9 +70,6 @@ struct llama_ssd_cpu_sink_runtime {
     uint64_t vram_budget = 0;
     int cache_max_per_layer = 8;
     std::vector<int32_t> layer_priority;
-    // Expert tensor shapes of every layer, so that the sink's next-layer prefetch can resolve the next layer's
-    // experts while the current layer's node is active: name -> (bytes per expert, experts).
-    std::map<std::string, std::pair<size_t, int64_t>> expert_shapes;
     decltype(&ssd_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
     decltype(&ssd_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
@@ -90,25 +83,21 @@ struct llama_ssd_cpu_sink_runtime {
     // them uncommitted for the first prefill.
     uint64_t prefill_pages = 0;
 
-    llama_ssd_cpu_sink_runtime(int n_layers, uint64_t context_epoch,
-            int64_t n_expert, const std::vector<int32_t> & routed_layers,
+    // routed: the model's routed layers in model order, each with its up, gate and down expert tensors.
+    llama_ssd_cpu_sink_runtime(uint64_t context_epoch,
+            const std::vector<ssd::store::expert_layout::routed_layer> & routed,
             const ssd::settings::snapshot & configured, const ssd::runtime_services & runtime_services,
-            ssd::store::source_view source_view)
-        : settings(configured), services(runtime_services), source(source_view), epoch(context_epoch) {
-        if (n_expert <= 0) { throw std::runtime_error("CPU sink requires a positive routed expert count"); }
+            const ssd::store::source_view & source)
+        : settings(configured), services(runtime_services), layout(ssd::store::expert_layout::build(routed, source)),
+          epoch(context_epoch) {
         // Supported v0.1 profile: resource-sized RAM cache, model-order priority,
         // fixed eight-expert read ring.
         cache_budget = std::numeric_limits<uint64_t>::max();
         cache_keep_across_requests = true;
         vram_budget = settings.vram_budget()->tier_bytes(services.gpu != nullptr);
-        cache_max_per_layer = int(std::min<int64_t>(n_expert, 896));
-        for (int32_t layer : routed_layers) {
-            if (layer >= 0 && layer < n_layers &&
-                    std::find(layer_priority.begin(), layer_priority.end(), layer) == layer_priority.end()) {
-                layer_priority.push_back(layer);
-            }
-        }
-        if (layer_priority.empty()) { throw std::runtime_error("CPU sink requires routed model layers"); }
+        const ssd_expert_layout & experts = *layout.abi();
+        cache_max_per_layer = int(std::min<int64_t>(experts.experts, 896));
+        for (int i = 0; i < experts.n_layers; ++i) { layer_priority.push_back(experts.layers[i].id); }
     }
 
     ~llama_ssd_cpu_sink_runtime() {
@@ -124,38 +113,6 @@ struct llama_ssd_cpu_sink_runtime {
         }
     }
 
-    static bool resolve_source(void * userdata, const char * tensor_name, int32_t expert,
-            ssd_cpu_sink_source * source) {
-        auto & runtime = *static_cast<llama_ssd_cpu_sink_runtime *>(userdata);
-        if (!runtime.source.resolve || !source) {
-            return false;
-        }
-        auto range = [&](size_t logical_nbytes, int64_t experts) {
-            *source = {};
-            if (!runtime.source.resolve(runtime.source.userdata, tensor_name, expert, logical_nbytes, experts,
-                    &source->fd_direct, &source->offset, &source->nbytes)) { return false; }
-            source->data_offset = source->offset % 4096;
-            source->payload_nbytes = logical_nbytes;
-            if (logical_nbytes > SIZE_MAX - source->data_offset - 4095) { return false; }
-            source->offset -= source->data_offset;
-            source->nbytes = (source->data_offset + logical_nbytes + 4095) / 4096 * 4096;
-            return true;
-        };
-        // the running node's tensors first; any routed layer's otherwise (the next layer's prefetch, the load's preload)
-        if (const auto * node = runtime.active_node) {
-            for (const ggml_tensor * tensor : { &node->up, &node->gate, &node->down }) {
-                if (std::strcmp(tensor_name, tensor->name) == 0) {
-                    return range(tensor->nb[2], tensor->ne[2]);
-                }
-            }
-        }
-        const auto shape = runtime.expert_shapes.find(tensor_name);
-        if (shape != runtime.expert_shapes.end()) {
-            return range(shape->second.first, shape->second.second);
-        }
-        return false;
-    }
-
     void bind_provider(ggml_backend_reg_t registry) {
         if (!registry) { throw std::runtime_error("CPU sink requires a loaded CPU backend"); }
         if (cpu_api) {
@@ -165,7 +122,7 @@ struct llama_ssd_cpu_sink_runtime {
         const auto get = reinterpret_cast<ssd::cpu::get_api_v2>(
             ggml_backend_reg_get_proc_address(registry, "ggml_backend_cpu_ssd_api_v2"));
         const auto * api = get ? get() : nullptr;
-        if (!ssd::cpu::valid(api) || api->source_size() != sizeof(ssd_cpu_sink_source)) {
+        if (!ssd::cpu::valid(api)) {
             throw std::runtime_error("CPU sink executor ABI mismatch; rebuild the CPU backend and model together");
         }
         cpu_api = api;
@@ -202,7 +159,7 @@ struct llama_ssd_cpu_sink_runtime {
         prefill_hint = cpu_api->prefill_hint;
         constexpr int ring_experts = 8;
         char error[512] = {};
-        sink = create(&settings, &services, resolve_source, this, error, sizeof(error));
+        sink = create(&settings, &services, layout.abi(), error, sizeof(error));
         if (!sink) {
             throw std::runtime_error(std::string("CPU sink initialization failed: ") + error + "; no fallback");
         }
@@ -308,29 +265,27 @@ struct llama_ssd_cpu_sink_runtime {
     // instead, with a GPU tier or without one, when it can give room back to the first prefill's ledger requests
     // (CACHE_PARTIAL_RECLAIM or CACHE_ELASTIC; the sink decides). The sink exists from here on, so the first request's
     // prefill goes through cache_begin and make_room as every later one does; a cache that cannot give room back is
-    // still sized at the first decode token. A failure leaves both to the first decode. experts: up, gate and down of
-    // every routed layer, whose expert types the sink keeps for the GPU tier.
-    void reserve_tier(ggml_backend_reg_t registry, const std::vector<const ggml_tensor *> & experts, int experts_used) {
+    // still sized at the first decode token. A failure leaves both to the first decode.
+    void reserve_tier(ggml_backend_reg_t registry, int experts_used) {
         std::lock_guard<std::mutex> lock(mutex);
-        if ((!vram_budget && !cache_budget) || !registry || experts.size() < 3) { return; }
+        if ((!vram_budget && !cache_budget) || !registry) { return; }
         initialize(registry);
         const auto reserve = cpu_api->vram_reserve;
         // the load-time graph's pages, held from here to the first decode token: the load step leaves their room
         if (prefill_pages && cache_prefill_room) { cache_prefill_room(sink, &settings, &services, prefill_pages, 0, 0); }
         char error[512] = {};
-        if (reserve && !reserve(sink, experts.data(), int(experts.size() / 3), experts_used, error, sizeof(error))) {
+        if (reserve && !reserve(sink, experts_used, error, sizeof(error))) {
             std::fprintf(stderr, "[ssd_vram_elastic] event=reserve status=fail error=%s\n", error);
         }
     }
 
     // At load, after the load's passes and before any request: the expert caches filled from the drive by the sink
-    // (ssd_cpu_sink_preload). Nothing to do before the sink exists (no reserve made it). experts: up, gate and down
-    // of every routed layer.
-    bool preload(const std::vector<const ggml_tensor *> & experts, std::string & error) {
+    // (ssd_cpu_sink_preload). Nothing to do before the sink exists (no reserve made it).
+    bool preload(std::string & error) {
         std::lock_guard<std::mutex> lock(mutex);
-        if (!sink || !cpu_api || experts.size() < 3) { return true; }
+        if (!sink || !cpu_api) { return true; }
         char message[512] = {};
-        if (cpu_api->preload(sink, experts.data(), int(experts.size() / 3), message, sizeof(message))) { return true; }
+        if (cpu_api->preload(sink, message, sizeof(message))) { return true; }
         error = message;
         return false;
     }
@@ -406,7 +361,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     }
     const llama_ssd_cpu_sink_call call(runtime, nth);
     std::lock_guard<std::mutex> lock(runtime.mutex);
-    runtime.active_node = &node;
+    const int64_t latent = runtime.layout.abi()->latent;
 
     const ggml_tensor * input = dst->src[0];
     const ggml_tensor * ids = dst->src[1];
@@ -417,7 +372,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     GGML_ASSERT(ggml_nelements(ids) == ggml_nelements(weights));
     const int ntokens = static_cast<int>(dst->ne[1]);
     GGML_ASSERT(ntokens >= 1);
-    GGML_ASSERT(ggml_nelements(input) == node.up.ne[0] * ntokens);
+    GGML_ASSERT(ggml_nelements(input) == latent * ntokens);
     GGML_ASSERT(ggml_nelements(ids) % ntokens == 0);
     const int nslots = static_cast<int>(ggml_nelements(ids) / ntokens);
 
@@ -429,7 +384,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     if (node.post_exp_norm) {
         const ggml_tensor * norm = dst->src[3];
         GGML_ASSERT(norm && norm->type == GGML_TYPE_F32 && ggml_is_contiguous(norm));
-        GGML_ASSERT(ggml_nelements(norm) == node.down.ne[1]);
+        GGML_ASSERT(ggml_nelements(norm) == latent);
         activation.post_exp_norm = static_cast<const float *>(norm->data);
         activation.post_exp_norm_eps = node.post_exp_norm_eps;
     }
@@ -442,7 +397,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
                 static_cast<int>(hint->ne[0]));
         }
         runtime.prefill.initialize(node.cpu_reg, runtime.sink);
-        ok = runtime.prefill.run_activation(runtime.prefill.context, &node.up, &node.gate, &node.down,
+        ok = runtime.prefill.run_activation(runtime.prefill.context, node.layer,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
             static_cast<const float *>(weights->data), nslots, ntokens,
             &activation, static_cast<float *>(dst->data),
@@ -450,7 +405,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
         stats = grouped_stats.stream;
     } else if (situ) {
         GGML_ASSERT(ntokens == 1);
-        ok = runtime.run(runtime.sink, &node.up, &node.gate, &node.down,
+        ok = runtime.run(runtime.sink, node.layer,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
             static_cast<const float *>(weights->data), nslots,
             node.situ_beta, node.situ_linear_beta, static_cast<float *>(dst->data),
@@ -463,12 +418,11 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
             runtime.prefetch_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data),
                 static_cast<int>(ggml_nelements(hint)));
         }
-        ok = runtime.run_activation(runtime.sink, &node.up, &node.gate, &node.down,
+        ok = runtime.run_activation(runtime.sink, node.layer,
             static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
             static_cast<const float *>(weights->data), nslots, &activation,
             static_cast<float *>(dst->data), &stats, error, sizeof(error));
     }
-    runtime.active_node = nullptr;
     if (!ok) {
         GGML_ABORT("CPU sink layer=%d failed: %s read_errors=%" PRIu64
             " fallback_count=%" PRIu64 "; output discarded", node.layer, error,
@@ -534,12 +488,3 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     }
 }
 
-inline ggml_tensor llama_ssd_cpu_sink_metadata(const ggml_tensor * tensor) {
-    ggml_tensor result = *tensor;
-    result.data = nullptr;
-    result.buffer = nullptr;
-    result.extra = nullptr;
-    result.view_src = nullptr;
-    std::memset(result.src, 0, sizeof(result.src));
-    return result;
-}

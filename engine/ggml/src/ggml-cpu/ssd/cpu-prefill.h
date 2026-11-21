@@ -42,8 +42,8 @@ GGML_BACKEND_API struct ssd_cpu_prefill * ssd_cpu_prefill_create(
 GGML_BACKEND_API void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill);
 
 // Token-major contiguous input/output [ntokens][latent] and routes
-// [ntokens][nslots]. Token count follows the configured ubatch; 0..16 route slots. Tensor and
-// activation requirements match ssd_cpu_sink_run_activation. Every distinct
+// [ntokens][nslots] of routed layer `layer`. Token count follows the configured ubatch; 0..16 route slots. Layer
+// and activation requirements match ssd_cpu_sink_run_activation. Every distinct
 // live expert is read once. Each token's routes are added in slot order from its
 // first live slot's product, as the graph does, for every batch size; the route
 // workspace (about ntokens * nslots * latent floats) is priced to the sink's
@@ -51,18 +51,14 @@ GGML_BACKEND_API void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill);
 // before any read. Negative IDs are skipped. On failure discard output; no
 // hidden mmap/GPU fallback is attempted and in-flight reads are drained.
 GGML_BACKEND_API bool ssd_cpu_prefill_run_activation(
-        struct ssd_cpu_prefill * prefill,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const float * input,
+        struct ssd_cpu_prefill * prefill, int32_t layer, const float * input,
         const int32_t * ids, const float * weights, int nslots, int ntokens,
         const struct ssd_cpu_sink_activation * activation, float * output,
         struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size);
 
 // Compatibility wrapper for Kimi-K3 SiTU callers.
 GGML_BACKEND_API bool ssd_cpu_prefill_run(
-        struct ssd_cpu_prefill * prefill,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const float * input,
+        struct ssd_cpu_prefill * prefill, int32_t layer, const float * input,
         const int32_t * ids, const float * weights, int nslots, int ntokens,
         float situ_beta, float situ_linear_beta, float * output,
         struct ssd_cpu_prefill_stats * stats, char * error, size_t error_size);

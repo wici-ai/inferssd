@@ -3,7 +3,7 @@
 #include "ggml-cpu.h"
 #include "ggml-ssd/gpu/source.h"
 #include "ggml-ssd/host/cache-stats.h"
-#include "ggml-ssd/host/cache-stats.h"
+#include "ggml-ssd/store/expert-layout.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,31 +11,17 @@ extern "C" {
 
 struct ssd_cpu_sink;
 
-// Borrowed descriptors must remain open until run returns. No tensor payload is
-// accessed: resolve the packed expert by its tensor name and expert index.
-
-
-// The model-side native-range resolver checks this before using the callback ABI.
-GGML_BACKEND_API size_t ssd_cpu_sink_source_size(void);
-
-typedef bool (*ssd_cpu_sink_resolver)(
-        void * userdata, const char * tensor_name, int32_t expert,
-        struct ssd_cpu_sink_source * source);
-
-
-
-
-
-// Sources are direct-read descriptors (platform::open_direct), read through the
-// OS read ring (io/read-ring.h). The sink owns an I/O thread (and, with
-// prefetch, its readers); it computes on the threads of its calls (below).
-// A context serializes run calls. This unconfigured factory is for explicit
-// CPU-only callers. Production uses ssd::cpu::create_configured with an owned
-// typed snapshot and borrowed context services. Test policies are explicit
-// constructor inputs; no environment configuration is read here.
+// The routed experts are the layout's (store/expert-layout.h), borrowed with its
+// direct-read descriptors (platform::open_direct) until the sink is destroyed;
+// they are read through the OS read ring (io/read-ring.h). Creation fails for a
+// format the CPU cannot compute, naming it and its layers. The sink owns an I/O
+// thread (and, with prefetch, its readers); it computes on the threads of its
+// calls (below). A context serializes run calls. This unconfigured factory is
+// for explicit CPU-only callers. Production uses ssd::cpu::create_configured
+// with an owned typed snapshot and borrowed context services. Test policies are
+// explicit constructor inputs; no environment configuration is read here.
 GGML_BACKEND_API struct ssd_cpu_sink * ssd_cpu_sink_create(
-        int ring_experts, ssd_cpu_sink_resolver resolver,
-        void * userdata, char * error, size_t error_size);
+        int ring_experts, const struct ssd_expert_layout * layout, char * error, size_t error_size);
 // No call may be open.
 GGML_BACKEND_API void ssd_cpu_sink_destroy(struct ssd_cpu_sink * sink);
 
@@ -67,7 +53,8 @@ GGML_BACKEND_API void ssd_cpu_sink_prefill_hint(struct ssd_cpu_sink * sink, int3
 
 // Configure while no run is in progress. Layer quotas are assigned in priority
 // order, up to max_experts_per_layer each; a final layer may receive a partial
-// quota. Layer IDs refer to canonical blk.N.ffn_{up,gate,down}_exps.weight names.
+// quota. Layer IDs are routed layers of the layout; a slot holds each role's
+// largest read (ssd_expert_layout::read_bytes).
 // Payload is an ordinary anonymous arena (platform/memory.h), never
 // pinned/registered. Configuration does not touch payload pages. budget=0
 // disables the cache. Reconfiguration releases the old arena first.
@@ -110,25 +97,19 @@ GGML_BACKEND_API bool ssd_cpu_sink_vram_phase_complete(
 // Reserve the GPU batch accumulator for this actual ubatch before streamed I/O begins.
 GGML_BACKEND_API bool ssd_cpu_sink_vram_reserve_accumulator(
         struct ssd_cpu_sink * sink, int tokens, char * error, size_t error_size);
-// At load, after the context reserved its worst-case graph, with the routed layers' expert tensors (`experts`: up,
-// gate and down of each of n_layers layers): with a GPU tier, the sink keeps each layer's expert types, which it
-// declares to the tier with every layer it gives it, once it has them for every configured layer; the layers must
-// share latent, hidden and the expert count. Then on unified memory the GPU tier takes its storage for these routed
-// experts (slots of the largest) and grows into what the host-memory ledger leaves, after the RAM cache's demand;
-// elsewhere (with a GPU tier or without) a RAM cache kept across requests that can give room back
-// (CACHE_PARTIAL_RECLAIM or CACHE_ELASTIC) takes its geometry from the largest layer's strides, its arena and the
-// pages of the slots the ledger admits now. A cache that cannot give room back takes nothing here: it is sized at
-// the first decode token, after the first prefill's ledger requests, which an arena made now would refuse.
-// experts_used: the model's routed experts a token.
-GGML_BACKEND_API bool ssd_cpu_sink_vram_reserve(struct ssd_cpu_sink * sink, const struct ggml_tensor * const * experts,
-        int n_layers, int experts_used, char * error, size_t error_size);
+// At load, after the context reserved its worst-case graph: on unified memory the GPU tier takes its storage for the
+// routed experts (slots of the largest format) and grows into what the host-memory ledger leaves, after the RAM
+// cache's demand; elsewhere (with a GPU tier or without) a RAM cache kept across requests that can give room back
+// (CACHE_PARTIAL_RECLAIM or CACHE_ELASTIC) takes its arena and the pages of the slots the ledger admits now. A cache
+// that cannot give room back takes nothing here: it is sized at the first decode token, after the first prefill's
+// ledger requests, which an arena made now would refuse. experts_used: the model's routed experts a token.
+GGML_BACKEND_API bool ssd_cpu_sink_vram_reserve(struct ssd_cpu_sink * sink, int experts_used, char * error, size_t error_size);
 // At load, after the load's passes, before any request: the expert caches filled from the drive. No request has named
 // an expert, so each layer's experts are taken in their order: the GPU tier's empty slots, shared alike among the
 // layers, take each layer's first experts, then the RAM cache's empty slots the next ones. What no request uses is as
 // good as an empty slot to whatever allocates later. A tier made at load on a discrete GPU first grows into the card
-// if its memory has settled in the load's passes. experts: up, gate and down of n routed layers.
-GGML_BACKEND_API bool ssd_cpu_sink_preload(struct ssd_cpu_sink * sink, const struct ggml_tensor * const * experts,
-        int n_layers, char * error, size_t error_size);
+// if its memory has settled in the load's passes.
+GGML_BACKEND_API bool ssd_cpu_sink_preload(struct ssd_cpu_sink * sink, char * error, size_t error_size);
 GGML_BACKEND_API void ssd_cpu_sink_cache_get_stats(
         struct ssd_cpu_sink * sink, struct ssd_cpu_sink_cache_stats * stats);
 // Room in host memory for other memory about to be allocated, decided by the host-memory ledger
@@ -150,19 +131,17 @@ GGML_BACKEND_API bool ssd_cpu_sink_cache_prefill_room(struct ssd_cpu_sink * sink
 // Explicit reset/errors always release, even when cross-request retention is on.
 GGML_BACKEND_API void ssd_cpu_sink_cache_reset(struct ssd_cpu_sink * sink);
 
-// Single token. up/gate=[latent,hidden,experts], down=[hidden,latent,experts].
-// Tensors must be contiguous. Kernels come from each tensor's CPU type traits:
-// up and gate share one type (e.g. Q3_K with a Q8_K input, MXFP4 with a Q8_0
-// input); down may use another. Column counts must be multiples of the weight
-// and input block sizes. ids<0 are skipped; each live weight must be finite and
-// nonnegative. Caller supplies the final normalized weights. Each expert's down
+// Single token of routed layer `layer`: input is its latent row, output gets
+// one. Kernels are those of the layer's format in the layout: each role's CPU
+// vec_dot against its input quantized to its vec_dot_type, up's and gate's one
+// (e.g. Q3_K with a Q8_K input, MXFP4 with a Q8_0 input); gate may have
+// another type than up's with the same input, down another again. ids<0 are
+// skipped; each live weight must be finite and nonnegative. Caller supplies the final normalized weights. Each expert's down
 // output is multiplied by its weight, then added in slot order, starting from
 // the first live slot's product as the graph's sum does. On failure output
 // must be discarded. This is ssd_cpu_sink_run_activation with SITU.
 GGML_BACKEND_API bool ssd_cpu_sink_run(
-        struct ssd_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const float * input,
+        struct ssd_cpu_sink * sink, int32_t layer, const float * input,
         const int32_t * ids, const float * weights, int nslots,
         float situ_beta, float situ_linear_beta, float * output,
         struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
@@ -191,12 +170,9 @@ struct ssd_cpu_sink_activation {
 };
 
 // ssd_cpu_sink_run with an explicit activation. A configured GPU tier serves
-// Q3_K SiTU experts through its original ABI and other expert formats only when
-// it exports ssd_vram_format_get_api; otherwise the call fails closed.
+// the experts it holds through its explicit-format ABI (ssd_vram_format_get_api).
 GGML_BACKEND_API bool ssd_cpu_sink_run_activation(
-        struct ssd_cpu_sink * sink,
-        const struct ggml_tensor * up, const struct ggml_tensor * gate,
-        const struct ggml_tensor * down, const float * input,
+        struct ssd_cpu_sink * sink, int32_t layer, const float * input,
         const int32_t * ids, const float * weights, int nslots,
         const struct ssd_cpu_sink_activation * activation, float * output,
         struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);

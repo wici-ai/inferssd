@@ -9,9 +9,11 @@ They use the CUDA runtime's names; under HIP the backend's vendor header
 (`vendors/hip.h`) maps them, as for every other source of the backend
 (`gpu-runtime.h`). No component DSO or preload is used.
 
-The owner supplies tensor types, geometry, expert count and layer IDs through
-`ssd_vram_format_api`; it supplies source file identities and ranges through
-`ssd_vram_request`. The tier shares admission policy, asynchronous and deferred
+The owner declares the model's expert layout (`ggml-ssd/store/expert-layout.h`:
+the geometry, each routed layer's format and its roles' bytes) once, right after
+it makes the tier (`ssd_vram_tier_api` declare); a format the tier cannot hold or
+compute fails there. A request (`ssd_vram_request`) names a layer, an expert and
+its roles' file identities and ranges, each role by its bytes in the layout. The tier shares admission policy, asynchronous and deferred
 uploads, residency leases, elastic blocks and failure cleanup across formats.
 A borrowed upload keeps its source pinned until collect/finish or failure drain.
 Reclaim refuses live compute/residency leases and drains queued copies before
@@ -25,11 +27,9 @@ ggml's CUDA backend, not the CPU sink bit for bit: on Blackwell, MMQ takes
 MXFP4 with FP4 activations, as ggml's own `MUL_MAT` does. The GPU backend does
 not link the CPU backend.
 
-The former implicit Q3_K transport path has been removed. The internal
-transport ABI remains version 2 with its existing field order; implicit
-`prepare`/`launch` slots return an explicit unsupported-format error and drain
-their context. Use the explicit format extension. Generic upstream Q3_K
-quantizers and kernels remain part of ggml.
+The former implicit Q3_K transport path and its retired `prepare`/`launch`
+slots are gone (tier ABI 3). Generic upstream Q3_K quantizers and kernels
+remain part of ggml.
 
 A grouped pass takes no device memory between its reserve and release. CUDA loads a
 kernel, with its local memory, on the kernel's first launch in the context; HIP

@@ -14,11 +14,12 @@ an installer from a release builds that release from source, as before. So does 
 
 ## What it is
 
-One archive, `inferssd-<label>-macos-arm64.tar.gz`, about 30 MB, 80 MB unpacked, named by the
-[build label](../README.md#versions) of the commit it was built from:
+One archive, `inferssd-<version>-macos-arm64.tar.gz`, about 30 MB, 80 MB unpacked, named by the
+build's [version](engine-resources.md), `<yymmdd>.<build>` (`inferssd-261119.301-macos-arm64`). A
+package built outside a release, by a pull request or a merge to `main`, is never published:
 
 ```text
-inferssd-<label>-macos-arm64/
+inferssd-<version>-macos-arm64/
   bin/inferssd               the command, on the package's own Python
   bin/inferssd-server        the engine, its libraries beside it
   bin/inferssd-cpuprobe, bin/inferssd-ssdprobe
@@ -53,24 +54,44 @@ with a space, checks every binary's libraries, search paths, signature and oldes
 installs it with `scripts/install.sh` from a package list of its own, with every developer tool
 replaced by a stub that fails, and profiles the machine.
 
-Every numbered `vX.Y.Z` release calls **Package macOS** and **Package Windows** at the same
-tag commit. macOS still builds on macOS 15 and checks on macOS 15 and 26; Windows also checks
-installation without developer tools. Only after both platforms pass does the common **Release**
-job attach both archives, manifests and installers to one numbered GitHub release and update both
-normal package feeds with `scripts/publish-package.py`. `APP_VERSIONING_TOKEN` is required.
+## Releases
 
-Each numbered installer pins its package manifest to that same GitHub release. The installer
-from `main` keeps following the normal latest package list; explicit `INFERSSD_REF` or
-`INFERSSD_FROM_SOURCE` continues to request a source build.
+Every published package is a release's. **Actions > Release**, run by hand on `main`, releases
+its head as its version, `<yymmdd>.<build>`: the commit's day (UTC) and `main`'s commit count, as
+every build is named. It calls **Package macOS**, and **Package Windows** once for Vulkan and once
+for CUDA, at that commit, with the release's tag, which is the version, and each package is checked
+against it. macOS builds on macOS 15 and checks on macOS 15 and 26; Windows also checks
+installation without developer tools, and signs (see [the Windows package](windows-package.md)).
+Each package, once its own checks pass, reaches the CDN and its package list points at it
+(`scripts/publish-package.py`, which publishes nothing but a release's package): none waits for
+the slowest, so the macOS and Vulkan packages reach the app while the CUDA one still builds. Once
+all three are published, the release job attaches the archives, manifests and pinned installers to
+the GitHub release named by the version, which tags the commit when it is published. A version
+that is already a tag stops the run before anything is built. `APP_VERSIONING_TOKEN` is required.
 
-**Package macOS** runs for pull requests that change how the package is built and after each merge
-to `main` that changes the engine, the framework or the packaging. It also runs manually on `main`
-for validation and its explicit **publish** option. The publisher uploads to `https://cdn.wici.ai/apps/inferssd/`, checks the
-served bytes before updating the list, and refuses a list older than the one already published.
+The release's notes list the pull requests merged since the last release, by their titles; a
+release with highlights of its own has a section in [CHANGELOG.md](../CHANGELOG.md), which comes
+first.
 
-The CDN keeps a file for a year, so a name never gets other bytes: packing a commit already
-uploaded again is refused. If publishing fails, re-run the failed job: it publishes the same
-files, and the service skips the ones it holds.
+With `github_release` off, a run builds, checks and signs the same packages and points the package
+lists at them, which the installers from `main` and the desktop app follow, but makes no GitHub
+release and no tag, so no notes or pinned installers are published. The CDN then holds the
+version, and a release built again at the same commit would be refused there: the next GitHub
+release needs a newer commit on `main`. The same holds for a run whose later package fails: the
+packages already published stay, and the failed one's list keeps its earlier version.
+
+Each release's installers pin their package lists to that same GitHub release. The installer
+from `main` follows the latest package list; explicit `INFERSSD_REF` or `INFERSSD_FROM_SOURCE`
+requests a source build.
+
+**Package macOS** also runs by hand on any branch, building and checking without publishing; run
+it for a change to how the package is built. Pull requests and merges to `main` build no package. The publisher uploads to
+`https://cdn.wici.ai/apps/inferssd/`, checks the served bytes before updating the list, and
+refuses a list older than the one already published.
+
+The CDN keeps a file for a year, so a name never gets other bytes: a version already uploaded is
+not uploaded again with other bytes. If publishing fails, re-run the release's failed job: it
+publishes the same files, and the service skips the ones it holds.
 
 ## The package list
 
@@ -80,19 +101,20 @@ The installer reads `https://appapi.wici.ai/versioning/inferssd/config/latest-ma
 ```json
 {
   "schema": "inferssd-package 1",
-  "name": "inferssd-261107.207.84bcc56-macos-arm64",
-  "version": "0.1.3",
-  "build": 207,
-  "revision": "84bcc569ac5f41690ad38cbd820b6113c9accc45",
-  "date": "2026-11-07",
+  "name": "inferssd-261119.301-macos-arm64",
+  "version": "261119.301",
+  "tag": "261119.301",
+  "build": 301,
+  "revision": "…",
+  "date": "2026-11-19",
   "branch": "main",
-  "label": "261107.207.84bcc56",
+  "label": "261119.301.61a66d5",
   "platform": "darwin-arm64",
   "minimum_macos": "15.0",
-  "file": "inferssd-261107.207.84bcc56-macos-arm64.tar.gz",
+  "file": "inferssd-261119.301-macos-arm64.tar.gz",
   "size": 27751636,
   "sha256": "…",
-  "url": "https://cdn.wici.ai/apps/inferssd/inferssd-261107.207.84bcc56-macos-arm64.tar.gz"
+  "url": "https://cdn.wici.ai/apps/inferssd/inferssd-261119.301-macos-arm64.tar.gz"
 }
 ```
 

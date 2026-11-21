@@ -25,7 +25,7 @@ from ci.contract import load, save
 from ci.selected_receipt import normalize
 from test_ci_operator_controller import functional_artifacts
 from test_ci_performance_series import POLICY, protocol_for, record, result
-from test_strategy_inputs import muse_like, write_gguf
+from test_strategy_inputs import engine_facts, muse_like
 
 from inferssd.machine.characteristics import dumps, load as load_machine
 
@@ -88,9 +88,14 @@ def sandbox_record(tmp_path, side="candidate", model="muse", patch=None, setting
     for path in (server, alias, root / "source" / side / "chat.jinja", root / "scratch" / side / "keep"):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("synthetic\n")
-    server.chmod(server.stat().st_mode | stat.S_IXUSR)
     (root / "models" / model).mkdir(parents=True)
-    shard = write_gguf(root / "models" / model / "model.gguf", *muse_like())
+    shard = root / "models" / model / "model.gguf"
+    shard.write_bytes(b"GGUF")
+    # The side's server prints the model's facts, as inferssd-server --ssd-model-facts does.
+    printed = root / "build" / side / "model-facts.json"
+    printed.write_text(json.dumps(engine_facts(*muse_like(), path=str(shard))))
+    server.write_text("#!/bin/sh\n[ \"$1\" = --ssd-model-facts ] && exec cat " + str(printed) + "\nexit 9\n")
+    server.chmod(server.stat().st_mode | stat.S_IXUSR)
     settings = root / "models" / ("settings-" + model + "-" + side + ".ssd")
     settings.write_text("inferssd-settings 1\nexpert.source = [\"" + str(alias) + "\"]\n" + "".join(line + "\n" for line in settings_lines))
     machine = root / "scratch/machine/machine.json"

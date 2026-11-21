@@ -12,6 +12,7 @@
 #include <memory>
 #include <set>
 #include <functional>
+#include <limits>
 #include <map>
 
 struct ggml_cgraph;
@@ -62,6 +63,17 @@ enum llm_norm_type {
     LLM_NORM_RMS,
     LLM_NORM_GROUP,
 };
+
+// The selected expert scores can be much smaller than the F16 floor in
+// DeepSeek-V4.1. Preserve its Gate.forward denominator without changing the
+// historical zero guard used by other architectures.
+inline ggml_tensor * llm_moe_weights_denominator(
+        ggml_context * ctx, ggml_tensor * weights_sum, llm_arch arch) {
+    if (arch == LLM_ARCH_DEEPSEEK41) {
+        return ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f);
+    }
+    return ggml_clamp(ctx, weights_sum, 6.103515625e-5f, std::numeric_limits<float>::infinity());
+}
 
 // TODO: tmp - need something better to pass the data from the encoder to the decoder
 struct llama_cross {
@@ -288,9 +300,9 @@ public:
     ggml_tensor * get_kq_mask_swa() const { return self_kq_mask_swa_cnv; }
 
     // n_tokens == n_batch
-    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_tokens, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_tokens, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_tokens, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_tokens, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_tokens, n_batch/n_stream, 1, n_stream]
 
     const llama_hparams hparams;
@@ -321,7 +333,7 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     // note: assumes v_rot^2 == I
@@ -361,7 +373,7 @@ public:
 
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     const llama_hparams hparams;
@@ -399,9 +411,9 @@ public:
     ggml_tensor * self_k_idxs_swa = nullptr; // I64 [n_batch]
     ggml_tensor * self_v_idxs_swa = nullptr; // I64 [n_batch] or [n_batch*n_embd_v_gqa]
 
-    ggml_tensor * self_kq_mask         = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask         = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv     = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
-    ggml_tensor * self_kq_mask_swa     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask_swa     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_swa_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream]
 
     ggml_tensor * self_k_rot = nullptr;
@@ -435,7 +447,7 @@ public:
     ggml_tensor * self_k_idxs = nullptr; // I64 [n_batch]
 
     // fork: the mask is filled as F32 (llama_kv_cache::set_input_kq_mask) and cast to F16 for flash attention
-    ggml_tensor * self_kq_mask     = nullptr; // F32 [n_kv, n_batch/n_stream, 1, n_stream]
+    ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //     [n_kv, n_batch/n_stream, 1, n_stream] (F16 with flash attention)
 
     ggml_tensor * self_k_rot = nullptr;
@@ -504,7 +516,7 @@ public:
 
     ggml_tensor * get_kq_mask_cross() const { return cross_kq_mask_cnv; }
 
-    ggml_tensor * cross_kq_mask     = nullptr; // F32 [n_outputs_enc, n_batch, 1, 1]
+    ggml_tensor * cross_kq_mask     = nullptr; // F32/F16 [n_outputs_enc, n_batch, 1, 1]
     ggml_tensor * cross_kq_mask_cnv = nullptr; // F32 [n_outputs_enc, n_batch, 1, 1]
 
     const llama_cross * cross = nullptr;

@@ -80,15 +80,28 @@ struct lane_geometry {
     uint64_t token_bytes, output_bytes;
     bool batched, in_place;
 };
-struct prefill_sample {
-    ssd_prefill_fit cpu, gpu, gpu_host;
-    double read_bytes, read_us, gpu_overhead_us, gpu_tokens;
+// One line's samples: the last `window` layers that measured it. A layer that did not (a pass whose experts all
+// stayed on the CPU, a layer without reads) tells nothing about that line and leaves its samples as they are; counted
+// as a sample, it would push out the layers that fix the line. A short pass that ends a request (a few tokens, every
+// expert on the CPU) then left the GPU lane's line one sample of one route an expert, and the next prompt's first
+// layers priced the lane at 101 us a route against the 0.94 it had measured, keeping their experts on the CPU.
+template <class T> struct prefill_line_window {
+    std::vector<T> items;
+    size_t next = 0;
+    void push(const T & item, size_t window) {
+        window = std::max<size_t>(1, window);
+        if (items.size() < window) { items.push_back(item); } else { items[next] = item; }
+        next = (next + 1) % window;
+    }
 };
+struct prefill_overhead_sample { double tokens, us; };
+struct prefill_read_sample { double bytes = 0, us = 0; };
 struct prefill_learning {
     ssd_prefill_fit cpu_fit;
     size_t window = 0;
-    std::vector<prefill_sample> samples;
-    size_t next = 0;
+    prefill_line_window<ssd_prefill_fit> cpu, gpu, gpu_host;
+    prefill_line_window<prefill_overhead_sample> overhead;
+    prefill_read_sample reads; // the newest layer with reads
     uint64_t calibrations = 0;
 };
 inline double overhead_row_prior(const cost_lines & prior, const lane_geometry & lane, double locked_us_per_mb) {
@@ -100,13 +113,9 @@ inline double overhead_row_prior(const cost_lines & prior, const lane_geometry &
 // rate to about 2%, and a drive changes speed at once (a throttled volume, a hot drive), so an older layer can only
 // make the line late. On the RTX 5090 VM, replaying 40 servers' 1,754 layers, the newest layer alone predicted the next
 // layer's reads within 4.0% on average at a steady rate, against 28% for the pass's 40 layers, and within 56% just
-// after a slow span, against 113%.
+// after a slow span, against 113%. Layers without reads (every expert a cache hit) keep it.
 inline void prefill_reads(const prefill_learning & s, ssd_prefill_fit & drive) {
-    const size_t n = s.samples.size();
-    for (size_t k = 0; k < n; ++k) {
-        const auto & x = s.samples[(s.next + n - 1 - k) % n];
-        if (x.read_bytes > 0.0 && x.read_us > 0.0) { drive.add(x.read_bytes / 1e6, x.read_us); return; }
-    }
+    if (s.reads.bytes > 0.0 && s.reads.us > 0.0) { drive.add(s.reads.bytes / 1e6, s.reads.us); }
 }
 inline ssd_place_table make_table(const cost_lines & s, const cost_lines & prior,
         const decode_learning & decode, const prefill_learning & prefill,
@@ -197,9 +206,9 @@ inline lock_plan plan_locks(const ssd_place_table & table, size_t ring_slots,
 }
 
 struct prefetch_plan { int layer, ranks; bool hinted, open_gate; };
-inline prefetch_plan plan_prefetch(int layer, int hint_layer, int hint_n, int topk, bool demand_reads) {
-    const bool hinted = hint_n && hint_layer == layer + 1;
-    return {layer + 1, hinted ? std::min(topk, hint_n) : 0, hinted, !demand_reads};
+inline prefetch_plan plan_prefetch(int next_layer, int hint_layer, int hint_n, int topk, bool demand_reads) {
+    const bool hinted = hint_n && next_layer >= 0 && hint_layer == next_layer;
+    return {next_layer, hinted ? std::min(topk, hint_n) : 0, hinted, !demand_reads};
 }
 // How likely the next layer selects a novel expert of a hint rank: the share of the rank's novel experts it selected,
 // by the rule of succession (no evidence: one half).
@@ -266,17 +275,18 @@ inline prefill_fit_result observe_prefill_lines(prefill_learning & learning, cos
     const double gpu_lane_us = f.gpu.t + f.host.t + (engine ? f.transient_wait_us : upload_us);
     const double gpu_overhead_us = !gpu_work ? 0.0 : f.output_add_us + (engine ? f.engine_overhead_us :
         std::max(0.0, f.total_worker_us - f.read_wait_us - gpu_lane_us));
-    const prefill_sample sample = { learning.cpu_fit, f.gpu, f.host, double(f.read_bytes), f.read_us,
-        gpu_overhead_us, gpu_work ? double(f.ntokens) : 0.0 };
-    if (learning.samples.size() < learning.window) { learning.samples.push_back(sample); }
-    else { learning.samples[learning.next] = sample; }
-    learning.next = (learning.next + 1) % learning.window;
+    // each line from the last layers that measured it
+    if (learning.cpu_fit.n > 0.0) { learning.cpu.push(learning.cpu_fit, learning.window); }
+    if (f.gpu.n > 0.0) { learning.gpu.push(f.gpu, learning.window); }
+    if (f.host.n > 0.0) { learning.gpu_host.push(f.host, learning.window); }
+    if (gpu_work) { learning.overhead.push({ double(f.ntokens), gpu_overhead_us }, learning.window); }
+    if (f.read_bytes > 0 && f.read_us > 0.0) { learning.reads = { double(f.read_bytes), f.read_us }; }
     ssd_prefill_fit cpu, gpu, gpu_host;
     ssd_prefill_overhead_fit overhead;
-    for (const auto & s : learning.samples) {
-        cpu.add(s.cpu); gpu.add(s.gpu); gpu_host.add(s.gpu_host);
-        if (s.gpu_tokens > 0.0) { overhead.add(int(s.gpu_tokens), s.gpu_overhead_us); }
-    }
+    for (const auto & s : learning.cpu.items) { cpu.add(s); }
+    for (const auto & s : learning.gpu.items) { gpu.add(s); }
+    for (const auto & s : learning.gpu_host.items) { gpu_host.add(s); }
+    for (const auto & s : learning.overhead.items) { overhead.add(int(s.tokens), s.us); }
     ssd_prefill_fit_line(cpu, prior.cpu_fixed_us, prior.cpu_route_us, cost.cpu_fixed_us, cost.cpu_route_us);
     ssd_prefill_fit_line(gpu, prior.gpu_fixed_us, prior.gpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us);
     ssd_prefill_fit_line(gpu_host, prior.gpu_host_fixed_us > 0 || prior.gpu_host_route_us > 0 ? prior.gpu_host_fixed_us :

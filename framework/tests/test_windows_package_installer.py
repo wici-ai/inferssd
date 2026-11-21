@@ -53,10 +53,10 @@ def windows_install(tmp_path):
         native=None,
         minimum_windows="10.0.10240",
     ):
-        name = f"inferssd-261109.{build}.aaaaaaa-windows-x64-{backend}"
+        name = f"inferssd-261109.{build}-windows-x64-{backend}"
         archive = tmp_path / (name + ".zip")
         metadata = {
-            "version": "0.1.3",
+            "version": f"261109.{build}",
             "build": build,
             "revision": "a" * 40,
             "date": "2026-11-09",
@@ -149,7 +149,7 @@ def test_failed_package_keeps_the_working_installation(windows_install, failure)
     old, wrapper = (home / "current").resolve(), (bindir / "inferssd.cmd").read_bytes()
     member = {
         "traversal": "../outside.txt",
-        "inner-traversal": "inferssd-261109.402.aaaaaaa-windows-x64-vulkan/../outside.txt",
+        "inner-traversal": "inferssd-261109.402-windows-x64-vulkan/../outside.txt",
     }.get(failure)
     bad, _ = make(
         402,
@@ -202,6 +202,60 @@ def test_downloads_manifest_and_archive_over_http(windows_install):
         thread.join()
 
 
+def test_a_dropped_archive_download_resumes(windows_install):
+    home, _, _, make, run = windows_install
+    listing, _ = make(402)
+    requests = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            name = self.path.lstrip("/")
+            body = (listing.parent / name).read_bytes()
+            requests.append((name, self.headers.get("Range")))
+            if not name.endswith(".zip"):
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            elif len([n for n, _ in requests if n == name]) == 1:
+                # The first answer stops half way, as a link that drops does.
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body[: len(body) // 2])
+                self.close_connection = True
+            else:
+                start = int(self.headers["Range"].removeprefix("bytes=").split("-")[0])
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{len(body) - 1}/{len(body)}")
+                self.send_header("Content-Length", str(len(body) - start))
+                self.end_headers()
+                self.wfile.write(body[start:])
+
+        def log_message(self, *_):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        base = f"http://127.0.0.1:{server.server_port}/"
+        manifest = json.loads(listing.read_text())
+        manifest["url"] = base + manifest["file"]
+        listing.write_text(json.dumps(manifest))
+        result = run(base + listing.name)
+        assert result.returncode == 0, result.stderr
+        assert "resuming" in result.stdout
+        archive = [rng for name, rng in requests if name == manifest["file"]]
+        half = manifest["size"] // 2
+        assert archive == [None, f"bytes={half}-"]
+        assert (home / "current/bin/inferssd.exe").is_file()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join()
+
+
 def test_ps5_installs_deep_python_paths_without_duplicate_archive_root(
     windows_install, tmp_path_factory
 ):
@@ -238,7 +292,7 @@ def test_installs_the_cuda_package_a_package_list_names(windows_install):
     listing, name = make_package(403, backend="cuda")
     result = run(listing)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert "261109.403.aaaaaaa, cuda" in result.stdout
+    assert "Downloading InferSSD 261109.403, cuda" in result.stdout
     assert (home / "current" / "bin" / "inferssd-server.exe").is_file()
 
 

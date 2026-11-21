@@ -28,8 +28,8 @@ templates = {
 # The standalone --ssd-schema query exits before loading compute backends.
 # Keep it standalone: mixed argument lists use normal backend-aware parsing.
 subprocess.run([str(binary), "--ssd-schema"], check=True, stdout=subprocess.DEVNULL)
-# A source archive has no Git metadata to name the revision, the build number (the commit count,
-# which needs the history the installer's blobless clone has), the day or the branch.
+# A source archive has no Git metadata to name the version, the revision, the build number (the
+# commit count, which needs the history the installer's blobless clone has), the day or the branch.
 
 
 def git(*arguments: str) -> str:
@@ -44,9 +44,32 @@ try:
     branch: Optional[str] = git("rev-parse", "--abbrev-ref", "HEAD")
 except (OSError, subprocess.CalledProcessError, ValueError):
     revision, build, date, branch = "unknown", None, None, None
+# The version is <yymmdd>.<build>: the commit's day (UTC) and the commit count, 261119.300.
+version: Optional[str] = f"{date[2:4]}{date[5:7]}{date[8:10]}.{build}" if build and date else None
+
+
+def released() -> Optional[str]:
+    """A release's tag, which is its version: the Release workflow passes the tag it is about to
+    create in INFERSSD_RELEASE_TAG, and a clone of a released commit has the tag itself. Any other
+    build has none."""
+    tag = os.environ.get("INFERSSD_RELEASE_TAG", "")
+    if tag:
+        if tag != version:
+            sys.exit(f"engine-resources: INFERSSD_RELEASE_TAG {tag!r} is not this build's version, {version!r}")
+        return tag
+    if not version:
+        return None
+    try:
+        tags = git("tag", "--points-at", "HEAD").split()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return version if version in tags else None
+
+
+tag = released()
 value = {
     "schema": "inferssd-engine 1", "binary": str(binary), "revision": revision,
-    "build": build, "date": date, "branch": branch,
+    "version": version, "tag": tag, "build": build, "date": date, "branch": branch,
     "capabilities": {
         "settings": "inferssd-settings 1", "telemetry": 1, "platform": platform,
         "gpu_backends": list(cmake_gpu_backends(

@@ -203,7 +203,7 @@ def estimates(
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
                     )
-                    if model.facts is not None
+                    if model.facts.experts is not None
                     else dense_decode_estimate(
                         value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
                     ),

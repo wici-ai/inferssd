@@ -3,7 +3,7 @@
 // The scope names the platforms whose mechanisms a setting configures. The backend, when not empty, lists the GPU
 // backends whose expert tier the setting configures (CUDA, and HIP for AMD GPUs, both built from ggml's CUDA sources):
 // an engine without that tier refuses the setting when it is set.
-SSD_SETTING("expert.source", paths, 0, 0, "[]", "path", "plan", scope_all, "", "Expert index source paths in declared order")
+SSD_SETTING("expert.source", paths, 0, 0, "[]", "path", "plan", scope_all, "", "Expert sources in declared order: the model's GGUF files, expert packs or alias indexes")
 SSD_SETTING("cpu.io_cpus", cpus, 0, 2147483647, "", "CPU ID", "plan", scope_all, "", "Ordered unique CPU IDs for I/O participants")
 SSD_SETTING("cpu.decode_participants", integer, 0, 255, "0", "compute participants", "plan", scope_all, "", "Decode compute participants; zero selects the measured/default policy")
 SSD_SETTING("prefetch.depth", integer, 0, 64, "64", "predicted experts", "plan", scope_all, "", "Next-layer predicted experts the prefetch weighs, best first (0: none); it reads those whose reads pay")

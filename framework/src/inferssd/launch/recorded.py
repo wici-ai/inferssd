@@ -1,196 +1,27 @@
-"""Local artifact preparation plus required recorded host facts; never starts an engine."""
+"""Local file facts plus required recorded host facts; never starts an engine."""
 
 from __future__ import annotations
 
-import glob
-import hashlib
-import io
-import json
 import os
-import shlex
-import shutil
-import subprocess
-import sys
-import tempfile
-import traceback
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Optional
 
-from inferssd.launch import ram
-from inferssd.launch.darwin import PROFILES
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
-from inferssd.source import experts
-from inferssd.source import header as gguf_header
 from inferssd.strategy import inputs as strategy_inputs
-
-
-def metadata(name: str, arguments: tuple[str, ...]) -> Reply:
-    """Keep the subprocess-style reply boundary using the typed artifact functions.
-
-    Tracebacks identify the actual Python source. They are not rewritten to look
-    like the former shell's helper process. SystemExit and partial writes remain.
-    """
-    stdout, stderr = io.StringIO(), io.StringIO()
-
-    def emit(*values: object, **keywords: Any) -> None:
-        stream = stderr if keywords.pop("file", None) is sys.stderr else stdout
-        print(*values, file=stream, **keywords)
-
-    try:
-        if name == "index":
-            experts.index(arguments[0], None, arguments[1], emit=emit)
-        elif name == "source_facts":
-            experts.facts(arguments[0], arguments[1] or None, emit=emit)
-        elif name == "dense":
-            experts.dense(*arguments, emit=emit)
-        else:
-            raise ValueError("Unknown artifact operation: " + name)
-    except SystemExit as error:
-        if isinstance(error.code, int):
-            code = error.code
-        elif error.code is None:
-            code = 0
-        else:
-            stderr.write(str(error.code) + "\n")
-            code = 1
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), code)
-    except Exception:
-        stderr.write(traceback.format_exc())
-        return Reply(None, stdout.getvalue(), stderr.getvalue(), 1)
-    values = (
-        dict(word.split("=", 1) for word in shlex.split(stdout.getvalue()))
-        if name != "index"
-        else {}
-    )
-    return Reply(values, stdout.getvalue(), stderr.getvalue())
-
-
-def alias_key(paths: tuple[str, ...], profile: Optional[str], repo: str) -> str:
-    """What an index depends on: the indexer's source, the expert count and provenance it is
-    given, and each shard as the file system identifies it (an edit or a replacement changes
-    its size, inode, or modification or change time)."""
-    from inferssd.source import gguf_alias
-
-    digest = hashlib.sha256(Path(gguf_alias.__file__).read_bytes())
-    digest.update(((profile or "") + "\0" + repo).encode())
-    for path in paths:
-        stat = os.stat(path)
-        identity = (
-            os.path.realpath(path),
-            stat.st_dev,
-            stat.st_ino,
-            stat.st_size,
-            stat.st_mtime_ns,
-            stat.st_ctime_ns,
-        )
-        digest.update(("\0" + "\0".join(str(part) for part in identity)).encode())
-    return digest.hexdigest()[:32]
-
-
-def generate_alias(
-    paths: tuple[str, ...],
-    profile: Optional[str],
-    cache_dir: Path,
-    *,
-    repo: str,
-    python: str,
-    run: Callable[[list[str]], None],
-    replace: Callable[[str, str], None],
-    reuse: Optional[Path] = None,
-) -> str:
-    """Run the strict GGUF alias indexer, then publish the index and its summary in order.
-
-    The historical launcher's profile also fixes the expert count it checks; without one
-    the indexer reads it from the model. With REUSE, an index built for the same inputs
-    (alias_key) is copied from there instead of built again: the indexer validates every
-    shard header, 1.8 s of a DeepSeek V4.1 launch. A new index is kept there for later ones.
-    """
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    name = hashlib.sha256(((profile or "") + "\0" + paths[0]).encode()).hexdigest()[:20]
-    alias, summary = cache_dir / f"{name}.tsv", cache_dir / f"{name}.json"
-    kept = None
-    if reuse is not None:
-        key = alias_key(paths, profile, repo)
-        kept = (reuse / f"{key}.tsv", reuse / f"{key}.json")
-    with tempfile.TemporaryDirectory(prefix=".index-", dir=cache_dir) as temporary:
-        pending_alias, pending_summary = (
-            Path(temporary) / "index.tsv",
-            Path(temporary) / "summary.json",
-        )
-        if kept and kept[0].is_file() and kept[1].is_file():
-            shutil.copyfile(kept[0], pending_alias)
-            shutil.copyfile(kept[1], pending_summary)
-        else:
-            command = [
-                python,
-                "-I",
-                "-m",
-                "inferssd.source.gguf_alias",
-                "--out",
-                str(pending_alias),
-                "--summary-json",
-                str(pending_summary),
-            ]
-            if profile:
-                command[4:4] = ["--n-experts", str(PROFILES[profile][0])]
-            if repo:
-                command[4:4] = ["--repo", repo]
-            for path in paths:
-                command.extend(("--model-glob", glob.escape(path)))
-            run(command)
-            if kept:
-                keep_alias((pending_alias, pending_summary), kept)
-        data = json.loads(pending_summary.read_text(encoding="utf-8"))
-        if data.get("model_shards") != len(paths) or data.get("entries", 0) <= 0:
-            raise ValueError("GGUF metadata did not produce a complete nonempty expert index")
-        data["output_tsv"] = str(alias)
-        pending_summary.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-        replace(str(pending_alias), str(alias))
-        replace(str(pending_summary), str(summary))
-    return str(alias)
-
-
-def keep_alias(built: tuple[Path, Path], kept: tuple[Path, Path]) -> None:
-    """Copies a new index and its summary for later launches, each published whole: the two
-    files of one key hold the same content whichever launch wrote them."""
-    kept[0].parent.mkdir(parents=True, exist_ok=True)
-    for source, target in zip(built, kept):
-        partial = target.with_name(f".{target.name}.{os.getpid()}")
-        shutil.copyfile(source, partial)
-        os.replace(partial, target)
-
-
-def run_indexer(command: list[str]) -> None:
-    # The only subprocess allowed by this adapter is the installed strict header
-    # indexer, assembled by generate_alias. Engine argv never reaches this call.
-    # Its summary is a log: a command's stdout is its result, such as a chat's answer.
-    subprocess.run(command, check=True, stdout=sys.stderr.fileno())
 
 
 class RecordedArtifacts:
     """Filesystem effects are local; host observations must be supplied explicitly.
 
     A missing host field fails only when requested. This object does not call
-    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable.
+    nvidia-smi, sysctl, systemd, sockets, /proc or a server executable, so the
+    model's facts (the engine's) are recorded too.
     """
 
-    def __init__(
-        self,
-        inputs: LaunchInput,
-        host: Mapping[str, object],
-        *,
-        run: Callable[[list[str]], None],
-        replace: Callable[[str, str], None],
-        python: str,
-        index_cache: Optional[Path] = None,
-    ):
-        """INDEX_CACHE: where expert indexes are kept for later launches (generate_alias)."""
+    def __init__(self, inputs: LaunchInput, host: Mapping[str, object]):
         self.inputs, self.host = inputs, host
-        self.run, self.replace, self.python = run, replace, python
-        self.index_cache = index_cache
 
     def __call__(self, fact: Fact) -> Reply:
         name, args = fact.name, fact.arguments
@@ -201,56 +32,15 @@ class RecordedArtifacts:
         if name == "read_text":
             with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())
-        if name == "model_matches":
-            directory, pattern = args
-            paths = [
-                path
-                for level in ("", "*/", "*/*/")
-                for path in sorted(glob.glob(directory + "/" + level + pattern))
-            ]
-            return Reply(tuple(paths))
-        if name == "absolute_directory":
-            return Reply(str(Path(args[0]).resolve(strict=True)))
         if name == "resolved_path":
             path = args[0]
             if path == "~" or path.startswith("~/"):
                 path = dict(self.inputs.environment).get("HOME", str(Path.home())) + path[1:]
             return Reply(str(Path(path).expanduser().resolve()))
-        if name == "older":
-            return Reply(os.stat(args[0]).st_mtime < os.stat(args[1]).st_mtime)
-        if name == "mkdir":
-            Path(args[0]).mkdir(parents=True, exist_ok=True)
-            return Reply()
         if name == "write_exclusive":
             with Path(args[0]).open("x", encoding="utf-8", newline="\n") as stream:
                 stream.write(args[1])
             return Reply()
-        if name in ("index", "source_facts", "dense"):
-            return metadata(name, args)
-        if name in ("mac_alias", "gguf_alias"):
-            # The historical Mac launcher names its profile first; the typed launch does not.
-            historical = name == "mac_alias"
-            profile = args[0] if historical else None
-            directory, *paths = args[1:] if historical else args
-            return Reply(
-                generate_alias(
-                    tuple(paths),
-                    profile,
-                    Path(directory),
-                    repo=self.inputs.repo,
-                    python=self.python,
-                    run=self.run,
-                    replace=self.replace,
-                    reuse=self.index_cache,
-                )
-            )
-        if name == "model_facts" and name not in self.host:
-            # Read from the model's own headers, as the alias index is.
-            headers = gguf_header.without_nextn([gguf_header.read(path) for path in args])
-            if headers[0].kv.get("general.architecture") == ram.ARCHITECTURE:
-                return Reply(ram.facts(headers))
-            model = strategy_inputs.facts_from_headers(headers)
-            return Reply(strategy_inputs.model_facts_json(model))
         if name == "cpu_topology" and name not in self.host:
             saved = self.host.get("machine_characteristics")
             if saved is not None:
@@ -304,8 +94,6 @@ class RecordedArtifacts:
             # Serialised strategy inputs, read back strictly and written out again.
             try:
                 if name == "model_facts":
-                    if isinstance(value, Mapping) and value.get("architecture") == ram.ARCHITECTURE:
-                        return Reply(ram.validate(value))
                     facts = strategy_inputs.model_facts_from(value)
                     return Reply(strategy_inputs.model_facts_json(facts))
                 runtime = strategy_inputs.runtime_facts_from(value)

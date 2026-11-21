@@ -251,19 +251,19 @@ def test_windows_installer_keeps_selected_branch_history_for_build_number(tmp_pa
     assert (installed / "version.txt").read_text() == "2"
 
 
-def package_name(label):
+def package_name(version):
     """The archive's name as scripts/package-macos.sh writes it."""
-    return f"inferssd-{label}-macos-arm64"
+    return f"inferssd-{version}-macos-arm64"
 
 
-def make_package(tmp_path, label, sha256=None):
+def make_package(tmp_path, version, sha256=None):
     """A package as scripts/package-macos.sh lays it out, with its list, for file:// URLs."""
     import hashlib
     import json
     import tarfile
 
-    name = package_name(label)
-    root = tmp_path / "packages" / label / name
+    name = package_name(version)
+    root = tmp_path / "packages" / version / name
     (root / "bin").mkdir(parents=True)
     (root / "python/bin").mkdir(parents=True)
     (root / "python/bin/python3").symlink_to(sys.executable)
@@ -290,7 +290,8 @@ def make_package(tmp_path, label, sha256=None):
             {
                 "schema": "inferssd-package 1",
                 "name": name,
-                "label": label,
+                "version": version,
+                "label": version + ".84bcc56",
                 "platform": "darwin-arm64",
                 "minimum_macos": "15.0",
                 "url": archive.as_uri(),
@@ -311,13 +312,13 @@ def install(env, **extra):
 @posix_installer
 def test_mac_installs_the_package_without_developer_tools(installation, tmp_path):
     home, bindir, env = installation
-    result = install(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207.84bcc56"))
+    result = install(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207"))
     assert result.returncode == 0, result.stderr
-    assert "Downloading InferSSD 261107.207.84bcc56" in result.stdout
+    assert "Downloading InferSSD 261107.207" in result.stdout
     assert "Building" not in result.stdout
     assert "export PATH=" in result.stdout
     current = home.joinpath("current").resolve()
-    assert current.name == "inferssd-261107.207.84bcc56-macos-arm64"
+    assert current.name == "inferssd-261107.207-macos-arm64"
     assert current.parent.parent == home.resolve() / "releases"
     descriptor = subprocess.check_output([str(bindir / "inferssd"), "serve", "--help"], text=True)
     assert Path(descriptor.strip()) == current / "engine-resources.json"
@@ -333,7 +334,7 @@ def test_tagged_mac_installer_still_uses_its_prebuilt_package(installation, tmp_
         ["sh"],
         input=text,
         text=True,
-        env=dict(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207.84bcc56")),
+        env=dict(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207")),
         capture_output=True,
     )
     assert result.returncode == 0, result.stderr
@@ -346,10 +347,10 @@ def test_tagged_mac_installer_still_uses_its_prebuilt_package(installation, tmp_
 @posix_installer
 def test_mac_refuses_a_package_that_does_not_match_its_list(installation, tmp_path):
     home, bindir, env = installation
-    first = make_package(tmp_path, "261106.202.03af979")
+    first = make_package(tmp_path, "261106.202")
     assert install(env, INFERSSD_PACKAGES=first).returncode == 0
     previous = (bindir / "inferssd").read_text()
-    result = install(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207.84bcc56", "0" * 64))
+    result = install(env, INFERSSD_PACKAGES=make_package(tmp_path, "261107.207", "0" * 64))
     assert result.returncode != 0
     assert "does not match the package list" in result.stderr
     assert (bindir / "inferssd").read_text() == previous
@@ -359,7 +360,7 @@ def test_mac_refuses_a_package_that_does_not_match_its_list(installation, tmp_pa
 @posix_installer
 def test_mac_package_needs_the_macos_it_was_built_for(installation, tmp_path):
     _, _, env = installation
-    listing = make_package(tmp_path, "261107.207.84bcc56")
+    listing = make_package(tmp_path, "261107.207")
     result = install(env, INFERSSD_PACKAGES=listing, TEST_MACOS="14.7.1")
     assert result.returncode != 0
     assert "needs macOS 15.0 or later" in result.stderr
@@ -383,13 +384,13 @@ def test_an_install_keeps_the_one_it_replaced_and_removes_older(installation, tm
     (tmp_path / "linked").symlink_to(tmp_path / "real")
     home = tmp_path / "linked" / "inferssd"
     env["INFERSSD_HOME"] = str(home)
-    labels = ["261105.190.0000001", "261106.202.03af979", "261107.207.84bcc56"]
-    for label in labels:
-        assert install(env, INFERSSD_PACKAGES=make_package(tmp_path, label)).returncode == 0
+    versions = ["261105.190", "261106.202", "261107.207"]
+    for version in versions:
+        assert install(env, INFERSSD_PACKAGES=make_package(tmp_path, version)).returncode == 0
     releases = (home / "releases").iterdir()
     kept = sorted(path.name for release in releases for path in release.iterdir())
-    assert kept == [package_name(label) for label in labels[1:]]
-    assert home.joinpath("current").resolve().name == package_name(labels[-1])
+    assert kept == [package_name(version) for version in versions[1:]]
+    assert home.joinpath("current").resolve().name == package_name(versions[-1])
 
 
 @posix_installer

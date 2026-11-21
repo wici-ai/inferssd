@@ -127,7 +127,8 @@ try {
     if ($LASTEXITCODE -ne 0 -or !$version.label) { throw 'The packaged command has no valid build label.' }
     Native $command @('serve', '--help')
   } finally { $env:INFERSSD_RESOURCES = $previousResources }
-  $name = 'inferssd-' + $version.label + '-' + $suffix
+  if ($version.version -notmatch '^[0-9]{6}\.[1-9][0-9]*$') { throw 'The packaged command has no <yymmdd>.<build> version.' }
+  $name = 'inferssd-' + $version.version + '-' + $suffix
   $archiveRoot = Join-Path $stage 'archive'
   [IO.Directory]::CreateDirectory($archiveRoot) | Out-Null
   Move-Item -LiteralPath $package -Destination (Join-Path $archiveRoot $name)
@@ -147,7 +148,7 @@ try {
     $listing['native_compute_capabilities'] = @($CudaArchitectures -split ';' | ForEach-Object {
       if ($_ -match '^([0-9]+)([0-9])a?-real$') { $Matches[1] + '.' + $Matches[2] } })
   }
-  foreach ($key in 'version', 'build', 'revision', 'date', 'branch', 'label') { $listing[$key] = $version.$key }
+  foreach ($key in 'version', 'tag', 'build', 'revision', 'date', 'branch', 'label') { $listing[$key] = $version.$key }
   [IO.File]::WriteAllText((Join-Path $out ($name+'.json')), ($listing | ConvertTo-Json -Depth 5), $utf8)
   Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'install.ps1') -Destination (Join-Path $out 'install.ps1')
   Write-Output "Packaged $archive"

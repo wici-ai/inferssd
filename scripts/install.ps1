@@ -136,12 +136,52 @@ No administrator rights are used. Models, settings and previous releases are pre
              -not ($uri.Scheme -eq 'http' -and $uri.Host -in @('127.0.0.1', 'localhost', '[::1]')))) {
             throw 'inferssd: package URLs require HTTPS (or a local test package list).'
         }
-        if ($uri.IsFile) { Copy-Item -LiteralPath $uri.LocalPath -Destination $Destination }
-        else {
-            # Windows PowerShell 5 redraws its progress bar for every block it receives, which makes a
-            # download of hundreds of MB take minutes even from this machine.
-            $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -UseBasicParsing -Uri $uri.AbsoluteUri -OutFile $Destination
+        if ($uri.IsFile) { Copy-Item -LiteralPath $uri.LocalPath -Destination $Destination; return }
+        # A package is hundreds of MB, and a slow or proxied link can stall or drop part way: each retry
+        # asks for the rest (an HTTP range) and appends it, so the download goes on from where it
+        # stopped. The caller checks the size and hash. The system proxy applies, as it does to
+        # Invoke-WebRequest. curl, which Windows 10 1803 and later carry, keeps a wide receive window on
+        # a link with a long round trip, where .NET's client slows to a crawl; .NET is the fallback.
+        if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+        $curl = Join-Path ([Environment]::SystemDirectory) 'curl.exe'
+        $proxy = [Net.WebRequest]::GetSystemWebProxy().GetProxy($uri)
+        $failures = 0
+        while ($true) {
+            try {
+                if (Test-Path -LiteralPath $curl) {
+                    $arguments = @('--fail', '--location', '--silent', '--show-error', '--connect-timeout', '30',
+                        '--speed-limit', '1024', '--speed-time', '60', '--continue-at', '-', '--output', $Destination)
+                    if ($proxy -and $proxy.AbsoluteUri -ne $uri.AbsoluteUri) { $arguments += @('--proxy', $proxy.AbsoluteUri) }
+                    $ErrorActionPreference = 'Continue'
+                    $answer = (& $curl @arguments $uri.AbsoluteUri 2>&1 | Out-String).Trim()
+                    $ErrorActionPreference = 'Stop'
+                    if ($LASTEXITCODE -eq 0) { return }
+                    throw "curl exited with $LASTEXITCODE`: $answer"
+                }
+                $have = $(if (Test-Path -LiteralPath $Destination) { (Get-Item -LiteralPath $Destination).Length } else { 0 })
+                $request = [Net.HttpWebRequest]::Create($uri)
+                $request.Timeout = 60000
+                $request.ReadWriteTimeout = 60000
+                if ($have -gt 0) { $request.AddRange([long]$have) }
+                $response = $request.GetResponse()
+                try {
+                    if ($have -gt 0 -and $response.StatusCode -ne [Net.HttpStatusCode]::PartialContent) { $have = 0 }
+                    $total = $(if ($response.StatusCode -eq [Net.HttpStatusCode]::PartialContent -and
+                        [string]$response.Headers['Content-Range'] -match '/([0-9]+)$') { [long]$Matches[1] }
+                        elseif ($response.ContentLength -ge 0) { $have + $response.ContentLength } else { -1 })
+                    $mode = $(if ($have -gt 0) { [IO.FileMode]::Append } else { [IO.FileMode]::Create })
+                    $file = [IO.File]::Open($Destination, $mode, [IO.FileAccess]::Write)
+                    try { $response.GetResponseStream().CopyTo($file) } finally { $file.Dispose() }
+                } finally { $response.Dispose() }
+                if ($total -lt 0 -or (Get-Item -LiteralPath $Destination).Length -ge $total) { return }
+                throw "the connection closed after $((Get-Item -LiteralPath $Destination).Length) of $total bytes"
+            } catch {
+                $ErrorActionPreference = 'Stop'
+                $failures++
+                if ($failures -ge 8) { throw }
+                Write-Host "The download stopped ($($_.Exception.Message.Trim())); resuming."
+                Start-Sleep -Seconds ([Math]::Min(30, 3 * $failures))
+            }
         }
     }
 
@@ -248,7 +288,7 @@ No administrator rights are used. Models, settings and previous releases are pre
             # No Windows build is refused by its number: the packaged programs run below, and one Windows
             # cannot start fails the installation with the reason (Assert-Ran).
             $backend = [string]$package.backend
-            Write-Output "Downloading InferSSD $($package.label), $backend ($([math]::Ceiling($package.size / 1000000)) MB)."
+            Write-Output "Downloading InferSSD $($package.version), $backend ($([math]::Ceiling($package.size / 1000000)) MB)."
             $archive = Join-Path $release 'package.zip'
             Download-File $package.url $archive
             $hash = [Security.Cryptography.SHA256]::Create()
@@ -278,7 +318,7 @@ No administrator rights are used. Models, settings and previous releases are pre
                     return $target
                 }
                 foreach ($entry in $zip.Entries) { [void](Entry-Path $entry) }
-                Write-Output "Unpacking InferSSD $($package.label)."
+                Write-Output "Unpacking InferSSD $($package.version)."
                 foreach ($entry in $zip.Entries) {
                     $target = Entry-Path $entry
                     if (!$target) { continue }

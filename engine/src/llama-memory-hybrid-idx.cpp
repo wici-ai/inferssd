@@ -377,6 +377,12 @@ int64_t kpool_rank(const std::vector<std::pair<llama_pos, uint32_t>> & cells, ll
 
 llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
 
+void llama_memory_hybrid_idx::kpool_layout_drop() noexcept {
+    if (!kpool_lay) { return; }
+    for (auto & sq : kpool_lay->seqs) { sq.cells.clear(); }
+    kpool_lay->n_pool_real = 0;
+}
+
 const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_layout_get() const {
     GGML_ASSERT(kpool_lay != nullptr);
 
@@ -500,6 +506,25 @@ bool llama_memory_hybrid_idx_context::next() {
     ++i_cur;
 
     return llama_memory_hybrid_context::next();
+}
+
+// the indexer cache is published with the attention and the recurrent cache, and apply() extends the pool layout
+bool llama_memory_hybrid_idx_context::save_precompute() {
+    const bool base = llama_memory_hybrid_context::save_precompute();
+    const bool idx  = !ctx_idx || ctx_idx->save_precompute();
+    return base && idx;
+}
+
+bool llama_memory_hybrid_idx_context::restore_precompute() noexcept {
+    if (mem != nullptr && mem->get_mem_idx() != nullptr) { mem->kpool_layout_drop(); }
+    const bool idx  = !ctx_idx || ctx_idx->restore_precompute();
+    const bool base = llama_memory_hybrid_context::restore_precompute();
+    return base && idx;
+}
+
+void llama_memory_hybrid_idx_context::discard_precompute() noexcept {
+    llama_memory_hybrid_context::discard_precompute();
+    if (ctx_idx) { ctx_idx->discard_precompute(); }
 }
 
 bool llama_memory_hybrid_idx_context::apply() {

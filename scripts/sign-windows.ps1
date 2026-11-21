@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 <#
 Signs Windows code with WiCi AI's certificate through SSL.com eSigner, the one way a release signs.
+eSigner's malware blocker, on for WiCi AI's credential, signs only a file it has scanned: each file
+is scanned, by its hash, before its batch is signed.
 
 Every PE image (exe, dll, pyd, winmd, ...) and PowerShell script under -Path that has no signature
 of its own gets WiCi AI's; one that carries its vendor's signature keeps it. A file whose unsigned
@@ -11,7 +13,7 @@ vendor's or WiCi AI's from the expected certificate. -VerifyOnly checks that alo
 
 Environment:
   ES_USERNAME, ES_PASSWORD, ES_TOTP_SECRET  the eSigner account and its automated-signing secret
-  ES_CREDENTIAL_ID            the signing credential (may be left out when the account has one)
+  ES_CREDENTIAL_ID            the signing credential, which a scan names
   ES_ENVIRONMENT              PROD (the default), or TEST for SSL.com's public sandbox
   WINDOWS_SIGNING_THUMBPRINT  SHA-1 thumbprint of the certificate WiCi AI's signatures come from
   APP_VERSIONING_TOKEN        stores newly signed files for later releases (without it, none are stored)
@@ -126,19 +128,13 @@ function Install-CodeSignTool {
   return $root
 }
 
-# Signs every file in $Directory in place of its unsigned bytes, by one batch of at most 100 files.
-# The tool exits 0 whatever happens, so success is judged by its message and then by each file.
-function Invoke-BatchSign([string]$Directory, [string]$Output) {
-  foreach ($name in 'ES_USERNAME', 'ES_PASSWORD', 'ES_TOTP_SECRET') {
-    if (![Environment]::GetEnvironmentVariable($name)) { throw "$name is not set: signing needs the eSigner credential." }
-  }
+# Runs CodeSignTool with the eSigner account and returns what it printed. The tool exits 0 whatever
+# happens, so its callers judge the outcome by its message.
+function Invoke-CodeSignTool([string]$Command, [string[]]$Arguments) {
   $tool = Install-CodeSignTool
-  $arguments = @('-jar', (Join-Path $tool 'jar\code_sign_tool-1.3.2.jar'), 'batch_sign',
-    "-username=$env:ES_USERNAME", "-password=$env:ES_PASSWORD", "-totp_secret=$env:ES_TOTP_SECRET",
-    "-input_dir_path=$Directory", "-output_dir_path=$Output")
-  if ($env:ES_CREDENTIAL_ID) { $arguments += "-credential_id=$env:ES_CREDENTIAL_ID" }
   $start = [Diagnostics.ProcessStartInfo]::new((Get-Java))
-  $start.Arguments = Join-CommandLine $arguments
+  $start.Arguments = Join-CommandLine (@('-jar', (Join-Path $tool 'jar\code_sign_tool-1.3.2.jar'), $Command,
+    "-username=$env:ES_USERNAME", "-password=$env:ES_PASSWORD", "-credential_id=$env:ES_CREDENTIAL_ID") + $Arguments)
   $start.WorkingDirectory = $tool
   $start.UseShellExecute = $false
   $start.RedirectStandardInput = $true
@@ -151,6 +147,21 @@ function Invoke-BatchSign([string]$Directory, [string]$Output) {
   $errors = $process.StandardError.ReadToEndAsync()
   $text = $process.StandardOutput.ReadToEnd() + $errors.Result
   $process.WaitForExit()
+  return $text
+}
+
+# Signs every file in $Directory in place of its unsigned bytes, by one batch of at most 100 files,
+# once eSigner has scanned each of them: unscanned, the batch is refused ("hash needs to be scanned
+# first"). A scan sends the file's hash, not the file, and spends no signing.
+function Invoke-BatchSign([string]$Directory, [string]$Output) {
+  foreach ($name in 'ES_USERNAME', 'ES_PASSWORD', 'ES_CREDENTIAL_ID', 'ES_TOTP_SECRET') {
+    if (![Environment]::GetEnvironmentVariable($name)) { throw "$name is not set: signing needs the eSigner credential." }
+  }
+  foreach ($file in @(Get-ChildItem -LiteralPath $Directory -File)) {
+    $text = Invoke-CodeSignTool 'scan_code' @("-input_file_path=$($file.FullName)")
+    if (!$text.Contains('is not a malware')) { throw "eSigner did not clear $($file.Name) for signing: $($text.Trim())" }
+  }
+  $text = Invoke-CodeSignTool 'batch_sign' @("-totp_secret=$env:ES_TOTP_SECRET", "-input_dir_path=$Directory", "-output_dir_path=$Output")
   if (!$text.Contains('Batch sign command executed successfully')) { throw "eSigner did not sign the batch: $($text.Trim())" }
 }
 

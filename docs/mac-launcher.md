@@ -17,8 +17,8 @@ shard. All shards must be present. The launch picks the `dsv`, `muse`,
 run directory. Settings are optional. See the
 [quick start](quickstart.md#prepare-a-launch).
 
-The framework checks GGUF metadata and creates an alias index without duplicating
-model weights. It selects the matching chat template from the deployment
+The engine reads the routed experts from the GGUF shards themselves, indexed from
+their headers, without copying model weights. It selects the matching chat template from the deployment
 resources; `qwen4exp` and `qwen35moe` keep the template embedded in their GGUF. The server runs
 the same SSD executor as on Linux: Metal computes the dense layers and the CPU
 sink reads and computes every routed expert, with its RAM cache sized within

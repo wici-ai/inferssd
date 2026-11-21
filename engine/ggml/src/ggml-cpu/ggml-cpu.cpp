@@ -860,8 +860,7 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 
 static const ssd::cpu::api_v2 * ggml_backend_cpu_ssd_api_v2() {
     static const ssd::cpu::api_v2 api = {
-        7, sizeof(ssd::cpu::api_v2),
-        &ssd_cpu_sink_source_size,
+        8, sizeof(ssd::cpu::api_v2),
         &ssd::cpu::create_configured,
         &ssd_cpu_sink_run,
         &ssd_cpu_sink_run_activation,

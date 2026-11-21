@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """The strategy step of a typed launch's resolution.
 
-The resolver asks four facts: the machine characteristics, the model's header
-facts, the key of the drive holding the model and the runtime facts. A live
+The resolver asks four facts: the machine characteristics, the engine's facts
+of the model, the key of the drive holding the model and the runtime facts. A live
 launch reads them on this host; a recorded dry-run takes them from its host
 facts. The strategy fills only settings and thread pool fields the user left
 unset, and its receipt records what it chose, what the user's values replaced
@@ -11,7 +11,7 @@ and what it left out to agree with them.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
@@ -19,7 +19,7 @@ from inferssd.configuration.settings import Snapshot
 from inferssd.launch.types import State, Threads
 from inferssd.machine.characteristics import loads
 from inferssd.strategy.derive import derive
-from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
+from inferssd.strategy.inputs import ModelFacts, runtime_facts_from
 from inferssd.strategy.merge import apply, server_arguments
 
 
@@ -41,16 +41,18 @@ def plan(
     platform: str,
     memory: int,
     paths: Sequence[str],
+    model_facts: Callable[[], ModelFacts],
     settings: Snapshot,
     threads: Threads,
     gpu_backends: Optional[tuple[str, ...]] = None,
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
-    MEMORY is the launch's memory budget: it is the strategy's budget and
-    bounds the memory available to it. GPU_BACKENDS are the engine's, None
-    when unknown. Without characteristics, or when no strategy can be derived
-    from them, the launch keeps its inputs and the receipt names why.
+    MODEL_FACTS reads the model's facts when a strategy needs them. MEMORY is
+    the launch's memory budget: it is the strategy's budget and bounds the
+    memory available to it. GPU_BACKENDS are the engine's, None when unknown.
+    Without characteristics, or when no strategy can be derived from them, the
+    launch keeps its inputs and the receipt names why.
     """
 
     def skipped(reason: str) -> Planned:
@@ -61,7 +63,7 @@ def plan(
     if text is None:
         return skipped("no machine characteristics")
     characteristics = loads(cast(str, text))
-    model = model_facts_from(s.value("model_facts", *paths))
+    model = model_facts()
     key = cast(Optional[str], s.value("model_drive_key", *paths))
     runtime = runtime_facts_from(s.value("runtime_facts"))
     available = runtime.available_bytes
@@ -109,4 +111,8 @@ def plan(
         "dropped": list(applied.dropped),
         "notes": list(strategy.notes),
     }
-    return Planned(applied.settings, applied.threads, arguments, receipt, one_pass=True)
+    # One pass a prompt saves the weight reads a pass makes: a model with routed experts reads the
+    # experts each pass routes to; one without them reads none of its weights a pass.
+    return Planned(
+        applied.settings, applied.threads, arguments, receipt, one_pass=model.experts is not None
+    )

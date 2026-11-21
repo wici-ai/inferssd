@@ -31,8 +31,8 @@ body:
   - type: input
     id: build
     attributes:
-      label: InferSSD build
-      description: The engine's build label the app shows, for example `261113.266.e91c7d7`.
+      label: InferSSD version
+      description: The engine's version the app shows, `date.build`, for example `261119.301`.
   - type: textarea
     id: description
     attributes:

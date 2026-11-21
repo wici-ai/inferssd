@@ -55,11 +55,11 @@ body:
   - type: input
     id: build
     attributes:
-      label: InferSSD build
+      label: InferSSD version
       description: >-
-        The build label `date.build.commit`, for example `261113.266.e91c7d7`. `inferssd --version` prints it
-        in parentheses and the desktop app shows it. For a build of your own, give the commit
-        (`git rev-parse --short HEAD`).
+        The version `date.build` with its commit, as `inferssd --version` prints them, for example
+        `inferssd 261119.301 (61a66d5)`; the desktop app shows the version. For a build of your own, give the
+        commit (`git rev-parse --short HEAD`).
     validations:
       required: true
   - type: dropdown

@@ -124,6 +124,8 @@ def read_resources(path: Path) -> EngineResources:
         "probes",
         "capabilities",
         "revision",
+        "version",
+        "tag",
         "build",
         "date",
         "branch",
@@ -143,7 +145,8 @@ def read_resources(path: Path) -> EngineResources:
     build = data.get("build")
     if build is not None and (not isinstance(build, int) or isinstance(build, bool) or build < 1):
         raise ValueError("engine build must be a positive integer")
-    for key in ("date", "branch"):
+    # The version and a release's tag are reported by inferssd/version.py.
+    for key in ("version", "tag", "date", "branch"):
         if data.get(key) is not None and (not isinstance(data[key], str) or not data[key]):
             raise ValueError("engine " + key + " must be nonempty text")
     backends = capabilities.get("gpu_backends")

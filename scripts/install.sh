@@ -5,7 +5,7 @@ set -eu
 
 # The release workflow replaces this with the tag it publishes.
 DEFAULT_REF=main
-# The prebuilt package of main for Apple silicon, as .github/workflows/package-macos.yml
+# The latest release's prebuilt package for Apple silicon, as .github/workflows/release.yml
 # publishes it (docs/macos-package.md).
 PACKAGES=https://appapi.wici.ai/versioning/inferssd/config/latest-macos.json
 
@@ -33,19 +33,19 @@ install_package() {
     platform=$(field platform)
     [ "$platform" = darwin-arm64 ] || die "The package list is for $platform."
     name=$(field name)
-    label=$(field label)
+    version=$(field version)
     url=$(field url)
     sha256=$(field sha256)
     size=$(field size)
     minimum=$(field minimum_macos)
     os_version=$(sw_vers -productVersion)
     [ "${os_version%%.*}" -ge "${minimum%%.*}" ] ||
-        die "InferSSD $label needs macOS $minimum or later and this Mac has $os_version. Update macOS, or set INFERSSD_FROM_SOURCE=1 to build from source."
-    printf 'Downloading InferSSD %s (%s MB).\n' "$label" "$(((size + 999999) / 1000000))"
+        die "InferSSD $version needs macOS $minimum or later and this Mac has $os_version. Update macOS, or set INFERSSD_FROM_SOURCE=1 to build from source."
+    printf 'Downloading InferSSD %s (%s MB).\n' "$version" "$(((size + 999999) / 1000000))"
     curl -fL --retry 3 -o "$release/package.tar.gz" "$url"
     actual=$(shasum -a 256 "$release/package.tar.gz")
     [ "${actual%% *}" = "$sha256" ] || die 'The download does not match the package list.'
-    printf 'Unpacking InferSSD %s.\n' "$label"
+    printf 'Unpacking InferSSD %s.\n' "$version"
     tar -xzf "$release/package.tar.gz" -C "$release"
     rm -f "$release/package.tar.gz" "$release/latest.json"
     package="$release/$name"

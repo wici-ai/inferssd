@@ -3,12 +3,14 @@
 
 #include "../../ggml/src/ggml-cpu/ssd/testing.h"
 #include "../../ggml/src/ggml-ssd/telemetry/telemetry.h"
+#include "expert-layout-fixture.h"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <sstream>
 #include <string>
@@ -37,12 +39,17 @@ public:
             }
         } catch (...) { std::fprintf(stderr, "sink joiner thread failed to start\n"); std::abort(); }
     }
-    sink_ptr(sink_ptr && other) noexcept : sink_(std::exchange(other.sink_, nullptr)), joiners_(std::move(other.joiners_)) {}
+    // The sink borrows its expert layout: kept here until the sink is destroyed.
+    sink_ptr(ssd_cpu_sink * sink, std::shared_ptr<const ssd::store::expert_layout> layout, int participants = 1)
+        : sink_ptr(sink, participants) { layout_ = std::move(layout); }
+    sink_ptr(sink_ptr && other) noexcept : sink_(std::exchange(other.sink_, nullptr)), joiners_(std::move(other.joiners_)),
+        layout_(std::move(other.layout_)) {}
     sink_ptr & operator=(sink_ptr && other) noexcept {
         if (this != &other) {
             reset();
             sink_ = std::exchange(other.sink_, nullptr);
             joiners_ = std::move(other.joiners_);
+            layout_ = std::move(other.layout_);
         }
         return *this;
     }
@@ -58,6 +65,7 @@ public:
         }
         ssd_cpu_sink_destroy(sink_);
         sink_ = nullptr;
+        layout_.reset();
     }
     ssd_cpu_sink * get() const { return sink_; }
     explicit operator bool() const { return sink_ != nullptr; }
@@ -65,6 +73,7 @@ public:
 private:
     ssd_cpu_sink * sink_ = nullptr;
     std::vector<std::thread> joiners_;
+    std::shared_ptr<const ssd::store::expert_layout> layout_;
 };
 
 // Locally owned fixture construction inputs, passed explicitly to a real sink
@@ -258,19 +267,21 @@ struct fixture_inputs {
         return out;
     }
     // threads counts the I/O thread, as the fixtures' CTest names do: threads - 1 compute participants.
-    sink_ptr create(int threads, int depth, ssd_cpu_sink_resolver resolver, void * userdata,
+    // layout: the experts the sink serves (test_layout::build); a null one fails the creation with `error`.
+    sink_ptr create(int threads, int depth, std::shared_ptr<const ssd::store::expert_layout> layout,
             char * error, size_t size) const {
         ssd_cpu_sink * sink = nullptr;
+        if (!layout) { return sink_ptr(); } // the layout's build named why in `error`
         try {
             const auto selection = debug();
             auto services = runtime;
             services.events = events ? events : runtime.events;
             services.debug = &selection;
-            sink = ssd::cpu::testing::create(depth, policy(), &services, resolver, userdata, error, size);
+            sink = ssd::cpu::testing::create(depth, policy(), &services, layout ? layout->abi() : nullptr, error, size);
         } catch (const std::exception & e) {
             if (error && size) { std::snprintf(error, size, "%s", e.what()); }
         }
-        return sink_ptr(sink, threads - 1);
+        return sink_ptr(sink, std::move(layout), threads - 1);
     }
     // The Linux ledger finds its cgroup here and takes the margin and the device reserve as the executor's host
     // client sets them (cpu-sink.cpp, sink_host_configuration); the native ledger (macOS, Windows) has its envelope
