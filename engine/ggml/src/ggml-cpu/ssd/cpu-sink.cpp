@@ -676,6 +676,8 @@ struct ssd_cpu_sink {
         int selected_n = 0;
         // The last decode run's hint and which of its ranks were novel, until the run of the layer it predicts.
         int32_t last_layer = -1;
+        bool matched_hint = false;
+        uint64_t observed_targets = 0, targets_without_demand = 0;
         int last_n = 0;
         int32_t last_hint[64] = {};
         bool last_novel[64] = {}, last_skipped[64] = {}; // last_skipped: within the depth and held by the tier
@@ -1279,7 +1281,8 @@ struct ssd_cpu_sink {
             const ptrdiff_t at = std::find(ids, ids + nids, expert) - ids;
             return at < nids && at < 1024 && held[at];
         };
-        if (ids && prefetch.last_layer == layer) {
+        prefetch.matched_hint = ids && prefetch.last_layer == layer;
+        if (prefetch.matched_hint) {
             for (int i = 0; i < prefetch.last_n; ++i) {
                 prefetch.novel_routed_r[i] += prefetch.last_novel[i] && selected(prefetch.last_hint[i]);
                 prefetch.skip_vram_lost += prefetch.last_skipped[i] && selected(prefetch.last_hint[i]) &&
@@ -1400,6 +1403,10 @@ struct ssd_cpu_sink {
     void prefetch_schedule(int index, bool demand_reads) {
         const int nhint = prefetch.hint_n;
         prefetch.hint_n = 0;
+        if (prefetch.matched_hint) {
+            ++prefetch.observed_targets;
+            prefetch.targets_without_demand += !demand_reads;
+        }
         const int next = index + 1 < layout.n_layers ? index + 1 : -1;
         const auto policy = ssd::place::plan_prefetch(next < 0 ? -1 : layout.layers[next].id, prefetch.hint_layer, nhint,
             prefetch.topk, demand_reads);
@@ -1466,13 +1473,16 @@ struct ssd_cpu_sink {
         for (int i = 0; i < nhint; ++i) { if (prefetch.hint[i] >= 0) { keep[size_t(prefetch.hint[i])] = 1; } }
         std::vector<std::unique_ptr<prefetch_job>> jobs;
         jobs.reserve(size_t(candidates));
+        // How often a matched target starts no demand reads. Until one is seen, assume demand competes.
+        const double no_demand_probability = prefetch.observed_targets
+            ? double(prefetch.targets_without_demand) / double(prefetch.observed_targets) : 0.0;
         for (int c = 0; c < candidates; ++c) {
             const int i = order[size_t(c)];
             const int32_t expert = prefetch.hint[i];
             // no read time measured yet: read, which measures it; a reader takes one read at a time
             const double start_us = double(jobs.size()) * read_us;
             if (read_us > 0 &&
-                    !(ssd::place::prefetch_read_value(use[size_t(i)], start_us, start_us, read_us, windows) > 0)) {
+                    !(ssd::place::prefetch_read_value(use[size_t(i)], start_us, start_us, read_us, windows, no_demand_probability) > 0)) {
                 for (int d = c; d < candidates; ++d) { ++prefetch.declined; ++prefetch.declined_r[order[size_t(d)]]; }
                 break;
             }

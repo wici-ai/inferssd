@@ -221,17 +221,18 @@ inline double prefetch_use_probability(uint64_t selected, uint64_t novel) {
 // takes one read at a time, later where the reads ahead of it are in flight with it); read_us how long the drive
 // takes on it; windows the idle windows seen (length in us, weight). A window that ends after the read saves a read
 // if the expert is used. One that ends during it, a share r of the read left: the done part (1 - r) is saved if the
-// expert is used, and the rest takes r of a read's drive time from the demand reads if it is not,
-// p (1 - r) - (1 - p) r = p - r. One that ends after the read's issue and before the drive gets to it leaves the
-// whole read to finish first: p - 1. One that ends before the issue drops the read, at no cost. No window seen yet: p.
+// expert is used. A wrong read competes with new demand with estimated probability (1 - no_demand_probability).
+// The score is p * (1 - r) - (1 - p) * (1 - no_demand_probability) * r. An issued read that has not started has
+// r = 1. A read not yet issued can be dropped at no cost. With no observed window the score is p.
 inline double prefetch_read_value(double p, double issue_us, double start_us, double read_us,
-        const std::vector<std::pair<double, double>> & windows) {
+        const std::vector<std::pair<double, double>> & windows, double no_demand_probability = 0.0) {
+    const double remaining_cost = 1.0 - (1.0 - p) * no_demand_probability;
     double value = 0, weight = 0;
     for (const auto & w : windows) {
         weight += w.second;
         if (w.first >= start_us + read_us) { value += w.second * p; }
-        else if (w.first > start_us) { value += w.second * (p - (start_us + read_us - w.first) / read_us); }
-        else if (w.first > issue_us) { value += w.second * (p - 1); }
+        else if (w.first > start_us) { value += w.second * (p - remaining_cost * ((start_us + read_us - w.first) / read_us)); }
+        else if (w.first > issue_us) { value -= w.second * (1.0 - p) * (1.0 - no_demand_probability); }
     }
     return weight > 0 ? value / weight : p;
 }

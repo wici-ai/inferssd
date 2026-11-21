@@ -66,6 +66,11 @@ static void prefetch_contract() {
     check(near(prefetch_read_value(.6, 1000, 2000, 1000, {{500, 1}}), 0), "a read the window ends before its issue costs nothing");
     check(near(prefetch_read_value(.9, 0, 1000, 1000, {{500, 1}, {1500, 1}, {2500, 1}}), (-.1 + .4 + .9) / 3),
           "a read in flight behind others: queued, half read and read windows");
+    check(near(prefetch_read_value(.25, 0, 0, 1000, {{600, 1}}, .6), .03), "a partial wrong read competes only when the target has demand");
+    check(near(prefetch_read_value(.25, 0, 1000, 1000, {{500, 1}}, .6), -.3), "a queued wrong read competes at its full remaining length when there is demand");
+    check(near(prefetch_read_value(1, 0, 0, 1000, {{600, 1}}, 1), .6), "a sure hit saves the completed part");
+    check(near(prefetch_read_value(.25, 0, 0, 1000, long_windows, 1), .25), "a finished read gets its original benefit");
+    check(near(prefetch_read_value(.25, 1000, 1000, 1000, {{500, 1}}, 1), 0), "an unissued read costs nothing");
     check(best_read_run({.5, -.2, -.2, .6}) == 4 && best_read_run({.5, -.4, .1}) == 1 && best_read_run({-.1, .3}) == 2 &&
           best_read_run({-.1}) == 0 && best_read_run({}) == 0, "a plan keeps the run of reads worth the most");
     check(near(prefetch_use_probability(0, 0), .5) && near(prefetch_use_probability(9, 10), 10.0 / 12),
