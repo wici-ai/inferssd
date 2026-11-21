@@ -1,7 +1,8 @@
 name: Package Windows
 
-# Build the prebuilt Windows packages, one per GPU backend, and check them. Release builds them for
-# each release, which signs them here and publishes them (release.yml). See docs/windows-package.md.
+# Build the prebuilt Windows packages, one per GPU backend, and check them. Only Release builds them,
+# for each release, which signs them here and publishes them (release.yml), and a run by hand, on any
+# branch, which builds and checks. See docs/windows-package.md.
 on:
   workflow_call:
     inputs:
@@ -10,9 +11,16 @@ on:
         required: true
         type: string
       release_tag:
-        description: The release's tag, vX.Y.Z, which gives the packages their version and names
+        description: The release's tag, its version <yymmdd>.<build>, which the packages are checked against
         required: true
         type: string
+      backends:
+        description: >-
+          The GPU backends to package, as a JSON list (both when unset). Release packages each in a
+          call of its own, so each is signed, checked and published without waiting for the other.
+        required: false
+        type: string
+        default: '["vulkan", "cuda"]'
     secrets:
       # The signed-file store (scripts/sign-windows.ps1).
       APP_VERSIONING_TOKEN:
@@ -27,69 +35,36 @@ on:
         required: true
       ES_TOTP_SECRET:
         required: true
-  # A pull request builds the packages when it changes how they are built; a change to main that reaches them
-  # builds them after the merge.
-  push:
-    branches: [main]
-    paths:
-      - 'engine/**'
-      - 'framework/**'
-      - CMakeLists.txt
-      - CMakePresets.json
-      - 'scripts/package-windows*'
-      - 'scripts/check-package-windows*'
-      - scripts/install-cuda-redist.ps1
-      - scripts/windows-launcher.cpp
-      - scripts/engine-resources.py
-      - scripts/install.ps1
-      - scripts/sign-windows.ps1
-      - .github/workflows/package-windows.yml
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'scripts/package-windows*'
-      - 'scripts/check-package-windows*'
-      - scripts/install-cuda-redist.ps1
-      - scripts/windows-launcher.cpp
-      - scripts/engine-resources.py
-      - scripts/install.ps1
-      - scripts/sign-windows.ps1
-      - .github/workflows/package-windows.yml
-  # By hand, on any branch: build and check. Only Release signs and publishes.
+  # By hand, on any branch: build and check. Only Release signs and publishes. Pull requests and
+  # merges do not build packages.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A pull request's newer run replaces its older one; a branch's other runs queue in its group, and
-  # a release's run in its own.
-  group: package-windows-${{ inputs.release_tag || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  # A branch's runs queue in its group, and a release's run in its own, one per backend, so a release's
+  # two calls do not queue behind each other.
+  group: package-windows-${{ inputs.release_tag || github.ref }}-${{ join(fromJSON(inputs.backends || '["vulkan", "cuda"]'), '-') }}
+  cancel-in-progress: false
 
 jobs:
   # One package for each GPU backend the launch's table names on Windows: CUDA for NVIDIA GPUs,
   # Vulkan for the others and the CPU. The installer picks by the machine's GPU.
   build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - backend: vulkan
-            package: windows-x64-vulkan
-            jobs: 2
-          - backend: cuda
-            package: windows-x64-cuda
-            jobs: 4
-    runs-on: windows-2025
+        backend: ${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}
+    # The CUDA package, the longest build by far, builds on the organization's larger runner.
+    runs-on: ${{ matrix.backend == 'cuda' && 'release-packaging-runner-windows' || 'windows-2025' }}
     timeout-minutes: 240
     env:
       CUDA_REDIST: 12.9.1
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_ref || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Install the build-time Vulkan SDK
@@ -123,6 +98,16 @@ jobs:
         if: matrix.backend == 'cuda'
         shell: pwsh
         run: scripts/install-cuda-redist.ps1 -Version $env:CUDA_REDIST -Root (Join-Path $env:RUNNER_TEMP 'cuda')
+      # As many CUDA compiles at once as the machine's cores and memory allow: one takes up to about
+      # 3 GiB. The Vulkan build keeps its two.
+      - name: Size the build to the machine
+        shell: pwsh
+        run: |
+          $cores = [Environment]::ProcessorCount
+          $gib = [math]::Floor((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB)
+          $jobs = if ('${{ matrix.backend }}' -eq 'cuda') { [math]::Max(1, [math]::Min($cores, [math]::Floor($gib / 3))) } else { 2 }
+          "BUILD_JOBS=$jobs" >> $env:GITHUB_ENV
+          Write-Host "$cores logical processors, $gib GiB of memory: $jobs build jobs"
       - name: Build the relocatable engine package
         shell: cmd
         env:
@@ -133,21 +118,30 @@ jobs:
           if defined VULKAN_SDK set "PATH=%VULKAN_SDK%\Bin;%PATH%"
           if defined CUDA_PATH set "PATH=%CUDA_PATH%\bin;%PATH%"
           set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
-          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Backend ${{ matrix.backend }} -OutputDirectory dist -Jobs ${{ matrix.jobs }}
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\package-windows.ps1 -Backend ${{ matrix.backend }} -OutputDirectory dist -Jobs %BUILD_JOBS%
           if errorlevel 1 exit /b 1
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: package-${{ matrix.package }}
+          name: package-windows-x64-${{ matrix.backend }}
           path: dist/
           if-no-files-found: error
           retention-days: 30
 
   # A release signs what it publishes: every code file in the packages carries WiCi AI's signature
-  # or its vendor's (docs/windows-package.md). Pull requests, main pushes and manual runs sign
-  # nothing. The signed packages replace the built ones, so the check runs on the published bytes.
+  # or its vendor's (docs/windows-package.md). A run by hand signs nothing. The signed packages replace the built ones, so the check runs on the published bytes.
+  # Each package is signed on its own; a file the other package shares, signed first, is taken from
+  # the signed-file store (scripts/sign-windows.ps1).
   sign:
     needs: build
     if: inputs.release_tag
+    strategy:
+      fail-fast: false
+      matrix:
+        backend: ${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}
+    # One signing at a time, across a release's calls: two must not use the eSigner one-time password at once.
+    concurrency:
+      group: windows-signing
+      cancel-in-progress: false
     runs-on: windows-2025
     timeout-minutes: 60
     environment: windows-signing
@@ -158,14 +152,12 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: package-windows-x64-vulkan
-          path: dist/windows-x64-vulkan
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
-        with:
-          name: package-windows-x64-cuda
-          path: dist/windows-x64-cuda
-      # A release also publishes an install.ps1 pinned to its tag, signed in the same pass.
+          name: package-windows-x64-${{ matrix.backend }}
+          path: dist/windows-x64-${{ matrix.backend }}
+      # A release also publishes an install.ps1 pinned to its tag, signed with the Vulkan package,
+      # which every release builds: one artifact of that name per run.
       - name: Pin the release's Windows installer
+        if: matrix.backend == 'vulkan'
         shell: powershell
         env:
           RELEASE_TAG: ${{ inputs.release_tag }}
@@ -183,22 +175,16 @@ jobs:
           APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
         run: |
           $installer = @(Get-ChildItem -LiteralPath dist/installer -Filter install.ps1 -File -ErrorAction SilentlyContinue | ForEach-Object FullName)
-          scripts/package-windows-sign.ps1 -Directory dist/windows-x64-vulkan, dist/windows-x64-cuda -File $installer
+          scripts/package-windows-sign.ps1 -Directory dist/windows-x64-${{ matrix.backend }} -File $installer
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: package-windows-x64-vulkan
-          path: dist/windows-x64-vulkan/
+          name: package-windows-x64-${{ matrix.backend }}
+          path: dist/windows-x64-${{ matrix.backend }}/
           if-no-files-found: error
           retention-days: 30
           overwrite: true
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
-        with:
-          name: package-windows-x64-cuda
-          path: dist/windows-x64-cuda/
-          if-no-files-found: error
-          retention-days: 30
-          overwrite: true
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: matrix.backend == 'vulkan'
         with:
           name: install-windows-signed
           path: dist/installer/install.ps1
@@ -212,23 +198,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package: [windows-x64-vulkan, windows-x64-cuda]
+        backend: ${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}
     runs-on: windows-2025
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
-          ref: ${{ inputs.source_ref || github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ inputs.source_ref || github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: package-${{ matrix.package }}
+          name: package-windows-x64-${{ matrix.backend }}
           path: dist
       - name: Relocate, install and run without developer tools
         # GitHub's runner has no GPU, so the CUDA package's check also shows it starts without NVIDIA's driver.
         shell: powershell
         run: |
-          $zip = @(Get-ChildItem -LiteralPath dist -Filter 'inferssd-*-${{ matrix.package }}.zip')
+          $zip = @(Get-ChildItem -LiteralPath dist -Filter 'inferssd-*-windows-x64-${{ matrix.backend }}.zip')
           if ($zip.Count -ne 1) { throw 'Expected one Windows engine archive' }
           & scripts/check-package-windows.ps1 -Archive $zip[0].FullName
 

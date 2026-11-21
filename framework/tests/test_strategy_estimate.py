@@ -28,35 +28,34 @@ def estimate(model, characteristics=MAC, available=9 * GIB, drive=DRIVE):
 
 
 def ssd_models():
-    """The supported models with an expert store; a RAM-only model has no expert facts."""
-    return [model for model in catalog.MODELS if model.facts is not None]
+    """The supported models with routed experts."""
+    return [model for model in catalog.MODELS if model.facts.experts is not None]
 
 
 def unmeasured(model):
     """MODEL's expert formats that the Mac profile has no CPU compute measurement of."""
     measured = {row["format"].upper() for row in MAC["compute"]["cpu"] if not row.get("cpus")}
-    return sorted({role.format.upper() for role in model.facts.roles} - measured)
+    return sorted({role.format.upper() for role in model.facts.experts.roles} - measured)
 
 
 def test_the_catalog_is_the_download_list_and_its_facts_add_up():
     assert hub.MODELS == {model.repo: model.quantization for model in catalog.MODELS}
     for model in catalog.MODELS:
-        facts = model.facts
-        if facts is None:  # RAM-only: no expert store; a token reads its dense weights
-            assert 0 < model.lookup_bytes < model.weight_bytes
-            assert model.dense_read_bytes == model.weight_bytes - model.lookup_bytes
+        assert 0 < model.dense_read_bytes < model.facts.dense_bytes
+        # The layers' tensors are dense tensors: all but those outside the layers.
+        assert sum(size for _, size in model.facts.layer_format_bytes) < model.facts.dense_bytes
+        facts = model.facts.experts
+        if facts is None:
             continue
-        assert model.weight_bytes == 0
-        assert 0 < model.dense_read_bytes < facts.dense_bytes
         # Each type's total is exactly its roles' layers of that type, over every expert.
         per_type: Counter[str] = Counter()
         for role in facts.roles:
-            assert sum(layers for _, layers in role.formats) == facts.layers
-            for name, layers in role.formats:
-                per_type[name] += layers * facts.experts * role.slice_bytes(name)
+            assert sum(layers for _, layers, _ in role.formats) == facts.layers
+            for name, layers, size in role.formats:
+                per_type[name] += layers * facts.count * size
         assert dict(facts.format_bytes) == dict(per_type)
         assert facts.expert_bytes <= facts.expert_read_bytes
-        assert facts.mean_expert_read_bytes <= facts.expert_read_bytes
+        assert facts.mean_read_bytes <= facts.expert_read_bytes
 
 
 def test_every_ssd_model_is_priced_on_a_mac_and_names_the_formats_it_borrows():

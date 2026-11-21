@@ -291,15 +291,3 @@ def test_truncated_stream_is_an_error(monkeypatch):
     monkeypatch.setattr(chat.urllib.request, "build_opener", lambda _: opener)
     with pytest.raises(RuntimeError, match="before completing"):
         chat.completion(8080, [], 16)
-
-
-@pytest.mark.parametrize("mode", ["serve", "cli"])
-@pytest.mark.parametrize("option", ["--shard", "--ple"])
-def test_explicit_table_reaches_owned_launch(ready_app, monkeypatch, mode, option):
-    launch = Mock(return_value=0)
-    monkeypatch.setattr(command.typed_command, "run", launch)
-    monkeypatch.setattr(engine_command, "run_native", launch)
-    table = str(ready_app.with_name("table with spaces.gguf"))
-    assert main([mode, "-m", str(ready_app), option, table]) == 0
-    args = launch.call_args.args[0]
-    assert args.shards == [table]

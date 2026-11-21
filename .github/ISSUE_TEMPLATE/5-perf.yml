@@ -40,7 +40,7 @@ body:
     attributes:
       label: Compared versions and hardware
       description: >-
-        The InferSSD build labels (`date.build.commit`) or commits, build flags, model revision and checksums,
+        The InferSSD versions (`date.build`) and commits, build flags, model revision and checksums,
         hardware and host settings.
     validations:
       required: true

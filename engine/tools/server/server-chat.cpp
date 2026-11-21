@@ -1,7 +1,102 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <optional>
 #include <sstream>
+#include <unordered_set>
+
+// The text of a Responses tool output: a string as is, or the text parts of an array joined by newlines.
+static std::string responses_output_text(const json & output) {
+    if (output.is_string()) {
+        return output.get<std::string>();
+    }
+    std::string text;
+    for (const json & part : output) {
+        const std::string type = json_value(part, "type", std::string());
+        if (!text.empty()) {
+            text += "\n";
+        }
+        text += type == "input_text" || type == "output_text" ? json_value(part, "text", std::string())
+                                                              : "[Unsupported " + type + "]";
+    }
+    return text;
+}
+
+// The text of a system or developer message that holds only text, its parts joined by a blank line.
+static std::optional<std::string> responses_system_text(const json & message) {
+    const std::string role = json_value(message, "role", std::string());
+    if (role != "system" && role != "developer") {
+        return std::nullopt;
+    }
+    const json content = json_value(message, "content", json());
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return std::nullopt;
+    }
+    std::string text;
+    for (const json & part : content) {
+        if (json_value(part, "type", std::string()) != "text") {
+            return std::nullopt;
+        }
+        const std::string part_text = json_value(part, "text", std::string());
+        if (!part_text.empty()) {
+            text += (text.empty() ? "" : "\n\n") + part_text;
+        }
+    }
+    return text;
+}
+
+// Codex sends its instructions and several developer messages at the start, another developer message at the start
+// of a later turn, and now and then one inside a tool-call loop. Chat templates often take one system message at
+// the start and raise on the others or drop them. As CC Switch's Codex proxy converts them for Chat Completions:
+// - the leading ones (the instructions and the first developer messages) become one system message;
+// - a later one whose next message other than a system message is a user message becomes a user message where it
+//   stands, so the request sent before stays a prefix of this one;
+// - any other later one joins the first system message, so a tool-call loop stays one turn.
+// Texts are joined by a blank line; an empty one is dropped.
+static std::vector<json> responses_collapse_system_messages(std::vector<json> messages) {
+    std::vector<bool> followed_by_user(messages.size(), false);
+    bool next_is_user = false;
+    for (size_t i = messages.size(); i-- > 0;) {
+        followed_by_user[i] = next_is_user;
+        if (!responses_system_text(messages[i])) {
+            next_is_user = json_value(messages[i], "role", std::string()) == "user";
+        }
+    }
+
+    std::vector<std::string> system_texts;
+    std::vector<json> rest;
+    bool seen_non_system = false;
+    for (size_t i = 0; i < messages.size(); i++) {
+        const auto text = responses_system_text(messages[i]);
+        if (!text) {
+            seen_non_system = true;
+            rest.push_back(std::move(messages[i]));
+            continue;
+        }
+        if (text->find_first_not_of(" \t\r\n") == std::string::npos) {
+            continue;
+        }
+        if (seen_non_system && followed_by_user[i]) {
+            rest.push_back({ { "role", "user" }, { "content", *text } });
+        } else {
+            system_texts.push_back(*text);
+        }
+    }
+
+    std::vector<json> out;
+    if (!system_texts.empty()) {
+        std::string joined;
+        for (const auto & text : system_texts) {
+            joined += (joined.empty() ? "" : "\n\n") + text;
+        }
+        out.push_back({ { "role", "system" }, { "content", joined } });
+    }
+    out.insert(out.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+    return out;
+}
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
@@ -15,6 +110,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
     std::vector<json> chatcmpl_messages;
+    std::vector<json> input_tools; // tools that additional_tools input items declare
 
     if (response_body.contains("instructions")) {
         chatcmpl_messages.push_back({
@@ -193,7 +289,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_calls", json::array({tool_call})}
                     });
                 }
-            } else if (exists_and_is_string(item, "call_id") &&
+            } else if (exists_and_is_string(item, "call_id") && !item.at("call_id").get<std::string>().empty() &&
                 (exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "function_call_output"
@@ -226,6 +322,33 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         {"tool_call_id", item.at("call_id")},
                     });
                 }
+            } else if ((exists_and_is_string(item, "output") || exists_and_is_array(item, "output")) &&
+                exists_and_is_string(item, "type") &&
+                item.at("type") == "function_call_output"
+            ) {
+                // An output without a call_id answers no call: Codex adds context this way, such as the ChatGPT
+                // app's snapshot of the open Page from the second turn on. A chat template takes a tool message
+                // only after a tool call, so it goes in as user text under the marker CC Switch's Codex proxy uses.
+                std::string name = json_value(item, "name", std::string());
+                const std::string ns = json_value(item, "namespace", std::string());
+                if (!ns.empty() && !name.empty()) {
+                    name = ns + "::" + name;
+                }
+                const std::string text = "[tool_result without a matching tool_call" +
+                    (name.empty() ? std::string() : ": " + name) + "]\n" + responses_output_text(item.at("output"));
+                chatcmpl_messages.push_back(json {
+                    {"role",    "user"},
+                    {"content", json::array({ json {
+                        {"text", text},
+                        {"type", "text"},
+                    }})},
+                });
+            } else if (exists_and_is_string(item, "type") && item.at("type") == "additional_tools") {
+                // Codex sends the tools of some models (those it runs on Responses Lite) as this input item
+                // instead of the tools field; they join the request's tools.
+                for (const json & tool : json_value(item, "tools", json::array())) {
+                    input_tools.push_back(tool);
+                }
             } else if (exists_and_is_array(item, "summary") &&
                 exists_and_is_string(item, "type") &&
                 item.at("type") == "reasoning") {
@@ -255,16 +378,34 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
-    chatcmpl_body["messages"] = chatcmpl_messages;
+    chatcmpl_body["messages"] = responses_collapse_system_messages(std::move(chatcmpl_messages));
 
-    if (response_body.contains("tools")) {
-        if (!response_body.at("tools").is_array()) {
-            throw std::invalid_argument("'tools' must be an array of objects");
+    if (response_body.contains("tools") && !response_body.at("tools").is_array()) {
+        throw std::invalid_argument("'tools' must be an array of objects");
+    }
+    if (response_body.contains("tools") || !input_tools.empty()) {
+        std::vector<json> resp_tools;
+        if (response_body.contains("tools")) {
+            resp_tools.insert(resp_tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
         }
-        std::vector<json> chatcmpl_tools;
-        for (json resp_tool : response_body.at("tools")) {
-            json chatcmpl_tool;
+        resp_tools.insert(resp_tools.end(), input_tools.begin(), input_tools.end());
 
+        // A tool keeps its first definition: Codex declares its additional_tools again in later turns.
+        std::vector<json> chatcmpl_tools;
+        std::unordered_set<std::string> tool_names;
+        const auto add_tool = [&](json function) {
+            if (!tool_names.insert(json_value(function, "name", std::string())).second) {
+                return;
+            }
+            if (!function.contains("strict")) {
+                function["strict"] = true;
+            }
+            chatcmpl_tools.push_back(json {
+                {"type",     "function"},
+                {"function", function},
+            });
+        };
+        for (json resp_tool : resp_tools) {
             const std::string type = json_value(resp_tool, "type", std::string());
             if (type == "namespace") {
                 // A namespace groups function tools (Codex: sub-agents, one per MCP server). Offer each as
@@ -282,13 +423,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     if (!ns_desc.empty()) {
                         sub_tool["description"] = ns_desc + "\n" + json_value(sub_tool, "description", std::string());
                     }
-                    if (!sub_tool.contains("strict")) {
-                        sub_tool["strict"] = true;
-                    }
-                    chatcmpl_tools.push_back(json {
-                        {"type",     "function"},
-                        {"function", sub_tool},
-                    });
+                    add_tool(sub_tool);
                 }
                 continue;
             }
@@ -299,13 +434,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 continue;
             }
             resp_tool.erase("type");
-            chatcmpl_tool["type"] = "function";
-
-            if (!resp_tool.contains("strict")) {
-                resp_tool["strict"] = true;
-            }
-            chatcmpl_tool["function"] = resp_tool;
-            chatcmpl_tools.push_back(chatcmpl_tool);
+            add_tool(resp_tool);
         }
         chatcmpl_body.erase("tools");
         if (!chatcmpl_tools.empty()) {
@@ -365,6 +494,59 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     } else {
         LOG_ERR("anthropic string not as expected: %s", system_text.c_str());
     }
+}
+
+// Claude Code puts system messages in the conversation too, such as its system reminders after the user's message.
+// Chat templates often take one system message at the start and raise on the others or drop them. As CC Switch
+// converts Claude requests for models that take no system message mid-conversation
+// (demote_mid_conversation_system_messages): the leading ones stay, a later one becomes a user message where it
+// stands, so the request stays append-only across turns, and one between an assistant's tool calls and their
+// results moves right after the results. An empty one is dropped.
+static void anthropic_demote_mid_conversation_system_messages(json & messages) {
+    const auto is_role = [](const json & message, const char * role) {
+        return json_value(message, "role", std::string()) == role;
+    };
+    size_t leading = 0;
+    while (leading < messages.size() && is_role(messages[leading], "system")) {
+        leading++;
+    }
+    bool later = false;
+    for (size_t i = leading; i < messages.size() && !later; i++) {
+        later = is_role(messages[i], "system");
+    }
+    if (!later) {
+        return;
+    }
+
+    json out = json::array();
+    for (size_t i = 0; i < leading; i++) {
+        out.push_back(std::move(messages[i]));
+    }
+    std::vector<json> deferred;
+    for (size_t i = leading; i < messages.size(); i++) {
+        json & message = messages[i];
+        if (is_role(message, "system")) {
+            const json content = json_value(message, "content", json());
+            const bool empty   = content.is_null() || (content.is_string() && content.get<std::string>().empty()) ||
+                               (content.is_array() && content.empty());
+            if (!empty) {
+                message["role"] = "user";
+                deferred.push_back(std::move(message));
+            }
+            continue;
+        }
+        if (!is_role(message, "tool")) {
+            for (auto & d : deferred) {
+                out.push_back(std::move(d));
+            }
+            deferred.clear();
+        }
+        out.push_back(std::move(message));
+    }
+    for (auto & d : deferred) {
+        out.push_back(std::move(d));
+    }
+    messages = std::move(out);
 }
 
 json server_chat_convert_anthropic_to_oai(const json & body) {
@@ -517,6 +699,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    anthropic_demote_mid_conversation_system_messages(oai_messages);
     oai_body["messages"] = oai_messages;
 
     // Convert tools
@@ -570,14 +753,23 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
-    // Handle Anthropic-specific thinking param
-    if (body.contains("thinking")) {
-        json thinking = json_value(body, "thinking", json::object());
-        std::string thinking_type = json_value(thinking, "type", std::string());
-        if (thinking_type == "enabled") {
-            int budget_tokens = json_value(thinking, "budget_tokens", 10000);
-            oai_body["thinking_budget_tokens"] = budget_tokens;
-        }
+    // Anthropic's thinking becomes reasoning_effort, which is fitted to what the chat template offers, as on every
+    // route: "enabled" or "adaptive" thinks at output_config.effort where it names one, else as the template does by
+    // default ("on"); "disabled", or no thinking at all, is "none", as in Anthropic's API, where a request thinks only
+    // when it asks to. Claude Code turns thinking off that way for a model it does not know, keeping
+    // output_config.effort. A budget stays a budget.
+    const json thinking = json_value(body, "thinking", json::object());
+    const std::string thinking_type = thinking.is_object() ? json_value(thinking, "type", std::string()) : std::string();
+    if (thinking_type == "enabled") {
+        int budget_tokens = json_value(thinking, "budget_tokens", 10000);
+        oai_body["thinking_budget_tokens"] = budget_tokens;
+    }
+    if (thinking_type.empty() || thinking_type == "disabled") {
+        oai_body["reasoning_effort"] = "none";
+    } else if (thinking_type == "enabled" || thinking_type == "adaptive") {
+        const json output_config = json_value(body, "output_config", json::object());
+        const std::string effort = output_config.is_object() ? json_value(output_config, "effort", std::string()) : std::string();
+        oai_body["reasoning_effort"] = effort.empty() ? "on" : effort;
     }
 
     // Handle Anthropic-specific metadata param

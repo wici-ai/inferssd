@@ -8,9 +8,9 @@
 #
 # Usage: scripts/package-macos.sh [OUTPUT_DIR]      (default: dist)
 #
-# OUTPUT_DIR receives inferssd-<version>-macos-arm64.tar.gz for a release (INFERSSD_RELEASE_TAG), else
-# inferssd-<label>-macos-arm64.tar.gz, named by the build's label, and beside it a .json that
-# describes it for scripts/publish-package.py. INFERSSD_JOBS sets the build parallelism (default: every CPU).
+# OUTPUT_DIR receives inferssd-<version>-macos-arm64.tar.gz, named by the build's version
+# (<yymmdd>.<build>), and beside it a .json that describes it for scripts/publish-package.py.
+# INFERSSD_JOBS sets the build parallelism (default: every CPU).
 set -eu
 
 # A relocatable CPython (python-build-standalone), pinned by its checksum.
@@ -111,11 +111,9 @@ data["binary"] = place(data["binary"], "bin")
 data["templates"] = {name: place(path, "templates") for name, path in data["templates"].items()}
 data["probes"] = {name: place(path, "bin") for name, path in data["probes"].items()}
 (package / "engine-resources.json").write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-built = label(data.get("build"), data.get("date"), data.get("revision"))
-if not built:
-    sys.exit("package-macos: the build has no build number, day and commit")
-# A release is named by its version, any other build by its label.
-named.write_text(f"inferssd-{data['version'] if data.get('tag') else built}-macos-arm64\n", encoding="utf-8")
+if not label(data.get("build"), data.get("date"), data.get("revision")) or not data.get("version"):
+    sys.exit("package-macos: the build has no version, build number, day and commit")
+named.write_text(f"inferssd-{data['version']}-macos-arm64\n", encoding="utf-8")
 PY
 name=$(cat "$stage/name")
 cp "$root/LICENSE" "$root/NOTICE" "$package/licenses/"

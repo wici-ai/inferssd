@@ -226,13 +226,7 @@ class Host:
 )
 def test_host_is_lazy_and_short_circuits_original_facts():
     host = Host()
-    adapter = LiveArtifacts(
-        LaunchInput("/fixture/repo", ()),
-        host=host,
-        run=lambda _: pytest.fail("unexpected indexer"),
-        replace=lambda *_: None,
-        python="fixture-python",
-    )
+    adapter = LiveArtifacts(LaunchInput("/fixture/repo", ()), host=host)
     assert host.events == []
     assert adapter(Fact("memory_kib")).value == (4000, 2000)
     host.replies["nproc"] = Command(0, "8\n")
@@ -245,13 +239,7 @@ def test_host_is_lazy_and_short_circuits_original_facts():
 def test_gpu_failed_or_na_and_checked_command_error():
     host = Host()
     host.replies["nvidia-smi"] = Command(1, "invalid")
-    adapter = LiveArtifacts(
-        LaunchInput("/fixture", ()),
-        host=host,
-        run=lambda _: None,
-        replace=lambda *_: None,
-        python="fixture",
-    )
+    adapter = LiveArtifacts(LaunchInput("/fixture", ()), host=host)
     assert adapter(Fact("gpu_memory")).value == ""
     host.replies["nvidia-smi"] = Command(0, "N/A\n999\n")
     assert adapter(Fact("gpu_memory")).value == "N/A"
@@ -275,13 +263,7 @@ def test_the_engine_gpu_backends_fact_reads_the_servers_build(tmp_path):
     build = tmp_path / "build-linux-cuda"
     (build / "bin").mkdir(parents=True)
     binary = str(build / "bin" / "inferssd-server")
-    adapter = LiveArtifacts(
-        LaunchInput(str(tmp_path), ()),
-        host=NativeHost(),
-        run=lambda _: pytest.fail("unexpected indexer"),
-        replace=lambda *_: None,
-        python="fixture-python",
-    )
+    adapter = LiveArtifacts(LaunchInput(str(tmp_path), ()), host=NativeHost())
     # A server outside a CMake build: its backends are unknown.
     assert adapter(Fact("engine_gpu_backends", (binary,))).value is None
     # A UTF-8 cache, whatever this host's locale: it names the build's paths.

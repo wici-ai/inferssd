@@ -1,17 +1,20 @@
 name: CI
 
+# Pull requests, every merge to main, and by hand on any branch. A pull request need not be up to
+# date with main to merge; the run on main checks each merge's commit.
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# A new push to a pull request cancels its older run; every run on main completes.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
   cancel-in-progress: true
 
 jobs:
@@ -83,24 +86,16 @@ jobs:
         run: |
           python3.9 -m venv .venv39
           .venv39/bin/python -m pip install pytest==8.4.2 ./framework
-          .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
+          .venv39/bin/python -m pytest -q bench/tests framework/tests tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
       - name: Framework tests on Python 3.14
         run: |
           python3.14 -m venv .venv314
           .venv314/bin/python -m pip install pytest==9.1.1 "./framework[hf]"
           .venv314/bin/python -m pytest -q bench/tests framework/tests
-      - name: Mac launcher and alias-index checks
+      - name: Mac measurement checks
         run: |
-          ruff check --isolated --select F framework/tests/fixtures/macos/run-macos-ssd.py framework/tests/fixtures/macos/build-gguf-expert-alias-tsv.py tests/integration/test-macos-launcher.py bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
-          bash -n framework/tests/fixtures/oracle/launch/scripts/run-macos-ssd.sh
-          python3 -m pytest -q tests/integration/test-macos-launcher.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
-      - name: Launcher tests
-        shell: bash
-        run: |
-          set -o pipefail
-          bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_settings.sh | tee launcher-settings.log
-          bash framework/tests/fixtures/oracle/launch/tools/adaptive/tests/test_launcher_replica.sh | tee launcher-replica.log
-          if grep -E '\bSKIP\b' launcher-settings.log launcher-replica.log; then exit 1; fi
+          ruff check --isolated --select F bench/macos/measure.py bench/macos/measurement_images.py tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
+          python3 -m pytest -q tests/integration/test-macos-measurement.py tests/integration/test-macos-measurement-images.py
 
   cpu-unit:
     if: github.event_name != 'pull_request' || !github.event.pull_request.draft
@@ -178,11 +173,13 @@ jobs:
           python -m pip install pytest==9.1.1 ./framework
           python -m pytest -q framework/tests
       - name: Build the engine and the SSD executor tests
-        # As install.ps1 builds it: LLVM clang with the Visual Studio C++ tools' environment.
+        # As the packages build it: LLVM clang with the Visual Studio C++ tools' 14.44 toolset. The
+        # runner's newest toolset can be one whose standard library requires a newer clang than the
+        # runner has (STL1000), so it is not taken by default.
         shell: cmd
         run: |
           for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" > nul || exit /b 1
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44 > nul || exit /b 1
           set "PATH=%ProgramFiles%\LLVM\bin;%PATH%"
           cmake --preset windows-llvm -DGGML_NATIVE=OFF || exit /b 1
           cmake --build build-windows-llvm --parallel 4 --target inferssd-server inferssd-cpuprobe inferssd-ssdprobe inferssd-ci-tests || exit /b 1

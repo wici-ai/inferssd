@@ -1,0 +1,178 @@
+{
+ "version": 1,
+ "architecture": "qwen3moe",
+ "layers": 2,
+ "files": [
+  "<dir>/toy-00001-of-00002.gguf",
+  "<dir>/toy-00002-of-00002.gguf"
+ ],
+ "metadata": {
+  "general.architecture": "qwen3moe",
+  "general.name": "toy \"quoted\"",
+  "qwen3moe.block_count": 3,
+  "qwen3moe.nextn_predict_layers": 1,
+  "qwen3moe.context_length": 64,
+  "qwen3moe.embedding_length": 64,
+  "qwen3moe.feed_forward_length": 32,
+  "qwen3moe.expert_feed_forward_length": 32,
+  "qwen3moe.attention.head_count": 2,
+  "qwen3moe.attention.head_count_kv": 1,
+  "qwen3moe.expert_count": 4,
+  "qwen3moe.expert_used_count": 2,
+  "qwen3moe.attention.layer_norm_rms_epsilon": 0.5,
+  "qwen3moe.test_pattern": [
+   true,
+   false,
+   true
+  ]
+ },
+ "tensors": [
+  {
+   "name": "token_embd.weight",
+   "type": "f32",
+   "shape": [
+    64,
+    16
+   ],
+   "file": 0,
+   "offset": 1120,
+   "bytes": 4096
+  },
+  {
+   "name": "blk.0.attn_q.weight",
+   "type": "f32",
+   "shape": [
+    64,
+    64
+   ],
+   "file": 0,
+   "offset": 5216,
+   "bytes": 16384
+  },
+  {
+   "name": "blk.0.ffn_down_exps.weight",
+   "type": "q8_0",
+   "shape": [
+    32,
+    64,
+    4
+   ],
+   "file": 0,
+   "offset": 39008,
+   "bytes": 8704
+  },
+  {
+   "name": "blk.0.ffn_gate_exps.weight",
+   "type": "q8_0",
+   "shape": [
+    64,
+    32,
+    4
+   ],
+   "file": 0,
+   "offset": 30304,
+   "bytes": 8704
+  },
+  {
+   "name": "blk.0.ffn_up_exps.weight",
+   "type": "q8_0",
+   "shape": [
+    64,
+    32,
+    4
+   ],
+   "file": 0,
+   "offset": 21600,
+   "bytes": 8704
+  },
+  {
+   "name": "blk.1.ffn_down_exps.weight",
+   "type": "q8_0",
+   "shape": [
+    32,
+    64,
+    4
+   ],
+   "file": 1,
+   "offset": 9856,
+   "bytes": 8704
+  },
+  {
+   "name": "blk.1.ffn_gate_exps.weight",
+   "type": "q4_0",
+   "shape": [
+    64,
+    32,
+    4
+   ],
+   "file": 1,
+   "offset": 5248,
+   "bytes": 4608
+  },
+  {
+   "name": "blk.1.ffn_up_exps.weight",
+   "type": "q4_0",
+   "shape": [
+    64,
+    32,
+    4
+   ],
+   "file": 1,
+   "offset": 640,
+   "bytes": 4608
+  }
+ ],
+ "experts": {
+  "count": 4,
+  "used": 2,
+  "latent": 64,
+  "hidden": 32,
+  "formats": [
+   {
+    "up": {
+     "type": "q8_0",
+     "bytes": 2176
+    },
+    "gate": {
+     "type": "q8_0",
+     "bytes": 2176
+    },
+    "down": {
+     "type": "q8_0",
+     "bytes": 2176
+    }
+   },
+   {
+    "up": {
+     "type": "q4_0",
+     "bytes": 1152
+    },
+    "gate": {
+     "type": "q4_0",
+     "bytes": 1152
+    },
+    "down": {
+     "type": "q8_0",
+     "bytes": 2176
+    }
+   }
+  ],
+  "layers": [
+   [
+    0,
+    0
+   ],
+   [
+    1,
+    1
+   ]
+  ],
+  "read_bytes": {
+   "up": 8192,
+   "gate": 8192,
+   "down": 8192
+  },
+  "expert_bytes": 6528,
+  "expert_read_bytes": 20480
+ }
+}

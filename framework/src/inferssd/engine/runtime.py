@@ -6,7 +6,6 @@ Darwin executes static M1 launches. Online adaptive Mac M2 remains deferred.
 from __future__ import annotations
 
 import os
-import sys
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Optional
@@ -14,13 +13,11 @@ from typing import Optional
 from inferssd.configuration.settings import Snapshot
 from inferssd.engine.core import Engine, NativeEffects
 from inferssd.engine.owned import OwnedProcess
-from inferssd.launch import ram
 from inferssd.launch.live import Host, LiveArtifacts
 from inferssd.launch.machine import MachineSource
 from inferssd.launch.machine import characteristics as machine_characteristics
 from inferssd.launch.prepare import prepare
-from inferssd.launch.recorded import run_indexer
-from inferssd.launch.resources import cache_directory, probe_paths, server_binary
+from inferssd.launch.resources import probe_paths, server_binary
 from inferssd.launch.typed import (
     LOOPBACK,
     LaunchSpec,
@@ -30,7 +27,6 @@ from inferssd.launch.typed import (
 )
 from inferssd.launch.types import LaunchInput, Output, Resolution
 from inferssd.platform.policy import Policy
-from inferssd.source.gguf_alias import shard_paths
 
 
 class Runtime:
@@ -58,28 +54,12 @@ class Runtime:
         if self.machine is None or specification is None or not specification.strategy:
             return None
         if self.characteristics_text is None:
-            if ram.is_model(specification.model):
-                # Ordinary models need a live RAM check, not expert/SSD calibration.
-                self.characteristics_text = (None,)
-                return None
             platform, repo = self.policy.platform, self.inputs.repo
             resources = specification.resources
             binary = server_binary(platform, specification.binary, resources, repo, os.path.isfile)
             binary = os.path.realpath(binary) if binary else None
             probes = probe_paths(platform, binary, resources, repo, os.path.isfile)
-            extras = shard_paths(
-                specification.shards, dict(self.inputs.environment).get("LLAMA_ARG_SHARD", "")
-            )
-            if extras:
-                text = machine_characteristics(
-                    self.machine,
-                    platform,
-                    specification.model,
-                    probes,
-                    extra_models=tuple(str(path.resolve()) for path in extras),
-                )
-            else:
-                text = machine_characteristics(self.machine, platform, specification.model, probes)
+            text = machine_characteristics(self.machine, platform, specification.model, probes)
             self.characteristics_text = (text,)
         return self.characteristics_text[0]
 
@@ -105,11 +85,7 @@ class Runtime:
         adapter = LiveArtifacts(
             inputs,
             host=self.host,
-            run=run_indexer,
-            replace=os.replace,
-            python=sys.executable,
             machine=self.characteristics(specification),
-            index_cache=cache_directory(dict(inputs.environment)) / "expert-index",
         )
         value = prepare(
             inputs,
@@ -120,7 +96,6 @@ class Runtime:
                 directory=directory,
                 memory=self.policy.memory_budget_bytes,
                 configured=configured,
-                reserve=self.policy.host_reserve_bytes or 0,
             ),
             observe=adapter,
             emit=self.emit,

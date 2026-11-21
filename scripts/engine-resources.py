@@ -3,7 +3,6 @@
 import argparse
 import json
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -26,7 +25,8 @@ templates = {
     "dsv": (engine / "models/templates/deepseek-ai-DeepSeek-V4.1.jinja").resolve(strict=True),
     "muse": (engine / "models/templates/muse-spark.jinja").resolve(strict=True),
 }
-# Only inspect the schema; never start inference or probe a device.
+# The standalone --ssd-schema query exits before loading compute backends.
+# Keep it standalone: mixed argument lists use normal backend-aware parsing.
 subprocess.run([str(binary), "--ssd-schema"], check=True, stdout=subprocess.DEVNULL)
 # A source archive has no Git metadata to name the version, the revision, the build number (the
 # commit count, which needs the history the installer's blobless clone has), the day or the branch.
@@ -37,36 +37,6 @@ def git(*arguments: str) -> str:
                           capture_output=True, text=True, env={**os.environ, "TZ": "UTC"}).stdout.strip()
 
 
-TAG = re.compile(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
-
-
-def released() -> tuple[Optional[str], Optional[str]]:
-    """The engine's version and, for a release, its tag.
-
-    A release is the version its tag names: the Release workflow passes the tag it is about to
-    create in INFERSSD_RELEASE_TAG, and a clone of a released commit has the tag itself. Any other
-    build is the next patch's development version, counted from the latest tag before it as
-    setuptools-scm counts: 0.1.6.dev3 three commits after v0.1.5. Without a tag, none.
-    """
-    tag = os.environ.get("INFERSSD_RELEASE_TAG", "")
-    if tag:
-        if not TAG.fullmatch(tag):
-            sys.exit(f"engine-resources: INFERSSD_RELEASE_TAG {tag!r} is not a vX.Y.Z tag")
-        return tag[1:], tag
-    try:
-        described = git("describe", "--tags", "--long", "--match", "v[0-9]*.[0-9]*.[0-9]*", "HEAD")
-    except (OSError, subprocess.CalledProcessError):
-        return None, None
-    match = re.fullmatch(r"(v[^-]+)-([0-9]+)-g[0-9a-f]+", described)
-    found = TAG.fullmatch(match[1]) if match else None
-    if not match or not found:
-        return None, None
-    if match[2] == "0":
-        return match[1][1:], match[1]
-    major, minor, patch = (int(part) for part in found.groups())
-    return f"{major}.{minor}.{patch + 1}.dev{match[2]}", None
-
-
 try:
     revision = git("rev-parse", "HEAD") or "unknown"
     build: Optional[int] = int(git("rev-list", "--count", "HEAD"))
@@ -74,7 +44,29 @@ try:
     branch: Optional[str] = git("rev-parse", "--abbrev-ref", "HEAD")
 except (OSError, subprocess.CalledProcessError, ValueError):
     revision, build, date, branch = "unknown", None, None, None
-version, tag = released()
+# The version is <yymmdd>.<build>: the commit's day (UTC) and the commit count, 261119.300.
+version: Optional[str] = f"{date[2:4]}{date[5:7]}{date[8:10]}.{build}" if build and date else None
+
+
+def released() -> Optional[str]:
+    """A release's tag, which is its version: the Release workflow passes the tag it is about to
+    create in INFERSSD_RELEASE_TAG, and a clone of a released commit has the tag itself. Any other
+    build has none."""
+    tag = os.environ.get("INFERSSD_RELEASE_TAG", "")
+    if tag:
+        if tag != version:
+            sys.exit(f"engine-resources: INFERSSD_RELEASE_TAG {tag!r} is not this build's version, {version!r}")
+        return tag
+    if not version:
+        return None
+    try:
+        tags = git("tag", "--points-at", "HEAD").split()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return version if version in tags else None
+
+
+tag = released()
 value = {
     "schema": "inferssd-engine 1", "binary": str(binary), "revision": revision,
     "version": version, "tag": tag, "build": build, "date": date, "branch": branch,

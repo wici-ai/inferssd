@@ -28,7 +28,7 @@ def inputs(tmp_path):
     for suffix, (platform, extension, _) in release.PACKAGES.items():
         directory = tmp_path / suffix
         directory.mkdir()
-        name = f"inferssd-0.1.3-{suffix}"
+        name = f"inferssd-261109.250-{suffix}"
         archive = directory / (name + extension)
         archive.write_bytes((suffix + " checked package").encode())
         package = {
@@ -38,8 +38,8 @@ def inputs(tmp_path):
             "file": archive.name,
             "size": archive.stat().st_size,
             "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
-            "version": "0.1.3",
-            "tag": "v0.1.3",
+            "version": "261109.250",
+            "tag": "261109.250",
             "revision": REVISION,
             "build": 250,
             "date": "2026-11-09",
@@ -50,7 +50,7 @@ def inputs(tmp_path):
     return root, directories, tmp_path / "assets"
 
 
-def prepare(inputs, tag="v0.1.3", revision=REVISION, signed_installer=None):
+def prepare(inputs, tag="261109.250", revision=REVISION, signed_installer=None):
     root, directories, output = inputs
     return release.prepare(
         root, directories, output, tag, revision, "wici-ai/inferssd", signed_installer
@@ -79,18 +79,18 @@ def test_one_release_contains_every_package_and_both_pinned_installers(inputs):
         assert package["platform"] == platform and package["revision"] == REVISION
         assert (
             package["url"]
-            == "https://github.com/wici-ai/inferssd/releases/download/v0.1.3/" + package["file"]
+            == "https://github.com/wici-ai/inferssd/releases/download/261109.250/" + package["file"]
         )
         assert (output / package["file"]).exists()
     shell = (output / "install.sh").read_text()
     powershell = (output / "install.ps1").read_text()
-    assert "DEFAULT_REF=v0.1.3" in shell
+    assert "DEFAULT_REF=261109.250" in shell
     assert (
-        "PACKAGES=https://github.com/wici-ai/inferssd/releases/download/v0.1.3/latest-macos.json"
+        "PACKAGES=https://github.com/wici-ai/inferssd/releases/download/261109.250/latest-macos.json"
         in shell
     )
-    assert "$DefaultRef = 'v0.1.3'" in powershell
-    base = "https://github.com/wici-ai/inferssd/releases/download/v0.1.3/"
+    assert "$DefaultRef = '261109.250'" in powershell
+    base = "https://github.com/wici-ai/inferssd/releases/download/261109.250/"
     assert f"$VulkanPackages = '{base}latest-windows-vulkan.json'" in powershell
     assert f"$CudaPackages = '{base}latest-windows-cuda.json'" in powershell
     for name, original in originals.items():
@@ -100,9 +100,10 @@ def test_one_release_contains_every_package_and_both_pinned_installers(inputs):
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("version", "0.1.4"),
+        ("version", "261109.251"),
         ("tag", None),
-        ("tag", "v0.1.4"),
+        ("tag", "261109.251"),
+        ("tag", "v261109.250"),
         ("name", "inferssd-261109.250.1111111-windows-x64-cuda"),
         ("revision", "2" * 40),
         ("build", 251),
@@ -111,9 +112,7 @@ def test_one_release_contains_every_package_and_both_pinned_installers(inputs):
         ("size", 1),
     ],
 )
-def test_other_version_commit_build_or_changed_bytes_cannot_enter_numbered_release(
-    inputs, field, value
-):
+def test_other_version_commit_build_or_changed_bytes_cannot_enter_a_release(inputs, field, value):
     _, directories, output = inputs
     listing = next(directories["windows-x64-cuda"].glob("*.json"))
     package = json.loads(listing.read_text())
@@ -142,25 +141,25 @@ def test_missing_platform_and_existing_assets_are_not_silently_replaced(inputs):
 
 def test_the_signed_pinned_installer_is_published_byte_for_byte(inputs, tmp_path):
     root, _, output = inputs
-    pinned = release.pinned_powershell(root, "v0.1.3", "wici-ai/inferssd")
+    pinned = release.pinned_powershell(root, "261109.250", "wici-ai/inferssd")
     signed = tmp_path / "signed-install.ps1"
     signed.write_bytes(pinned.encode() + SIGNATURE)
     prepare(inputs, signed_installer=signed)
     assert (output / "install.ps1").read_bytes() == signed.read_bytes()
-    assert "$DefaultRef = 'v0.1.3'" in pinned
+    assert "$DefaultRef = '261109.250'" in pinned
 
 
 @pytest.mark.parametrize(
     "change",
     [
-        lambda body: body.replace(b"v0.1.3", b"v0.1.2", 1) + SIGNATURE,
+        lambda body: body.replace(b"261109.250", b"261109.249", 1) + SIGNATURE,
         lambda body: body + b"Write-Output 'added'\n" + SIGNATURE,
         lambda body: body,
     ],
 )
 def test_a_signed_installer_must_be_the_pinned_installer(inputs, tmp_path, change):
     root, _, output = inputs
-    pinned = release.pinned_powershell(root, "v0.1.3", "wici-ai/inferssd").encode()
+    pinned = release.pinned_powershell(root, "261109.250", "wici-ai/inferssd").encode()
     signed = tmp_path / "signed-install.ps1"
     signed.write_bytes(change(pinned))
     with pytest.raises(ValueError, match="pinned installer"):
@@ -177,13 +176,13 @@ def test_the_signing_job_writes_the_same_pinned_installer(tmp_path):
             "--pinned-install-ps1",
             str(written),
             "--tag",
-            "v0.1.3",
+            "261109.250",
             "--repository",
             "wici-ai/inferssd",
         ],
         check=True,
     )
-    expected = release.pinned_powershell(ROOT, "v0.1.3", "wici-ai/inferssd")
+    expected = release.pinned_powershell(ROOT, "261109.250", "wici-ai/inferssd")
     assert written.read_bytes() == expected.encode()
 
 
@@ -196,34 +195,37 @@ def test_released_windows_packages_are_signed_before_their_check():
     assert sign["needs"] == "build" and sign["environment"] == "windows-signing"
     assert sign["if"] == "inputs.release_tag"
     uploads = [s for s in sign["steps"] if s.get("uses", "").startswith("actions/upload-artifact")]
+    # Each backend's signing replaces that backend's built package with the signed one.
     assert {s["with"]["name"] for s in uploads if s["with"].get("overwrite") == "true"} == {
-        "package-windows-x64-vulkan",
-        "package-windows-x64-cuda",
+        "package-windows-x64-${{ matrix.backend }}",
     }
     assert set(jobs["check"]["needs"]) == {"build", "sign"}
 
 
 def test_the_tag_and_commit_must_be_the_packages(inputs):
     with pytest.raises(ValueError, match="release version and tag commit"):
-        prepare(inputs, tag="v0.1.4")
+        prepare(inputs, tag="261109.251")
+    # A tag of the old form names no release now.
+    with pytest.raises(ValueError, match="<yymmdd>.<build>"):
+        prepare(inputs, tag="v0.1.3")
     with pytest.raises(ValueError, match="tag commit"):
         prepare(inputs, revision="3" * 40)
 
 
 def test_release_notes_put_highlights_and_installation_before_the_changes(tmp_path):
     (tmp_path / "CHANGELOG.md").write_text(
-        "# Changelog\n\n## 0.1.5 - 2026-11-18\n\nSigned packages.\n\n"
+        "# Changelog\n\n## 261118.294 - 2026-11-18\n\nSigned packages.\n\n"
         "## 0.1.4 - 2026-11-10\n\nOlder.\n"
     )
     changes = "## What's Changed\n* ci: one release (#1)\n"
-    notes = release.release_notes(tmp_path, "v0.1.5", "wici-ai/inferssd", changes)
-    base = "https://github.com/wici-ai/inferssd/releases/download/v0.1.5"
+    notes = release.release_notes(tmp_path, "261118.294", "wici-ai/inferssd", changes)
+    base = "https://github.com/wici-ai/inferssd/releases/download/261118.294"
     assert notes.startswith("Signed packages.\n\n### Install or upgrade\n")
     assert f"curl -fsSL {base}/install.sh | sh" in notes
     assert f"irm {base}/install.ps1 | iex" in notes
     assert notes.endswith(changes) and "Older." not in notes
     # A release without a section of its own has the installation and the changes alone.
-    plain = release.release_notes(tmp_path, "v0.1.6", "wici-ai/inferssd", changes)
+    plain = release.release_notes(tmp_path, "261119.301", "wici-ai/inferssd", changes)
     assert plain.startswith("### Install or upgrade\n") and plain.endswith(changes)
 
 
@@ -241,7 +243,7 @@ def test_release_notes_name_pull_requests_and_credit_every_contributor(tmp_path)
         f"* @Bi666666 made their first contribution in {pull}/292\n"
         "\n**Full Changelog**: https://github.com/wici-ai/inferssd/compare/v0.1.4...v0.1.5\n"
     )
-    notes = release.release_notes(tmp_path, "v0.1.5", "wici-ai/inferssd", changes)
+    notes = release.release_notes(tmp_path, "261119.301", "wici-ai/inferssd", changes)
     changed = notes[notes.index("## What's Changed") :]
     assert changed == (
         "## What's Changed\n"
@@ -262,44 +264,103 @@ def test_every_published_package_is_a_release_of_main():
         (ROOT / ".github/workflows/release.yml").read_text(), Loader=yaml.BaseLoader
     )
     assert set(workflow["on"]) == {"workflow_dispatch"}
-    assert workflow["on"]["workflow_dispatch"]["inputs"]["bump"]["default"] == "patch"
+    # The version is main's head's own: a run's one input says whether a GitHub release is made.
+    inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert set(inputs) == {"github_release"}
+    assert inputs["github_release"]["type"] == "boolean"
+    assert inputs["github_release"]["default"] == "true"
     jobs = workflow["jobs"]
-    for name in ("macos", "windows"):
-        assert jobs[name]["uses"] == f"./.github/workflows/package-{name}.yml"
-        assert jobs[name]["with"] == {
-            "source_ref": "${{ needs.validate.outputs.revision }}",
-            "release_tag": "${{ needs.validate.outputs.tag }}",
-        }
+    release_with = {
+        "source_ref": "${{ needs.validate.outputs.revision }}",
+        "release_tag": "${{ needs.validate.outputs.tag }}",
+    }
+    assert jobs["macos"]["uses"] == "./.github/workflows/package-macos.yml"
+    assert jobs["macos"]["with"] == release_with
+    # Each Windows package in a call of its own, so one does not wait for the other.
+    for backend in ("vulkan", "cuda"):
+        call = jobs[f"windows-{backend}"]
+        assert call["uses"] == "./.github/workflows/package-windows.yml"
+        assert call["with"] == {**release_with, "backends": f'["{backend}"]'}
     # Every secret the Windows package workflow reads is declared, required and passed by name: a
     # reusable workflow's job reads an environment secret only when its caller passes it, and an
     # unpassed one is an empty string, which once left the signing job without its credential.
     windows_text = (ROOT / ".github/workflows/package-windows.yml").read_text()
-    declared = yaml.load(windows_text, Loader=yaml.BaseLoader)["on"]["workflow_call"]["secrets"]
+    windows = yaml.load(windows_text, Loader=yaml.BaseLoader)
+    declared = windows["on"]["workflow_call"]["secrets"]
     assert set(re.findall(r"secrets\.([A-Z_]+)", windows_text)) == set(declared)
     signing = {"ES_USERNAME", "ES_PASSWORD", "ES_CREDENTIAL_ID", "ES_TOTP_SECRET"}
     assert set(declared) == {"APP_VERSIONING_TOKEN"} | signing
     assert all(entry["required"] == "true" for entry in declared.values())
-    assert jobs["windows"]["secrets"] == {name: f"${{{{ secrets.{name} }}}}" for name in declared}
-    assert set(jobs["release"]["needs"]) == {"validate", "macos", "windows"}
+    for backend in ("vulkan", "cuda"):
+        assert jobs[f"windows-{backend}"]["secrets"] == {
+            name: f"${{{{ secrets.{name} }}}}" for name in declared
+        }
     choice = next(s["run"] for s in jobs["validate"]["steps"] if s.get("id") == "version")
-    assert "refs/heads/main" in choice and "sort -V" in choice
-    preparation = next(
-        s["run"] for s in jobs["release"]["steps"] if "Prepare both" in s.get("name", "")
-    )
+    assert "refs/heads/main" in choice
+    assert "--date=format-local:%y%m%d HEAD).$(git rev-list --count HEAD)" in choice
+    # A version that is already a tag stops the run before anything is built or published.
+    assert 'git rev-parse -q --verify "refs/tags/$tag"' in choice
+    # Each package reaches the CDN and its package list once its own package checks pass, not
+    # when the slowest does.
+    published = {
+        "publish-macos": ("macos", "package-macos", "dist/macos"),
+        "publish-windows-vulkan": (
+            "windows-vulkan",
+            "package-windows-x64-vulkan",
+            "dist/windows-vulkan",
+        ),
+        "publish-windows-cuda": ("windows-cuda", "package-windows-x64-cuda", "dist/windows-cuda"),
+    }
+    for job, (package, artifact, dist) in published.items():
+        assert set(jobs[job]["needs"]) == {"validate", package}
+        steps = jobs[job]["steps"]
+        assert any(s.get("with", {}).get("name") == artifact for s in steps)
+        run = next(s["run"] for s in steps if "Publish the" in s.get("name", ""))
+        assert run.rstrip().endswith(f"scripts/publish-package.py {dist}")
+    # The GitHub release comes last, once every package is published, and only when asked for.
+    release = jobs["release"]
+    assert release["if"] == "inputs.github_release"
+    assert set(release["needs"]) == {"validate", *(p for p, _, _ in published.values()), *published}
+    preparation = next(s["run"] for s in release["steps"] if "Prepare both" in s.get("name", ""))
     assert "--signed-install-ps1 dist/install-windows/install.ps1" in preparation
     publication = next(
-        s["run"] for s in jobs["release"]["steps"] if "Publish the release" in s.get("name", "")
+        s["run"] for s in release["steps"] if "Publish the release" in s.get("name", "")
     )
-    assert "scripts/publish-package.py dist/macos" in publication
-    assert "scripts/publish-package.py dist/windows-vulkan\n" in publication
-    assert "scripts/publish-package.py dist/windows-cuda" in publication
     assert "--draft --target" in publication and "--draft=false --latest" in publication
     assert "its release and assets will not be replaced" in publication
-    # The package workflows build and check; only Release publishes.
+    assert "publish-package.py" not in yaml.dump(release)
+    # The Windows package workflow packages the backends it is given, each signed on its own, one
+    # signing at a time; the Vulkan package's signing also signs the pinned installer, once a run.
+    backends = windows["on"]["workflow_call"]["inputs"]["backends"]
+    assert backends["required"] == "false" and backends["default"] == '["vulkan", "cuda"]'
+    every = """${{ fromJSON(inputs.backends || '["vulkan", "cuda"]') }}"""
+    for job in ("build", "sign", "check"):
+        assert windows["jobs"][job]["strategy"]["matrix"]["backend"] == every
+    assert "inputs.backends" in windows["concurrency"]["group"]
+    # The CUDA build takes the organization's larger runner; signing and checking stay on the
+    # standard one.
+    build_on = windows["jobs"]["build"]["runs-on"]
+    assert build_on == (
+        "${{ matrix.backend == 'cuda' && 'release-packaging-runner-windows' || 'windows-2025' }}"
+    )
+    assert (
+        windows["jobs"]["sign"]["runs-on"] == windows["jobs"]["check"]["runs-on"] == "windows-2025"
+    )
+    sign = windows["jobs"]["sign"]
+    assert sign["concurrency"] == {"group": "windows-signing", "cancel-in-progress": "false"}
+    installer = [
+        s
+        for s in sign["steps"]
+        if "install" in (s.get("name", "") + str(s.get("with", {}))).lower()
+    ]
+    assert installer and all(s["if"] == "matrix.backend == 'vulkan'" for s in installer)
+    # The package workflows build and check; only Release publishes. Packages are built only for a
+    # release and by hand: no pull request or merge builds one.
     for name in ("macos", "windows"):
         package_workflow = yaml.load(
             (ROOT / f".github/workflows/package-{name}.yml").read_text(),
             Loader=yaml.BaseLoader,
         )
+        assert set(package_workflow["on"]) == {"workflow_call", "workflow_dispatch"}
         assert "publish" not in package_workflow["jobs"]
         assert "inputs" not in (package_workflow["on"]["workflow_dispatch"] or {})

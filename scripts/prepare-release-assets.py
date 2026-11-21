@@ -36,7 +36,7 @@ def checked_package(
     ):
         raise ValueError(f"wrong package schema/platform: {listings[0]}")
     if (
-        package.get("version") != tag[1:]
+        package.get("version") != tag
         or package.get("tag") != tag
         or package.get("revision") != revision
     ):
@@ -44,7 +44,7 @@ def checked_package(
             f"{platform} package does not match the release version and tag commit"
         )
     name = package.get("name", "")
-    if name != f"inferssd-{tag[1:]}-{suffix}":
+    if name != f"inferssd-{tag}-{suffix}":
         raise ValueError("the package is not named by the release version")
     if package.get("file") != name + extension:
         raise ValueError("archive filename does not match package name")
@@ -79,8 +79,8 @@ def replace_once(text: str, old: str, new: str) -> str:
 
 
 def release_base(tag: str, repository: str) -> str:
-    if not re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag):
-        raise ValueError("a numbered version tag is required")
+    if not re.fullmatch(r"[0-9]{6}\.[1-9][0-9]*", tag):
+        raise ValueError("a release tag, <yymmdd>.<build>, is required")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise ValueError("invalid GitHub repository")
     return f"https://github.com/{repository}/releases/download/{tag}"
@@ -163,7 +163,7 @@ def release_notes(root: Path, tag: str, repository: str, changes: str) -> str:
     it, then the changes since the last release (GitHub's list of the pull requests merged) and
     who made them."""
     base = release_base(tag, repository)
-    heading = f"## {tag[1:]} "
+    heading = f"## {tag} "
     highlights: list[str] = []
     found = False
     for line in (root / "CHANGELOG.md").read_text(encoding="utf-8").splitlines():
@@ -205,7 +205,7 @@ def prepare(
 ) -> list[str]:
     base = release_base(tag, repository)
     if not re.fullmatch(r"[a-f0-9]{40}", revision):
-        raise ValueError("a numbered version tag and its exact commit SHA are required")
+        raise ValueError("a release tag and its exact commit SHA are required")
     if set(directories) != set(PACKAGES):
         raise ValueError("a release holds every package: " + ", ".join(PACKAGES))
     packages = {

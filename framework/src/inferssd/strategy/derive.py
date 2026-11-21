@@ -2,7 +2,7 @@
 """Derive one launch's native settings, thread pools and server arguments.
 
 ``derive`` is a pure function of the machine characteristics, the model's
-header facts, the runtime facts and the platform. It chooses thread counts and
+facts, the runtime facts and the platform. It chooses thread counts and
 CPU placement, placement cost priors, and the host memory budget and margin; a
 launch with a strategy prefills each prompt in one pass.
 The pass shape changes the computation, for speed; everything else keeps it
@@ -34,7 +34,7 @@ from inferssd.configuration.settings import (
 from inferssd.launch.types import Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
 from inferssd.machine.identity import TIER_BACKENDS
-from inferssd.strategy.inputs import GPUState, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
 # read at 1e3 / gbps microseconds per 1e6 bytes.
@@ -233,21 +233,19 @@ def prefill_threads(rows: Sequence[ComputeRow], name: str, most: int) -> Optiona
         return most, (
             f"{name} computes fastest at {tokens} tokens on the most threads measured up to "
             f"{most}, {count} ({within[count] / 1e9:.0f} GFLOP/s), and faster on {max(faster)} "
-            f"({rates[max(faster)] / 1e9:.0f} GFLOP/s), so up to {most}, which leaves a CPU to the "
-            "I/O threads"
+            f"({rates[max(faster)] / 1e9:.0f} GFLOP/s), so up to {most}"
         )
     return count, (
         f"the measured count with the most {name} FLOP/s at {tokens} tokens "
-        f"({within[count] / 1e9:.0f} GFLOP/s), of up to {most} so that a CPU stays with the I/O "
-        "threads"
+        f"({within[count] / 1e9:.0f} GFLOP/s), of up to {most}"
     )
 
 
 def pinned_rate(
-    characteristics: Characteristics, model: ModelFacts, cpus: Sequence[int]
+    characteristics: Characteristics, name: str, cpus: Sequence[int]
 ) -> Optional[float]:
-    """The dominant format's weight bytes/s at one token, one thread pinned to each of CPUS."""
-    name, want = model.dominant_format.upper(), sorted(cpus)
+    """NAME's weight bytes/s at one token, one thread pinned to each of CPUS."""
+    want = sorted(cpus)
     for row in characteristics["compute"]["cpu"]:
         if row["format"].upper() == name and sorted(row.get("cpus", ())) == want:
             for point in row["points"]:
@@ -279,26 +277,34 @@ def placement(
 ) -> tuple[Threads, tuple[int, ...], str]:
     """The thread pools, the I/O CPUs and the reason for both, by one rule on every platform.
 
-    A prompt pass computes: it runs unpinned on the measured count that computes the dominant
-    format fastest (prefill_threads), at most every allowed CPU but one, which the sink's I/O
-    threads keep wherever threads can be pinned (io_cpu). Decode streams each expert's weights
-    once a token, so it runs where one token streams them fastest: on the fewest unpinned
-    threads at the best measured rate (decode_threads), or, where threads can be pinned and the
-    profile measured it faster than those threads, on the performance cluster alone, one thread
-    a CPU, its first CPUs as the pinned measurement placed them. The engine runs decode on fewer
-    of them while the machine's other work needs their CPUs.
+    The CPU computes the type of the model's cpu_format: its routed experts' dominant type, or a
+    model without routed experts' layers'. A prompt pass computes: it runs unpinned on the
+    measured count that computes that type fastest (prefill_threads), at most every allowed CPU,
+    but one where the sink's I/O threads read routed experts and threads can be pinned: those
+    keep it (io_cpu). Decode streams the CPU's weights once a token, so it runs where one token
+    streams them fastest: on the fewest unpinned threads at the best measured rate
+    (decode_threads), or, where threads can be pinned and the profile measured it faster than
+    those threads, on the performance cluster alone, one thread a CPU, its first CPUs as the
+    pinned measurement placed them. The engine runs decode on fewer of them while the machine's
+    other work needs their CPUs.
     """
     logical = {row["id"] for row in characteristics["cpu"]["logical"]}
     allowed = sorted(set(runtime.cpus) & logical)
     if not allowed:
         raise ValueError("none of the CPUs this process may use is in the machine characteristics")
-    name = model.dominant_format.upper()
+    name = model.cpu_format.upper()
     unpinned = _unpinned(characteristics)
-    most = min(MAX_THREADS, max(1, len(allowed) - 1))
+    # The sink's I/O threads read the routed experts; a model without them reads nothing so.
+    reads = model.experts is not None
+    most = min(MAX_THREADS, max(1, len(allowed) - 1) if reads else len(allowed))
+    spare = (
+        "every allowed CPU but one, which stays with the I/O threads"
+        if reads
+        else ("every allowed CPU")
+    )
     batch, batch_why = prefill_threads(unpinned, name, most) or (
         most,
-        f"every allowed CPU but one, which stays with the I/O threads ({name} not measured at a "
-        "prompt)",
+        f"{spare} ({name} not measured at a prompt)",
     )
     decode, decode_why = decode_threads(unpinned, name, min(MAX_THREADS, len(allowed))) or (
         most,
@@ -318,7 +324,7 @@ def placement(
     shape = f"{len(fast)} performance and {len(slow)} other" if fast and slow else "uniform"
     why = "one CPU cluster"
     if fast and slow:
-        on_fast = pinned_rate(characteristics, model, fast) if fast == sorted(performance) else None
+        on_fast = pinned_rate(characteristics, name, fast) if fast == sorted(performance) else None
         on_pool = next(
             (
                 one
@@ -348,17 +354,18 @@ def placement(
                 if row.get("cpus") == fast[: row["threads"]]
             ]
             pinned, chosen = decode_threads(prefixes, name, len(fast)) or (len(fast), "")
-            io = io_cpu(allowed, fast[:pinned], performance)
+            io = io_cpu(allowed, fast[:pinned], performance) if reads else ()
             reason = (
                 f"decode on the performance cluster {span(fast)}: pinned, one token streams "
                 f"{name} at {on_fast / GB:.1f} GB/s there against {on_pool / GB:.1f} GB/s on "
-                f"{decode} unpinned threads; prefill on {batch} unpinned threads; {_io_reason(io)}"
+                f"{decode} unpinned threads; prefill on {batch} unpinned threads; "
+                + _io_reason(io, reads)
             )
             notes.append("threads: " + reason)
             if chosen:
                 notes.append(f"threads: decode {pinned} of them, {chosen}")
             return Threads(pinned, batch, (), tuple(fast[:pinned])), io, reason
-    io = io_cpu(allowed, (), performance)
+    io = io_cpu(allowed, (), performance) if reads else ()
     notes.append(
         f"threads: all placement, decode {decode} and prefill {batch} unpinned threads for the "
         f"{len(allowed)} allowed CPUs {span(allowed)} ({shape}); decode not on a cluster alone: "
@@ -367,13 +374,15 @@ def placement(
     return (
         Threads(decode, batch, ()),
         io,
-        f"all placement: {_io_reason(io)}, decode {decode} and prefill {batch} unpinned "
+        f"all placement: {_io_reason(io, reads)}, decode {decode} and prefill {batch} unpinned "
         f"threads for the {len(allowed)} allowed CPUs {span(allowed)}; decode not on a "
         f"cluster alone: {why}",
     )
 
 
-def _io_reason(io: Sequence[int]) -> str:
+def _io_reason(io: Sequence[int], reads: bool = True) -> str:
+    if not reads:
+        return "no I/O CPU: the model has no routed experts to read"
     return f"I/O on CPU {span(io)}" if io else "no I/O CPU: no CPU to spare"
 
 
@@ -427,7 +436,7 @@ def _rates(row: ComputeRow) -> tuple[Optional[float], dict[int, float]]:
 
 
 def cpu_line(
-    characteristics: Characteristics, model: ModelFacts, threads: int
+    characteristics: Characteristics, experts: Experts, threads: int
 ) -> tuple[Optional[tuple[float, float]], str]:
     """The CPU's cost line of one expert in a grouped prefill pass, and how it was built.
 
@@ -443,7 +452,7 @@ def cpu_line(
     between the measured thread counts around THREADS, or taken from the
     nearest one outside them.
     """
-    names = [role.format.upper() for role in model.roles]
+    names = [role.format.upper() for role in experts.roles]
     rows = {(row["format"].upper(), row["threads"]): row for row in _unpinned(characteristics)}
     missing = sorted(set(names) - {name for name, _ in rows})
     if missing:
@@ -475,9 +484,10 @@ def cpu_line(
         ]
         return values[0] + share * (values[-1] - values[0])
 
-    one_us = sum(role.slice_bytes() / rate(i, 1) for i, role in enumerate(model.roles)) * 1e6
+    one_us = sum(role.slice_bytes() / rate(i, 1) for i, role in enumerate(experts.roles)) * 1e6
     many_us = 1e6 * sum(
-        2.0 * role.rows * role.cols * tokens / rate(i, tokens) for i, role in enumerate(model.roles)
+        2.0 * role.rows * role.cols * tokens / rate(i, tokens)
+        for i, role in enumerate(experts.roles)
     )
     route = (many_us - one_us) / (tokens - 1)
     fixed = one_us - route
@@ -491,7 +501,7 @@ def cpu_line(
         else f"the {pair[0]}- and {pair[1]}-thread measurements"
     )
     why = (
-        f"one {'/'.join(names)} expert, latent {model.up.cols} hidden {model.up.rows}, "
+        f"one {'/'.join(names)} expert, latent {experts.up.cols} hidden {experts.up.rows}, "
         f"on {threads} threads ({source}): {one_us:.1f} us at 1 token, "
         f"{many_us:.1f} us at {tokens} tokens"
     )
@@ -501,7 +511,7 @@ def cpu_line(
 
 
 def drive_rate(
-    characteristics: Characteristics, model: ModelFacts, key: Optional[str]
+    characteristics: Characteristics, experts: Experts, key: Optional[str]
 ) -> tuple[Optional[float], str]:
     """The model drive's read rate in GB/s for the requests the engine issues.
 
@@ -518,7 +528,7 @@ def drive_rate(
     if entry is None:
         return None, f"no measurement of the drive {key}; run inferssd profile --model <model>"
     name = key if entry["model"] == "unknown" else entry["model"]
-    request = model.mean_expert_read_bytes / 3
+    request = experts.mean_read_bytes / 3
     knee = min(entry["knee"], key=lambda row: (abs(math.log(row["bytes"] / request)), row["bytes"]))
     deepest = min(IN_FLIGHT, entry["qd_cap"] or IN_FLIGHT)
     shallowest = knee["qd"] if knee["qd"] <= deepest else 1
@@ -638,30 +648,35 @@ def derive(
     if conflicts or threads.batch is None:
         raise AssertionError("derived thread pools the launcher refuses: " + "; ".join(conflicts))
 
-    terms: dict[str, float] = {}
-    reasons: list[str] = []
-    line, why = cpu_line(characteristics, model, threads.batch)
-    if line is not None:
-        terms["cpu_fixed_us"], terms["cpu_route_us"] = line
-        reasons.append(f"cpu {line[0]:.1f} + {line[1]:.2f} us a route for {why}")
-    notes.append(
-        "place.costs: cpu "
-        + (f"{line[0]:.1f} + {line[1]:.2f} us a route for " if line else "omitted, ")
-        + why
-    )
-    link, why = link_rates(characteristics, runtime)
-    terms.update(link)
-    if link:
-        reasons.append(why)
-    notes.append("place.costs: link " + ("" if link else "omitted, ") + why)
-    drive, why = drive_rate(characteristics, model, model_drive_key)
-    if drive is not None:
-        terms["drive_gbps"] = drive
-        reasons.append(why)
-    notes.append("place.costs: drive " + ("" if drive is not None else "omitted, ") + why)
-    costs = _costs(terms, reasons)
-    if costs is not None:
-        choices["place.costs"] = costs
+    # The cost priors price where each routed expert computes; a model without them has none.
+    experts = model.experts
+    if experts is None:
+        notes.append("place.costs: omitted, the model has no routed experts to place")
+    else:
+        terms: dict[str, float] = {}
+        reasons: list[str] = []
+        line, why = cpu_line(characteristics, experts, threads.batch)
+        if line is not None:
+            terms["cpu_fixed_us"], terms["cpu_route_us"] = line
+            reasons.append(f"cpu {line[0]:.1f} + {line[1]:.2f} us a route for {why}")
+        notes.append(
+            "place.costs: cpu "
+            + (f"{line[0]:.1f} + {line[1]:.2f} us a route for " if line else "omitted, ")
+            + why
+        )
+        link, why = link_rates(characteristics, runtime)
+        terms.update(link)
+        if link:
+            reasons.append(why)
+        notes.append("place.costs: link " + ("" if link else "omitted, ") + why)
+        drive, why = drive_rate(characteristics, experts, model_drive_key)
+        if drive is not None:
+            terms["drive_gbps"] = drive
+            reasons.append(why)
+        notes.append("place.costs: drive " + ("" if drive is not None else "omitted, ") + why)
+        costs = _costs(terms, reasons)
+        if costs is not None:
+            choices["place.costs"] = costs
 
     # The VRAM tier's budget, where the engine has the tier (CUDA, ROCm). A GPU lane (Vulkan,
     # Metal) takes the default.
@@ -710,17 +725,25 @@ def derive(
         # Every pass takes the SSD sink. It reads each expert a pass routes to once, from the VRAM
         # tier, the RAM cache or the drive, places it on the CPU or the GPU by place.costs, and
         # seeds the VRAM tier for decode.
+        if experts is not None:
+            notes.append(
+                "prefill: the SSD sink for every pass; it reads only what the VRAM tier and the "
+                "RAM cache do not hold"
+            )
+    # A prompt in one pass, on every platform: a pass reads every expert it routes to once, whatever
+    # computes it. The engine reserves each prompt's own graph, a smaller one where that does not
+    # fit, and the expert caches give back what it needs. A model without routed experts reads
+    # none of its weights a pass, and keeps the launch's batch sizes.
+    if experts is not None:
         notes.append(
-            "prefill: the SSD sink for every pass; it reads only what the VRAM tier and the "
-            "RAM cache do not hold"
+            "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
+            "expert it routes to once"
         )
-    # A prompt in one pass, on every platform: a pass reads every expert it routes to once,
-    # whatever computes it. The engine reserves each prompt's own graph, a smaller one where that
-    # does not fit, and the expert caches give back what it needs.
-    notes.append(
-        "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
-        "expert it routes to once"
-    )
+    else:
+        notes.append(
+            "prefill: the launch's batch sizes; a pass reads none of the model's weights, which "
+            "has no routed experts"
+        )
     if offered("host.budget_mib", platform) and runtime.memory_budget_bytes:
         mib = runtime.memory_budget_bytes >> 20
         if mib:

@@ -12,7 +12,8 @@
   <a href="https://wici.ai/research"><b>Blog</b></a> &nbsp;·&nbsp;
   <a href="https://discord.gg/wici"><b>Discord</b></a> &nbsp;·&nbsp;
   <a href="https://join.slack.com/t/wici-ai/shared_invite/zt-4f2e7ob2s-9nUg35Phqyqt4EI6qUjw5w"><b>Slack</b></a> &nbsp;·&nbsp;
-  <a href="LICENSE">Apache-2.0</a>
+  <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp;
+  <a href="docs/README.zh-CN.md">简体中文</a>
 </p>
 <p align="center">macOS (Metal) &nbsp;·&nbsp; Windows 10/11 (CUDA · Vulkan · ROCm in progress) &nbsp;·&nbsp; Linux (CUDA · ROCm · Vulkan in progress)</p>
 

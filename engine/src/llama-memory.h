@@ -58,9 +58,13 @@ struct llama_memory_context_i {
     // Precompute metadata transaction. Capturing may allocate but cannot
     // publish cells; cancellation after apply must not allocate. Tensor/state
     // writes are excluded: discard the undo immediately before async submit.
-    virtual bool save_precompute() { return false; }
-    virtual bool restore_precompute() noexcept { return false; }
-    virtual void discard_precompute() noexcept {}
+    // Every memory type implements it: a ubatch whose graph gets no memory is
+    // undone and its batch split again (prefill_refit) on every model, and only
+    // what is saved differs by memory type. save_precompute returns false only
+    // for a context with no ubatches, which applies nothing to undo.
+    virtual bool save_precompute() = 0;
+    virtual bool restore_precompute() noexcept = 0;
+    virtual void discard_precompute() noexcept = 0;
 
     [[nodiscard]] bool apply_precompute() {
         precompute_state = state::untouched;

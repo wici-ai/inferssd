@@ -1,6 +1,7 @@
 #include "llama-model.h"
 #include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
+#include "ssd/dense-homes.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -30,6 +31,7 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <climits>
@@ -697,6 +699,9 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // after ctxs_bufs: its device copies go before the host buffers its matrices return to
+    std::unique_ptr<llama_dense_homes> dense_homes;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -8746,7 +8751,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(!defer_expert_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // homed layers are read where they go (into the GPU, a pinned copy, or from the drive): no file read ahead
+    ml.init_mappings(!defer_expert_mmap && ml.homed_matrices.empty(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
     if (defer_expert_mmap) {
         pimpl->expert_mmap_ranges = ml.expert_tensor_index.file_ranges;
@@ -8867,11 +8873,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+            // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
+            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
+                std::vector<ggml_backend_buffer_t> lock_bufs;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
+                        lock_bufs.push_back(t->buffer);
+                    }
+                }
+                for (ggml_backend_buffer_t lock_buf : lock_bufs) {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(lock_buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(lock_buf));
+                }
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -8996,7 +9011,40 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the layers' matrices homed in host memory: the SSD context moves into the GPU what its memory holds
+    if (!ml.homed_matrices.empty() && !ml.no_alloc) {
+        auto homes = std::make_unique<llama_dense_homes>();
+        size_t bytes = 0;
+        for (const auto & [il, matrix] : ml.homed_matrices) {
+            homes->add(il, dev_layer(il), matrix);
+            bytes += ggml_nbytes(matrix);
+        }
+        homes->finish();
+        for (size_t i = 0; i < pimpl->mappings.size() && i < ml.paths.size(); ++i) {
+            if (pimpl->mappings[i]) {
+                homes->add_file(ml.paths[i], pimpl->mappings[i]->addr(), pimpl->mappings[i]->size());
+            }
+        }
+        homes->set_drop_pages([this](const void * data, size_t bytes) {
+            for (const auto & mapping : pimpl->mappings) {
+                const auto * base = static_cast<const uint8_t *>(mapping->addr());
+                const auto * at = static_cast<const uint8_t *>(data);
+                if (at >= base && at + bytes <= base + mapping->size()) {
+                    (void) mapping->dontneed_fragment(size_t(at - base), size_t(at - base) + bytes);
+                    return;
+                }
+            }
+        });
+        LLAMA_LOG_INFO("%s: %zu layer matrices (%.2f GiB) homed in host memory for the SSD context to place\n",
+                __func__, ml.homed_matrices.size(), bytes / 1024.0 / 1024.0 / 1024.0);
+        pimpl->dense_homes = std::move(homes);
+    }
+
     return true;
+}
+
+llama_dense_homes * llama_model::dense_homes() const {
+    return pimpl->dense_homes.get();
 }
 
 std::string llama_model::arch_name() const {
@@ -10108,6 +10156,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.defer_experts               =*/ false,
+        /*.ssd_homes                   =*/ false,
         /*.no_alloc                    =*/ false,
     };
 

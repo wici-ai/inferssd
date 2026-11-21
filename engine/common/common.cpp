@@ -1464,6 +1464,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
     mparams.defer_experts   = params.defer_experts;
+    mparams.ssd_homes       = params.ssd_enabled;
 
     params.model.shard_ptrs.clear();
     for (const auto & shard : params.model.shards) {

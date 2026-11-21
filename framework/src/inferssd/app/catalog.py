@@ -1,19 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The models InferSSD supports, with the header facts of their tested quantization.
+"""The models InferSSD supports, with the facts of their tested quantization.
 
-Each model's facts are ``model_facts_json`` of its shards' GGUF headers at the
-revision named, so a speed estimate needs no download. ``lookup_bytes`` counts
+Each model's facts are ``model_facts_json`` of the engine's facts of its shards
+(``inferssd-server --ssd-model-facts``) at the revision named, so a speed
+estimate needs no download. ``lookup_bytes`` counts
 the dense tensors a token reads one row of rather than whole: the token
 embeddings, DeepSeek-V4.1's engram tables and Gemma 4's per-layer embeddings
-(Gemma's token embeddings are also its output projection, read whole). A RAM-only
-model has no expert facts; ``weight_bytes`` is the sum of its tensors' bytes at
-the revision named.
+(Gemma's token embeddings are also its output projection, read whole).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
 
 from inferssd.strategy.inputs import ModelFacts, model_facts_from
 
@@ -23,15 +21,13 @@ class Model:
     repo: str
     quantization: str
     revision: str  # the Hugging Face commit the facts were read at
-    facts: Optional[ModelFacts]  # None for an ordinary RAM-only model, with no expert store.
+    facts: ModelFacts
     lookup_bytes: int
-    weight_bytes: int = 0  # a RAM-only model's tensors; an expert model's are in its facts
 
     @property
     def dense_read_bytes(self) -> int:
         """The dense weights one token reads whole."""
-        dense = self.facts.dense_bytes if self.facts is not None else self.weight_bytes
-        return dense - self.lookup_bytes if dense else 0
+        return self.facts.dense_bytes - self.lookup_bytes
 
 
 def _shards(prefix: str, count: int) -> list[str]:
@@ -47,18 +43,25 @@ MODELS: tuple[Model, ...] = (
             {
                 "paths": _shards("Q8_0/DeepSeek-V4.1-Flash-1017-Q8_0", 10),
                 "architecture": "deepseek41",
-                "layers": 40,
-                "experts": 384,
-                "experts_used": 6,
-                "roles": {
-                    "gate": {"formats": [["MXFP4", 40]], "rows": 2304, "cols": 5120},
-                    "up": {"formats": [["MXFP4", 40]], "rows": 2304, "cols": 5120},
-                    "down": {"formats": [["MXFP4", 40]], "rows": 5120, "cols": 2304},
-                },
-                "expert_bytes": 18800640,
-                "expert_read_bytes": 18812928,
                 "dense_bytes": 219170559968,
-                "format_bytes": [["MXFP4", 288777830400]],
+                "layer_format_bytes": [
+                    ["Q8_0", 216166225440],
+                    ["BF16", 197296128],
+                    ["F32", 159363520],
+                ],
+                "experts": {
+                    "layers": 40,
+                    "count": 384,
+                    "used": 6,
+                    "roles": {
+                        "gate": {"formats": [["MXFP4", 40, 6266880]], "rows": 2304, "cols": 5120},
+                        "up": {"formats": [["MXFP4", 40, 6266880]], "rows": 2304, "cols": 5120},
+                        "down": {"formats": [["MXFP4", 40, 6266880]], "rows": 5120, "cols": 2304},
+                    },
+                    "expert_bytes": 18800640,
+                    "expert_read_bytes": 18812928,
+                    "format_bytes": [["MXFP4", 288777830400]],
+                },
             }
         ),
         210226042400,
@@ -71,18 +74,21 @@ MODELS: tuple[Model, ...] = (
             {
                 "paths": _shards("UD-Q4_K_XL/Muse-Spark-Open-816B-A42B-UD-Q4_K_XL", 12),
                 "architecture": "muse-spark",
-                "layers": 62,
-                "experts": 256,
-                "experts_used": 8,
-                "roles": {
-                    "gate": {"formats": [["Q4_K", 62]], "rows": 4096, "cols": 4096},
-                    "up": {"formats": [["Q4_K", 62]], "rows": 4096, "cols": 4096},
-                    "down": {"formats": [["Q5_K", 62]], "rows": 4096, "cols": 4096},
-                },
-                "expert_bytes": 30408704,
-                "expert_read_bytes": 30420992,
                 "dense_bytes": 22842110976,
-                "format_bytes": [["Q4_K", 299573968896], ["Q5_K", 183072980992]],
+                "layer_format_bytes": [["Q8_0", 18788384768], ["F32", 536441856]],
+                "experts": {
+                    "layers": 62,
+                    "count": 256,
+                    "used": 8,
+                    "roles": {
+                        "gate": {"formats": [["Q4_K", 62, 9437184]], "rows": 4096, "cols": 4096},
+                        "up": {"formats": [["Q4_K", 62, 9437184]], "rows": 4096, "cols": 4096},
+                        "down": {"formats": [["Q5_K", 62, 11534336]], "rows": 4096, "cols": 4096},
+                    },
+                    "expert_bytes": 30408704,
+                    "expert_read_bytes": 30420992,
+                    "format_bytes": [["Q4_K", 299573968896], ["Q5_K", 183072980992]],
+                },
             }
         ),
         1758625792,
@@ -95,22 +101,37 @@ MODELS: tuple[Model, ...] = (
             {
                 "paths": ["Qwen3.6-35B-A3B-UD-Q4_K_XL.gguf"],
                 "architecture": "qwen35moe",
-                "layers": 40,
-                "experts": 256,
-                "experts_used": 8,
-                "roles": {
-                    "gate": {"formats": [["Q4_K", 39], ["Q5_K", 1]], "rows": 512, "cols": 2048},
-                    "up": {"formats": [["Q4_K", 39], ["Q5_K", 1]], "rows": 512, "cols": 2048},
-                    "down": {"formats": [["Q5_K", 36], ["Q6_K", 4]], "rows": 2048, "cols": 512},
-                },
-                "expert_bytes": 2301952,
-                "expert_read_bytes": 2314240,
                 "dense_bytes": 2678180352,
-                "format_bytes": [
-                    ["Q4_K", 11777605632],
-                    ["Q5_K", 7012876288],
-                    ["Q6_K", 880803840],
-                ],
+                "layer_format_bytes": [["Q8_0", 1492910080], ["F32", 104573440]],
+                "experts": {
+                    "layers": 40,
+                    "count": 256,
+                    "used": 8,
+                    "roles": {
+                        "gate": {
+                            "formats": [["Q4_K", 39, 589824], ["Q5_K", 1, 720896]],
+                            "rows": 512,
+                            "cols": 2048,
+                        },
+                        "up": {
+                            "formats": [["Q4_K", 39, 589824], ["Q5_K", 1, 720896]],
+                            "rows": 512,
+                            "cols": 2048,
+                        },
+                        "down": {
+                            "formats": [["Q5_K", 36, 720896], ["Q6_K", 4, 860160]],
+                            "rows": 2048,
+                            "cols": 512,
+                        },
+                    },
+                    "expert_bytes": 2301952,
+                    "expert_read_bytes": 2314240,
+                    "format_bytes": [
+                        ["Q4_K", 11777605632],
+                        ["Q5_K", 7012876288],
+                        ["Q6_K", 880803840],
+                    ],
+                },
             }
         ),
         540344320,
@@ -123,18 +144,30 @@ MODELS: tuple[Model, ...] = (
             {
                 "paths": _shards("Qwen3.8-Flash-Next-IQ4_XS/Qwen3.8-Flash-Next-IQ4_XS", 3),
                 "architecture": "qwen4exp",
-                "layers": 48,
-                "experts": 512,
-                "experts_used": 10,
-                "roles": {
-                    "gate": {"formats": [["IQ4_XS", 48]], "rows": 640, "cols": 2560},
-                    "up": {"formats": [["IQ4_XS", 48]], "rows": 640, "cols": 2560},
-                    "down": {"formats": [["IQ4_NL", 48]], "rows": 2560, "cols": 640},
-                },
-                "expert_bytes": 2662400,
-                "expert_read_bytes": 2678784,
                 "dense_bytes": 32239669760,
-                "format_bytes": [["IQ4_XS", 42781900800], ["IQ4_NL", 22649241600]],
+                "layer_format_bytes": [
+                    ["IQ4_XS", 1279139840],
+                    ["Q8_0", 459571200],
+                    ["F32", 297561600],
+                    ["IQ4_NL", 199065600],
+                    ["Q6_K", 154828800],
+                    ["Q5_K", 129761280],
+                    ["BF16", 47185920],
+                    ["F16", 81920],
+                ],
+                "experts": {
+                    "layers": 48,
+                    "count": 512,
+                    "used": 10,
+                    "roles": {
+                        "gate": {"formats": [["IQ4_XS", 48, 870400]], "rows": 640, "cols": 2560},
+                        "up": {"formats": [["IQ4_XS", 48, 870400]], "rows": 640, "cols": 2560},
+                        "down": {"formats": [["IQ4_NL", 48, 921600]], "rows": 2560, "cols": 640},
+                    },
+                    "expert_bytes": 2662400,
+                    "expert_read_bytes": 2678784,
+                    "format_bytes": [["IQ4_XS", 42781900800], ["IQ4_NL", 22649241600]],
+                },
             }
         ),
         29137853440,
@@ -143,8 +176,15 @@ MODELS: tuple[Model, ...] = (
         "google/gemma-4-E4B-it-qat-q4_0-gguf",
         "Q4_0",
         "4b4a2c1d584be7264f87aac328a1bc739ce81b6c",
-        None,
+        model_facts_from(
+            {
+                "paths": ["gemma-4-E4B_q4_0-it.gguf"],
+                "architecture": "gemma4",
+                "dense_bytes": 5139117224,
+                "layer_format_bytes": [["Q4_0", 2219212800], ["F32", 2229416]],
+                "experts": None,
+            }
+        ),
         2312110080,  # per_layer_token_embd.weight
-        5139117224,  # gemma-4-E4B_q4_0-it.gguf's 666 tensors
     ),
 )

@@ -1,22 +1,24 @@
 name: Release
 
-# Releases main as the next version, vX.Y.Z: the checked macOS and Windows (Vulkan and CUDA)
-# packages of one commit, signed, published as one GitHub release, which tags the commit, and named
-# by the installers' package lists, which the desktop app follows. Every published package is a
+# Releases main's head as its version, <yymmdd>.<build> (261119.300): the checked macOS and Windows
+# (Vulkan and CUDA) packages of one commit, signed. Each reaches the CDN and the installers' package
+# list, which the desktop app follows, as soon as it is checked, not when the slowest is; then one
+# GitHub release holds them all and tags the commit with the version. Every published package is a
 # release's. See docs/macos-package.md and docs/windows-package.md.
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: The part of the last release's version to raise (patch for most releases)
-        type: choice
-        options: [patch, minor, major]
-        default: patch
+      github_release:
+        description: >-
+          Publish the GitHub release, which tags the commit. Off, the same signed packages reach
+          only the CDN and its package lists, which the installers on main and the desktop app read.
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
-# One release at a time, so each takes the version after the one before it.
+# One release at a time.
 concurrency:
   group: release
   cancel-in-progress: false
@@ -35,29 +37,28 @@ jobs:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - name: Choose the next version
+      - name: Name the version
         id: version
         shell: bash
-        env:
-          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
           if [ "$GITHUB_REF" != refs/heads/main ]; then
             echo '::error::A release is made from main.'
             exit 1
           fi
-          previous=$(git tag --list 'v*' | grep -E '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' | sort -V | tail -n 1)
-          IFS=. read -r major minor patch <<< "${previous#v}"
-          case "$BUMP" in
-            major) tag="v$((major + 1)).0.0" ;;
-            minor) tag="v$major.$((minor + 1)).0" ;;
-            patch) tag="v$major.$minor.$((patch + 1))" ;;
-            *) echo "::error::Unknown bump: $BUMP"; exit 1 ;;
-          esac
           revision=$(git rev-parse HEAD)
-          git merge-base --is-ancestor "$previous" HEAD || { echo "::error::$previous is not in main's history."; exit 1; }
+          # The commit's day (UTC) and main's commit count, as scripts/engine-resources.py names
+          # every build; the release's tag is the version.
+          tag="$(TZ=UTC git show -s --format=%cd --date=format-local:%y%m%d HEAD).$(git rev-list --count HEAD)"
+          # The release before it: the nearest tag in main's history, of either form.
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --match '[0-9][0-9][0-9][0-9][0-9][0-9].[0-9]*' HEAD)
           if [ "$(git rev-parse "$previous^{commit}")" = "$revision" ]; then
             echo "::error::main has not changed since $previous."
+            exit 1
+          fi
+          # Before any package is published: a version that is already a tag is not released again.
+          if git rev-parse -q --verify "refs/tags/$tag" > /dev/null; then
+            echo "::error::$tag is already a tag; its release and packages will not be replaced."
             exit 1
           fi
           echo "Releasing $revision as $tag, after $previous."
@@ -70,12 +71,15 @@ jobs:
       source_ref: ${{ needs.validate.outputs.revision }}
       release_tag: ${{ needs.validate.outputs.tag }}
 
-  windows:
+  # The Windows packages in calls of their own, so the Vulkan package is signed, checked and
+  # published while the CUDA one, which takes longest, still builds.
+  windows-vulkan:
     needs: validate
     uses: ./.github/workflows/package-windows.yml
     with:
       source_ref: ${{ needs.validate.outputs.revision }}
       release_tag: ${{ needs.validate.outputs.tag }}
+      backends: '["vulkan"]'
     secrets:
       # The signed-file store, so a later release signs only what changed.
       APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
@@ -87,8 +91,90 @@ jobs:
       ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
       ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
 
+  windows-cuda:
+    needs: validate
+    uses: ./.github/workflows/package-windows.yml
+    with:
+      source_ref: ${{ needs.validate.outputs.revision }}
+      release_tag: ${{ needs.validate.outputs.tag }}
+      backends: '["cuda"]'
+    secrets:
+      # The signed-file store, so a later release signs only what changed.
+      APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+      # The windows-signing environment's eSigner credential. A reusable workflow's job reads an
+      # environment secret only when its caller passes it by name, even though only the called job
+      # names the environment.
+      ES_USERNAME: ${{ secrets.ES_USERNAME }}
+      ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+      ES_CREDENTIAL_ID: ${{ secrets.ES_CREDENTIAL_ID }}
+      ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+
+  # Each package reaches the CDN and points its package list at it once its own checks pass.
+  publish-macos:
+    needs: [validate, macos]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-macos
+          path: dist/macos
+      - name: Publish the macOS package and its package list
+        env:
+          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+        run: |
+          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for the package lists.' >&2; exit 1; }
+          python3 scripts/publish-package.py dist/macos
+
+  publish-windows-vulkan:
+    needs: [validate, windows-vulkan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-windows-x64-vulkan
+          path: dist/windows-vulkan
+      - name: Publish the Windows Vulkan package and its package list
+        env:
+          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+        run: |
+          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for the package lists.' >&2; exit 1; }
+          python3 scripts/publish-package.py dist/windows-vulkan
+
+  publish-windows-cuda:
+    needs: [validate, windows-cuda]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ needs.validate.outputs.revision }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package-windows-x64-cuda
+          path: dist/windows-cuda
+      - name: Publish the Windows CUDA package and its package list
+        env:
+          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
+        run: |
+          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for the package lists.' >&2; exit 1; }
+          python3 scripts/publish-package.py dist/windows-cuda
+
+  # The GitHub release, once every package is published: it holds them all, with the notes and the
+  # tag-pinned installers, and tags the commit. Without it the packages are published all the same.
   release:
-    needs: [validate, macos, windows]
+    if: inputs.github_release
+    needs: [validate, macos, windows-vulkan, windows-cuda, publish-macos, publish-windows-vulkan, publish-windows-cuda]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
@@ -116,7 +202,7 @@ jobs:
         with:
           name: package-windows-x64-cuda
           path: dist/windows-cuda
-      # The Windows package workflow signed the pinned install.ps1 with the packages.
+      # The Windows Vulkan call signed the pinned install.ps1 with its package.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: install-windows-signed
@@ -136,13 +222,10 @@ jobs:
             -f target_commitish="$RELEASE_REVISION" -f previous_tag_name="$PREVIOUS" --jq .body > changes.md
           python3 scripts/prepare-release-assets.py --release-notes release-notes.md --changes changes.md \
             --tag "$TAG" --repository "$GITHUB_REPOSITORY"
-      - name: Publish the release and the package lists
+      - name: Publish the release
         shell: bash
-        env:
-          APP_VERSIONING_TOKEN: ${{ secrets.APP_VERSIONING_TOKEN }}
         run: |
           set -euo pipefail
-          test -n "$APP_VERSIONING_TOKEN" || { echo 'APP_VERSIONING_TOKEN is required for the package lists.' >&2; exit 1; }
           if gh release view "$TAG" >/dev/null 2>&1 || gh api "repos/$GH_REPO/git/ref/tags/$TAG" >/dev/null 2>&1; then
             echo "$TAG already exists; its release and assets will not be replaced." >&2
             exit 1
@@ -158,9 +241,6 @@ jobs:
           gh release create "$TAG" --draft --target "$RELEASE_REVISION" --title "$TAG" --notes-file release-notes.md
           created=yes
           gh release upload "$TAG" release-assets/*
-          python3 scripts/publish-package.py dist/macos
-          python3 scripts/publish-package.py dist/windows-vulkan
-          python3 scripts/publish-package.py dist/windows-cuda
           gh release edit "$TAG" --draft=false --latest
           created=no
           test "$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)" = "$RELEASE_REVISION"

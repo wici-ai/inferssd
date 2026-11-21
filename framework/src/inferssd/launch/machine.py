@@ -94,7 +94,6 @@ def characteristics(
     runner: Optional[Runner] = None,
     environ: Mapping[str, str] = os.environ,
     home: Optional[Path] = None,
-    extra_models: tuple[str, ...] = (),
     clock: Clock = time.time,
     progress: Progress = launch_progress,
 ) -> Optional[str]:
@@ -113,7 +112,7 @@ def characteristics(
     try:
         with exclusive(path):
             previous = _saved(path, progress)
-            found = survey(live, [model, *extra_models], previous, source.reprofile, progress)
+            found = survey(live, [model], previous, source.reprofile, progress)
             if previous is not None and found.current:
                 return dumps(previous)
             if previous is not None and futile(found, probes):
@@ -140,7 +139,7 @@ def characteristics(
             value = profile(
                 live,
                 Probes(tuple(probes.items()), runner or run_process, environ),
-                [model, *extra_models],
+                [model],
                 previous,
                 source.reprofile,
                 clock=clock,

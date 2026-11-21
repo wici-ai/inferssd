@@ -901,7 +901,37 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
+static void common_print_version() {
+    fprintf(stderr, "%s\n", inferssd_build_name());
+    fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
+}
+
+// The queries that answer from the engine's own facts and exit (the settings schema, a model's facts from its headers,
+// the version) need no compute backend. Given alone they are answered here, before the parser loads every backend, which
+// starts each GPU's driver; given with other arguments they are parsed as usual, where one can be another option's value.
+static void common_params_answer_query(int argc, char ** argv) {
+    if (argc < 2 || argc > 3) {
+        return;
+    }
+    std::string arg = argv[1];
+    if (arg.rfind("--", 0) == 0) {
+        std::replace(arg.begin(), arg.end(), '_', '-'); // as the parser spells long options
+    }
+    if (argc == 2 && arg == "--ssd-schema") {
+        common_ssd_print_schema();
+        exit(0);
+    }
+    if (argc == 3 && arg == "--ssd-model-facts") {
+        exit(common_ssd_print_model_facts(argv[2]) ? 0 : 1);
+    }
+    if (argc == 2 && arg == "--version") {
+        common_print_version();
+        exit(0);
+    }
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    common_params_answer_query(argc, argv);
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 
@@ -1059,6 +1089,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         common_ssd_print_schema();
         exit(0);
     }));
+    add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
+        "print the facts of the GGUF model FNAME as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
+        [](common_params &, const std::string & value) { exit(common_ssd_print_model_facts(value) ? 0 : 1); }));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",
@@ -1087,8 +1120,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--version"},
         "show version and build info",
         [](common_params &) {
-            fprintf(stderr, "%s\n", inferssd_build_name());
-            fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
+            common_print_version();
             exit(0);
         }
     ));
