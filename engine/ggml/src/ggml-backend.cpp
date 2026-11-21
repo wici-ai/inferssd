@@ -1027,6 +1027,28 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
         }
     }
 
+    // An op that reads what a GPU holds besides weights (the context's KV, recurrent or indexer cache, kept in that
+    // GPU's buffer) runs on that GPU, as an op on its weights does. Left to the expansion below, it takes its
+    // neighbours' backend: between two CPU nodes (the CPU-run experts of a MoE layer, a row lookup in a host table) it
+    // would read the GPU's cache from the CPU, where no other graph of the model runs it. An op the GPU does not support,
+    // or on a cache in host memory (whose backend is the CPU's or an accelerator's), is still left to the expansion.
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        const struct ggml_tensor * src = tensor->src[i];
+        const ggml_backend_buffer_t buffer = src == NULL ? NULL : src->view_src ? src->view_src->buffer : src->buffer;
+        if (buffer == NULL || buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            continue;
+        }
+        const int src_backend_id = ggml_backend_sched_backend_from_buffer(sched, src, tensor);
+        if (src_backend_id == -1) {
+            continue;
+        }
+        const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(sched->backends[src_backend_id]));
+        if (type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            SET_CAUSE(tensor, "1.cache%d", i);
+            return src_backend_id;
+        }
+    }
+
     return -1;
 }
 
