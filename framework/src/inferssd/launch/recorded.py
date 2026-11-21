@@ -6,7 +6,6 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
-from inferssd.launch import ram
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
@@ -95,8 +94,6 @@ class RecordedArtifacts:
             # Serialised strategy inputs, read back strictly and written out again.
             try:
                 if name == "model_facts":
-                    if isinstance(value, Mapping) and value.get("architecture") == ram.ARCHITECTURE:
-                        return Reply(ram.validate(value))
                     facts = strategy_inputs.model_facts_from(value)
                     return Reply(strategy_inputs.model_facts_json(facts))
                 runtime = strategy_inputs.runtime_facts_from(value)

@@ -350,6 +350,21 @@ void ggml_metal_set_tensor_async(ggml_metal_t ctx, struct ggml_tensor * tensor, 
 
 void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     @autoreleasepool {
+        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
+        if (bid_src.metal == nil) {
+            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
+        }
+
+        bid_src.offs += offset;
+
+        // A buffer in shared storage is memory the CPU reads: copy from it once the queued work is done. A blit costs a
+        // command buffer and a wrap of the destination for every read, which needs a page-aligned destination.
+        if ([bid_src.metal storageMode] == MTLStorageModeShared) {
+            ggml_metal_synchronize(ctx);
+            memcpy(data, (const char *) [bid_src.metal contents] + bid_src.offs, size);
+            return;
+        }
+
         id<MTLDevice> device = ggml_metal_device_get_obj(ctx->dev);
         id<MTLBuffer> buf_dst = [device newBufferWithBytesNoCopy:data
                                                           length:size
@@ -357,13 +372,6 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
                                                      deallocator:nil];
 
         GGML_ASSERT(buf_dst);
-
-        struct ggml_metal_buffer_id bid_src = ggml_metal_get_buffer_id(tensor);
-        if (bid_src.metal == nil) {
-            GGML_ABORT("%s: failed to find buffer for tensor '%s'\n", __func__, tensor->name);
-        }
-
-        bid_src.offs += offset;
 
         // queue the copy operation into the queue of the Metal context
         // this will be queued at the end, after any currently ongoing GPU operations

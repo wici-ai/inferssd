@@ -51,7 +51,68 @@
         "gpu_processes": "",
         "engine_gpu_backends": [
           "CUDA"
-        ]
+        ],
+        "model_facts": {
+          "paths": [
+            "/models/DeepSeek-V4.1-00001-of-00002.gguf"
+          ],
+          "architecture": "deepseek41",
+          "dense_bytes": 6410240,
+          "layer_format_bytes": [
+            [
+              "F32",
+              819200
+            ]
+          ],
+          "experts": {
+            "layers": 40,
+            "count": 384,
+            "used": 6,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 2304,
+                "cols": 5120
+              },
+              "up": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 2304,
+                "cols": 5120
+              },
+              "down": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 5120,
+                "cols": 2304
+              }
+            },
+            "expert_bytes": 18800640,
+            "expert_read_bytes": 18800640,
+            "format_bytes": [
+              [
+                "MXFP4",
+                288777830400
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [
@@ -155,7 +216,72 @@
         "gpu_processes": "",
         "engine_gpu_backends": [
           "CUDA"
-        ]
+        ],
+        "model_facts": {
+          "paths": [
+            "/models/muse-spark.gguf"
+          ],
+          "architecture": "muse-spark",
+          "dense_bytes": 5488640,
+          "layer_format_bytes": [
+            [
+              "F32",
+              1015808
+            ]
+          ],
+          "experts": {
+            "layers": 62,
+            "count": 256,
+            "used": 8,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "Q4_K",
+                    62,
+                    9437184
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              },
+              "up": {
+                "formats": [
+                  [
+                    "Q4_K",
+                    62,
+                    9437184
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              },
+              "down": {
+                "formats": [
+                  [
+                    "Q5_K",
+                    62,
+                    11534336
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              }
+            },
+            "expert_bytes": 30408704,
+            "expert_read_bytes": 30408704,
+            "format_bytes": [
+              [
+                "Q4_K",
+                299573968896
+              ],
+              [
+                "Q5_K",
+                183072980992
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [
@@ -234,7 +360,72 @@
       "directory": "/opt/inferssd/runs/muse",
       "host": {
         "platform_system": "Darwin",
-        "platform_machine": "arm64"
+        "platform_machine": "arm64",
+        "model_facts": {
+          "paths": [
+            "/Volumes/models/muse-spark-00001-of-00003.gguf"
+          ],
+          "architecture": "muse-spark",
+          "dense_bytes": 5488640,
+          "layer_format_bytes": [
+            [
+              "F32",
+              1015808
+            ]
+          ],
+          "experts": {
+            "layers": 62,
+            "count": 256,
+            "used": 8,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "Q4_K",
+                    62,
+                    9437184
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              },
+              "up": {
+                "formats": [
+                  [
+                    "Q4_K",
+                    62,
+                    9437184
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              },
+              "down": {
+                "formats": [
+                  [
+                    "Q5_K",
+                    62,
+                    11534336
+                  ]
+                ],
+                "rows": 4096,
+                "cols": 4096
+              }
+            },
+            "expert_bytes": 30408704,
+            "expert_read_bytes": 30408704,
+            "format_bytes": [
+              [
+                "Q4_K",
+                299573968896
+              ],
+              [
+                "Q5_K",
+                183072980992
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [
@@ -304,7 +495,68 @@
         "platform_system": "Linux",
         "systemd": true,
         "cgroup_v2": true,
-        "euid": 0
+        "euid": 0,
+        "model_facts": {
+          "paths": [
+            "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf"
+          ],
+          "architecture": "qwen4exp",
+          "dense_bytes": 3287040,
+          "layer_format_bytes": [
+            [
+              "F32",
+              491520
+            ]
+          ],
+          "experts": {
+            "layers": 48,
+            "count": 512,
+            "used": 10,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 640,
+                "cols": 2560
+              },
+              "up": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 640,
+                "cols": 2560
+              },
+              "down": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 2560,
+                "cols": 640
+              }
+            },
+            "expert_bytes": 5222400,
+            "expert_read_bytes": 5222400,
+            "format_bytes": [
+              [
+                "Q8_0",
+                128345702400
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [
@@ -383,7 +635,68 @@
       "threads": {},
       "directory": "C:\\inferssd\\runs\\qwen4exp",
       "host": {
-        "platform_system": "Windows"
+        "platform_system": "Windows",
+        "model_facts": {
+          "paths": [
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf"
+          ],
+          "architecture": "qwen4exp",
+          "dense_bytes": 3287040,
+          "layer_format_bytes": [
+            [
+              "F32",
+              491520
+            ]
+          ],
+          "experts": {
+            "layers": 48,
+            "count": 512,
+            "used": 10,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 640,
+                "cols": 2560
+              },
+              "up": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 640,
+                "cols": 2560
+              },
+              "down": {
+                "formats": [
+                  [
+                    "Q8_0",
+                    48,
+                    1740800
+                  ]
+                ],
+                "rows": 2560,
+                "cols": 640
+              }
+            },
+            "expert_bytes": 5222400,
+            "expert_read_bytes": 5222400,
+            "format_bytes": [
+              [
+                "Q8_0",
+                128345702400
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [
@@ -455,7 +768,68 @@
       },
       "directory": "C:\\inferssd\\runs\\dsv",
       "host": {
-        "platform_system": "Windows"
+        "platform_system": "Windows",
+        "model_facts": {
+          "paths": [
+            "D:\\models\\DeepSeek-V4.1.gguf"
+          ],
+          "architecture": "deepseek41",
+          "dense_bytes": 6410240,
+          "layer_format_bytes": [
+            [
+              "F32",
+              819200
+            ]
+          ],
+          "experts": {
+            "layers": 40,
+            "count": 384,
+            "used": 6,
+            "roles": {
+              "gate": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 2304,
+                "cols": 5120
+              },
+              "up": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 2304,
+                "cols": 5120
+              },
+              "down": {
+                "formats": [
+                  [
+                    "MXFP4",
+                    40,
+                    6266880
+                  ]
+                ],
+                "rows": 5120,
+                "cols": 2304
+              }
+            },
+            "expert_bytes": 18800640,
+            "expert_read_bytes": 18800640,
+            "format_bytes": [
+              [
+                "MXFP4",
+                288777830400
+              ]
+            ]
+          }
+        }
       }
     },
     "argv": [

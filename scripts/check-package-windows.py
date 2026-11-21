@@ -126,7 +126,6 @@ def main() -> None:
     import httpx
     import inferssd
     import yaml
-    from inferssd.launch.ram import admission
     from inferssd.machine.probes import parse as parse_probe
 
     for module in (inferssd, hf_xet, httpx, yaml):
@@ -155,11 +154,7 @@ def main() -> None:
     cpu = parse_probe("cpu", subprocess.check_output([str(package / resources["probes"]["cpu"]),
         "--rows", "64", "--cols", "256", "--tokens", "1,2", "--min-seconds", "0", "--threads", "1"]).decode("utf-8"))
     assert cpu["compute"] and not cpu["skipped"]
-    # Exercise the packaged Gemma RAM admission contract without downloading model weights.
-    fit = admission({"architecture": "gemma4", "model_bytes": 1024, "tensor_bytes": 1024,
-                     "embedding_bytes": 512, "ple_bytes": 0, "kv_layers": [[0, 1024]]},
-                    context=512, batch=512, weights="file", budget=4 << 30)
-    receipt = {"version": version, "binary_audit": audit(package), "gemma_ram_admission": fit,
+    receipt = {"version": version, "binary_audit": audit(package),
                "owned_runtime": owned_runtime(package, args.work / "owned run")}
     (args.work / "check-receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     print(json.dumps({"package_check": "passed", "label": version["label"], **receipt["binary_audit"]}))

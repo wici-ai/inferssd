@@ -28,7 +28,7 @@ struct llama_memory_i;
 struct llama_memory_context_i;
 struct llama_memory_params;
 
-// The copies of the weights homed on the drive in one phase of a request (the [dense_stream] line): the prefill from
+// The copies of the streamed weights in one phase of a request (the [dense_stream] line): the prefill from
 // the request's start to its end, the decode from there to the request's end.  begin when the phase starts, add the
 // tokens of each ubatch, end when it ends with the scheduler's counters then.  end returns the line, without a
 // newline, and nothing for a phase that copied no such weight.
@@ -309,6 +309,14 @@ private:
     // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
     // SSD experts, whose KV cache allocates its cells as they are used).
     uint32_t fit_context(const llama_memory_params & params_mem) const;
+
+    // The layers' matrices the model homes in host memory (llama_dense_homes) with an SSD context on a GPU that
+    // streams: the GPU holds those its memory has room for once the graph is reserved, ahead of the expert caches, and
+    // gives layers back when the KV cache grows past what the expert caches can give (they stream from then on).
+    void hold_dense_layers();
+    bool give_dense_layers(size_t bytes);
+    // the streamed layers' pinned host copies, as far as the context's host budget has room
+    void pin_dense_layers();
     // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
     uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos

@@ -262,8 +262,8 @@ A different quantization needs matching model facts before its estimate is valid
 
 Two defaults stand in for measurements the profile lacks. An expert format the
 probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight
-bytes per second) of the measured format nearest it in bits per weight. A RAM-only
-model without routed experts, such as Gemma 4 E4B, reads its dense weights once a
+bytes per second) of the measured format nearest it in bits per weight. A model
+without routed experts, such as Gemma 4 E4B, reads its dense weights once a
 token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
 measured RAM read rate. Each estimate names the default it used in its
 assumptions; neither is calibrated against a run.

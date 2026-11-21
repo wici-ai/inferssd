@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
-from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, recorded_facts
+from test_strategy_inputs import F32, Q8_0, deepseek_like, moe, muse_like, recorded_facts
 
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
@@ -54,6 +54,7 @@ def setup(tmp_path, platform="linux", automatic=False):
         "engine_gpu_backends": ["Metal"] if platform == "darwin" else ["CUDA"],
     }
     tensors = [(f"blk.0.ffn_{r}_exps.weight", (32, 32, 256), Q8_0) for r in ("up", "gate", "down")]
+    tensors.append(("blk.0.attn_norm.weight", (32,), F32))
     model = model_file(root / "model.gguf", host, tensors, {})
     spec = LaunchSpec(model, 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
