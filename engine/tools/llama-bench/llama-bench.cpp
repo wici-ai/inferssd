@@ -2237,7 +2237,7 @@ int main(int argc, char ** argv) {
             uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
             cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
 
-            common_fit_params(inst.model.c_str(), &mparams, &cparams,
+            common_fit_params({ inst.model }, &mparams, &cparams,
                 fit_tensor_split.data(),
                 fit_overrides.data(),
                 margins.data(),

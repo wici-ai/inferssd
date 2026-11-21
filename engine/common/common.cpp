@@ -1148,7 +1148,7 @@ common_init_result::common_init_result(common_params & params) :
 
     if (params.fit_params) {
         LOG_INF("%s: fitting params to device memory, for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on\n", __func__);
-        common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+        common_fit_params(params.model.get_paths(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
             params.fit_params_target.data(),
@@ -1156,7 +1156,7 @@ common_init_result::common_init_result(common_params & params) :
             params.verbosity >= 4 ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
     }
 
-    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+    llama_model * model = common_model_load(params.model.get_paths(), mparams);
     if (model == NULL) {
         return;
     }
@@ -1466,13 +1466,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.defer_experts   = params.defer_experts;
     mparams.ssd_homes       = params.ssd_enabled;
 
-    params.model.shard_ptrs.clear();
-    for (const auto & shard : params.model.shards) {
-        params.model.shard_ptrs.push_back(shard.c_str());
-    }
-    params.model.shard_ptrs.push_back(nullptr);
-    mparams.extra_files = params.model.shard_ptrs.data();
-
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
@@ -1492,6 +1485,19 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_alloc                    = params.no_alloc;
 
     return mparams;
+}
+
+struct llama_model * common_model_load(const std::vector<std::string> & paths, const struct llama_model_params & mparams) {
+    if (paths.size() == 1) {
+        return llama_model_load_from_file(paths[0].c_str(), mparams);
+    }
+
+    std::vector<const char *> c_paths;
+    c_paths.reserve(paths.size());
+    for (const auto & path : paths) {
+        c_paths.push_back(path.c_str());
+    }
+    return llama_model_load_from_splits(c_paths.data(), c_paths.size(), mparams);
 }
 
 struct llama_context_params common_context_params_to_llama(const common_params & params) {

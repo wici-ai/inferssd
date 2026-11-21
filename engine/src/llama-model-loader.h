@@ -61,13 +61,8 @@ struct llama_model_loader {
                 throw std::runtime_error(format("tensor '%s' not found in the model", ggml_get_name(tensor)));
             }
 
-            const size_t data_offset = gguf_get_data_offset(gguf_ctx);
-            const size_t tensor_offset = gguf_get_tensor_offset(gguf_ctx, tensor_idx);
-            if (data_offset > file->size() || tensor_offset > file->size() - data_offset) {
-                throw std::runtime_error(format("tensor '%s' offset is outside the file bounds", ggml_get_name(tensor)));
-            }
-            offs = data_offset + tensor_offset;
-            if (ggml_nbytes(tensor) > file->size() - offs) {
+            offs = gguf_get_data_offset(gguf_ctx) + gguf_get_tensor_offset(gguf_ctx, tensor_idx);
+            if (offs + ggml_nbytes(tensor) < offs || offs + ggml_nbytes(tensor) > file->size()) {
                 throw std::runtime_error(format("tensor '%s' data is not within the file bounds, model is corrupted or incomplete", ggml_get_name(tensor)));
             }
         }
@@ -171,8 +166,7 @@ struct llama_model_loader {
         bool defer_experts,
         bool no_alloc,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
-        const char ** extra_files = nullptr);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -236,7 +230,6 @@ struct llama_model_loader {
     void drop_mmap_expert_pages() const;
 
     std::map<size_t, std::pair<size_t, size_t>> ple_lazy_ranges;
-    int replaced_ple_file = -1; // do not prefetch an unused table after an explicit replacement
     void mark_ple_lazy(const llama_tensor_weight & weight);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);

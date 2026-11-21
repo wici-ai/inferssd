@@ -495,14 +495,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             if (arg_to_options.find(arg) == arg_to_options.end()) {
                 throw std::invalid_argument(string_format("error: invalid argument: %s", arg.c_str()));
             }
-            const bool appends_shard = arg == "--shard" || arg == "--ple";
-            if (!seen_args.insert(arg).second && !appends_shard) {
+            if (!seen_args.insert(arg).second) {
                 LOG_WRN("DEPRECATED: argument '%s' specified multiple times, use comma-separated values instead (only last value will be used)\n", arg.c_str());
             }
             auto & tmp = arg_to_options[arg];
             auto opt = *tmp.first;
             bool is_positive = tmp.second;
-            if (opt.has_value_from_env() && !appends_shard) {
+            if (opt.has_value_from_env()) {
                 fprintf(stderr, "warn: %s environment variable is set, but will be overwritten by command line argument %s\n", opt.env, arg.c_str());
             }
             try {
@@ -2661,13 +2660,10 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
     add_opt(common_arg(
         {"--ple", "--shard"}, "FNAME,...",
-        "extra PLE-only GGUF file, independent of model split naming or directory;\n"
-        "comma separated and repeatable (currently one PLE table is supported)",
+        "extra GGUF shards for the model, comma separated; may be given more than once\n"
+        "paths may live anywhere, including on different drives; --ple is an alias for --shard",
         [](common_params & params, const std::string & value) {
             for (const auto & item : parse_csv_row(value)) {
-                if (item.empty()) {
-                    throw std::invalid_argument("extra GGUF path must not be empty");
-                }
                 params.model.shards.push_back(item);
             }
         }
