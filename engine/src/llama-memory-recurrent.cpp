@@ -673,6 +673,25 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     return n >= n_seqs;
 }
 
+std::unique_ptr<llama_memory_recurrent::metadata_undo> llama_memory_recurrent::save_metadata() const {
+    auto saved = std::make_unique<metadata_undo>();
+    saved->head  = head;
+    saved->used  = used;
+    saved->n     = n;
+    saved->rs_z  = rs_z;
+    saved->cells = cells;
+    return saved;
+}
+
+void llama_memory_recurrent::restore_metadata(metadata_undo & saved) noexcept {
+    head = saved.head;
+    used = saved.used;
+    n    = saved.n;
+    rs_z = saved.rs_z;
+    // the cell count never changes, so the copy always has as many cells
+    cells.swap(saved.cells);
+}
+
 bool llama_memory_recurrent::get_can_shift() const {
     // shifting the pos is trivial for recurrent models
     return true;
@@ -1145,6 +1164,21 @@ bool llama_memory_recurrent_context::next() {
 
     return true;
 }
+
+bool llama_memory_recurrent_context::save_precompute() {
+    if (ubatches.empty()) { return false; }
+    precompute_undo = mem->save_metadata();
+    return true;
+}
+
+bool llama_memory_recurrent_context::restore_precompute() noexcept {
+    if (!precompute_undo) { return true; }
+    mem->restore_metadata(*precompute_undo);
+    precompute_undo.reset();
+    return true;
+}
+
+void llama_memory_recurrent_context::discard_precompute() noexcept { precompute_undo.reset(); }
 
 bool llama_memory_recurrent_context::apply() {
     assert(!llama_memory_status_is_fail(status));

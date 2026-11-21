@@ -70,6 +70,14 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // the attention cache's cells, and the indexer's with them (idx_follow)
+    void set_commit(const commit_cb & commit) override;
+    bool cells_short(uint32_t n_tokens) const override;
+    bool reserve_cells(uint32_t n_tokens) override;
+    bool fit_cells(uint32_t n_tokens) override;
+    bool get_can_grow() const override;
+    uint32_t get_generation() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -91,6 +99,9 @@ public:
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
+    // Forget the layout, kept allocated: the next kpool_layout_update rebuilds it from the cells. A ubatch undone
+    // after apply leaves a layout that holds cells the caches no longer have.
+    void kpool_layout_drop() noexcept;
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
@@ -108,6 +119,10 @@ public:
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
 private:
+    // the indexer cache's cells set to the attention cache's; false (the attention cache back to the indexer's) when
+    // there is no memory for them
+    bool idx_follow();
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -180,6 +195,10 @@ public:
     bool next()  override;
     bool apply() override;
     llama_memory_status get_status() const override;
+
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     //
     // llama_memory_hybrid_idx_context specific API

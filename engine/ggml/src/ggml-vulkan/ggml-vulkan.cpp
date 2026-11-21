@@ -639,6 +639,7 @@ struct vk_device_struct {
     uint32_t subgroup_size_log2;
     uint32_t shader_core_count;
     bool uma;
+    bool rebar;
     bool prefer_host_memory;
     bool float_controls_rte_fp16;
     bool subgroup_basic;
@@ -2873,7 +2874,7 @@ static std::vector<vk::MemoryPropertyFlags> ggml_vk_device_memory_flags(const vk
                  vk::MemoryPropertyFlagBits::eDeviceLocal,
                  vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
     }
-    if (device->disable_host_visible_vidmem) {
+    if (!device->rebar || device->disable_host_visible_vidmem) {
         if (device->allow_sysmem_fallback) {
             return { vk::MemoryPropertyFlagBits::eDeviceLocal,
                      vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent };
@@ -5061,6 +5062,24 @@ static void ggml_vk_load_shaders(vk_device& device) {
 static bool ggml_vk_khr_cooperative_matrix_support(const vk::PhysicalDeviceProperties& props, const vk::PhysicalDeviceDriverProperties& driver_props, vk_device_architecture arch);
 static uint32_t ggml_vk_intel_shader_core_count(const vk::PhysicalDevice& vkdev);
 
+static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
+    const vk::PhysicalDeviceMemoryProperties mem_props = physical_device.getMemoryProperties();
+    const vk::MemoryPropertyFlags hvv = vk::MemoryPropertyFlagBits::eDeviceLocal |
+                                        vk::MemoryPropertyFlagBits::eHostVisible |
+                                        vk::MemoryPropertyFlagBits::eHostCoherent;
+    uint32_t vram_heap = UINT32_MAX;
+    for (uint32_t i = 0; i < mem_props.memoryTypeCount; i++) {
+        const vk::MemoryType & t = mem_props.memoryTypes[i];
+        if (vram_heap == UINT32_MAX && (t.propertyFlags & vk::MemoryPropertyFlagBits::eDeviceLocal)) {
+            vram_heap = t.heapIndex;
+        }
+        if ((t.propertyFlags & hvv) == hvv && t.heapIndex == vram_heap) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5272,6 +5291,7 @@ static vk_device ggml_vk_get_device(size_t idx) {
         device->subgroup_size = subgroup_props.subgroupSize;
         device->subgroup_size_log2 = uint32_t(log2f(float(device->subgroup_size)));
         device->uma = device->properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+        device->rebar = ggml_vk_has_rebar(device->physical_device);
         if (sm_builtins) {
             device->shader_core_count = sm_props.shaderSMCount;
         } else if (amd_shader_core_properties2) {
@@ -5978,6 +5998,7 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     uint32_t default_subgroup_size = get_subgroup_size("", device_architecture);
     const size_t subgroup_size = (default_subgroup_size != 0) ? default_subgroup_size : subgroup_props.subgroupSize;
     const bool uma = props2.properties.deviceType == vk::PhysicalDeviceType::eIntegratedGpu;
+    const bool rebar = ggml_vk_has_rebar(physical_device);
 
     integer_dot_product = integer_dot_product
                        && shader_integer_dot_product_props.integerDotProduct4x8BitPackedSignedAccelerated
@@ -5992,8 +6013,8 @@ static void ggml_vk_print_gpu_info(size_t idx) {
     std::string matrix_cores = coopmat2_support ? "NV_coopmat2" : coopmat_support ? "KHR_coopmat" : "none";
 
     std::string device_name = props2.properties.deviceName.data();
-    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
-              idx, device_name.c_str(), driver_props.driverName.data(), uma, fp16, bf16, subgroup_size,
+    GGML_LOG_DEBUG("ggml_vulkan: %zu = %s (%s) | uma: %d | rebar: %d | fp16: %d | bf16: %d | warp size: %zu | shared memory: %d | int dot: %d | matrix cores: %s\n",
+              idx, device_name.c_str(), driver_props.driverName.data(), uma, rebar, fp16, bf16, subgroup_size,
               props2.properties.limits.maxComputeSharedMemorySize, integer_dot_product, matrix_cores.c_str());
 
     if (props2.properties.deviceType == vk::PhysicalDeviceType::eCpu) {
@@ -9152,8 +9173,11 @@ static bool ggml_vk_flash_attn_coopmat_shmem_support(const vk_device& device, co
     return supported;
 }
 
-static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
-    VK_LOG_DEBUG("ggml_vk_flash_attn((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
+// One dispatch of a flash attention over the query rows that q, mask and dst hold. n_rows_all is the row count of the
+// whole attention (ggml_vk_flash_attn): the tiles, the pipeline and the KV split are chosen for it, so a range of its
+// rows computes what those rows get in one dispatch of all of them.
+static void ggml_vk_flash_attn_rows(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst, uint32_t n_rows_all) {
+    VK_LOG_DEBUG("ggml_vk_flash_attn_rows((" << q << ", name=" << q->name << ", type=" << q->type << ", ne0=" << q->ne[0] << ", ne1=" << q->ne[1] << ", ne2=" << q->ne[2] << ", ne3=" << q->ne[3] << ", nb0=" << q->nb[0] << ", nb1=" << q->nb[1] << ", nb2=" << q->nb[2] << ", nb3=" << q->nb[3];
     std::cerr << "), (" << k << ", name=" << k->name << ", type=" << k->type << ", ne0=" << k->ne[0] << ", ne1=" << k->ne[1] << ", ne2=" << k->ne[2] << ", ne3=" << k->ne[3] << ", nb0=" << k->nb[0] << ", nb1=" << k->nb[1] << ", nb2=" << k->nb[2] << ", nb3=" << k->nb[3];
     std::cerr << "), (" << v << ", name=" << v->name << ", type=" << v->type << ", ne0=" << v->ne[0] << ", ne1=" << v->ne[1] << ", ne2=" << v->ne[2] << ", ne3=" << v->ne[3] << ", nb0=" << v->nb[0] << ", nb1=" << v->nb[1] << ", nb2=" << v->nb[2] << ", nb3=" << v->nb[3];
     std::cerr << "), (" << dst << ", name=" << dst->name << ", type=" << dst->type << ", ne0=" << dst->ne[0] << ", ne1=" << dst->ne[1] << ", ne2=" << dst->ne[2] << ", ne3=" << dst->ne[3] << ", nb0=" << dst->nb[0] << ", nb1=" << dst->nb[1] << ", nb2=" << dst->nb[2] << ", nb3=" << dst->nb[3];
@@ -9227,8 +9251,10 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         N = gqa_ratio;
         workgroups_y /= gqa_ratio;
     }
+    // the rows the pipeline, its tiles and the KV split are chosen for (ggml_vk_flash_attn_rows)
+    const uint32_t N_all = gqa_ratio > 1 ? N : n_rows_all;
 
-    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N, KV, k->type, f32acc);
+    tuning_params = get_fa_tuning_params(ctx->device, HSK, HSV, N_all, KV, k->type, f32acc);
 
     const uint32_t q_stride = (uint32_t)(nbq1 / ggml_type_size(q->type));
     uint32_t k_stride = (uint32_t)(nbk1 / ggml_type_size(k->type));
@@ -9300,12 +9326,13 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
 
     GGML_ASSERT(Br == pipeline->wg_denoms[0]);
     const uint32_t Tr = CEIL_DIV(N, Br);
+    const uint32_t Tr_all = CEIL_DIV(N_all, Br);
 
     // Try to use split_k when KV is large enough to be worth the overhead.
     if (gqa_ratio > 1 && workgroups_x <= Br) {
         split_k = shader_core_count * 2 / (workgroups_x * workgroups_y * workgroups_z);
     } else if (gqa_ratio <= 1) {
-        uint32_t total_wgs_no_split = Tr * workgroups_y * workgroups_z;
+        uint32_t total_wgs_no_split = Tr_all * workgroups_y * workgroups_z;
         if (total_wgs_no_split < shader_core_count * 2) {
             split_k = shader_core_count * 2 / total_wgs_no_split;
         }
@@ -9441,6 +9468,87 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
                                     {q_buf, k_buf, v_buf, mask_buf, sinks_buf, dst_buf, mask_opt_buf},
                                     pc, { workgroups_x, workgroups_y, workgroups_z });
     }
+}
+
+// A shader addresses a tensor through a binding of at most maxStorageBufferRange bytes (1 GiB on Intel GPUs) unless
+// the device has 64-bit indexing. A flash attention's mask holds keys times queries, so a long prompt's attention in
+// one ubatch outgrows a binding first: at about 23k tokens on 1 GiB. Such an attention runs as dispatches over ranges
+// of its query rows, each binding its rows of q, the mask and dst, and stays on the GPU
+// (ggml_backend_vk_device_supports_op); it would otherwise run on the CPU. The ranges are as few as the binding
+// allows: each dispatch ends with GPU cores idle while its last tiles finish.
+//
+// A range starts at a multiple of VK_FA_ROW_GRANULE, which every row tile (Br, at most 64) divides; the pipeline and
+// KV split are chosen for all the rows (ggml_vk_flash_attn_rows). So each range computes what its rows get in one
+// dispatch, and the result does not depend on the ranges.
+static constexpr int64_t VK_FA_ROW_GRANULE = 64;
+
+// Whether a flash attention can run as ranges of its query rows: one sequence of queries and of masks (the shaders
+// address q, the mask and dst as one block of rows for them), enough rows for two ranges, and ranges that start at
+// offsets a binding may start at.
+static bool ggml_vk_flash_attn_row_ranges(const vk_device & device, const ggml_tensor * q, const ggml_tensor * mask, const ggml_tensor * dst) {
+    if (q->ne[1] < 2 * VK_FA_ROW_GRANULE || q->ne[3] != 1 || dst->ne[3] != 1 || (mask && (mask->ne[2] != 1 || mask->ne[3] != 1))) {
+        return false;
+    }
+    const uint64_t align = device->properties.limits.minStorageBufferOffsetAlignment;
+    return (VK_FA_ROW_GRANULE * q->nb[1]) % align == 0 && (VK_FA_ROW_GRANULE * dst->nb[2]) % align == 0 &&
+        (!mask || (VK_FA_ROW_GRANULE * mask->nb[1]) % align == 0);
+}
+
+// The most rows of t along dim that one binding addresses.
+static int64_t ggml_vk_rows_in_binding(const vk_device & device, const ggml_tensor * t, int dim) {
+    if (device->shader_64b_indexing) {
+        return INT64_MAX;
+    }
+    ggml_tensor row = *t;
+    row.ne[dim] = 1;
+    const uint64_t range = device->properties.limits.maxStorageBufferRange;
+    const uint64_t one = ggml_nbytes(&row);
+    return one > range ? 0 : 1 + (int64_t) ((range - one) / t->nb[dim]);
+}
+
+// rows [r0, r0 + rows) of t along dim, as a tensor at the same place in the same buffer
+static ggml_tensor ggml_vk_row_range(const ggml_tensor * t, int dim, int64_t r0, int64_t rows) {
+    ggml_tensor range = *t;
+    const size_t offset = (size_t) r0 * t->nb[dim];
+    range.ne[dim] = rows;
+    range.data = (char *) t->data + offset;
+    if (t->view_src) {
+        range.view_offs += offset;
+    }
+    return range;
+}
+
+static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * q, const ggml_tensor * k, const ggml_tensor * v, const ggml_tensor * mask, const ggml_tensor * sinks, ggml_tensor * dst) {
+    const int64_t N = q->ne[1];
+    if (ggml_vk_flash_attn_row_ranges(ctx->device, q, mask, dst)) {
+        // rows that one binding addresses; the last range holds the mask's padding rows as well
+        const int64_t mask_pad = mask ? mask->ne[1] - N : 0;
+        int64_t fit = std::min(ggml_vk_rows_in_binding(ctx->device, q, 1), ggml_vk_rows_in_binding(ctx->device, dst, 2));
+        if (mask) {
+            fit = std::min(fit, ggml_vk_rows_in_binding(ctx->device, mask, 1) - mask_pad);
+        }
+        if (fit < N) {
+            const int64_t max_rows = fit / VK_FA_ROW_GRANULE * VK_FA_ROW_GRANULE; // at least two granules (supports_op)
+            const int64_t ranges = (N + max_rows - 1) / max_rows;
+            const int64_t rows = ((N + ranges - 1) / ranges + VK_FA_ROW_GRANULE - 1) / VK_FA_ROW_GRANULE * VK_FA_ROW_GRANULE;
+            for (int64_t r0 = 0; r0 < N; r0 += rows) {
+                const int64_t r1 = std::min(N, r0 + rows);
+                if (r0 > 0) {
+                    // the range before reads what this range's mask_opt pass rewrites
+                    ggml_vk_sync_buffers(ctx, subctx);
+                }
+                ggml_tensor q_range = ggml_vk_row_range(q, 1, r0, r1 - r0);
+                ggml_tensor dst_range = ggml_vk_row_range(dst, 2, r0, r1 - r0);
+                ggml_tensor mask_range;
+                if (mask) {
+                    mask_range = ggml_vk_row_range(mask, 1, r0, (r1 == N ? mask->ne[1] : r1) - r0);
+                }
+                ggml_vk_flash_attn_rows(ctx, subctx, &q_range, k, v, mask ? &mask_range : nullptr, sinks, &dst_range, (uint32_t) N);
+            }
+            return;
+        }
+    }
+    ggml_vk_flash_attn_rows(ctx, subctx, q, k, v, mask, sinks, dst, (uint32_t) N);
 }
 
 static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, uint32_t K, uint32_t NPQ) {
@@ -14220,11 +14328,21 @@ static void ggml_backend_vk_get_tensor_async(ggml_backend_t backend, const ggml_
 
     ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
 
-    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
-
     vk_buffer buf = buf_ctx->dev_buffer;
 
     auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+
+    // On a UMA device a buffer the host can see is memory the CPU reads: copy from it once the queued work is done, as
+    // a synchronous read does. A copy on the GPU would add a transfer and a barrier to the submission for every read.
+    if ((buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostVisible) && ctx->device->uma) {
+        GGML_ASSERT(buf->memory_property_flags & vk::MemoryPropertyFlagBits::eHostCoherent);
+        ggml_vk_synchronize(ctx);
+        memcpy(data, (const uint8_t *) buf->ptr + src_offset, size);
+        return;
+    }
+
+    vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
+
     bool ret = ggml_vk_buffer_read_async(compute_ctx, buf, src_offset, data, size);
 
     // If that failed, copy synchronously through a staging buffer
@@ -14852,7 +14970,8 @@ static ggml_status ggml_backend_vk_graph_compute(ggml_backend_t backend, ggml_cg
         std::fill(ctx->query_nodes.begin(), ctx->query_nodes.end(), nullptr);
         std::fill(ctx->query_node_idx.begin(), ctx->query_node_idx.end(), 0);
 
-        GGML_ASSERT(ctx->compute_ctx.expired());
+        // Copies queued before the graph (set_tensor_async) may hold the compute context open: the first timestamp
+        // follows them in it.
         compute_ctx = ggml_vk_get_compute_ctx(ctx);
         ctx->query_idx = 0;
         compute_ctx->s->buffer->buf.writeTimestamp(vk::PipelineStageFlagBits::eAllCommands, ctx->query_pool, ctx->query_idx++);
@@ -15469,23 +15588,66 @@ static void ggml_backend_vk_event_wait(ggml_backend_t backend, ggml_backend_even
     }
 }
 
+// A Vulkan call that fails throws (vulkan.hpp), and an exception no one catches ends the process with no message, as
+// when the driver or the operating system resets the GPU and the device is lost. The backend's calls that submit or
+// wait for work end the process with what failed instead.
+template <typename F>
+static auto ggml_vk_guard(const char * call, F && f) -> decltype(f()) {
+    try {
+        return f();
+    } catch (const vk::DeviceLostError & e) {
+        GGML_ABORT("ggml_vulkan: %s: the device was lost (%s): the driver or the operating system reset the GPU, "
+            "as Windows does to work that runs past its timeout", call, e.what());
+    } catch (const vk::SystemError & e) {
+        GGML_ABORT("ggml_vulkan: %s: %s", call, e.what());
+    }
+}
+
+static void ggml_backend_vk_set_tensor_async_guarded(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    ggml_vk_guard("set_tensor_async", [&] { ggml_backend_vk_set_tensor_async(backend, tensor, data, offset, size); });
+}
+
+static void ggml_backend_vk_get_tensor_async_guarded(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    ggml_vk_guard("get_tensor_async", [&] { ggml_backend_vk_get_tensor_async(backend, tensor, data, offset, size); });
+}
+
+static bool ggml_backend_vk_cpy_tensor_async_guarded(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+    return ggml_vk_guard("cpy_tensor_async", [&] { return ggml_backend_vk_cpy_tensor_async(backend_src, backend_dst, src, dst); });
+}
+
+static void ggml_backend_vk_synchronize_guarded(ggml_backend_t backend) {
+    ggml_vk_guard("synchronize", [&] { ggml_backend_vk_synchronize(backend); });
+}
+
+static ggml_status ggml_backend_vk_graph_compute_guarded(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    return ggml_vk_guard("graph_compute", [&] { return ggml_backend_vk_graph_compute(backend, cgraph); });
+}
+
+static void ggml_backend_vk_event_record_guarded(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_vk_guard("event_record", [&] { ggml_backend_vk_event_record(backend, event); });
+}
+
+static void ggml_backend_vk_event_wait_guarded(ggml_backend_t backend, ggml_backend_event_t event) {
+    ggml_vk_guard("event_wait", [&] { ggml_backend_vk_event_wait(backend, event); });
+}
+
 // TODO: enable async and synchronize
 static ggml_backend_i ggml_backend_vk_interface = {
     /* .get_name                = */ ggml_backend_vk_name,
     /* .free                    = */ ggml_backend_vk_free,
-    /* .set_tensor_async        = */ ggml_backend_vk_set_tensor_async,
-    /* .get_tensor_async        = */ ggml_backend_vk_get_tensor_async,
+    /* .set_tensor_async        = */ ggml_backend_vk_set_tensor_async_guarded,
+    /* .get_tensor_async        = */ ggml_backend_vk_get_tensor_async_guarded,
     /* .get_tensor_2d_async     = */ NULL,
     /* .set_tensor_2d_async     = */ NULL,
-    /* .cpy_tensor_async        = */ ggml_backend_vk_cpy_tensor_async,
-    /* .synchronize             = */ ggml_backend_vk_synchronize,
+    /* .cpy_tensor_async        = */ ggml_backend_vk_cpy_tensor_async_guarded,
+    /* .synchronize             = */ ggml_backend_vk_synchronize_guarded,
     /* .graph_plan_create       = */ NULL,
     /* .graph_plan_free         = */ NULL,
     /* .graph_plan_update       = */ NULL,
     /* .graph_plan_compute      = */ NULL,
-    /* .graph_compute           = */ ggml_backend_vk_graph_compute,
-    /* .event_record            = */ ggml_backend_vk_event_record,
-    /* .event_wait              = */ ggml_backend_vk_event_wait,
+    /* .graph_compute           = */ ggml_backend_vk_graph_compute_guarded,
+    /* .event_record            = */ ggml_backend_vk_event_record_guarded,
+    /* .event_wait              = */ ggml_backend_vk_event_wait_guarded,
     /* .graph_optimize          = */ ggml_vk_graph_optimize,
     /* .graph_reserve           = */ NULL,
 };
@@ -15695,13 +15857,36 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         }
         return true;
     };
+    // An op that runs no shader (a leaf, a view) binds nothing: only a buffer has to hold it.
+    if (ggml_op_is_empty(op->op)) {
+        return ggml_nbytes(op) <= device->max_buffer_size;
+    }
+
+    // A flash attention that runs as ranges of its query rows binds a range of q, the mask and dst at a time
+    // (ggml_vk_flash_attn): those need only fit a buffer, and a range of VK_FA_ROW_GRANULE rows with the mask's padding
+    // a binding.
+    const bool fa_row_ranges = op->op == GGML_OP_FLASH_ATTN_EXT && ggml_vk_flash_attn_row_ranges(device, op->src[0], op->src[3], op);
+    auto ranged = [&](const ggml_tensor * t, int dim, int64_t pad) {
+        return ggml_nbytes(t) <= device->max_buffer_size &&
+            ggml_vk_rows_in_binding(device, t, dim) - pad >= 2 * VK_FA_ROW_GRANULE;
+    };
+    if (fa_row_ranges) {
+        const ggml_tensor * mask = op->src[3];
+        if (!ranged(op->src[0], 1, 0) || !ranged(op, 2, 0) || (mask && !ranged(mask, 1, mask->ne[1] - op->src[0]->ne[1]))) {
+            return false;
+        }
+    }
+
     // reject any tensors larger than the max buffer size
     for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (fa_row_ranges && (i == 0 || i == 3)) {
+            continue;
+        }
         if (op->src[i] && !tensor_size_supported(ggml_nbytes(op->src[i]))) {
             return false;
         }
     }
-    if (!tensor_size_supported(ggml_nbytes(op))) {
+    if (!fa_row_ranges && !tensor_size_supported(ggml_nbytes(op))) {
         return false;
     }
 

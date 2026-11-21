@@ -141,6 +141,9 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
             throw std::runtime_error("error loading model hyperparameters: " + std::string(e.what()));
         }
         model.drop_nextn_blocks(ml);
+        // A model without routed experts homes its layers' matrices for the SSD context; one with them loads its layers
+        // into the GPU as before, its experts placed by the SSD expert executor.
+        ml.home_layer_matrices = params.ssd_homes && model.hparams.n_expert == 0;
         if (params.defer_experts && params.use_mmap) {
             ml.build_expert_tensor_index(model.hparams);
         }

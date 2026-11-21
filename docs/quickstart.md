@@ -3,7 +3,7 @@
 
 [Back to README](../README.md)
 
-Every platform uses `wici-ai/inferssd`. Numbered releases share one version and tagged commit across platforms. Use the
+Every platform uses `wici-ai/inferssd`. A release has one version, `<yymmdd>.<build>`, and one tagged commit across platforms. Use the
 [one-command installation](#one-command-installation), or build manually for
 **[Apple Silicon](#apple-silicon)** / **[Linux / NVIDIA](#linux--nvidia)** / **[Linux / AMD](#linux--amd)** /
 **[Windows](#windows)** and [prepare a launch](#prepare-a-launch).
@@ -27,7 +27,7 @@ On Windows, in PowerShell:
 irm https://github.com/wici-ai/inferssd/releases/latest/download/install.ps1 | iex
 ```
 
-A numbered release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
+A release includes prebuilt [macOS](macos-package.md) and [Windows](windows-package.md)
 packages from the same tagged commit. Its installers download that version without developer
 tools on Apple Silicon macOS 15 or later and Windows 10 or 11 x64. Linux still builds from source.
 The installer on `main` installs the latest published package:
@@ -42,7 +42,7 @@ or require Git, Python, Visual Studio or a Vulkan SDK. On a machine with an NVID
 driver is at least the CUDA package's minimum it installs the CUDA package; otherwise the
 Vulkan package, which also runs on the CPU, and it says when a newer NVIDIA driver would give
 CUDA. Its package lists are `latest-windows-cuda.json` and `latest-windows-vulkan.json` under
-`https://appapi.wici.ai/versioning/inferssd/config/` on `main`; a numbered release's installer
+`https://appapi.wici.ai/versioning/inferssd/config/` on `main`; a release's installer
 pins its own release manifests instead.
 `INFERSSD_PACKAGES` can select another list. A missing package list reports an error rather
 than silently starting a source build.
@@ -92,7 +92,7 @@ Hugging Face token store or `HF_TOKEN`. `--revision` pins a model revision;
 Downloads use the Hub client's local metadata and resume support. The disk check
 conservatively reserves the full size of unfinished shards plus 1 GiB, so a
 partially downloaded shard may require more free space than its remaining bytes.
-The source alias index references the GGUF payloads without an extra expert pack.
+The engine reads the routed experts from these files directly; no expert pack is needed.
 
 Both commands use the owned runtime, machine measurement, model profile
 selection and chat templates. They need no memory settings: the engine
@@ -251,9 +251,9 @@ inferssd serve \
   -m /path/to/model-00001-of-00010.gguf
 ```
 
-For Muse, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B, select that model's first GGUF shard instead. The launch picks the model profile from the GGUF's `general.architecture`: `dsv` for DeepSeek-V4.1 (with its own sampling defaults, temperature 1.0, top-p 0.95), `muse` for Muse Spark, `qwen4exp` for Qwen3.8-Flash-Next and `qwen35moe` for Qwen3.6-35B-A3B; the two Qwen profiles keep the chat template embedded in their GGUF. The context defaults to the largest multiple of 8192, up to the model's trained context, whose KV cache fits memory when full: the KV cache takes memory 8192 tokens at a time as a conversation grows and gives it back when a shorter one starts, so a long context costs nothing until a conversation fills it, and the expert caches give it room as it grows. Where the GPU's buffers cannot grow in place (CUDA without VMM, Vulkan without sparse residency buffers), the KV cache holds every token from the start and the context defaults to at most 32768. A RAM-only model takes the largest multiple of 8192 up to 65536 that fits the memory available now, or 8192 when none does. `--context` sets it. The batch sizes default to what the launch chooses for this machine. The server listens on `127.0.0.1:8080`; `--port` chooses another port, and `--host` another IPv4 address to listen on, `0.0.0.0` for every network interface. Each launch keeps its logs and receipts under `~/.local/share/inferssd/state/runs`, and uses the whole machine: the engine keeps its own margin for the host.
+For Muse, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B, select that model's first GGUF shard instead. The launch picks the model profile from the GGUF's `general.architecture`: `dsv` for DeepSeek-V4.1 (with its own sampling defaults, temperature 1.0, top-p 0.95), `muse` for Muse Spark, `qwen4exp` for Qwen3.8-Flash-Next, `qwen35moe` for Qwen3.6-35B-A3B and `gemma4` for Gemma 4; the Qwen and Gemma profiles keep the chat template embedded in their GGUF. A model with routed experts needs a profile; a model without them, such as Gemma 4 E4B, launches the same way with or without one, and takes the chat template in its GGUF. The context defaults to the largest multiple of 8192, up to the model's trained context, whose KV cache fits memory when full: the KV cache takes memory 8192 tokens at a time as a conversation grows and gives it back when a shorter one starts, so a long context costs nothing until a conversation fills it, and the expert caches give it room as it grows. Where the GPU's buffers cannot grow in place (CUDA without VMM, Vulkan without sparse residency buffers), the KV cache holds every token from the start and the context defaults to at most 32768. `--context` sets it. The batch sizes default to what the launch chooses for this machine. The server listens on `127.0.0.1:8080`; `--port` chooses another port, and `--host` another IPv4 address to listen on, `0.0.0.0` for every network interface. Each launch keeps its logs and receipts under `~/.local/share/inferssd/state/runs`, and uses the whole machine: the engine keeps its own margin for the host.
 
-If `expert.source` is omitted, the framework builds an alias index from the GGUF metadata without duplicating weight payloads. Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
+If `expert.source` is omitted, the launch sets it to the model's GGUF shards, and the engine indexes their routed experts from the headers without copying weights. Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 
 To create a v1 pack, run the bundled builder on the shards you load. It needs NumPy and PyYAML for the bundled GGUF reader (`python3 -m pip install numpy pyyaml`):
 

@@ -79,7 +79,7 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
     static const ssd::gpu::testing::api testing = { 3, sizeof(ssd::gpu::testing::api),
         [](uint64_t, const ssd::gpu::testing::tier_options *, char *, size_t) noexcept -> void * {
             return &tier_context; } };
-    static const ssd::gpu::transport_v1 transport = {};
+    static const ssd::gpu::transport_v2 transport = {};
     static const ssd::gpu::provider_v1 provider = { 2, sizeof(ssd::gpu::provider_v1), &api, &residency, &format,
         &prefill, &elastic, &deferred, &host, &policy, &settings, &testing, &transport,
         [](int) { return false; }, [](ggml_backend_t) { return 0; },

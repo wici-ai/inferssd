@@ -10,8 +10,7 @@ from pathlib import Path
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
-from test_gguf_alias import fixture as gguf_fixture
-from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, write_gguf
+from test_strategy_inputs import F32, Q8_0, deepseek_like, moe, muse_like, recorded_facts
 
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
@@ -20,7 +19,13 @@ from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
 from inferssd.launch.typed_command import main
 from inferssd.launch.types import LaunchInput, Threads
-from inferssd.source import gguf_alias
+
+
+def model_file(path, host, tensors, kv):
+    """PATH, a model file whose facts, the engine's of TENSORS and KV, HOST records."""
+    path.write_bytes(b"GGUF")
+    host["model_facts"] = recorded_facts(tensors, kv, path=str(path))
+    return str(path)
 
 
 def setup(tmp_path, platform="linux", automatic=False):
@@ -32,12 +37,6 @@ def setup(tmp_path, platform="linux", automatic=False):
     binary.parent.mkdir()
     binary.write_text("must never execute")
     binary.chmod(0o755)
-    model = root / "model.gguf"
-    tensors = [
-        (f"blk.0.ffn_{role}_exps.weight", (32, 32, 256), 8, i * 278528)
-        for i, role in enumerate(("up", "gate", "down"))
-    ]
-    gguf_fixture(model, tensors=tensors, payload=3 * 278528)
     settings = root / "input.ssd"
     source = root / "provided.tsv"
     source.write_text("explicit source fixture; resolver does not validate payloads")
@@ -45,7 +44,6 @@ def setup(tmp_path, platform="linux", automatic=False):
     if not automatic:
         text += "expert.source=" + json.dumps([str(source)]) + " # provided index\n"
     settings.write_text(text)
-    spec = LaunchSpec(str(model), 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     host = {
         "platform_system": {"linux": "Linux", "darwin": "Darwin", "windows": "Windows"}[platform],
         "platform_machine": "arm64",
@@ -55,20 +53,15 @@ def setup(tmp_path, platform="linux", automatic=False):
         "gpu_processes": "",
         "engine_gpu_backends": ["Metal"] if platform == "darwin" else ["CUDA"],
     }
+    tensors = [(f"blk.0.ffn_{r}_exps.weight", (32, 32, 256), Q8_0) for r in ("up", "gate", "down")]
+    tensors.append(("blk.0.attn_norm.weight", (32,), F32))
+    model = model_file(root / "model.gguf", host, tensors, {})
+    spec = LaunchSpec(model, 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
     out = tmp_path / "run"
     out.mkdir()
-    seen = []
-
-    def indexer(command):
-        assert command[:4] == ["metadata-python", "-I", "-m", "inferssd.source.gguf_alias"]
-        seen.append(command)
-        assert gguf_alias.main(command[4:]) == 0
-
-    adapter = RecordedArtifacts(
-        inputs, host, run=indexer, replace=lambda a, b: Path(a).replace(b), python="metadata-python"
-    )
-    return inputs, spec, host, adapter, out, seen
+    adapter = RecordedArtifacts(inputs, host)
+    return inputs, spec, host, adapter, out
 
 
 def session(variables, home):
@@ -97,7 +90,7 @@ def resolve(inputs, spec, adapter, out, platform="linux", configured=None):
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     result = resolve(inputs, spec, adapter, out, platform)
     assert result.code == 0 and not result.assigned_environment
     assert "--ssd-settings" in result.argv and "--ssd-telemetry" in result.argv
@@ -131,7 +124,7 @@ def test_settings_file_and_cli_provenance_reach_native_argv(tmp_path, platform):
     ],
 )
 def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, present, chosen):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     for name in present:
         binary = Path(inputs.repo) / name / "bin/inferssd-server"
         binary.parent.mkdir(parents=True)
@@ -146,7 +139,7 @@ def test_repo_adapter_prefers_preset_build_directories(tmp_path, platform, prese
     "platform,first", [("linux", "build-linux-cuda"), ("darwin", "build-macos-metal")]
 )
 def test_repo_adapter_reports_the_preset_build_when_none_exists(tmp_path, platform, first):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     missing = "missing server executable: .*" + re.escape(
         os.sep + os.path.join(first, "bin", "inferssd-server")
     )
@@ -154,17 +147,14 @@ def test_repo_adapter_reports_the_preset_build_when_none_exists(tmp_path, platfo
         resolve(inputs, replace(spec, binary=None), adapter, out, platform)
 
 
-def test_auto_alias_uses_real_strict_header_indexer(tmp_path):
-    inputs, spec, _, adapter, out, calls = setup(tmp_path, automatic=True)
+def test_the_engine_reads_the_experts_from_the_model_files_by_default(tmp_path):
+    inputs, spec, _, adapter, out = setup(tmp_path, automatic=True)
     result = resolve(inputs, spec, adapter, out)
-    assert result.code == 0 and len(calls) == 1
+    assert result.code == 0
     value = parse((out / "settings.ssd").read_text(), str(out / "settings.ssd"))
-    alias = Path(value.at("expert.source").value[0])
-    rows = alias.read_text().splitlines()
-    assert "--n-experts" not in calls[0]  # the expert count comes from the model
-    assert len(rows) == 1 + 3 * 256 and "source_path" in rows[0]
-    assert str(Path(spec.model)) in rows[-1]
-    assert "source=generated" in value.at("expert.source").receipt
+    assert value.at("expert.source").value == (str(Path(spec.model).resolve()),)
+    assert "source=model" in value.at("expert.source").receipt
+    assert not (out / "artifacts").exists()  # no index is built
 
 
 @pytest.mark.parametrize(
@@ -191,7 +181,7 @@ def test_retired_inputs_fail_by_name_without_value(name):
     ],
 )
 def test_cannot_override_index_model_or_owned_listener(tmp_path, extra):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     with pytest.raises(ValueError, match="explicit typed"):
         resolve(replace(inputs, extra=extra), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
@@ -206,15 +196,9 @@ def test_cannot_override_index_model_or_owned_listener(tmp_path, extra):
     ],
 )
 def test_resource_preparation_refuses_before_materialized_settings(tmp_path, fact, value, message):
-    inputs, spec, host, _, out, _ = setup(tmp_path)
+    inputs, spec, host, _, out = setup(tmp_path)
     host[fact] = value
-    adapter = RecordedArtifacts(
-        inputs,
-        host,
-        run=lambda _: pytest.fail("no index"),
-        replace=lambda *_: None,
-        python="unused",
-    )
+    adapter = RecordedArtifacts(inputs, host)
     with pytest.raises(ValueError, match=message):
         resolve(inputs, spec, adapter, out)
     assert not (out / "settings.ssd").exists()
@@ -227,7 +211,7 @@ def test_resource_preparation_refuses_before_materialized_settings(tmp_path, fac
 def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(
     tmp_path, monkeypatch, host, address
 ):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     spec = replace(spec, host=host)
     effects = Effects()
     owner = Owner(effects)
@@ -273,7 +257,7 @@ def test_runtime_uses_typed_resolution_and_keeps_owned_process_port(
 
 @pytest.mark.parametrize("host", ["localhost", "::1", "127.0.1"])
 def test_launch_refuses_a_host_that_is_not_an_ipv4_address(tmp_path, host):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     with pytest.raises(ValueError, match="IPv4 address"):
         resolve(inputs, replace(spec, host=host), adapter, out)
 
@@ -296,7 +280,7 @@ def test_busy_port_refuses_before_claim_or_owner(tmp_path, monkeypatch):
 def test_typed_command_prepares_native_file_without_executing_or_recording_secrets(
     tmp_path, monkeypatch
 ):
-    inputs, spec, host, _, out, _ = setup(tmp_path)
+    inputs, spec, host, _, out = setup(tmp_path)
     contract = tmp_path / "policy.json"
     contract.write_text(json.dumps(asdict(policy(tmp_path, "linux"))))
     facts = tmp_path / "facts.json"
@@ -348,7 +332,7 @@ def test_typed_command_prepares_native_file_without_executing_or_recording_secre
 
 
 def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypatch, capsys):
-    inputs, spec, host, _, _, _ = setup(tmp_path)
+    inputs, spec, host, _, _ = setup(tmp_path)
     contract = tmp_path / "policy.json"
     contract.write_text(json.dumps(asdict(policy(tmp_path, "linux"))))
     facts = tmp_path / "facts.json"
@@ -375,7 +359,7 @@ def test_omitted_output_directory_creates_a_new_run_directory(tmp_path, monkeypa
 
 
 def test_owned_snapshot_does_not_reread_mutated_settings_file(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     configured = parse(Path(spec.settings_file).read_text(), spec.settings_file)
     Path(spec.settings_file).unlink()
     assert resolve(inputs, spec, adapter, out, configured=configured).code == 0
@@ -383,7 +367,7 @@ def test_owned_snapshot_does_not_reread_mutated_settings_file(tmp_path):
 
 @pytest.mark.parametrize("threads", [4, 8])
 def test_mac_measured_prefill_threads_are_explicit_and_preserved(tmp_path, threads):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, "darwin")
+    inputs, spec, _, adapter, out = setup(tmp_path, "darwin")
     spec = replace(spec, threads=Threads(threads, 12))
     result = resolve(inputs, spec, adapter, out, "darwin")
     assert result.argv[result.argv.index("-t") + 1] == str(threads)
@@ -405,7 +389,7 @@ def test_mac_measured_prefill_threads_are_explicit_and_preserved(tmp_path, threa
 def test_threadpool_counts_and_strict_cpu_masks_reach_native_argv(
     tmp_path, threads, decode, batch, mask
 ):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     # Decode participants bound only the decode pool, the one that runs decode.
     spec = replace(spec, overrides=spec.overrides + (("cpu.decode_participants", "2"),))
     result = resolve(inputs, replace(spec, threads=threads), adapter, out)
@@ -446,7 +430,7 @@ def test_threadpool_counts_and_strict_cpu_masks_reach_native_argv(
 def test_bad_explicit_threads_refused_before_native_file(
     tmp_path, platform, threads, overrides, message
 ):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     spec = replace(spec, threads=threads, overrides=spec.overrides + overrides)
     with pytest.raises(ValueError, match=message):
         resolve(inputs, spec, adapter, out, platform)
@@ -454,7 +438,7 @@ def test_bad_explicit_threads_refused_before_native_file(
 
 
 def test_decode_cpus_pin_only_the_decode_pool(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     threads = Threads(None, 19, (), (5, 6, 7, 8, 9, 15, 16, 17, 18, 19))
     result = resolve(inputs, replace(spec, threads=threads), adapter, out)
     argv = list(result.argv)
@@ -470,7 +454,7 @@ def test_decode_cpus_pin_only_the_decode_pool(tmp_path):
 def test_prompt_cache_on_disk_per_model(tmp_path):
     # The cache is named from the model's path, which follows this host's conventions.
     platform = "windows" if sys.platform == "win32" else "linux"
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     result = resolve(inputs, spec, adapter, out, platform)
     assert result.argv[result.argv.index("--cache-ram") + 1] == "0"
     assert "--cache-disk" not in result.argv
@@ -508,7 +492,7 @@ def test_sizes_default_to_the_context_and_batch():
     ],
 )
 def test_extra_cannot_replace_selected_native_placement(tmp_path, extra):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     with pytest.raises(ValueError, match="explicit typed"):
         resolve(replace(inputs, extra=extra), spec, adapter, out)
 
@@ -517,7 +501,7 @@ def test_extra_cannot_replace_selected_native_placement(tmp_path, extra):
 def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_values(
     tmp_path, explicit, expected
 ):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     inputs = replace(inputs, profile="dsv")
     (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text(
         "template"
@@ -540,7 +524,7 @@ def test_deepseek_profile_materializes_model_policy_and_preserves_explicit_value
 
 @pytest.mark.parametrize("profile", ["qwen4exp", "qwen35moe"])
 def test_qwen_profiles_launch_with_the_template_in_their_gguf(tmp_path, profile):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     inputs = replace(inputs, profile=profile)
     result = resolve(inputs, spec, adapter, out)
     assert result.code == 0 and "--chat-template-file" not in result.argv
@@ -553,7 +537,7 @@ def test_qwen_profiles_launch_with_the_template_in_their_gguf(tmp_path, profile)
 
 
 def test_unknown_profile_refused_before_native_file(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     with pytest.raises(ValueError, match="dsv, muse, qwen4exp, qwen35moe"):
         resolve(replace(inputs, profile="qwen"), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
@@ -583,8 +567,8 @@ def qwen_like(arch="qwen4exp"):
     ],
 )
 def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *layout()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *layout())
     (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
     result = resolve(replace(inputs, profile=""), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == profile
@@ -603,8 +587,8 @@ def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
 
 
 def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_refused(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *deepseek_like())
     result = resolve(replace(inputs, profile="muse"), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == "muse" and "--temp" not in result.argv
     tensors, kv = moe(
@@ -618,7 +602,7 @@ def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_re
         up=Q8_0,
         down=Q8_0,
     )
-    other = str(write_gguf(tmp_path / "other.gguf", tensors, kv))
+    other = model_file(tmp_path / "other.gguf", host, tensors, kv)
     second = tmp_path / "second"
     second.mkdir()
     with pytest.raises(ValueError, match="no model profile for the GGUF architecture mystery"):
@@ -626,8 +610,8 @@ def test_an_explicit_profile_overrides_the_architecture_and_an_unknown_one_is_re
 
 
 def test_the_users_sampling_wins(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
-    model = str(write_gguf(tmp_path / "model.gguf", *deepseek_like()))
+    inputs, spec, host, adapter, out = setup(tmp_path)
+    model = model_file(tmp_path / "model.gguf", host, *deepseek_like())
     (Path(inputs.repo) / "engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja").write_text("t")
     inputs = replace(inputs, profile="", extra=("--temp", "0.6", "--top-k=40"))
     argv = list(resolve(inputs, replace(spec, model=model), adapter, out).argv)

@@ -220,12 +220,12 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
         catalog.MODELS
     )
     # This machine measured Q4_K alone: every expert model is priced with its other formats taken
-    # from Q4_K's rate, and the RAM-only model by its dense weights from RAM (its GPU measured no
-    # matrix product).
+    # from Q4_K's rate, and the model without routed experts by its dense weights from RAM (its GPU
+    # measured no matrix product).
     for model, line in zip(catalog.MODELS, out[7:]):
         assert line.startswith(f"estimate: {model.repo}:{model.quantization} ")
         assert " tok/s" in line and "none:" not in line
-        if model.facts is None:
+        if model.facts.experts is None:
             assert "GB of dense weights from RAM at " in line
         else:
             assert " ms a token: dense " in line

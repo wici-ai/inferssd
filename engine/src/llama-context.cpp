@@ -1,4 +1,5 @@
 #include "llama-context.h"
+#include "llama-node-name.h"
 
 #include "ggml.h"
 #include "llama-arch.h"
@@ -7,6 +8,9 @@
 #include "ssd/cpu-runtime.h"
 #include "ssd/model-adapter.h"
 #include "ssd/host-gather.h"
+#include "ssd/dense-homes.h"
+#include "ggml-ssd/gpu/shared-memory.h"
+#include "ggml-ssd/platform/file.h"
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
@@ -222,11 +226,13 @@ llama_context::llama_context(
     // keeps a one-token decode graph. The configured ubatch remains available
     // to the recurrent backend and to the next prompt.
     reserve_horizon_enabled = true;
+    // A prompt in one pass, the SSD experts' (each pass reads the experts it routes to once), its ubatch as large as
+    // the context: each prompt reserves its own graph, a smaller ubatch where that does not fit (prefill_refit).
     cpu_prefill_actual_shape_enabled = cpu_sink_enabled;
     if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
-    // The SSD expert architectures size the prompt graph's outputs by the request, not one per token.
-    cpu_prefill_output_sizing_enabled = llama_ssd::describe_experts(model.arch, model.hparams, -1).activation !=
-        llama_ssd::expert_activation::unsupported;
+    // An SSD context's prompt graph holds the outputs the request asks for, not one a token: with routed experts or
+    // without.
+    cpu_prefill_output_sizing_enabled = ssd_runtime != nullptr;
     if (cpu_prefill_output_sizing_enabled) { sched_reserve_n_outputs = cparams.n_seq_max; }
 
     cparams.op_offload = params.op_offload;
@@ -315,6 +321,25 @@ llama_context::llama_context(
 
         if (ssd_runtime) {
             for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            // A model without routed experts streams the layers it keeps in host memory to the GPU; one with them
+            // keeps the scheduler's own rule for any weight there, as before.
+            ssd_runtime->stream.set_streaming(model.hparams.n_expert == 0);
+            // the model files its homed layers are mapped from: a streamed layer without a pinned copy is read from
+            // the drive, around the page cache
+            const llama_dense_homes * homes = model.dense_homes();
+            if (homes && ssd_runtime->services.gpu_transport && !homes->files().empty()) {
+                std::vector<ssd::gpu::stream_file> files;
+                for (const auto & file : homes->files()) {
+                    std::string error;
+                    const int fd = ssd::platform::open_direct(file.path.c_str(), &error);
+                    if (fd < 0) {
+                        LLAMA_LOG_WARN("%s: %s reads through its mapping: %s\n", __func__, file.path.c_str(), error.c_str());
+                        continue;
+                    }
+                    files.push_back({file.base, uint64_t(file.bytes), fd});
+                }
+                (void) ssd_runtime->stream.stream_files(files.data(), files.size());
+            }
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here
@@ -336,13 +361,14 @@ llama_context::llama_context(
             if (!ssd::cpu::valid(api)) {
                 throw std::runtime_error("CPU backend has no compatible SSD executor table");
             }
-            if (cpu_sink_runtime && !api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
+            // The host budget the settings give (host.headroom_mib, host.budget_mib), with routed experts or without:
+            // the CPU backend's work memory takes its room from it as the expert caches do.
+            if (!api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
                 throw std::runtime_error("cannot configure the context host budget");
             }
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
             }
-            ssd_runtime->prepare_dense(model);
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -379,8 +405,9 @@ llama_context::llama_context(
             /*.swa_full =*/ params.swa_full,
         };
 
-        // n_ctx 0 with SSD experts: the largest context whose KV cache fits memory when full
-        if (params.n_ctx == 0 && cpu_sink_runtime && cparams.n_seq_max == 1) {
+        // n_ctx 0 in an SSD context: the largest context whose KV cache fits memory when full, with routed experts or
+        // without (the expert caches and the layers a GPU holds give it room as it grows)
+        if (params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1) {
             const uint32_t fitted = fit_context(params_mem);
             if (fitted && fitted < cparams.n_ctx) {
                 cparams.n_ctx = cparams.n_ctx_seq = fitted;
@@ -395,18 +422,23 @@ llama_context::llama_context(
         memory.reset(model.create_memory(params_mem, cparams));
 
         // The KV cache allocates its cells as they are used. Before it allocates more, the expert caches give the room
-        // (on unified memory the device's bytes are the host's DRAM); a refusal fails the batch that needed them.
+        // (on unified memory the device's bytes are the host's DRAM; a discrete GPU's tier gives its own in the
+        // allocation); where they have none left, the layers the GPU holds give theirs; a refusal fails the batch that
+        // needed them.
         if (memory) {
             memory->set_commit([this](size_t host_bytes, size_t device_bytes, const std::function<bool()> & allocate) {
+                const auto grow = [&] {
+                    return allocate() || (device_bytes && give_dense_layers(device_bytes) && allocate());
+                };
                 if (!cpu_sink_runtime) {
-                    return allocate();
+                    return grow();
                 }
                 auto granted = cpu_sink_runtime->take_room(host_bytes, device_bytes);
                 if (!granted) {
                     LLAMA_LOG_ERROR("%s: no room for more KV cache: %s\n", __func__, granted.error.c_str());
                     return false;
                 }
-                if (!allocate()) {
+                if (!grow()) {
                     granted.value.cancel();
                     return false;
                 }
@@ -492,6 +524,9 @@ llama_context::llama_context(
         if (cpu_prefill_actual_shape_enabled) { cparams.n_ubatch = 1; }
 
         sched_reserve();
+
+        // the layers the GPU holds, once the graph is reserved and before the expert caches take their storage
+        hold_dense_layers();
 
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
@@ -664,14 +699,6 @@ static std::map<ggml_backend_buffer_type_t, size_t> llama_memory_size(const llam
     return sizes;
 }
 
-// Whether a device's memory is the host's DRAM (Apple silicon, a GPU that shares the host's memory).
-static bool llama_dev_shares_host_memory(ggml_backend_dev_t dev) {
-    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
-    auto * shares = reg ? (bool (*)(ggml_backend_dev_t))
-        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ssd_dev_shares_host_memory") : nullptr;
-    return shares && shares(dev);
-}
-
 uint32_t llama_context::fit_context(const llama_memory_params & params_mem) const {
     constexpr uint32_t step = 8192;
     const uint32_t n_train = model.hparams.n_ctx_train;
@@ -688,7 +715,8 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
         return 0;
     }
     // The room the expert caches would otherwise take: host memory (with a device's that is the host's) as the host
-    // arbiter measures it, a discrete device's free memory less vram.reserve_mib.
+    // arbiter measures it, and each device's free memory less vram.reserve_mib. A device that shares the host's memory
+    // has that limit of its own as well (Metal: the working set it keeps resident).
     const auto measured = ssd_runtime->host->measure(0);
     if (!measured) {
         LLAMA_LOG_WARN("%s: cannot measure host memory: %s\n", __func__, measured.error.c_str());
@@ -705,18 +733,27 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
         const double at_small = small.count(buft) ? double(small.at(buft)) : 0.0;
         const double cell = (double(bytes) - at_small) / double(n_train - step);
         ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft);
-        term * t = &host;
-        if (dev && !ggml_backend_buft_is_host(buft) && !llama_dev_shares_host_memory(dev)) {
+        const bool device = dev && !ggml_backend_buft_is_host(buft);
+        const bool shared = device && ssd::gpu::shares_host_memory(dev);
+        std::vector<term *> terms;
+        if (!device || shared) {
+            terms.push_back(&host);
+        }
+        if (device) {
             auto inserted = devices.emplace(dev, term{});
-            t = &inserted.first->second;
             if (inserted.second) {
                 size_t free = 0, total = 0;
                 ggml_backend_dev_memory(dev, &free, &total);
-                t->room = free > reserve ? double(free - reserve) : 0.0;
+                // a device that shares the host's memory and reports none has no limit beside the host's
+                inserted.first->second.room = shared && total == 0 ? HUGE_VAL :
+                    free > reserve ? double(free - reserve) : 0.0;
             }
+            terms.push_back(&inserted.first->second);
         }
-        t->fixed += at_small - cell*step;
-        t->cell  += cell;
+        for (term * t : terms) {
+            t->fixed += at_small - cell*step;
+            t->cell  += cell;
+        }
     }
     const auto fits = [&](uint32_t n) {
         const auto holds = [n](const term & t) { return t.fixed + t.cell*n <= t.room; };
@@ -749,6 +786,92 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem) cons
     }
     LLAMA_LOG_CONT("\n");
     return n;
+}
+
+void llama_context::hold_dense_layers() {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || homes->empty() || !homes->next_bytes() || !ssd_runtime || !ssd_runtime->services.gpu_transport) {
+        return;
+    }
+    // what the GPU keeps free beside them: the settings' reserve, the ring the streamed matrices land in, and the
+    // backend's work memory for a product of the largest matrix (a copy of it at 16 bits where it runs through BLAS);
+    // the ring now is part of what is free for them
+    const size_t keep = ssd_runtime->services.gpu_reserve_bytes +
+        ssd::stream::runtime::ring_bytes_for(homes->largest()) + homes->largest_f16();
+    size_t free = 0, total = 0;
+    ggml_backend_dev_memory(homes->device(), &free, &total);
+    free += ssd_runtime->stream.ring_bytes();
+    if (free < keep || free - keep < homes->next_bytes()) {
+        return;
+    }
+    if (sched) { ggml_backend_sched_synchronize(sched.get()); }
+    // the ring was cut for every matrix streamed: a new one for those that still stream
+    ssd_runtime->stream.release_ring();
+    ggml_backend_dev_memory(homes->device(), &free, &total);
+    const size_t pinned_before = homes->pinned_bytes();
+    const size_t held = homes->hold(free > keep ? free - keep : 0);
+    if (homes->pinned_bytes() != pinned_before && ssd_runtime->host) {
+        (void) ssd_runtime->host->note_known_memory_change(); // the held layers' pinned copies went
+    }
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s holds %.2f GiB of the layers' matrices, %.2f GiB stream (%.2f GiB of them pinned; "
+            "%.2f GiB free, %.2f GiB kept)\n", __func__, ggml_backend_dev_name(homes->device()),
+            homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0, free / 1073741824.0, keep / 1073741824.0);
+    // the graph reserved before read the matrices in host memory and placed their copies in the ring just freed
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    sched_need_reserve = true;
+    sched_reserve();
+}
+
+bool llama_context::give_dense_layers(size_t bytes) {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || homes->held_bytes() == 0 || !ssd_runtime) {
+        return false;
+    }
+    // the work queued reads the layers given back; the ring takes its full size once a layer streams
+    if (sched) { ggml_backend_sched_synchronize(sched.get()); }
+    const uint64_t ring = ssd::stream::runtime::ring_bytes_for(homes->largest());
+    const uint64_t ring_now = ssd_runtime->stream.ring_bytes();
+    const size_t given = homes->give_back(bytes + size_t(ring > ring_now ? ring - ring_now : 0));
+    if (!given) {
+        return false;
+    }
+    pin_dense_layers();
+    LLAMA_LOG_INFO("%s: %s gave back %.2f GiB of the layers' matrices for %.2f MiB: %.2f GiB held, %.2f GiB stream "
+            "(%.2f GiB of them pinned)\n", __func__, ggml_backend_dev_name(homes->device()), given / 1073741824.0,
+            bytes / 1048576.0, homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
+            homes->pinned_bytes() / 1073741824.0);
+    // the graphs split before read the given-back matrices in the device
+    if (gf_res_prev) { gf_res_prev->reset(); }
+    sched_need_reserve = true;
+    return true;
+}
+
+void llama_context::pin_dense_layers() {
+    llama_dense_homes * homes = model.dense_homes();
+    if (!homes || !ssd_runtime || !ssd_runtime->host || !ssd_runtime->services.gpu_transport) {
+        return;
+    }
+    size_t pinned = 0;
+    // a pinned copy grows as a cache does (a layer without one streams from the drive): within the host budget less
+    // its headroom, the expert caches giving room for it
+    for (size_t bytes = homes->next_pin_bytes(); bytes; bytes = homes->next_pin_bytes()) {
+        auto ticket = ssd_runtime->host->take(bytes, 0, ssd::host::requester::ram_cache);
+        if (!ticket) {
+            break;
+        }
+        if (!homes->pin_next()) {
+            ticket.value.cancel();
+            break;
+        }
+        ticket.value.commit();
+        pinned += bytes;
+    }
+    // the graphs split before stream the matrices from where they were
+    if (pinned && gf_res_prev) {
+        gf_res_prev->reset();
+    }
 }
 
 uint32_t llama_context::memory_n_pos() const {
@@ -1105,7 +1228,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     auto complete_vram_phase = [&](bool decode) {
         return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
-    // One line per request phase with the copies of the weights homed on the drive: a request's start ends the
+    // One line per request phase with the copies of the streamed weights: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
     {
         ggml_backend_sched_ssd_copy_stats now = {};
@@ -1146,6 +1269,8 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             LLAMA_LOG_ERROR("%s: no memory for the KV cache of %u more tokens\n", __func__, prefill_tokens);
             return false;
         }
+        // the cells past the prompt gave their memory back: the GPU holds again the layers it has room for
+        hold_dense_layers();
     }
     // Graphs reserved before were sized for the cache's old cells. A prompt's own graph is reserved from the cache as it
     // is now (actual-shape prefill), and the decode graph again as the prompt ends; otherwise decode() reserves them.
@@ -2644,7 +2769,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     }
                 }
 
-                // a prompt whose own graph does not fit: the batch split again with a smaller ubatch
+                // a prompt whose own graph does not fit: the batch split again with a smaller ubatch. Before submit
+                // every memory type restores its metadata exactly, so this holds on every model; the removal above
+                // runs only after a submit (or a failed restore), when the states may already be written.
                 if (status == GGML_STATUS_ALLOC_FAILED && restored && n_tokens_prev == 0 && prefill_refit()) {
                     refit = true;
                     break;
@@ -3122,6 +3249,16 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
     return static_cast<llm_graph_result *>(gf_res_reserve.get());
 }
 
+// Whether the scheduler runs node on the CPU or a CPU accelerator (BLAS).
+static bool llama_sched_runs_on_host(ggml_backend_sched_t sched, ggml_tensor * node) {
+    ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, node);
+    if (!backend) {
+        return false;
+    }
+    const enum ggml_backend_dev_type type = ggml_backend_dev_type(ggml_backend_get_device(backend));
+    return type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
+}
+
 bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted) {
     if (!cpu_sink_runtime) {
         if (admitted) { admitted(); }
@@ -3138,18 +3275,61 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         }
     }
     std::vector<size_t> required(backend_ptrs.size(), 0);
+    // A GPU backend refuses an op whose tensors outgrow what its kernels address. Where the op writes into that GPU's
+    // own buffer (a state cache), it cannot move: the scheduler cannot place the graph, and the graph is refused here.
     if (!ggml_backend_sched_prepare_graph(sched.get(), graph, required.data())) { return false; }
+    // Elsewhere the scheduler runs such an op on the CPU: for a long prompt in one ubatch, minutes a layer. So a
+    // prompt's graph runs on the GPU what the decode graph runs there; one that would not is refused as well. A graph
+    // refused either way is one that gets no memory: the batch is split again (prefill_refit) into ubatches whose ops
+    // stay where decode runs them. A node is the same op in both graphs by the name the model gave it; ggml's names
+    // for unnamed nodes are their positions, which in the other graph are other ops.
+    if (!prefill) {
+        std::unordered_set<std::string> gpu, host;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (llama_node_name_is_given(node->name)) {
+                (llama_sched_runs_on_host(sched.get(), node) ? host : gpu).insert(node->name);
+            }
+        }
+        for (const auto & name : host) {
+            gpu.erase(name);
+        }
+        decode_gpu_nodes = std::move(gpu);
+    } else if (!decode_gpu_nodes.empty()) {
+        int moved = 0;
+        const char * first = nullptr;
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            if (llama_node_name_is_given(node->name) && decode_gpu_nodes.count(node->name) &&
+                    llama_sched_runs_on_host(sched.get(), node)) {
+                first = first ? first : node->name;
+                ++moved;
+            }
+        }
+        if (moved) {
+            LLAMA_LOG_WARN("%s: the prompt graph would run %d nodes on the CPU that decode runs on the GPU, the first %s\n",
+                __func__, moved, first);
+            ggml_backend_sched_reset(sched.get());
+            return false;
+        }
+    }
     uint64_t host_bytes = 0, device_bytes = 0;
+    std::map<ggml_backend_dev_t, uint64_t> shared_bytes; // the growth on each device that shares the host's memory
     for (size_t i = 0; i < backend_ptrs.size(); ++i) {
         // Query AFTER the probe: it can have released chunks even when the
         // replacement's total bytes fit inside the previous aggregate size.
         if (required[i] > ggml_backend_sched_get_buffer_size(sched.get(), backend_ptrs[i])) {
-            auto & bytes = ggml_backend_buft_is_host(backend_buft[i]) ? host_bytes : device_bytes;
+            const bool host = ggml_backend_buft_is_host(backend_buft[i]);
+            auto & bytes = host ? host_bytes : device_bytes;
             if (required[i] > UINT64_MAX - bytes) {
                 ggml_backend_sched_reset(sched.get());
                 return false;
             }
             bytes += required[i];
+            ggml_backend_dev_t dev = ggml_backend_get_device(backend_ptrs[i]);
+            if (!host && dev && ssd::gpu::shares_host_memory(dev)) {
+                shared_bytes[dev] += required[i];
+            }
         }
     }
     const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
@@ -3159,6 +3339,21 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, room.error.c_str());
         ggml_backend_sched_reset(sched.get());
         return false;
+    }
+    // A device that shares the host's memory has a limit of its own beside the host's: Metal keeps at most its
+    // recommended working set resident, and past it a command buffer fails when it runs, though the allocation went
+    // through. So the graph's growth on such a device fits what the device reports free, once the host's room is taken
+    // (where the GPU tier is on unified memory, it has given back its blocks by then); a graph that does not is
+    // refused as one that gets no memory. A discrete device's allocation fails by itself when the device is full.
+    for (const auto & [dev, bytes] : shared_bytes) {
+        size_t free = 0, total = 0;
+        ggml_backend_dev_memory(dev, &free, &total);
+        if (total > 0 && bytes > free) {
+            LLAMA_LOG_ERROR("%s: %s refused: the graph needs %.1f MiB more of it, %.1f of %.1f MiB are free\n",
+                __func__, ggml_backend_dev_name(dev), bytes / 1048576.0, free / 1048576.0, total / 1048576.0);
+            ggml_backend_sched_reset(sched.get());
+            return false;
+        }
     }
     // the room is taken, the pages the graph gathers among it: what reads them may start
     if (admitted) { admitted(); }
@@ -3246,12 +3441,11 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
     if (phase == nullptr || tensors == 0) {
         return {};
     }
-    char line[320];
+    char line[256];
     snprintf(line, sizeof(line), "[dense_stream] phase=%s tokens=%" PRIu64 " tensors=%" PRIu64 " bytes=%" PRIu64
-        " read_us=%" PRIu64 " first_us=%" PRIu64 " wait_us=%" PRIu64 " readahead=%" PRIu64 " fallbacks=%" PRIu64,
+        " issue_us=%" PRIu64 " ahead=%" PRIu64,
         phase, tokens, tensors, now.dense_bytes - start.dense_bytes, now.dense_read_us - start.dense_read_us,
-        now.dense_first_us - start.dense_first_us, now.dense_wait_us - start.dense_wait_us,
-        now.dense_readahead - start.dense_readahead, now.dense_fallbacks - start.dense_fallbacks);
+        now.dense_readahead - start.dense_readahead);
     return line;
 }
 
@@ -3284,20 +3478,26 @@ uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, cons
     const uint32_t step = std::min<uint32_t>(std::max<uint32_t>(256, granularity), std::max<uint32_t>(1, target / 2));
     // the largest size in (0, target) that reserve accepts, and the smallest it refused
     uint32_t lo = 0, found = 0, failed = target;
+    // whether the last reserve was the one of found: a refused probe after it left no graph
+    bool holds_found = false;
     while (failed > lo + step) {
         uint32_t probe = lo + (failed - lo) / 2;
         probe = std::max(lo + step, probe - probe % step);
         if (probe >= failed) { break; }
-        if (reserve(probe)) {
+        holds_found = reserve(probe);
+        if (holds_found) {
             lo = found = probe;
         } else {
             failed = probe;
         }
     }
-    if (!found && failed > 1 && reserve(1)) {
+    if (found) {
+        return holds_found || reserve(found) ? found : 0;
+    }
+    if (failed > 1 && reserve(1)) {
         return 1;
     }
-    return found;
+    return 0;
 }
 
 llm_graph_params llama_context::graph_params(

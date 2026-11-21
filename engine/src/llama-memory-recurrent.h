@@ -5,6 +5,7 @@
 #include "llama-memory.h"
 
 #include <map>
+#include <memory>
 #include <set>
 #include <vector>
 
@@ -99,6 +100,20 @@ public:
 
     std::vector<mem_cell> cells;
 
+    // What find_slot changes, kept whole: the cache holds one cell per sequence, so the copy is small. A ubatch
+    // whose graph gets no memory is undone with it before anything reads its states. Saving may allocate,
+    // restoring swaps the copy back and does not.
+    struct metadata_undo {
+        uint32_t head = 0;
+        uint32_t used = 0;
+        uint32_t n    = 0;
+        int32_t  rs_z = -1;
+        std::vector<mem_cell> cells;
+    };
+
+    std::unique_ptr<metadata_undo> save_metadata() const;
+    void restore_metadata(metadata_undo & saved) noexcept;
+
     // per layer
     std::vector<ggml_tensor *> p_l;
     std::vector<ggml_tensor *> r_l;
@@ -148,6 +163,10 @@ public:
     bool next()  override;
     bool apply() override;
 
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
+
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
@@ -174,6 +193,8 @@ private:
     size_t i_next = 0;
 
     std::vector<llama_ubatch> ubatches;
+
+    std::unique_ptr<llama_memory_recurrent::metadata_undo> precompute_undo;
 
     //
     // data needed for building the compute graph for the current ubatch:

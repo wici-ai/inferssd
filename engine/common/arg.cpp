@@ -1058,6 +1058,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         common_ssd_print_schema();
         exit(0);
     }));
+    add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
+        "print the facts of the GGUF model FNAME as the engine would load it, as JSON, and exit: no weight is read and no backend starts",
+        [](common_params &, const std::string & value) { exit(common_ssd_print_model_facts(value) ? 0 : 1); }));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",

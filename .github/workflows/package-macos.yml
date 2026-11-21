@@ -1,7 +1,8 @@
 name: Package macOS
 
 # Build the prebuilt Apple silicon package and check it on the oldest and the newest macOS it runs
-# on. Release builds it for each release, which publishes it (release.yml). See docs/macos-package.md.
+# on. Only Release builds it, for each release, which publishes it (release.yml), and a run by hand,
+# on any branch, which builds and checks. See docs/macos-package.md.
 on:
   workflow_call:
     inputs:
@@ -10,46 +11,23 @@ on:
         required: true
         type: string
       release_tag:
-        description: The release's tag, vX.Y.Z, which gives the package its version and name
+        description: The release's tag, its version <yymmdd>.<build>, which the package is checked against
         required: true
         type: string
-  # A pull request builds the package when it changes how it is built; a change to main that reaches it
-  # builds it after the merge.
-  push:
-    branches: [main]
-    paths:
-      - 'engine/**'
-      - 'framework/**'
-      - CMakeLists.txt
-      - CMakePresets.json
-      - 'scripts/package-macos*'
-      - scripts/check-package-macos.sh
-      - scripts/engine-resources.py
-      - scripts/install.sh
-      - .github/workflows/package-macos.yml
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - 'scripts/package-macos*'
-      - scripts/check-package-macos.sh
-      - scripts/engine-resources.py
-      - scripts/install.sh
-      - .github/workflows/package-macos.yml
-  # By hand, on any branch: build and check. Only Release publishes.
+  # By hand, on any branch: build and check. Only Release publishes. Pull requests and merges do not
+  # build the package.
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  # A pull request's newer run replaces its older one; a branch's other runs queue in its group, and
-  # a release's run in its own.
+  # A branch's runs queue in its group, and a release's run in its own.
   group: package-macos-${{ inputs.release_tag || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 jobs:
   build:
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: macos-15
     timeout-minutes: 90
     steps:

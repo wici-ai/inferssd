@@ -42,7 +42,6 @@ struct llama_ssd_context {
 
     explicit llama_ssd_context(const llama_ssd_options & options);
     void attach_backend(ggml_backend_t backend);
-    void prepare_dense(const llama_model & model);
 };
 
 struct llama_ssd_host_reservation {

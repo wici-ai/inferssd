@@ -20,11 +20,10 @@ from typing import Optional
 
 from inferssd.configuration.settings import PLATFORMS, cpus, host_platform
 from inferssd.launch.prepare import prepare
-from inferssd.launch.recorded import RecordedArtifacts, run_indexer
+from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cache_directory, read_resources
 from inferssd.launch.typed import (
     BATCH,
-    CONTEXT,
     LOOPBACK,
     PROFILES,
     LaunchSpec,
@@ -70,7 +69,6 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--set", dest="overrides", action="append", default=[], help="typed key=literal override"
     )
     launch.add_argument("--binary", type=Path)
-    launch.add_argument("--artifact-dir", type=Path)
     launch.add_argument(
         "--profile",
         choices=tuple(PROFILES),
@@ -87,7 +85,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--context",
         type=int,
         help="-c (default: the largest multiple of 8192, up to the model's trained context, "
-        f"that memory holds when full; up to {CONTEXT} for a RAM-only model)",
+        "that memory holds when full)",
     )
     launch.add_argument(
         "--batch",
@@ -151,7 +149,6 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         str(args.settings.resolve()) if args.settings else None,
         tuple(overrides),
         str(args.binary.resolve()) if args.binary else None,
-        str(args.artifact_dir.resolve()) if args.artifact_dir else None,
         args.context,
         args.batch,
         args.ubatch,
@@ -211,9 +208,7 @@ def run(args: argparse.Namespace) -> int:
     if policy.platform != args.platform:
         raise ValueError("launch platform differs from policy")
     claim = reserve(str(args.output_dir))
-    adapter = RecordedArtifacts(
-        launch_input, host, run=run_indexer, replace=os.replace, python=sys.executable
-    )
+    adapter = RecordedArtifacts(launch_input, host)
 
     def emit(event: Output) -> None:
         (sys.stdout if event.channel == "stdout" else sys.stderr).write(event.text)
@@ -227,7 +222,6 @@ def run(args: argparse.Namespace) -> int:
             platform=args.platform,
             directory=str(claim.directory),
             memory=policy.memory_budget_bytes,
-            reserve=policy.host_reserve_bytes or 0,
         ),
         observe=adapter,
         emit=emit,
