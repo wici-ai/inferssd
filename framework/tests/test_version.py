@@ -46,19 +46,20 @@ def test_gpu_backends_are_left_out_when_not_recorded_or_not_known(tmp_path):
 
 def test_a_release_reports_its_recorded_version_and_tag(tmp_path):
     path = tmp_path / "resources.json"
-    path.write_text(json.dumps({"version": "0.1.5", "tag": "v0.1.5", "build": 289}))
+    path.write_text(json.dumps({"version": "261119.301", "tag": "261119.301", "build": 301}))
     value = report({"INFERSSD_RESOURCES": str(path)})
-    assert (value["version"], value["tag"]) == ("0.1.5", "v0.1.5")
+    assert (value["version"], value["tag"]) == ("261119.301", "261119.301")
 
 
-def test_a_development_build_has_no_tag(tmp_path):
+def test_any_other_build_has_no_tag(tmp_path):
     path = tmp_path / "resources.json"
     for recorded in (
-        {"version": "0.1.6.dev3", "tag": None},
-        {"version": "0.1.6.dev3", "tag": "v0.1.6"},
-        {"version": "0.1.5", "tag": "0.1.5"},
+        {"version": "261119.302", "tag": None},
+        {"version": "261119.302", "tag": "261119.301"},
+        {"version": "261119.302", "tag": "v261119.302"},
+        {"version": "0.1.5", "tag": "v0.1.5"},
     ):
-        path.write_text(json.dumps({**recorded, "build": 292}))
+        path.write_text(json.dumps({**recorded, "build": 302}))
         value = report({"INFERSSD_RESOURCES": str(path)})
         assert value["version"] == recorded["version"] and value["tag"] is None
 

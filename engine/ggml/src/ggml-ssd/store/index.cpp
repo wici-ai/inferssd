@@ -22,6 +22,7 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
         // ring. No transport choice or mutable environment is parsed here.
         description.io_backend = 1;
         description.require_direct = true;
+        description.read_gguf = c0::append_gguf_source;
         for (const auto & path : paths) {
             std::unique_ptr<FILE, close_probe> probe(platform::open_stream(path.c_str()));
             if (!probe) { return {nullptr, status::io, "cannot open expert index: " + path}; }
@@ -30,7 +31,7 @@ result<std::unique_ptr<source_index>> source_index::open(const std::vector<std::
             if (count >= 13 && std::memcmp(magic, "GGMLMOEPACKv1", 13) == 0) {
                 description.packs.push_back(path);
             } else if (count >= 4 && std::memcmp(magic, "GGUF", 4) == 0) {
-                return {nullptr, status::invalid, "expert.source takes an alias TSV for direct GGUF reads: " + path};
+                description.ggufs.push_back(path);
             } else {
                 description.aliases.push_back(path);
             }

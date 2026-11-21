@@ -26,7 +26,7 @@ The generic SSD tests use `test-ssd-*` for source files and executables, and
 (such as `[ssd_cpu_sink_cache]`) and CMake option (`GGML_CUDA_SSD_VRAM_TIER`) use
 `ssd` as well. The former `kimi` names came from the predecessor repository, whose
 runtime was first written for a Kimi model. Kimi model support and
-`test-kimi-deepseek2-guards` keep their model-specific names. Frozen launcher
+`test-kimi-deepseek2-guards` keep their model-specific names. Frozen
 oracles, the recorded c0-store references and release-comparison sources retain
 their original names, paths and hashes, and the retired `GGML_KIMI_*` environment
 variables keep their names where the engine and the launcher refuse them.
@@ -53,8 +53,8 @@ invalid scales. It runs in hosted CI. The `ssd_cpu_sink_swiglu_q2` and
 `ssd_cpu_sink_swiglu_q2_ordinary` tests include mixed
 IQ3_XXS up/gate and Q2_0 down experts at 2560/640 geometry, compared bit for bit
 with a resident ggml graph for decode and grouped prefill. `ssd_source_index`
-checks the corresponding unaligned 180-byte expert aliases and direct reads.
-The Python alias tests cover four shards, exact ranges and malformed inputs.
+checks the corresponding unaligned 180-byte expert aliases and direct reads, and
+a two-shard GGUF whose experts it indexes from the headers and reads back.
 
 CUDA supports Q2_0 conversion, row gathering, matrix-vector and matrix-matrix
 products, including the SSD expert tier. On an owned GPU, run
@@ -77,9 +77,9 @@ comparison.
 static library that only llama links; each context owns its source index. The
 supported configuration uses bundled ggml, shared or static libraries, the CPU
 backend, and linked backends (`GGML_BACKEND_DL=OFF`, `GGML_CPU_ALL_VARIANTS=OFF`).
-The GPU SSD transport (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda` and
-`linux-rocm` presets) reads through the same read ring as the CPU sink, so no build needs
-liburing: on Linux the ring submits io_uring requests through system calls. System-ggml and runtime backend-plugin variants remain
+The GPU SSD build (`GGML_CUDA_SSD_VRAM_TIER=ON`, set by the `linux-cuda` and
+`linux-rocm` presets) needs no liburing either: on Linux the read ring submits io_uring
+requests through system calls. System-ggml and runtime backend-plugin variants remain
 outside this store's supported build boundary. Every OS runs configured experts
 through the store and the CPU sink. The OFF configuration is retained for explicit legacy
 comparison, not as a runtime fallback. `ssd_source_index` checks the store end to
@@ -175,8 +175,7 @@ macOS runs configured experts on the same CPU sink and store as Linux and
 Windows, so the sink, prefill, store, read-ring and platform suites above are its
 expert-path tests. `test-llama-mmap-dontneed` separately verifies Apple's mapping
 advice with a tiny temporary file; production memory/performance effects still
-require model runs. Launcher and metadata validation tests run with
-`python3 -m pytest -q tests/integration/test-macos-launcher.py`.
+require model runs.
 
 The Mac CI build enables Metal and runs a hosted-runner subset of those suites:
 the sink at one to three ggml threads, its SITU, SWIGLU_CLAMP and SWIGLU activations,

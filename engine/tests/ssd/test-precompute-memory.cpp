@@ -1,12 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+#include "llama-context.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsv4.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
+#include "llama-memory-hybrid-idx.h"
+#include "llama-memory-recurrent.h"
 #include "llama-model.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
+#include <memory>
 #include <new>
+#include <numeric>
 
 static std::atomic<long> fail_after{-1};
 static std::atomic<size_t> allocations{0};
@@ -80,8 +88,153 @@ static void cells_partial_insert_oom() {
         require(cells.seq_pos_tok_le(0, 2) == 42, "cell ext token not restored");
     }
 }
+static std::vector<llama_pos> span(llama_pos first, llama_pos count) {
+    std::vector<llama_pos> result(count);
+    std::iota(result.begin(), result.end(), first);
+    return result;
+}
+static std::vector<uint32_t> cells_of(const std::vector<llama_pos> & positions) {
+    return std::vector<uint32_t>(positions.begin(), positions.end());
+}
+static bool same_recurrent(const llama_memory_recurrent & mem, const llama_memory_recurrent::metadata_undo & saved) {
+    if (mem.head != saved.head || mem.used != saved.used || mem.n != saved.n || mem.rs_z != saved.rs_z ||
+            mem.cells.size() != saved.cells.size()) { return false; }
+    for (size_t i = 0; i < mem.cells.size(); ++i) {
+        const auto & a = mem.cells[i];
+        const auto & b = saved.cells[i];
+        if (a.pos != b.pos || a.src != b.src || a.src0 != b.src0 || a.tail != b.tail || a.seq_id != b.seq_id) {
+            return false;
+        }
+    }
+    return true;
+}
+static void require_named(bool condition, const char * name, const char * message) {
+    if (!condition) { std::fprintf(stderr, "FAIL: %s: %s\n", name, message); std::abort(); }
+}
+// A prompt ubatch whose graph gets no memory is undone and split again (prefill_refit). Each allocation the
+// capture and the apply make fails in turn, then none fails: the undo must succeed, allocate nothing, and leave
+// the caches as they were.
+static void undo_every_failure(const char * name, const std::function<std::unique_ptr<llama_memory_context_i>()> & make,
+                               const std::function<bool()> & unchanged) {
+    size_t total = 0;
+    {
+        auto context = make();
+        const auto start = allocations.load();
+        require_named(context->apply_precompute(), name, "apply failed");
+        total = allocations.load() - start;
+        require_named(context->cancel_precompute() && unchanged(), name, "undo after a full apply failed");
+    }
+    for (size_t budget = 0; budget <= total + 1; ++budget) {
+        auto context = make();
+        fail_after = (long) budget;
+        try { (void) context->apply_precompute(); } catch (const std::bad_alloc &) {}
+        fail_after = 0;
+        const auto a = allocations.load();
+        const bool undone = context->cancel_precompute();
+        const auto b = allocations.load();
+        fail_after = -1;
+        require_named(undone && a == b, name, "undo allocated or failed");
+        require_named(unchanged(), name, "caches changed after the undo");
+    }
+}
+// Qwen3.6 and the other hybrid models: a prompt from position 0 (nothing reused) and one after a kept prefix.
+static void recurrent_and_hybrid_undo(llama_model & model) {
+    for (const bool prefix : {false, true}) {
+        const auto first  = prefix ? span(0, 11) : std::vector<llama_pos>();
+        const auto prompt = prefix ? span(11, 10) : span(0, 10);
+        const llama_pos last = prefix ? 10 : -1;
+
+        llama_memory_recurrent recr(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 1, 1, {});
+        if (prefix) { require(recr.find_slot(batch(first)), "recurrent prefix"); }
+        const auto recr_saved = recr.save_metadata();
+        undo_every_failure("recurrent",
+            [&] { return std::make_unique<llama_memory_recurrent_context>(&recr, std::vector<llama_ubatch>{batch(prompt)}); },
+            [&] { return same_recurrent(recr, *recr_saved) && recr.seq_pos_max(0) == last; });
+
+        llama_memory_hybrid hybrid(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 32, 1, 0, LLAMA_SWA_TYPE_NONE,
+                                   GGML_TYPE_F32, GGML_TYPE_F32, 1, 1, false, true);
+        if (prefix) {
+            hybrid.get_mem_attn()->apply_ubatch(slot(cells_of(first)), batch(first));
+            require(hybrid.get_mem_recr()->find_slot(batch(first)), "hybrid recurrent prefix");
+        }
+        const auto hybrid_saved = hybrid.get_mem_recr()->save_metadata();
+        undo_every_failure("hybrid",
+            [&] { return std::make_unique<llama_memory_hybrid_context>(&hybrid,
+                      llama_kv_cache::slot_info_vec_t{slot(cells_of(prompt))}, std::vector<llama_ubatch>{batch(prompt)}); },
+            [&] { return same_recurrent(*hybrid.get_mem_recr(), *hybrid_saved) &&
+                      hybrid.get_mem_attn()->seq_pos_max(0) == last && hybrid.get_mem_recr()->seq_pos_max(0) == last; });
+
+        llama_memory_hybrid_iswa iswa(model, GGML_TYPE_F32, GGML_TYPE_F32, false, true, 32, 16, 1,
+                                      GGML_TYPE_F32, GGML_TYPE_F32, 1, 1, false, true);
+        auto * base = iswa.get_mem_attn()->get_base();
+        auto * swa  = iswa.get_mem_attn()->get_swa();
+        if (prefix) {
+            base->apply_ubatch(slot(cells_of(first)), batch(first));
+            swa->apply_ubatch(slot(cells_of(first)), batch(first));
+            require(iswa.get_mem_recr()->find_slot(batch(first)), "hybrid iswa recurrent prefix");
+        }
+        const auto iswa_saved = iswa.get_mem_recr()->save_metadata();
+        const llama_pos swa_min = swa->seq_pos_min(0);
+        undo_every_failure("hybrid iswa",
+            [&] { return std::make_unique<llama_memory_hybrid_iswa_context>(&iswa,
+                      llama_kv_cache::slot_info_vec_t{slot(cells_of(prompt))},
+                      llama_kv_cache::slot_info_vec_t{slot(cells_of(prompt))}, std::vector<llama_ubatch>{batch(prompt)}); },
+            [&] { return same_recurrent(*iswa.get_mem_recr(), *iswa_saved) && base->seq_pos_max(0) == last &&
+                      swa->seq_pos_max(0) == last && swa->seq_pos_min(0) == swa_min; });
+
+        // qwen4exp: the indexer cache and the pool layout too
+        model.hparams.indexer_kpool = 2;
+        llama_memory_hybrid_idx idx(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 32, 1, 0, LLAMA_SWA_TYPE_NONE,
+                                    GGML_TYPE_F32, GGML_TYPE_F32, 1, 1, false, true, nullptr, nullptr,
+                                    [](int32_t) { return true; });
+        model.hparams.indexer_kpool = 0;
+        require(idx.get_mem_idx() != nullptr && idx.get_kpool() == 2, "indexer cache setup");
+        if (prefix) {
+            idx.get_mem_attn()->apply_ubatch(slot(cells_of(first)), batch(first));
+            idx.get_mem_idx()->apply_ubatch(slot(cells_of(first)), batch(first));
+            require(idx.get_mem_recr()->find_slot(batch(first)), "hybrid idx recurrent prefix");
+            (void) idx.kpool_layout_update();
+        }
+        const auto idx_saved = idx.get_mem_recr()->save_metadata();
+        const auto make_idx = [&] { return std::make_unique<llama_memory_hybrid_idx_context>(&idx,
+            llama_kv_cache::slot_info_vec_t{slot(cells_of(prompt))},
+            llama_kv_cache::slot_info_vec_t{slot(cells_of(prompt))}, std::vector<llama_ubatch>{batch(prompt)}); };
+        undo_every_failure("hybrid idx", make_idx,
+            [&] { return same_recurrent(*idx.get_mem_recr(), *idx_saved) && idx.get_mem_attn()->seq_pos_max(0) == last &&
+                      idx.get_mem_idx()->seq_pos_max(0) == last; });
+        // the dropped layout is rebuilt from the restored cells when the prompt is applied again
+        auto applied = make_idx();
+        require(applied->apply_precompute(), "hybrid idx apply after an undo");
+        applied->submit_precompute();
+        require(idx.get_mem_idx()->seq_pos_max(0) == prompt.back(), "hybrid idx apply after an undo did not publish");
+    }
+}
+
+// The refit's ubatch search, whatever probe it ends on: the graph left reserved is the one of the size it returns.
+// 48040 tokens with 25856 fitting ends on a refused probe (26112), as DeepSeek-V4.1 did on a 48 GB Mac, so 25856 is
+// reserved again; 35418 with 18432 fitting ends on 18432 itself. A refused second reserve selects nothing.
+static void refit_search_holds_selected() {
+    struct search_case { uint32_t target, fits; bool again; uint32_t expect; const char * name; };
+    for (const auto & c : {search_case{48040, 25856, true, 25856, "ends refused"},
+                           search_case{35418, 18432, true, 18432, "ends accepted"},
+                           search_case{48040, 25856, false, 0, "second reserve refused"}}) {
+        uint32_t held = 0, last = 0;
+        bool reserved_fits = false;
+        const uint32_t got = llama_prefill_ubatch_search(c.target, 1, [&](uint32_t n) {
+            bool ok = n <= c.fits && !(n == c.fits && reserved_fits && !c.again);
+            reserved_fits = reserved_fits || (ok && n == c.fits);
+            held = ok ? n : 0;
+            last = n;
+            return ok;
+        });
+        require_named(got == c.expect, c.name, "search selected another size");
+        require_named(got == 0 || (held == got && last == got), c.name, "the graph held is not the selected size's");
+    }
+}
+
 int main() {
     cells_partial_insert_oom();
+    refit_search_holds_selected();
     llama_model model(llama_model_default_params());
     model.hparams = {};
     model.arch = LLM_ARCH_LLAMA;
@@ -210,5 +363,6 @@ int main() {
         fail_after = -1;
         require(raw.get_swa()->seq_pos_max(0) == 1, "prepare exception leaked simulated metadata");
     }
-    std::puts("PRECOMPUTE_METADATA_PASS: purge/ext/shared indexes, OOM capture/partial inserts, compound raw, prepare exception, submit boundary");
+    recurrent_and_hybrid_undo(model);
+    std::puts("PRECOMPUTE_METADATA_PASS: purge/ext/shared indexes, OOM capture/partial inserts, compound raw, prepare exception, submit boundary, recurrent and hybrid, refit search");
 }

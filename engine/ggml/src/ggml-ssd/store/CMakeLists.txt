@@ -1,9 +1,13 @@
 cmake_minimum_required(VERSION 3.19)
 # This component can be consumed without configuring llama or an executor.
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
-    project(inferssd_store LANGUAGES CXX)
+    project(inferssd_store LANGUAGES C CXX)
     include(CTest)
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+endif()
+# GGUF headers are read with ggml's own reader (ggml also brings the platform layer).
+if(NOT TARGET ggml-base)
+    add_subdirectory(../../.. "${CMAKE_CURRENT_BINARY_DIR}/ggml" EXCLUDE_FROM_ALL)
 endif()
 # The store reaches the OS only through the platform layer.
 if(NOT TARGET ggml-ssd-platform)
@@ -14,9 +18,9 @@ endif()
 # Static: each context owns its source_index and executors borrow a source_view,
 # so no state needs one instance per process, and only llama links the store.
 find_package(Threads REQUIRED)
-add_library(ggml-ssd-c0-store STATIC parser.cpp index.cpp parser.h index.h source.h catalog.h legacy-index.h)
+add_library(ggml-ssd-c0-store STATIC parser.cpp gguf.cpp index.cpp parser.h index.h source.h catalog.h legacy-index.h)
 target_compile_features(ggml-ssd-c0-store PRIVATE cxx_std_17)
-target_link_libraries(ggml-ssd-c0-store PUBLIC ggml-ssd-platform PRIVATE Threads::Threads)
+target_link_libraries(ggml-ssd-c0-store PUBLIC ggml-ssd-platform PRIVATE ggml-base Threads::Threads)
 set_target_properties(ggml-ssd-c0-store PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(ggml-ssd-c0-store PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
 
@@ -31,6 +35,6 @@ if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND BUILD_TESTING)
     add_executable(test-ssd-source-index "${SSD_ENGINE_ROOT}/tests/ssd/test-source-index.cpp")
     target_compile_features(test-ssd-source-index PRIVATE cxx_std_17)
     target_include_directories(test-ssd-source-index PRIVATE "${SSD_ENGINE_ROOT}/ggml/src")
-    target_link_libraries(test-ssd-source-index PRIVATE ggml-ssd-c0-store)
+    target_link_libraries(test-ssd-source-index PRIVATE ggml-ssd-c0-store ggml-base)
     add_test(NAME ssd_source_index COMMAND test-ssd-source-index)
 endif()

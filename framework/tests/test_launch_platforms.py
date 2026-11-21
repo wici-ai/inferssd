@@ -39,10 +39,6 @@ def render(case):
             return Reply(case["settings"])
         if name == "mkdir":
             return Reply()
-        if name == "gguf_alias":
-            assert list(arguments[1:]) == case["shards"]
-            files.add(case["alias"])
-            return Reply(case["alias"])
         if name == "write_exclusive":
             written[arguments[0]] = arguments[1]
             return Reply()
@@ -93,7 +89,7 @@ def test_windows_qwen4exp_command_uses_the_model_template_and_settings_envelope(
     # No scope: host.budget_mib reaches the server through its settings file, as given.
     assert expected["scope"] == [] and not any(word.startswith("--ssd-host") for word in argv)
     settings = expected["settings"]["C:\\inferssd\\runs\\qwen4exp\\settings.ssd"]
-    assert "host.budget_mib = 14336" in settings and json.dumps([case["alias"]]) in settings
+    assert "host.budget_mib = 14336" in settings and json.dumps(case["shards"]) in settings
 
 
 def test_windows_passes_cli_settings_and_pins_threads():

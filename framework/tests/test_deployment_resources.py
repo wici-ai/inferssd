@@ -28,7 +28,7 @@ def descriptor(tmp_path, spec, profile="muse"):
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_deployed_resources_do_not_need_checkout(tmp_path, monkeypatch, platform):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
     resources = read_resources(descriptor(tmp_path, spec))
     foreign = tmp_path / "unrelated-cwd"
     foreign.mkdir()
@@ -45,7 +45,7 @@ def test_deployed_resources_do_not_need_checkout(tmp_path, monkeypatch, platform
 
 
 def test_explicit_paths_override_descriptor(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     resources = replace(read_resources(descriptor(tmp_path, spec)), binary="/missing")
     explicit = tmp_path / "custom.jinja"
     explicit.write_text("custom")
@@ -64,7 +64,7 @@ def test_explicit_paths_override_descriptor(tmp_path):
     [{}, {"settings": "old", "telemetry": 1}, {"settings": "inferssd-settings 1", "telemetry": 2}],
 )
 def test_incompatible_capabilities_refuse_before_preparation(tmp_path, capabilities):
-    inputs, spec, _, _, out, _ = setup(tmp_path)
+    inputs, spec, _, _, out = setup(tmp_path)
     path = descriptor(tmp_path, spec)
     value = json.loads(path.read_text())
     value["capabilities"] = capabilities
@@ -75,7 +75,7 @@ def test_incompatible_capabilities_refuse_before_preparation(tmp_path, capabilit
 
 
 def test_descriptor_without_a_profile_template_launches_with_the_gguf_template(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     resources = read_resources(descriptor(tmp_path, spec))
     result = resolve(
         replace(inputs, repo="", profile="qwen4exp"),
@@ -88,7 +88,7 @@ def test_descriptor_without_a_profile_template_launches_with_the_gguf_template(t
 
 
 def test_windows_descriptor_binds_only_a_windows_launch(tmp_path):
-    inputs, spec, _, adapter, out, _ = setup(tmp_path)
+    inputs, spec, _, adapter, out = setup(tmp_path)
     path = descriptor(tmp_path, spec)
     value = json.loads(path.read_text())
     value["capabilities"]["platform"] = "windows"
@@ -100,7 +100,7 @@ def test_windows_descriptor_binds_only_a_windows_launch(tmp_path):
 
 
 def test_a_descriptor_names_the_gpu_backends_its_engine_was_built_with(tmp_path):
-    _, spec, _, _, _, _ = setup(tmp_path)
+    _, spec, _, _, _ = setup(tmp_path)
     path = descriptor(tmp_path, spec)
     assert read_resources(path).gpu_backends is None
     value = json.loads(path.read_text())
@@ -123,7 +123,7 @@ def test_a_descriptor_names_the_gpu_backends_its_engine_was_built_with(tmp_path)
 
 def test_the_descriptors_gpu_backends_decide_whether_the_vram_tier_needs_the_gpus_driver(tmp_path):
     # The recorded build has CUDA; the descriptor of the engine launched speaks for it.
-    inputs, spec, host, adapter, _, _ = setup(tmp_path)
+    inputs, spec, host, adapter, _ = setup(tmp_path)
     host["gpu_available"] = False
     path = descriptor(tmp_path, spec)
     value = json.loads(path.read_text())
@@ -143,7 +143,7 @@ def test_the_descriptors_gpu_backends_decide_whether_the_vram_tier_needs_the_gpu
 
 @pytest.mark.parametrize("platform", ["linux", "darwin"])
 def test_a_cuda_tier_setting_needs_an_engine_with_cuda(tmp_path, platform):
-    inputs, spec, host, adapter, out, _ = setup(tmp_path, platform)
+    inputs, spec, host, adapter, out = setup(tmp_path, platform)
     launch = replace(spec, overrides=spec.overrides + (("vram.max_slots", "4"),))
     if platform == "linux":
         assert resolve(inputs, launch, adapter, out, platform).code == 0
@@ -164,8 +164,8 @@ def test_descriptor_carries_the_build_it_was_made_from(tmp_path):
         "revision": "fixture",
     }
     made = {
-        "version": "0.1.5",
-        "tag": "v0.1.5",
+        "version": "261106.202",
+        "tag": "261106.202",
         "build": 202,
         "date": "2026-11-06",
         "branch": "main",

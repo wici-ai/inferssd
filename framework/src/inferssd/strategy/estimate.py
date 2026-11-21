@@ -10,6 +10,7 @@ bounds. Attention, graph overhead and cache warm-up are not measured here.
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -22,7 +23,7 @@ from inferssd.strategy.derive import (
     single_gpu,
     tier_gpus,
 )
-from inferssd.strategy.inputs import BLOCKS, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import Experts, ModelFacts, RuntimeFacts
 
 GB = 1e9
 ENGINE_RESERVE_BYTES = 512 << 20
@@ -68,7 +69,7 @@ def routing_hit(capacity: float, hot_fraction: float, traffic_fraction: float) -
 
 
 def drive_iqr(
-    c: Characteristics, model: ModelFacts, key: Optional[str], central_Bps: float
+    c: Characteristics, experts: Experts, key: Optional[str], central_Bps: float
 ) -> tuple[float, float, int]:
     """Repeated measurements of the same request size/QD used by drive_rate.
 
@@ -76,7 +77,7 @@ def drive_iqr(
     storage stall. Do not use measurements from different queues as repetitions.
     """
     entry = next(row for row in c["storage"] if row["drive_key"] == key)
-    request = model.mean_expert_read_bytes / 3
+    request = experts.mean_read_bytes / 3
     knee = min(entry["knee"], key=lambda r: (abs(math.log(r["bytes"] / request)), r["bytes"]))
     cap = min(IN_FLIGHT, entry["qd_cap"] or IN_FLIGHT)
     first = knee["qd"] if knee["qd"] <= cap else 1
@@ -131,31 +132,33 @@ def matvec_rate(
     return point["weight_Bps"] * point["us"] / duration if duration > 0 else point["weight_Bps"]
 
 
-def bits_per_weight(name: str) -> float:
-    block, size = BLOCKS[name.upper()]
-    return 8 * size / block
-
-
-def format_proxies(rows: list[ComputeRow], names: set[str]) -> dict[str, str]:
-    """Each of NAMES priced as itself when ROWS measure it at one token, else as the measured
-    format nearest it in bits per weight (the higher of two as near): a default for a format the
-    probe does not measure, such as IQ4_XS and IQ4_NL, until a run calibrates it. A name with no
-    block size, or rows that measure nothing, has no entry."""
-    measured = {
-        row["format"].upper()
-        for row in rows
-        if row["format"].upper() in BLOCKS
-        and any(p["tokens"] == 1 and p.get("weight_Bps", 0) > 0 for p in row["points"])
+def model_bits(experts: Experts) -> dict[str, float]:
+    """Bits per weight of each ggml type the routed EXPERTS take, from their bytes."""
+    return {
+        name.upper(): role.bits_per_weight(name)
+        for role in experts.roles
+        for name, _, _ in role.formats
     }
-    proxies = {}
-    for name in names:
-        if name.upper() in measured:
-            proxies[name] = name.upper()
-        elif name.upper() in BLOCKS and measured:
-            want = bits_per_weight(name)
-            proxies[name] = min(
-                measured, key=lambda m: (abs(bits_per_weight(m) - want), -bits_per_weight(m), m)
+
+
+def format_proxies(rows: list[ComputeRow], wanted: Mapping[str, float]) -> dict[str, str]:
+    """Each format of WANTED (with its bits per weight) priced as itself when ROWS measure it at
+    one token, else as the measured format nearest it in bits per weight (the higher of two as
+    near): a default for a format the probe does not measure, such as IQ4_XS and IQ4_NL, until a
+    run calibrates it. A row's bits per weight are its weight bytes over its matrix. Rows that
+    measure nothing give no entry."""
+    measured: dict[str, float] = {}
+    for row in rows:
+        if any(p["tokens"] == 1 and p.get("weight_Bps", 0) > 0 for p in row["points"]):
+            measured.setdefault(
+                row["format"].upper(), 8 * row["weight_bytes"] / (row["rows"] * row["cols"])
             )
+    proxies = {}
+    for name, want in wanted.items():
+        if name in measured:
+            proxies[name] = name
+        elif measured:
+            proxies[name] = min(measured, key=lambda m: (abs(measured[m] - want), -measured[m], m))
     return proxies
 
 
@@ -171,13 +174,13 @@ def proxy_note(where: str, proxies: dict[str, str]) -> Optional[str]:
 
 
 def cpu_decode_seconds(
-    c: Characteristics, model: ModelFacts, threads: int, timing: str = "median"
+    c: Characteristics, experts: Experts, threads: int, timing: str = "median"
 ) -> tuple[Optional[float], str]:
     """One expert, using only one-token points and all of its quantization types."""
     rows = [row for row in c["compute"]["cpu"] if not row.get("cpus")]
-    names = {name.upper() for role in model.roles for name, _ in role.formats}
+    names = model_bits(experts)
     proxies = format_proxies(rows, names)
-    missing = sorted(names - set(proxies))
+    missing = sorted(set(names) - set(proxies))
     if missing:
         return None, "no CPU compute measurement of " + ", ".join(missing)
     rates = {}
@@ -185,8 +188,8 @@ def cpu_decode_seconds(
         selected = [row for row in rows if row["threads"] == count]
         values = [
             matvec_rate(selected, proxies[name.upper()], role.rows, role.cols, timing)
-            for role in model.roles
-            for name, _ in role.formats
+            for role in experts.roles
+            for name, _, _ in role.formats
         ]
         if all(rate is not None for rate in values):
             rates[count] = [rate or 0 for rate in values]
@@ -196,10 +199,10 @@ def cpu_decode_seconds(
     upper = min((n for n in rates if n >= threads), default=max(rates))
     share = (threads - lower) / (upper - lower) if upper != lower else 0
     total, index = 0.0, 0
-    for role in model.roles:
-        for name, layers in role.formats:
+    for role in experts.roles:
+        for name, layers, _ in role.formats:
             rate = rates[lower][index] + share * (rates[upper][index] - rates[lower][index])
-            total += layers / model.layers * role.slice_bytes(name) / rate
+            total += layers / experts.layers * role.slice_bytes(name) / rate
             index += 1
     return total, ""
 
@@ -243,8 +246,11 @@ def decode_estimate(
         routing_hit(0, pattern.expert_fraction, pattern.traffic_fraction)
     if min(host_work_bytes, gpu_work_bytes, dense_read_bytes) < 0:
         raise ValueError("memory sizes must be nonnegative")
-    if not model.experts_used or not model.routed_bytes:
-        return Estimate(None, "the GGUF header names no routed experts per token")
+    experts = model.experts
+    if experts is None:
+        return Estimate(None, "the model has no routed experts")
+    if not experts.used or not experts.routed_bytes:
+        return Estimate(None, "the model names no routed experts per token")
     memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
     if memory_Bps <= 0:
         return Estimate(None, "no memory read rate in the profile")
@@ -253,10 +259,10 @@ def decode_estimate(
     except ValueError as error:
         return Estimate(None, str(error))
     # Decode uses the decode pool; the previous implementation used the prefill pool.
-    cpu_expert_s, why = cpu_decode_seconds(characteristics, model, threads.decode or 1)
+    cpu_expert_s, why = cpu_decode_seconds(characteristics, experts, threads.decode or 1)
     if cpu_expert_s is None:
         return Estimate(None, why)
-    drive_gbps, why = drive_rate(characteristics, model, drive_key)
+    drive_gbps, why = drive_rate(characteristics, experts, drive_key)
     if drive_gbps is None:
         return Estimate(None, why)
     available = runtime.available_bytes
@@ -286,19 +292,19 @@ def decode_estimate(
     gpu_fast_s = 0.0
     gpu_slow_s = 0.0
     missing = []
-    names = {name.upper() for role in model.roles for name, _ in role.formats}
+    names = model_bits(experts)
     cpu_proxies = format_proxies(
         [row for row in characteristics["compute"]["cpu"] if not row.get("cpus")], names
     )
     gpu_proxies = format_proxies(rows, names)
-    for role in model.roles:
-        for name, layers in role.formats:
+    for role in experts.roles:
+        for name, layers, _ in role.formats:
             used = gpu_proxies.get(name.upper(), name)
             rate = matvec_rate(rows, used, role.rows, role.cols)
             if rate is None:
                 missing.append(name)
             else:
-                weight = layers * role.slice_bytes(name) / model.layers
+                weight = layers * role.slice_bytes(name) / experts.layers
                 gpu_expert_s += weight / rate
                 gpu_fast_s += weight / (matvec_rate(rows, used, role.rows, role.cols, "q1") or rate)
                 gpu_slow_s += weight / (matvec_rate(rows, used, role.rows, role.cols, "q3") or rate)
@@ -326,15 +332,15 @@ def decode_estimate(
         cache = room - resident
         gpu_cache = 0
         dense_s = resident / memory_Bps + (dense_read_bytes - resident) / (drive_gbps * GB)
-    experts = model.routed_bytes
-    ram_fraction = min(1.0, cache / experts)
-    gpu_fraction = min(1.0, gpu_cache / experts)
+    routed = experts.routed_bytes
+    ram_fraction = min(1.0, cache / routed)
+    gpu_fraction = min(1.0, gpu_cache / routed)
     # A VRAM copy may also occupy RAM: summing the two capacities double-counts it.
     hit = max(ram_fraction, gpu_fraction)
-    routes = model.layers * model.experts_used
+    routes = experts.layers * experts.used
     cpu_all_s = routes * cpu_expert_s
     gpu_all_s = routes * gpu_expert_s
-    io_all_s = routes * model.mean_expert_read_bytes / (drive_gbps * GB)
+    io_all_s = routes * experts.mean_read_bytes / (drive_gbps * GB)
 
     def terms(gpu_hit: float, storage_miss: float) -> tuple[float, float, float]:
         return cpu_all_s * (1 - gpu_hit), gpu_all_s * gpu_hit, io_all_s * storage_miss
@@ -348,9 +354,9 @@ def decode_estimate(
     }
     disjoint_miss = 1 - min(1.0, ram_fraction + gpu_fraction)
     scenarios["uniform_disjoint_serial"] = 1 / (dense_s + cpu_s + gpu_s + io_all_s * disjoint_miss)
-    io_low, io_high, io_samples = drive_iqr(characteristics, model, drive_key, drive_gbps * GB)
-    cpu_fast, _ = cpu_decode_seconds(characteristics, model, threads.decode or 1, "q1")
-    cpu_slow, _ = cpu_decode_seconds(characteristics, model, threads.decode or 1, "q3")
+    io_low, io_high, io_samples = drive_iqr(characteristics, experts, drive_key, drive_gbps * GB)
+    cpu_fast, _ = cpu_decode_seconds(characteristics, experts, threads.decode or 1, "q1")
+    cpu_slow, _ = cpu_decode_seconds(characteristics, experts, threads.decode or 1, "q3")
     if use_gpu:
         dense_fast = dense_read_bytes / (
             matvec_rate(rows, "Q8_0", 4096, 4096, "q1") or dense_rate or 1
@@ -403,7 +409,7 @@ def decode_estimate(
         + (f" ({spill / GB:.1f} GB of it from the drive)" if spill else "")
         + f", CPU experts {cpu_s * 1e3:.0f} ms, GPU experts {gpu_s * 1e3:.0f} ms, "
         f"{1 - hit:.0%} from the drive at {drive_gbps:.2f} GB/s {drive_s * 1e3:.0f} ms "
-        f"(a {cache / GB:.1f} GB cache of {experts / GB:.0f} GB of experts); "
+        f"(a {cache / GB:.1f} GB cache of {routed / GB:.0f} GB of experts); "
         "uniform-routing estimate, not a measured hit rate"
     )
     return Estimate(

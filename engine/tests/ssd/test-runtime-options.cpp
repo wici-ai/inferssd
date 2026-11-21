@@ -25,6 +25,9 @@ int main() {
     require(*context->settings.integer("prefetch.depth") == 4, "context borrowed freed options");
     require(context->services.events == context->events.get() && context->services.debug == &context->debug,
         "context service pointers differ from owned objects");
+    // A context without routed experts measures host memory too: the engine fits its context to it.
+    require(context->settings.sources()->empty() && context->host && context->services.host == context->host.get(),
+        "a context without an expert source has no host memory client");
 
     const llama_ssd_override other[] = {{"prefetch.depth", "3"}};
     options = llama_ssd_options_create(nullptr, other, 1, second.c_str(), error, sizeof(error));

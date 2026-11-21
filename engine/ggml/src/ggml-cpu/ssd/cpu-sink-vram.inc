@@ -713,13 +713,15 @@ struct sink_vram {
         ssd::place::observe_prefill_overhead(learning, cost, overhead, overhead_row_prior(table().locked_us_per_mb));
         const ssd_place_table t = table();
         std::fprintf(stderr,
-            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
+            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu gpu_samples=%zu gpu_host_samples=%zu "
+            "cpu_fixed_us=%.3f cpu_route_us=%.3f "
             "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
             "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_overhead_fixed_us=%.3f gpu_token_us=%.3f "
             "gpu_overhead_samples=%.0f gpu_overhead_min_tokens=%d gpu_overhead_max_tokens=%d cpu_one_us=%.1f "
             "predicted_us=%.1f measured_us=%.1f cpu_predicted_us=%.1f cpu_us=%.1f gpu_predicted_us=%.1f gpu_us=%.1f "
             "drive_predicted_us=%.1f drive_us=%.1f gpu_overhead_predicted_us=%.1f gpu_overhead_us=%.1f\n",
-            (unsigned long long) learning.calibrations, plan.ntokens, learning.samples.size(),
+            (unsigned long long) learning.calibrations, plan.ntokens, learning.cpu.items.size(),
+            learning.gpu.items.size(), learning.gpu_host.items.size(),
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
             cost.gpu_host_route_us, t.locked_us_per_mb > 0 ? 1e3 / t.locked_us_per_mb : 0.0,
             t.pageable_us_per_mb > 0 ? 1e3 / t.pageable_us_per_mb : 0.0, t.drive_us_per_mb > 0 ? 1e3 / t.drive_us_per_mb : 0.0,

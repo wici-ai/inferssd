@@ -1133,30 +1133,63 @@ void server_turn_memory_record(const common_chat_msg & msg) {
     memory.turns[key] = std::move(turn);
 }
 
-// Refuses a reasoning_effort the chat template does not offer, naming the ones it does.
-static void check_reasoning_effort(const std::optional<common_chat_reasoning> & reasoning, const std::string & effort) {
+// Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
+// which Anthropic's and Codex's go up to. Codex's ultra and persistent ask for more than max. -1 for any other word.
+static int reasoning_effort_rank(const std::string & effort) {
+    static const std::vector<std::string> ladder = {"minimal", "low", "medium", "high", "xhigh", "max"};
+    const auto it = std::find(ladder.begin(), ladder.end(), effort);
+    if (it != ladder.end()) {
+        return (int) (it - ladder.begin());
+    }
+    return effort == "ultra" || effort == "persistent" ? (int) ladder.size() : -1;
+}
+
+// How a request runs: thinking or not, and the reasoning_effort the template gets (empty: none, its own default).
+struct reasoning_choice {
+    bool        think = false;
+    std::string effort;
+};
+
+// Fits a request's reasoning_effort to what the chat template offers, as /props reports it, so that each client's
+// own words run as the nearest the model has instead of being refused. A value the template takes is used as it is.
+// "none" turns thinking off, or, where the template cannot, takes its least effort. An effort on the ladder above
+// takes the template's highest that does not exceed it, or its least if all of them do; a template with no such
+// efforts (one that only turns thinking on and off) thinks as it does by default, as do "on" and any other word.
+// A model that does not think runs without thinking whatever is asked.
+static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat_reasoning> & reasoning,
+                                                 const std::string & effort) {
     if (!reasoning) {
-        if (effort == "none") {
-            return; // thinking is already off
-        }
-        throw std::invalid_argument("This model does not think, so \"reasoning_effort\" can only be \"none\"");
+        return {false, ""};
     }
-    std::vector<std::string> offered;
-    if (reasoning->can_turn_off) {
-        offered.push_back("none");
-    }
-    offered.insert(offered.end(), reasoning->efforts.begin(), reasoning->efforts.end());
+    const auto & offered = reasoning->efforts;
     if (std::find(offered.begin(), offered.end(), effort) != offered.end()) {
-        return;
+        return {true, effort};
     }
-    if (offered.empty()) {
-        throw std::invalid_argument("This model's chat template takes no \"reasoning_effort\"");
+    std::vector<std::pair<int, std::string>> ladder; // the template's efforts on the ladder, least first
+    for (const auto & value : offered) {
+        const int rank = reasoning_effort_rank(value);
+        if (rank >= 0) {
+            ladder.emplace_back(rank, value);
+        }
     }
-    for (auto & value : offered) {
-        value = "\"" + value + "\"";
+    std::sort(ladder.begin(), ladder.end());
+    if (effort == "none") {
+        if (reasoning->can_turn_off) {
+            return {false, ""};
+        }
+        return {true, ladder.empty() ? std::string() : ladder.front().second};
     }
-    throw std::invalid_argument("This model's chat template takes \"reasoning_effort\" " + string_join(offered, ", ") +
-        ", not \"" + effort + "\"");
+    const int rank = reasoning_effort_rank(effort);
+    if (rank < 0 || ladder.empty()) {
+        return {true, ""};
+    }
+    std::string chosen = ladder.front().second;
+    for (const auto & [value_rank, value] : ladder) {
+        if (value_rank <= rank) {
+            chosen = value;
+        }
+    }
+    return {true, chosen};
 }
 
 json oaicompat_chat_params_parse(
@@ -1314,22 +1347,28 @@ json oaicompat_chat_params_parse(
         inputs.chat_template_kwargs[item.key()] = item.value().dump();
     }
 
-    // reasoning_effort (the OpenAI chat-completions field): "none" turns thinking off for this request, any other
-    // effort turns it on and goes to the template as reasoning_effort. Either must be something the template offers,
-    // as /props reports it, so a request never runs as something other than what it asked for. Template kwargs given
-    // in the request take precedence.
+    // reasoning_effort (the OpenAI chat-completions field) switches thinking per request: it is fitted to what the
+    // template offers (resolve_reasoning_effort), so that OpenAI's, Codex's and Anthropic's efforts all run on any
+    // model, and "on" thinks as the template does with no reasoning_effort. Template kwargs given in the request take
+    // precedence.
     if (body.contains("reasoning_effort") && !body.at("reasoning_effort").is_null()) {
         const json & effort = body.at("reasoning_effort");
         if (!effort.is_string()) {
             throw std::invalid_argument("\"reasoning_effort\" must be a string");
         }
-        check_reasoning_effort(opt.reasoning, effort.get<std::string>());
-        const bool   off    = effort.get<std::string>() == "none";
-        if (!chat_template_kwargs_object.contains("enable_thinking")) {
-            inputs.chat_template_kwargs["enable_thinking"] = off ? "false" : "true";
+        const std::string      asked  = effort.get<std::string>();
+        const reasoning_choice choice = resolve_reasoning_effort(opt.reasoning, asked);
+        const std::string used = !choice.think         ? std::string("thinking off") :
+                                 choice.effort.empty() ? std::string("the template's default") :
+                                                         "\"" + choice.effort + "\"";
+        if (choice.effort != asked && asked != "on" && !(asked == "none" && !choice.think)) {
+            SRV_INF("reasoning_effort \"%s\" runs as %s\n", asked.c_str(), used.c_str());
         }
-        if (!off && !chat_template_kwargs_object.contains("reasoning_effort")) {
-            inputs.chat_template_kwargs["reasoning_effort"] = effort.dump();
+        if (!chat_template_kwargs_object.contains("enable_thinking")) {
+            inputs.chat_template_kwargs["enable_thinking"] = choice.think ? "true" : "false";
+        }
+        if (!choice.effort.empty() && !chat_template_kwargs_object.contains("reasoning_effort")) {
+            inputs.chat_template_kwargs["reasoning_effort"] = json(choice.effort).dump();
         }
     }
 

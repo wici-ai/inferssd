@@ -22,7 +22,7 @@ flowchart LR
 
 ## Expert sources and caching
 
-Source indexes locate expert byte ranges in the original GGUF files or a matching v1 expert pack. Indexing GGUF headers does not copy the model payload. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
+Source indexes locate expert byte ranges in the model's GGUF files, a matching v1 expert pack, or an alias index of other files. The engine indexes GGUF files from their headers with ggml's own reader, without copying the payload. The framework reads no GGUF file: before a launch it asks the server for the model's facts (`inferssd-server --ssd-model-facts MODEL`), which the engine builds by the steps of its load, the routed experts' layout among them, without reading a weight or starting a backend. Packs group expert slices by layer and expert with **4 KiB alignment**, preserving the existing quantized bytes. The v1 format has no checkpoint fingerprint, so keep each pack paired with its source checkpoint.
 
 The runtime owns immutable source metadata, readers, host-budget accounting and telemetry for each context. Executors borrow those services. Linux, macOS and Windows run configured experts on the same CPU sink, which reads through the OS read ring (`io_uring` on Linux, IoRing on Windows, persistent reader threads with `F_NOCACHE` on macOS) into its RAM cache; with CUDA, or ROCm for an AMD GPU, the GPU cache tier joins it. A GPU backend without that tier, such as Metal, runs the dense layers, and the sink computes the routed experts on the CPU, but for a prompt's heavy experts on a GPU that shares host memory ([the GPU lane](#the-gpu-lane)). Device and source validation remains necessary for the selected configuration.
 
@@ -50,18 +50,18 @@ Prompt batching lets tokens share weight access. The launch strategy sets the na
 
 ## Modules
 
-The runtime extends the bundled llama.cpp snapshot. Its integration points are listed in [upstream patches](development/upstream-patches.md).
+The runtime extends the llama.cpp snapshot bundled under `engine/`: commit `8884f83` in the history of `main`, which imports upstream llama.cpp `f42e29fdf1`. [NOTICE](../NOTICE) lists its attribution and the code ported from other sources. InferSSD does not move the snapshot to a newer llama.cpp as a whole. It ports each upstream change it needs on its own, and the commit that ports it names the upstream commit, so `git log --grep=<upstream commit>` finds it. `git diff 8884f83:<path> HEAD:engine/<path>` shows how a bundled file differs from the snapshot.
 
 | Layer | Directory | Owns |
 | --- | --- | --- |
-| Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes, explicit pack/alias parsing, and the expert layout: each routed layer's format and every expert role's place, described once at load for every executor |
+| Core | `engine/ggml/src/ggml-ssd/store` | Immutable per-context source indexes (GGUF headers, packs, alias indexes) and the expert layout: each routed layer's format and every expert role's place, described once at load for every executor |
 | Core | `engine/ggml/src/ggml-ssd/io` | One read ring per OS (io_uring through system calls, IoRing, reader threads), an instance per reader; portable pread |
 | Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
 | Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |
-| Core | `engine/ggml/src/ggml-ssd/stream` | Copies of the dense weights homed on the drive, their lookahead and observations |
+| Core | `engine/ggml/src/ggml-ssd/stream` | The weights a context keeps in host memory or on the drive, streamed to its GPU for each graph: the device ring their copies land in, ahead of their use, and their counters |
 | Core | `engine/ggml/src/ggml-ssd/settings`, `telemetry` | Immutable validated settings, source receipts and owned JSONL writers |
 | Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; the VRAM tier, staging, events and format kernels, built into the CUDA backend and, from the same sources, the HIP backend for AMD GPUs |
-| Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics |
+| Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics; a model's facts from its headers alone (`--ssd-model-facts`), which the launch strategy reads; where a model without routed experts keeps its layers (the GPU's memory as far as it has room, else pinned host memory within the host budget, else the drive) |
 | llama extensions | `engine/src/inferssd` | KV state codecs and positional state serialization |
 | Common | `engine/common/inferssd` | CLI glue, model chat parsing, reasoning budgets |
 | Server | `engine/tools/server/inferssd` | Prompt cache, checkpoints and request lifecycle |

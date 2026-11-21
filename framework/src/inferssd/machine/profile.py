@@ -22,6 +22,7 @@ from __future__ import annotations
 import glob
 import ntpath
 import posixpath
+import re
 import sys
 import time
 from collections.abc import Callable, Sequence
@@ -70,8 +71,9 @@ from inferssd.machine.probes import (
     storage_entry,
 )
 from inferssd.machine.store import CPU_GROUP, Refresh, plan_refresh
-from inferssd.source.header import SHARD
 
+# A split GGUF's shard: <prefix>-00002-of-00004.gguf
+SHARD = re.compile("(.*)-\\d{5}-of-(\\d{5})\\.gguf$")
 MIN_FILE_BYTES = 1 << 30
 MAX_FILES = 8
 TEST_FILE_BYTES = 4 << 30  # spread over 4 GiB, reads do not stay in a drive's own cache

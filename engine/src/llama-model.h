@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class llama_dense_homes;
 
 // available models
 enum llm_type {
@@ -695,6 +696,9 @@ struct llama_model {
 
     // whether a weight's bytes are the model's file mapping (mmap): reading them brings file pages into the page cache
     bool file_mapped(const ggml_tensor * t) const;
+
+    // the layers' matrices an SSD context homes (llama_model_params::ssd_homes), nullptr when there are none
+    llama_dense_homes * dense_homes() const;
 
     std::string arch_name() const;
     std::string type_name() const;

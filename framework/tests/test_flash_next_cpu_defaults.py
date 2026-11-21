@@ -4,17 +4,18 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
-from test_ram_launch import resolved
-from test_strategy_inputs import Q8_0, moe, write_gguf
-from test_typed_launch import setup
+from test_dense_launch import resolved
+from test_strategy_inputs import Q8_0, moe
+from test_typed_launch import model_file, setup
 
 from inferssd.launch.types import Threads
 
 
 def flash(tmp_path, platform, backends=()):
-    inputs, spec, host, adapter, out, _ = setup(tmp_path, platform)
-    write_gguf(
-        spec.model,
+    inputs, spec, host, adapter, out = setup(tmp_path, platform)
+    model_file(
+        Path(spec.model),
+        host,
         *moe(
             "qwen4exp",
             layers=1,

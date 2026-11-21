@@ -91,6 +91,9 @@ public:
 
     const kpool_layout & kpool_layout_update();
     const kpool_layout & kpool_layout_get() const;
+    // Forget the layout, kept allocated: the next kpool_layout_update rebuilds it from the cells. A ubatch undone
+    // after apply leaves a layout that holds cells the caches no longer have.
+    void kpool_layout_drop() noexcept;
 
     // The pooled keys persist in the idx cache across batches. A sequence edit can regroup the pools
     // from some position on, which stales every pooled key at or after it. POS_CLEAN means none.
@@ -180,6 +183,10 @@ public:
     bool next()  override;
     bool apply() override;
     llama_memory_status get_status() const override;
+
+    bool save_precompute() override;
+    bool restore_precompute() noexcept override;
+    void discard_precompute() noexcept override;
 
     //
     // llama_memory_hybrid_idx_context specific API

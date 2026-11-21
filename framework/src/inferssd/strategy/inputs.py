@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """What a strategy is derived from besides the machine characteristics.
 
-``ModelFacts`` come from the GGUF header of the model being launched.
+``ModelFacts`` come from the engine's facts of the model being launched
+(inferssd.engine.model): what the engine would load, before it loads anything.
 ``RuntimeFacts`` are read when the launch starts, because they change while the
 machine runs: the CPUs this process may use, the GPUs with the expert VRAM tier
 it can use and their free memory, the memory available now, and the user's
@@ -12,11 +13,10 @@ Readers take an injectable host and never write anything.
 from __future__ import annotations
 
 import os
-import re
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import Optional, Protocol, cast
+from typing import Any, Optional, Protocol, cast
 
 from inferssd.configuration.settings import cpus as cpu_list
 from inferssd.contracts import ContractError
@@ -25,31 +25,25 @@ from inferssd.machine.characteristics import (
     COUNT,
     POSITIVE,
     TEXT,
-    Check,
     array,
     nullable,
     record,
 )
-from inferssd.source import header as gguf_header
-from inferssd.source.experts import ROLE, is_role, widened
-from inferssd.source.files import LOCAL_FILES, SourceFiles
 
 ROLES = ("gate", "up", "down")
-# ggml type name -> (elements per block, bytes per block)
-BLOCKS = {name: (block, size) for name, block, size in gguf_header.TYPES.values()}
 
 
 @dataclass(frozen=True)
 class Role:
-    """One routed-expert role as the header describes it.
+    """One routed-expert role as the engine lays it out.
 
     A role is a matrix of ``rows`` output features by ``cols`` reduction
-    columns per expert; ``formats`` counts the layers per ggml type, the most
-    common first.
+    columns per expert; ``formats`` gives each ggml type it takes, the layers
+    in it and one expert's bytes of the role in it, the most common type first.
     """
 
     name: str
-    formats: tuple[tuple[str, int], ...]
+    formats: tuple[tuple[str, int, int], ...]
     rows: int
     cols: int
 
@@ -59,25 +53,28 @@ class Role:
 
     def slice_bytes(self, format: Optional[str] = None) -> int:
         """One expert's bytes of this role in FORMAT (default: the most common one)."""
-        block, size = BLOCKS[format or self.format]
-        return self.rows * (self.cols // block) * size
+        name = format or self.format
+        for item, _, size in self.formats:
+            if item == name:
+                return size
+        raise KeyError(f"routed {self.name} experts take no {name}")
+
+    def bits_per_weight(self, format: Optional[str] = None) -> float:
+        return 8 * self.slice_bytes(format) / (self.rows * self.cols)
 
 
 @dataclass(frozen=True)
-class ModelFacts:
-    """Model facts from the GGUF header; nothing here depends on the machine."""
+class Experts:
+    """A model's routed experts as the engine lays them out."""
 
-    paths: tuple[str, ...]
-    architecture: Optional[str]
     layers: int  # layers with routed experts
-    experts: int  # routed experts per layer
-    experts_used: Optional[int]  # routed experts per token
+    count: int  # routed experts per layer
+    used: Optional[int]  # routed experts per token
     gate: Role
     up: Role
     down: Role
     expert_bytes: int  # the largest expert, all three roles
-    expert_read_bytes: int  # its three role reads, each widened to whole 4 KiB pages
-    dense_bytes: int  # every tensor that is not a routed expert
+    expert_read_bytes: int  # the most one expert's three role reads (whole 4 KiB pages) take
     format_bytes: tuple[tuple[str, int], ...]  # routed bytes per ggml type, the most first
 
     @property
@@ -90,14 +87,14 @@ class ModelFacts:
         return sum(size for _, size in self.format_bytes)
 
     @property
-    def mean_expert_read_bytes(self) -> float:
+    def mean_read_bytes(self) -> float:
         """What the engine reads for one routed expert on average.
 
         Layers may quantize their experts to different types, so the largest expert overstates
         the rest: this is the mean expert's bytes, widened to whole pages as the largest one's
         three role reads are. It equals expert_read_bytes when every layer has one type.
         """
-        mean = self.routed_bytes / (self.layers * self.experts)
+        mean = self.routed_bytes / (self.layers * self.count)
         return mean + self.expert_read_bytes - self.expert_bytes
 
     @property
@@ -106,169 +103,198 @@ class ModelFacts:
         return self.format_bytes[0][0]
 
 
+@dataclass(frozen=True)
+class ModelFacts:
+    """Model facts from the engine; nothing here depends on the machine."""
+
+    paths: tuple[str, ...]
+    architecture: Optional[str]
+    dense_bytes: int  # every tensor that is not a routed expert
+    # The layers' tensors (blk.N.*) that are not routed experts: bytes per ggml type, the most
+    # first. The lookup tables outside the layers (token and per-layer embeddings) are not in it.
+    layer_format_bytes: tuple[tuple[str, int], ...]
+    experts: Optional[Experts]  # None for a model without routed experts
+
+    @property
+    def cpu_format(self) -> str:
+        """The ggml type the CPU computes the most of in a token: the routed experts' dominant
+        type, or the layers' for a model without routed experts."""
+        return self.experts.dominant_format if self.experts else self.layer_format_bytes[0][0]
+
+
 def _ranked(counts: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
     return tuple(sorted(counts.items(), key=lambda item: (-item[1], item[0])))
 
 
-def facts_from_headers(headers: Sequence[gguf_header.Header]) -> ModelFacts:
-    """ModelFacts of a model whose shards have HEADERS, in shard order."""
-    if not headers:
-        raise ValueError("a model needs at least one GGUF header")
-    kv: dict[str, object] = {}
-    for item in headers:
-        for key, value in item.kv.items():
-            kv.setdefault(key, value)
-    tensors = [tensor for item in headers for tensor in item.tensors]
-    routed = [tensor for tensor in tensors if is_role(tensor)]
-    if not routed:
-        raise ValueError(f"{headers[0].path}: the model has no routed expert tensors")
-    counts = {tensor.shape[2] for tensor in routed}
-    if len(counts) != 1:
-        raise ValueError("routed expert tensors disagree on the expert count: " + str(counts))
-    experts = counts.pop()
-    formats: dict[str, Counter[str]] = {role: Counter() for role in ROLES}
-    shapes: dict[str, Counter[tuple[int, int]]] = {role: Counter() for role in ROLES}
-    per_format: Counter[str] = Counter()
-    expert: Counter[tuple[int, int]] = Counter()
-    read: Counter[tuple[int, int]] = Counter()
-    for tensor in routed:
-        match = cast(re.Match[str], ROLE.match(tensor.name))
-        layer, role = int(match.group(1)), match.group(2)
-        formats[role][tensor.type_name] += 1
-        shapes[role][(tensor.shape[1], tensor.shape[0])] += 1
-        per_format[tensor.type_name] += tensor.nbytes
-        size = tensor.nbytes // experts
-        for index in range(experts):
-            expert[(layer, index)] += size
-            read[(layer, index)] += widened(tensor.offset + index * size, size)
-    missing = [role for role in ROLES if not formats[role]]
-    if missing:
-        raise ValueError("the model has no routed " + " or ".join(missing) + " expert tensors")
-    roles = {}
-    for role in ROLES:
-        (rows, cols), _ = max(sorted(shapes[role].items()), key=lambda item: item[1])
-        ranked = _ranked(formats[role])
-        for name, _ in ranked:
-            if name not in BLOCKS or cols % BLOCKS[name][0]:
-                raise ValueError(f"routed {role} tensors of type {name} have {cols} columns")
-        roles[role] = Role(role, ranked, rows, cols)
-    architecture = kv.get("general.architecture")
-    used = kv.get(f"{architecture}.expert_used_count") if isinstance(architecture, str) else None
+def routed_tensor(layer: int, role: str) -> str:
+    return f"blk.{layer}.ffn_{role}_exps.weight"
+
+
+def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
+    """ModelFacts of MODEL, the engine's facts of a model (inferssd.engine.model.validate)."""
+    experts = model["experts"]
+    routed: set[str] = set()
+    found: Optional[Experts] = None
+    if experts is not None:
+        formats, layers = experts["formats"], experts["layers"]
+        counts: dict[str, Counter[str]] = {role: Counter() for role in ROLES}
+        sizes: dict[str, dict[str, int]] = {role: {} for role in ROLES}
+        per_format: Counter[str] = Counter()
+        for _, index in layers:
+            for role in ROLES:
+                # ggml's type names, as the GGUF and every receipt spell them: Q4_K, MXFP4, IQ4_XS
+                name, size = formats[index][role]["type"].upper(), formats[index][role]["bytes"]
+                counts[role][name] += 1
+                sizes[role][name] = size
+                per_format[name] += size * experts["count"]
+        shapes = {
+            "gate": (experts["hidden"], experts["latent"]),
+            "up": (experts["hidden"], experts["latent"]),
+            "down": (experts["latent"], experts["hidden"]),
+        }
+        roles = {
+            role: Role(
+                role,
+                tuple((name, count, sizes[role][name]) for name, count in _ranked(counts[role])),
+                *shapes[role],
+            )
+            for role in ROLES
+        }
+        routed = {routed_tensor(layer, role) for layer, _ in layers for role in ROLES}
+        found = Experts(
+            layers=len(layers),
+            count=experts["count"],
+            used=experts["used"] or None,
+            gate=roles["gate"],
+            up=roles["up"],
+            down=roles["down"],
+            expert_bytes=experts["expert_bytes"],
+            expert_read_bytes=experts["expert_read_bytes"],
+            format_bytes=_ranked(per_format),
+        )
+    dense = [t for t in model["tensors"] if t["name"] not in routed]
+    per_type: Counter[str] = Counter()
+    for t in dense:
+        if t["name"].startswith("blk."):
+            per_type[t["type"].upper()] += t["bytes"]
+    if not per_type:
+        raise ValueError(f"{model['files'][0]}: the model has no layer tensors")
     return ModelFacts(
-        paths=tuple(item.path for item in headers),
-        architecture=architecture if isinstance(architecture, str) else None,
-        layers=len({layer for layer, _ in expert}),
-        experts=experts,
-        experts_used=used if isinstance(used, int) and not isinstance(used, bool) else None,
-        gate=roles["gate"],
-        up=roles["up"],
-        down=roles["down"],
-        expert_bytes=max(expert.values()),
-        expert_read_bytes=max(read.values()),
-        dense_bytes=sum(tensor.nbytes for tensor in tensors if not is_role(tensor)),
-        format_bytes=_ranked(per_format),
+        paths=tuple(model["files"]),
+        architecture=model["architecture"],
+        dense_bytes=sum(t["bytes"] for t in dense),
+        layer_format_bytes=_ranked(per_type),
+        experts=found,
     )
 
 
-def model_facts(path: str, *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
-    """ModelFacts of the model PATH names; a split model's first shard brings all of them."""
-    return facts_from_headers(
-        gguf_header.without_nextn(gguf_header.read_model(path, filesystem=filesystem))
-    )
-
-
-def shard_facts(paths: Sequence[str], *, filesystem: SourceFiles = LOCAL_FILES) -> ModelFacts:
-    """ModelFacts of exactly the shards PATHS, in their order."""
-    return facts_from_headers(
-        gguf_header.without_nextn([gguf_header.read(path, filesystem=filesystem) for path in paths])
-    )
-
-
-def _type_counts(value: object, field: str) -> None:
-    """A nonempty list of [ggml type name, positive count] pairs."""
+def _formats(value: object, field: str) -> None:
+    """A nonempty list of [ggml type name, layers, one expert's bytes] triples."""
     if not isinstance(value, list) or not value:
         raise ContractError(f"{field} must be a nonempty array")
     for index, item in enumerate(value):
-        if not isinstance(item, list) or len(item) != 2 or item[0] not in BLOCKS:
-            raise ContractError(f"{field}[{index}] must be [a ggml type name, a count]")
+        if not isinstance(item, list) or len(item) != 3 or not isinstance(item[0], str):
+            raise ContractError(f"{field}[{index}] must be [a ggml type name, layers, bytes]")
+        POSITIVE(item[1], f"{field}[{index}][1]")
+        POSITIVE(item[2], f"{field}[{index}][2]")
+
+
+def _type_bytes(value: object, field: str) -> None:
+    """A nonempty list of [ggml type name, positive bytes] pairs."""
+    if not isinstance(value, list) or not value:
+        raise ContractError(f"{field} must be a nonempty array")
+    for index, item in enumerate(value):
+        if not isinstance(item, list) or len(item) != 2 or not isinstance(item[0], str):
+            raise ContractError(f"{field}[{index}] must be [a ggml type name, bytes]")
         POSITIVE(item[1], f"{field}[{index}][1]")
 
 
-PAIRS: Check = _type_counts
-ROLE_RECORD = record({"formats": PAIRS, "rows": POSITIVE, "cols": POSITIVE})
+ROLE_RECORD = record({"formats": _formats, "rows": POSITIVE, "cols": POSITIVE})
+EXPERTS_RECORD = record(
+    {
+        "layers": POSITIVE,
+        "count": POSITIVE,
+        "used": nullable(POSITIVE),
+        "roles": record({role: ROLE_RECORD for role in ROLES}),
+        "expert_bytes": POSITIVE,
+        "expert_read_bytes": POSITIVE,
+        "format_bytes": _type_bytes,
+    }
+)
 MODEL_RECORD = record(
     {
         "paths": array(TEXT, minimum=1),
         "architecture": nullable(TEXT),
-        "layers": POSITIVE,
-        "experts": POSITIVE,
-        "experts_used": nullable(POSITIVE),
-        "roles": record({role: ROLE_RECORD for role in ROLES}),
-        "expert_bytes": POSITIVE,
-        "expert_read_bytes": POSITIVE,
         "dense_bytes": COUNT,
-        "format_bytes": PAIRS,
+        "layer_format_bytes": _type_bytes,
+        "experts": nullable(EXPERTS_RECORD),
     }
 )
 
 
-def _pairs(value: Sequence[tuple[str, int]]) -> list[list[object]]:
-    return [[name, count] for name, count in value]
-
-
 def model_facts_json(facts: ModelFacts) -> dict[str, object]:
     """FACTS as a JSON object; model_facts_from reads it back."""
+    experts = facts.experts
     return {
         "paths": list(facts.paths),
         "architecture": facts.architecture,
-        "layers": facts.layers,
-        "experts": facts.experts,
-        "experts_used": facts.experts_used,
-        "roles": {
-            role.name: {"formats": _pairs(role.formats), "rows": role.rows, "cols": role.cols}
-            for role in facts.roles
-        },
-        "expert_bytes": facts.expert_bytes,
-        "expert_read_bytes": facts.expert_read_bytes,
         "dense_bytes": facts.dense_bytes,
-        "format_bytes": _pairs(facts.format_bytes),
+        "layer_format_bytes": [list(item) for item in facts.layer_format_bytes],
+        "experts": None
+        if experts is None
+        else {
+            "layers": experts.layers,
+            "count": experts.count,
+            "used": experts.used,
+            "roles": {
+                role.name: {
+                    "formats": [list(item) for item in role.formats],
+                    "rows": role.rows,
+                    "cols": role.cols,
+                }
+                for role in experts.roles
+            },
+            "expert_bytes": experts.expert_bytes,
+            "expert_read_bytes": experts.expert_read_bytes,
+            "format_bytes": [list(item) for item in experts.format_bytes],
+        },
     }
-
-
-def _ranked_pairs(value: object) -> tuple[tuple[str, int], ...]:
-    return tuple((name, count) for name, count in cast(list[tuple[str, int]], value))
 
 
 def model_facts_from(value: object) -> ModelFacts:
     """ModelFacts from their JSON object; errors name the offending field."""
     MODEL_RECORD(value, "model_facts")
-    item = cast(dict[str, object], value)
-    roles = cast(dict[str, dict[str, object]], item["roles"])
-    built = {
-        name: Role(
-            name,
-            _ranked_pairs(roles[name]["formats"]),
-            cast(int, roles[name]["rows"]),
-            cast(int, roles[name]["cols"]),
+    item = cast(dict[str, Any], value)
+    experts = cast(Optional[dict[str, Any]], item["experts"])
+    found: Optional[Experts] = None
+    if experts is not None:
+        roles = cast(dict[str, dict[str, Any]], experts["roles"])
+        built = {
+            name: Role(
+                name,
+                tuple((format, layers, size) for format, layers, size in roles[name]["formats"]),
+                roles[name]["rows"],
+                roles[name]["cols"],
+            )
+            for name in ROLES
+        }
+        found = Experts(
+            layers=experts["layers"],
+            count=experts["count"],
+            used=experts["used"],
+            gate=built["gate"],
+            up=built["up"],
+            down=built["down"],
+            expert_bytes=experts["expert_bytes"],
+            expert_read_bytes=experts["expert_read_bytes"],
+            format_bytes=tuple((name, size) for name, size in experts["format_bytes"]),
         )
-        for name in ROLES
-    }
-    for role in built.values():
-        if any(role.cols % BLOCKS[name][0] for name, _ in role.formats):
-            raise ContractError(f"model_facts.roles.{role.name}: cols fit no block of its types")
     return ModelFacts(
-        paths=tuple(cast(list[str], item["paths"])),
-        architecture=cast(Optional[str], item["architecture"]),
-        layers=cast(int, item["layers"]),
-        experts=cast(int, item["experts"]),
-        experts_used=cast(Optional[int], item["experts_used"]),
-        gate=built["gate"],
-        up=built["up"],
-        down=built["down"],
-        expert_bytes=cast(int, item["expert_bytes"]),
-        expert_read_bytes=cast(int, item["expert_read_bytes"]),
-        dense_bytes=cast(int, item["dense_bytes"]),
-        format_bytes=_ranked_pairs(item["format_bytes"]),
+        paths=tuple(item["paths"]),
+        architecture=item["architecture"],
+        dense_bytes=item["dense_bytes"],
+        layer_format_bytes=tuple((name, size) for name, size in item["layer_format_bytes"]),
+        experts=found,
     )
 
 
