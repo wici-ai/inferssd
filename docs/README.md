@@ -12,6 +12,7 @@
 - [Deployment resources](engine-resources.md): engine descriptors for installations outside a checkout.
 - [Machine profile](machine-profile.md): what `inferssd profile` measures, where it keeps the result, and its speed estimates.
 - [Usage events](usage-events.md): the request and token counts the server records for its host.
+- [DeepSeek-V4.1 Engram](deepseek-v41-engram.md): the Engram layouts of published GGUFs, and a table kept apart from the model (`--ple`).
 - [Framework commands](../framework/README.md): `serve`, `cli` and `profile`, typed settings and the owned launch.
 - [简体中文](README.zh-CN.md): the project README in Simplified Chinese.
 
@@ -32,6 +33,5 @@
 
 ## Development
 
-- [DeepSeek IQ2_XS](deepseek-iq2-xs.md): shared Engram compatibility, mixed-IQ tests and single-GPU validation.
 - [GPU prefill overhead](development/prefill-overhead.md): the placement cost model for batched GPU work.
 

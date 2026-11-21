@@ -71,8 +71,11 @@ host.headroom_mib = 3072 # operator resource reserve
 vram.budget = auto # use admitted capacity
 ```
 
-A model must be a local GGUF or the first shard of a complete set. An omitted
-`expert.source` names that set, and the engine indexes the routed experts from the
+A model must be a local GGUF or the first shard of a split set. `--ple FILE`
+(or `--shard`, repeatable, comma separated) adds its extra shards, such as a
+per-layer embedding table kept apart from it ([DeepSeek-V4.1
+Engram](../docs/deepseek-v41-engram.md)). An omitted `expert.source` names the
+files the engine loads the model from, and the engine indexes the routed experts from the
 GGUF headers; explicit sources must be nonempty existing paths (GGUF files, expert
 packs or alias indexes). Native source validation remains a separate boundary. `serve` and `cli` download a tested model with `-hf`, or take
 a local one with `-m`. Other compute processes on the GPU do not stop a launch:
@@ -80,7 +83,7 @@ it leaves them VRAM (`vram.reserve_mib` in the [settings](../docs/configuration.
 
 The framework reads no GGUF file itself. Before it starts a server, a launch
 asks that server for the model's facts (`inferssd-server --ssd-model-facts
-MODEL`): the engine reads the headers as its load does, without reading a weight
+MODEL`, with the model's `--shard` values): the engine reads the headers as its load does, without reading a weight
 or starting a backend, and prints its files, metadata, tensors and the layout of
 the routed experts as JSON (`inferssd.engine.model`). The strategy and the RAM
 admission take their model facts from it, and a recorded dry run takes them from
