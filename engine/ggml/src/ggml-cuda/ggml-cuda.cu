@@ -1322,11 +1322,9 @@ static int ggml_cuda_oom_reclaimer_invoke(int device, size_t requested_bytes, si
 }
 
 #ifdef GGML_CUDA_USE_CUB
-// A CUB scratch-size query can itself report OOM before the graph has run.
+// A CUB scratch-size query can itself report OOM before the graph has run (the reserve sizes the pool by it): have the
+// current device's cache give memory back, as for the other allocations it makes.
 bool ggml_cuda_reclaim_cub_query_oom() {
-    if (ggml_backend_cuda_get_device_count() != 1) {
-        return false;
-    }
     (void) cudaGetLastError();
     size_t freed = 0;
     const int device = ggml_cuda_get_device();
@@ -3608,7 +3606,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 // the most that ggml_cuda_mul_mat_id takes from the memory pool
-static size_t ggml_cuda_mul_mat_id_pool_size(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+static size_t ggml_cuda_mul_mat_id_pool_size(const ggml_backend_cuda_context & ctx, const ggml_tensor * dst,
+        bool * needs_cublas = nullptr) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
@@ -3677,7 +3676,7 @@ static size_t ggml_cuda_mul_mat_id_pool_size(const ggml_backend_cuda_context & c
     dst_slice.nb[2]  = dst_slice.ne[1] * dst_slice.nb[1];
     dst_slice.nb[3]  = dst_slice.ne[2] * dst_slice.nb[2];
 
-    return size + ggml_cuda_mul_mat_pool_size(ctx, &src0_slice, &src1_slice, &dst_slice);
+    return size + ggml_cuda_mul_mat_pool_size(ctx, &src0_slice, &src1_slice, &dst_slice, needs_cublas);
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
@@ -6039,7 +6038,7 @@ static size_t ggml_cuda_op_pool_size(ggml_backend_cuda_context & ctx, ggml_tenso
         case GGML_OP_MUL_MAT:
             return ggml_cuda_mul_mat_pool_size(ctx, node->src[0], node->src[1], node, &needs_cublas);
         case GGML_OP_MUL_MAT_ID:
-            return ggml_cuda_mul_mat_id_pool_size(ctx, node);
+            return ggml_cuda_mul_mat_id_pool_size(ctx, node, &needs_cublas);
         case GGML_OP_ARGSORT:
             return ggml_cuda_op_argsort_pool_size(node);
         case GGML_OP_TOP_K:
@@ -6098,11 +6097,9 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
         }
     }
 #endif // USE_CUDA_GRAPH
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
-    // On a single CUDA device the dense prefill graph uses this context's handle.
-    // Create it while the SSD tier can still return blocks to the allocator.
-    if (needs_cublas && cuda_ctx->pool_hold && !cuda_ctx->cublas_handles[cuda_ctx->device] &&
-            ggml_backend_cuda_get_device_count() == 1) {
+    // A graph that multiplies through cuBLAS creates the context's handle on first use, which allocates device memory
+    // outside the pool: create it here, while the device's cache can still give memory back.
+    if (needs_cublas && cuda_ctx->pool_hold && !cuda_ctx->cublas_handles[cuda_ctx->device]) {
         auto & entry = g_cuda_oom_reclaimers[cuda_ctx->device];
         bool registered;
         {
@@ -6118,7 +6115,6 @@ static bool ggml_backend_cuda_graph_reserve(ggml_backend_t backend, ggml_cgraph 
             GGML_LOG_INFO("%s: device %d prepared cuBLAS handle for prefill\n", __func__, cuda_ctx->device);
         }
     }
-#endif
     return true;
 }
 

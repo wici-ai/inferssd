@@ -31,8 +31,8 @@ static int cannot_reclaim(void *, size_t requested, size_t * freed) {
 }
 
 int main() {
-    if (ggml_backend_cuda_get_device_count() != 1) {
-        std::fprintf(stderr, "This fixture requires one visible NVIDIA GPU.\n");
+    if (ggml_backend_cuda_get_device_count() < 1) {
+        std::fprintf(stderr, "This fixture requires a visible NVIDIA GPU.\n");
         return EXIT_FAILURE;
     }
     auto backend = ggml_backend_cuda_init(0);
