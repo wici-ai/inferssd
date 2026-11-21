@@ -43,10 +43,12 @@ def cpu_count(value: str) -> str:
     return str(len(seen)) if seen else ""
 
 
-def model_facts(binary: str, path: str, run: engine_model.Run) -> object:
-    """The model_facts fact of the model PATH as the server BINARY would load it
-    (inferssd.strategy.inputs)."""
-    model = engine_model.query(binary, path, run)
+def model_facts(
+    binary: str, path: str, run: engine_model.Run, shards: Sequence[str] = ()
+) -> object:
+    """The model_facts fact of the model PATH, with its --shard/--ple values SHARDS, as the
+    server BINARY would load it (inferssd.strategy.inputs)."""
+    model = engine_model.query(binary, path, run, shards)
     return strategy_inputs.model_facts_json(strategy_inputs.facts_from_engine(model))
 
 
@@ -227,9 +229,13 @@ class LiveArtifacts:
         if name == "model_drive_key":
             return strategy_inputs.model_drive_key(args, self.strategy_host)
         if name == "model_facts":
-            # The engine's facts of the model ARGS[1], as the server ARGS[0] would load it.
+            # The engine's facts of the model ARGS[1] with its shards ARGS[2:], as the server
+            # ARGS[0] would load it.
             return model_facts(
-                args[0], args[1], lambda argv: host.command(argv, timeout=engine_model.TIMEOUT_S)
+                args[0],
+                args[1],
+                lambda argv: host.command(argv, timeout=engine_model.TIMEOUT_S),
+                args[2:],
             )
         if name == "engine_gpu_backends":
             # The build the server executable came from: build/bin/inferssd-server lies beside

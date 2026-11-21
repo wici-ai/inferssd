@@ -31,6 +31,16 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
             "-hf", "--hf-repo", help="README Hugging Face repository[:quantization]"
         )
         source.add_argument("-m", "--model", type=Path, help="local first GGUF shard (no download)")
+        parser.add_argument(
+            "--ple",
+            "--shard",
+            dest="shards",
+            action="append",
+            default=[],
+            metavar="FNAME,...",
+            help="extra GGUF shards of the model, comma separated, repeatable: a per-layer "
+            "embedding table kept apart from the model, say",
+        )
         parser.add_argument("--revision", default="main", help="Hugging Face revision")
         parser.add_argument("--model-dir", type=Path, default=data_directory() / "models")
         parser.add_argument(
@@ -150,6 +160,8 @@ def run(args: argparse.Namespace) -> int:
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
+    for shard in args.shards:
+        command.extend(["--shard", shard])
     if args.context is not None:
         command.extend(["--context", str(args.context)])
     for name in ("settings", "machine"):

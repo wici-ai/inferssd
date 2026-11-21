@@ -54,7 +54,8 @@
         ],
         "model_facts": {
           "paths": [
-            "/models/DeepSeek-V4.1-00001-of-00002.gguf"
+            "/models/DeepSeek-V4.1-00001-of-00002.gguf",
+            "/models/DeepSeek-V4.1-00002-of-00002.gguf"
           ],
           "architecture": "deepseek41",
           "dense_bytes": 6410240,
@@ -363,7 +364,9 @@
         "platform_machine": "arm64",
         "model_facts": {
           "paths": [
-            "/Volumes/models/muse-spark-00001-of-00003.gguf"
+            "/Volumes/models/muse-spark-00001-of-00003.gguf",
+            "/Volumes/models/muse-spark-00002-of-00003.gguf",
+            "/Volumes/models/muse-spark-00003-of-00003.gguf"
           ],
           "architecture": "muse-spark",
           "dense_bytes": 5488640,
@@ -498,7 +501,8 @@
         "euid": 0,
         "model_facts": {
           "paths": [
-            "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf"
+            "/models/Qwen3.8-Flash-Next-Q8_0-00001-of-00002.gguf",
+            "/models/Qwen3.8-Flash-Next-Q8_0-00002-of-00002.gguf"
           ],
           "architecture": "qwen4exp",
           "dense_bytes": 3287040,
@@ -638,7 +642,12 @@
         "platform_system": "Windows",
         "model_facts": {
           "paths": [
-            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf"
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf",
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf",
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf",
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf",
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf",
+            "C:\\models\\Qwen3.8-Flash-Next-GGUF\\Q8_0\\Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf"
           ],
           "architecture": "qwen4exp",
           "dense_bytes": 3287040,

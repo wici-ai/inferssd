@@ -111,10 +111,16 @@ def validate(value: object) -> dict[str, Any]:
     return model
 
 
-def query(binary: str, path: str, run: Run) -> dict[str, Any]:
-    """The facts of the model PATH (a GGUF file or a split model's first shard) from BINARY."""
+def query(binary: str, path: str, run: Run, shards: Sequence[str] = ()) -> dict[str, Any]:
+    """The facts of the model PATH (a GGUF file or a split model's first shard) from BINARY.
+
+    SHARDS are the model's --shard/--ple values, as the server takes them: the facts name
+    the files the engine loads the model from, theirs among them."""
+    argv = [binary, "--ssd-model-facts", path]
+    for shard in shards:
+        argv += ["--shard", shard]
     try:
-        done = run([binary, "--ssd-model-facts", path])
+        done = run(argv)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         raise ValueError(f"cannot read the model {path}: {error}") from error
     if done.returncode != 0:

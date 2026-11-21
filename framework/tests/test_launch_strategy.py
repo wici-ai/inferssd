@@ -433,6 +433,16 @@ def test_live_model_facts_are_the_engines(tmp_path):
         *deepseek_like(), path=model
     )
     assert asked == [(["/bin/server", "--ssd-model-facts", model], 120.0)]
+    # the model's --shard/--ple values reach the engine as the server takes them
+    asked.clear()
+    adapter(Fact("model_facts", ("/bin/server", model, "/t/table.gguf", "a.gguf,b.gguf")))
+    assert asked == [
+        (
+            ["/bin/server", "--ssd-model-facts", model]
+            + ["--shard", "/t/table.gguf", "--shard", "a.gguf,b.gguf"],
+            120.0,
+        )
+    ]
     printed["model"] = None
     with pytest.raises(ValueError, match="the engine cannot read the model .*: no such file"):
         adapter(Fact("model_facts", ("/bin/server", model)))

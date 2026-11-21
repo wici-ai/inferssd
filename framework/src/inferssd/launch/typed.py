@@ -83,6 +83,10 @@ class LaunchSpec:
     prompt_cache: Optional[str] = None
     # The IPv4 address the server listens on; see listen_host.
     host: str = LOOPBACK
+    # The model's extra GGUF shards, the server's --shard/--ple values as given (comma separated
+    # paths, any number of them): a per-layer embedding table kept apart from the model, say. The
+    # engine's facts name the files the model loads from.
+    shards: tuple[str, ...] = ()
 
 
 def listen_host(text: str) -> str:
@@ -244,6 +248,8 @@ def _resolve(
     protected = {
         "-m",
         "--model",
+        "--shard",
+        "--ple",
         "--model-url",
         "-hf",
         "--hf-repo",
@@ -339,19 +345,6 @@ def _resolve(
     # Host paths follow the launch platform's conventions, wherever this resolver runs.
     os_path = ntpath if platform == "windows" else posixpath
     model = s.text("resolved_path", spec.model)
-    match = re.fullmatch(r"(.+)-(\d{5})-of-(\d{5})\.gguf", os_path.basename(model))
-    paths = [model]
-    if match:
-        prefix, first, count = match.groups()
-        if first != "00001" or not 1 <= int(count) <= 100000:
-            raise ValueError("--model must name the first GGUF shard")
-        paths = [
-            os_path.join(os_path.dirname(model), f"{prefix}-{i:05d}-of-{count}.gguf")
-            for i in range(1, int(count) + 1)
-        ]
-    for path in paths:
-        if not s.value("is_file", path):
-            raise ValueError("missing GGUF shard: " + path)
     resources = spec.resources
     if resources is not None and resources.platform not in (None, platform):
         raise ValueError("engine resource platform differs from the selected platform")
@@ -363,8 +356,14 @@ def _resolve(
     binary = s.text("resolved_path", binary_path)
     if not s.value("is_file", binary) or not s.value("is_executable", binary):
         raise ValueError("missing server executable: " + binary)
-    # The engine's facts of the model, read once for the profile and the strategy.
-    facts = model_facts_from(s.value("model_facts", binary, model))
+    # The engine's facts of the model, read once for the profile and the strategy. They name the
+    # files the engine loads the model from: its shards, as its split numbering and any --shard
+    # values give them.
+    facts = model_facts_from(s.value("model_facts", binary, model, *spec.shards))
+    paths = list(facts.paths)
+    for path in paths:
+        if not s.value("is_file", path):
+            raise ValueError("missing GGUF file: " + path)
     experts = facts.experts is not None
     profile = s.inputs.profile or ARCHITECTURES.get(facts.architecture or "")
     if not profile and experts:
@@ -551,7 +550,10 @@ def _resolve(
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
-    command = [binary, "-m", model, "--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    command = [binary, "-m", model]
+    for shard in spec.shards:
+        command += ["--shard", shard]
+    command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
     for item in value.entries:
         if item.origin == "cli":
             command += [
@@ -596,6 +598,7 @@ def _resolve(
         command += ["--cache-ram", "0"]
     else:
         # One directory per model, named as its file is without the shard suffix.
+        match = re.fullmatch(r"(.+)-\d{5}-of-\d{5}\.gguf", os_path.basename(model))
         name = match.group(1) if match else os_path.basename(model)
         if name.endswith(".gguf"):
             name = name[: -len(".gguf")]

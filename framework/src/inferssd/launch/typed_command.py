@@ -55,6 +55,16 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
     launch.add_argument("--resources", type=Path, help="inferssd-engine 1 deployment descriptor")
     launch.add_argument("--template", type=Path, help="explicit chat template, overrides resources")
     launch.add_argument("--model", type=Path, required=True)
+    launch.add_argument(
+        "--ple",
+        "--shard",
+        dest="shards",
+        action="append",
+        default=[],
+        metavar="FNAME,...",
+        help="extra GGUF shards of the model, as the server takes them: comma separated, "
+        "repeatable (a per-layer embedding table kept apart from the model, say)",
+    )
     launch.add_argument("--runtime-policy", type=Path, required=True)
     launch.add_argument(
         "--output-dir",
@@ -160,6 +170,7 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
+        tuple(args.shards),
     )
 
 
