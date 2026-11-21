@@ -977,14 +977,6 @@ llama_build_and_test(ssd/test-dsv41-engram.cpp)
 target_include_directories(test-dsv41-engram PRIVATE ../src)
 inferssd_ci_test(test-dsv41-engram test-dsv41-engram)
 
-# Pure metadata admission: no weights, backend or device needed.
-add_executable(test-dsv41-ple ssd/test-dsv41-ple.cpp)
-target_compile_features(test-dsv41-ple PRIVATE cxx_std_17)
-target_include_directories(test-dsv41-ple PRIVATE ../src)
-add_test(NAME test-dsv41-ple COMMAND test-dsv41-ple)
-set_property(TEST test-dsv41-ple PROPERTY LABELS unit)
-inferssd_ci_test(test-dsv41-ple test-dsv41-ple)
-
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     llama_build(ssd/test-llama-mmap-random.cpp)
     target_include_directories(test-llama-mmap-random PRIVATE ${PROJECT_SOURCE_DIR}/src)

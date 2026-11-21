@@ -11,13 +11,16 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model.h"
+#include "../src/llama-model-loader.h"
 #include "../src/ssd/dense-homes.h"
 #include "../src/llama-model-saver.h"
+#include "../src/models/deepseek41-engram.h"
 
 #include <algorithm>
 #include <functional>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
@@ -98,6 +101,8 @@ static const std::vector<uint64_t>   DSV41_ENGRAM_MULTIPLIERS = { 76632096046245
                                                                   67716810739261ull, 51510806800915ull, 30921347202721ull };
 static const std::vector<uint64_t>   DSV41_ENGRAM_PRIMES     = { 101, 103, 107, 109,   113, 127, 131, 137 };
 static const std::vector<uint64_t>   DSV41_ENGRAM_OFFSETS    = {   0, 101, 204, 311,     0, 113, 240, 371 };
+// the tokens the compressed token map marks -1; the pad token is 2, compressed 2
+static const std::array<llama_token, 2> DSV41_ENGRAM_DEAD_TOKENS = { 5, 70 };
 
 // n_nextn NextN blocks follow the model's blocks in the file, which counts them in block_count and
 // sizes its per-block metadata for them too.
@@ -264,6 +269,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         std::vector<int32_t> token_map(n_vocab);
         for (uint32_t i = 0; i < n_vocab; ++i) {
             token_map[i] = (int32_t) (i % 61);
+        }
+        // tokens no n-gram reaches across
+        for (const llama_token dead : DSV41_ENGRAM_DEAD_TOKENS) {
+            token_map[dead] = -1;
         }
         const LLM_KV kv(arch);
         ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,     std::vector<uint32_t>(DSV41_ENGRAM_LAYERS.begin(), DSV41_ENGRAM_LAYERS.end()));
@@ -1470,6 +1479,220 @@ static void test_engram_files(const llama_model * model, const gguf_context * kv
     printf("%s: %d identical-logit loads, %d invalid inputs refused\n", __func__, accepted, rejected);
 }
 
+// One Engram in each layout a GGUF stores: engram.*, ple.* (one table, offsets running on across the layers, the pad
+// named by its token) and antirez's e4m3_e8m0_32_row264 (8 heads of 256 over 4-grams in two layers, U32 arrays, each
+// layer's offsets from its prime sums). Each reader gives the same parameters, and the one hash the same rows: ple.*'s
+// offset by the rows of the layers before.
+static int test_engram_readers(const size_t seed) {
+    const llm_arch arch = LLM_ARCH_DEEPSEEK41;
+    const LLM_KV kv(arch);
+    const uint32_t n_gram = 4, n_head = 8, key = 256, n_cols = (n_gram - 1)*n_head;
+    const std::array<uint32_t, 2> layers = { 1, 3 };
+    const uint32_t vocab = 128, compressed = 97, pad = 2;
+
+    std::mt19937_64 gen(seed);
+    std::vector<int32_t> token_map(vocab);
+    for (auto & id : token_map) {
+        id = int32_t(gen() % compressed);
+    }
+    uint32_t pad_token = vocab - 1; // a token other than the pad's compressed id stands for it
+    token_map[pad_token] = (int32_t) pad;
+    std::vector<uint64_t> mult(layers.size()*n_gram);
+    for (auto & m : mult) {
+        m = (gen() % (uint64_t(1) << 37)) | 1; // odd, and below INT64_MAX / compressed
+    }
+    std::vector<uint64_t> primes(layers.size()*n_cols), offsets(primes.size()), global(primes.size());
+    std::vector<uint32_t> rows(layers.size());
+    uint64_t base = 0;
+    for (size_t e = 0; e < layers.size(); ++e) {
+        uint64_t offset = 0;
+        for (uint32_t c = 0; c < n_cols; ++c) {
+            const size_t k = e*n_cols + c;
+            primes[k]  = 1009 + gen() % 50000;
+            offsets[k] = offset;
+            global[k]  = base + offset;
+            offset    += primes[k];
+        }
+        rows[e] = (uint32_t) offset;
+        base   += offset;
+    }
+
+    auto layout = [&](int which) {
+        gguf_context_ptr g = get_gguf_ctx(arch, moe_mandatory(arch));
+        for (const llm_kv k : { LLM_KV_ENGRAM_LAYER_IDS, LLM_KV_ENGRAM_HEAD_COUNT, LLM_KV_ENGRAM_KEY_LENGTH,
+                                LLM_KV_ENGRAM_MAX_NGRAM_SIZE, LLM_KV_ENGRAM_PAD_ID, LLM_KV_ENGRAM_MULTIPLIERS,
+                                LLM_KV_ENGRAM_PRIMES, LLM_KV_ENGRAM_OFFSETS, LLM_KV_ENGRAM_TOKEN_MAP }) {
+            GGML_ASSERT(gguf_remove_key(g.get(), kv(k).c_str()) >= 0);
+        }
+        gguf_context * c = g.get();
+        const std::vector<uint32_t> ids(layers.begin(), layers.end());
+        if (which == 1) {
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_LAYERS).c_str(), GGUF_TYPE_UINT32, ids.data(), ids.size());
+            gguf_set_val_u32 (c, kv(LLM_KV_PLE_HEADS_PER_NGRAM).c_str(), n_head);
+            gguf_set_val_u32 (c, kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER).c_str(), key);
+            gguf_set_val_u32 (c, kv(LLM_KV_PLE_NGRAM_SIZE).c_str(), n_gram);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(), pad_token);
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, mult.data(), mult.size());
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(), GGUF_TYPE_UINT64, primes.data(), primes.size());
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(), GGUF_TYPE_UINT64, global.data(), global.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_INT32, token_map.data(), token_map.size());
+            return g;
+        }
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_LAYER_IDS).c_str(), GGUF_TYPE_UINT32, ids.data(), ids.size());
+        gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_PAD_ID).c_str(), pad);
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, mult.data(), mult.size());
+        if (which == 0) {
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_HEAD_COUNT).c_str(), n_head);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_KEY_LENGTH).c_str(), key);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE).c_str(), n_gram);
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_PRIMES).c_str(), GGUF_TYPE_UINT64, primes.data(), primes.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_OFFSETS).c_str(), GGUF_TYPE_UINT64, offsets.data(), offsets.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_INT32, token_map.data(), token_map.size());
+            return g;
+        }
+        // antirez's files name the model's other hyperparameters after its config.json
+        auto value = [&](llm_kv from, double fallback) -> double {
+            const int64_t id = gguf_find_key(c, kv(from).c_str());
+            if (id < 0) {
+                GGML_ASSERT(!std::isnan(fallback));
+                return fallback;
+            }
+            gguf_type type = gguf_get_kv_type(c, id);
+            const void * data = gguf_get_val_data(c, id);
+            if (type == GGUF_TYPE_ARRAY) {
+                type = gguf_get_arr_type(c, id);
+                data = gguf_get_arr_data(c, id);
+            }
+            switch (type) {
+                case GGUF_TYPE_UINT32:  return *(const uint32_t *) data;
+                case GGUF_TYPE_INT32:   return *(const int32_t *) data;
+                case GGUF_TYPE_FLOAT32: return *(const float *) data;
+                case GGUF_TYPE_BOOL:    return *(const int8_t *) data;
+                default:                GGML_ABORT("unexpected type of %s", kv(from).c_str());
+            }
+        };
+        const struct { const char * name; llm_kv from; gguf_type type; double fallback; } renamed[] = {
+            { "max_position_embeddings", LLM_KV_CONTEXT_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "hidden_size", LLM_KV_EMBEDDING_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "num_hidden_layers", LLM_KV_BLOCK_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "n_routed_experts", LLM_KV_EXPERT_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_experts_per_tok", LLM_KV_EXPERT_USED_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_attention_heads", LLM_KV_ATTENTION_HEAD_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_key_value_heads", LLM_KV_ATTENTION_HEAD_COUNT_KV, GGUF_TYPE_UINT32, 1 },
+            { "rope_scaling.original_max_position_embeddings", LLM_KV_CONTEXT_LENGTH, GGUF_TYPE_FLOAT32, NAN },
+            { "rope_theta", LLM_KV_ROPE_FREQ_BASE, GGUF_TYPE_UINT32, 10000 },
+            { "rope_scaling.factor", LLM_KV_ROPE_SCALING_FACTOR, GGUF_TYPE_FLOAT32, 1 },
+            { "head_dim", LLM_KV_ATTENTION_KEY_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "qk_rope_head_dim", LLM_KV_ROPE_DIMENSION_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "rms_norm_eps", LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, GGUF_TYPE_FLOAT32, NAN },
+            { "q_lora_rank", LLM_KV_ATTENTION_Q_LORA_RANK, GGUF_TYPE_UINT32, NAN },
+            { "sliding_window", LLM_KV_ATTENTION_SLIDING_WINDOW, GGUF_TYPE_UINT32, NAN },
+            { "moe_intermediate_size", LLM_KV_EXPERT_FEED_FORWARD_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "n_shared_experts", LLM_KV_EXPERT_SHARED_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "routed_scaling_factor", LLM_KV_EXPERT_WEIGHTS_SCALE, GGUF_TYPE_FLOAT32, 1 },
+            { "norm_topk_prob", LLM_KV_EXPERT_WEIGHTS_NORM, GGUF_TYPE_BOOL, 1 },
+            { "swiglu_limit", LLM_KV_SWIGLU_CLAMP_EXP, GGUF_TYPE_FLOAT32, NAN },
+            { "index_n_heads", LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "index_head_dim", LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "index_topk", LLM_KV_ATTENTION_INDEXER_TOP_K, GGUF_TYPE_UINT32, NAN },
+            { "o_groups", LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "o_lora_rank", LLM_KV_ATTENTION_OUTPUT_LORA_RANK, GGUF_TYPE_UINT32, NAN },
+            { "hc_mult", LLM_KV_HYPER_CONNECTION_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "hc_sinkhorn_iters", LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, GGUF_TYPE_UINT32, NAN },
+            { "hc_eps", LLM_KV_HYPER_CONNECTION_EPSILON, GGUF_TYPE_FLOAT32, NAN },
+            { "compress_rope_theta", LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, GGUF_TYPE_UINT32, NAN },
+            { "rope_scaling.beta_fast", LLM_KV_ROPE_SCALING_YARN_BETA_FAST, GGUF_TYPE_FLOAT32, 32 },
+            { "rope_scaling.beta_slow", LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, GGUF_TYPE_FLOAT32, 1 },
+        };
+        for (const auto & r : renamed) {
+            const std::string name = std::string("deepseek41.") + r.name;
+            const double v = value(r.from, r.fallback);
+            switch (r.type) {
+                case GGUF_TYPE_UINT32:  gguf_set_val_u32 (c, name.c_str(), (uint32_t) v); break;
+                case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (c, name.c_str(), (float) v); break;
+                default:                gguf_set_val_bool(c, name.c_str(), v != 0); break;
+            }
+        }
+        const int64_t ratios = gguf_find_key(c, kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str());
+        GGML_ASSERT(ratios >= 0);
+        gguf_set_arr_data(c, "deepseek41.compress_ratios", gguf_get_arr_type(c, ratios), gguf_get_arr_data(c, ratios),
+                          gguf_get_arr_n(c, ratios));
+        gguf_set_val_str(c, "deepseek41.scoring_func", "sqrtsoftplus");
+
+        const std::vector<uint32_t> primes32(primes.begin(), primes.end());
+        const std::vector<uint32_t> map32(token_map.begin(), token_map.end());
+        gguf_set_val_str (c, kv(LLM_KV_ENGRAM_ENCODING).c_str(), "e4m3_e8m0_32_row264");
+        gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE).c_str(), compressed);
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_ROWS).c_str(), GGUF_TYPE_UINT32, rows.data(), rows.size());
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_PRIMES).c_str(), GGUF_TYPE_UINT32, primes32.data(), primes32.size());
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_UINT32, map32.data(), map32.size());
+        return g;
+    };
+
+    // a prompt of two sequences' worth of positions; its predecessors are its own tokens
+    const uint32_t n_tokens = 40;
+    std::vector<llama_token> tokens(n_tokens);
+    std::vector<llama_pos> pos(n_tokens);
+    std::vector<llama_token> prev(n_tokens*(n_gram - 1));
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        tokens[i] = llama_token(gen() % vocab);
+        pos[i]    = llama_pos(i < 25 ? i : i - 25);
+        for (uint32_t s = 1; s < n_gram; ++s) {
+            prev[i*(n_gram - 1) + (n_gram - 1 - s)] = pos[i] >= (llama_pos) s ? tokens[i - s] : LLAMA_TOKEN_NULL;
+        }
+    }
+
+    const char * names[3] = { "engram.*", "ple.*", "e4m3_e8m0_32_row264" };
+    std::vector<int32_t> found[3];
+    int failures = 0;
+    for (int which = 0; which < 3; ++which) {
+        // the metadata read as a load reads it, up to the hyperparameters (as llama_ssd_model_facts does)
+        gguf_context_ptr g = layout(which);
+        std::vector<std::string> splits;
+        llama_model_loader ml(g.get(), nullptr, nullptr, "", splits, nullptr, /* use_mmap */ false,
+            /* use_direct_io */ false, /* check_tensors */ false, /* defer_experts */ false, /* no_alloc */ true,
+            nullptr, nullptr);
+        llama_model m(llama_model_default_params());
+        try {
+            m.load_arch(ml);
+            m.load_hparams(ml);
+        } catch (const std::exception & error) {
+            printf("%s: the %s reader refused its metadata: %s\n", __func__, names[which], error.what());
+            return 1;
+        }
+        const bool same = m.engram_n_layer == layers.size() && m.engram_pad_id == pad && m.engram_token_map == token_map &&
+            m.engram_multipliers == mult && m.engram_primes == primes &&
+            m.engram_offsets == (which == 1 ? global : offsets) &&
+            m.hparams.engram_n_head == n_head && m.hparams.engram_key_length == key &&
+            m.hparams.engram_max_ngram_size == n_gram;
+        if (!same) {
+            printf("%s: the %s reader's parameters differ\n", __func__, names[which]);
+            ++failures;
+        }
+        for (uint32_t e = 0; e < m.engram_n_layer; ++e) {
+            const llama_dsv41_engram_hash_params hp = {
+                n_gram, n_head, m.engram_multipliers.data() + e*n_gram, m.engram_primes.data() + e*n_cols,
+                m.engram_offsets.data() + e*n_cols, m.engram_token_map.data(), m.engram_token_map.size(), m.engram_pad_id,
+            };
+            std::vector<int32_t> out(n_tokens*n_cols);
+            llama_dsv41_engram_hash(hp, n_tokens, tokens.data(), pos.data(), prev.data(), out.data());
+            const uint64_t first = which == 1 ? global[e*n_cols] : 0; // ple.*: the rows of the layers before
+            for (auto & row : out) {
+                found[which].push_back(row - (int32_t) first);
+            }
+        }
+    }
+    for (int which = 1; which < 3; ++which) {
+        if (found[which] != found[0]) {
+            printf("%s: the %s rows differ from the engram.* rows\n", __func__, names[which]);
+            ++failures;
+        }
+    }
+    printf("%s: engram.*, ple.* and e4m3_e8m0_32_row264 readers: %s (%zu rows each)\n", __func__,
+           failures ? "DIFFERENT" : "identical", found[0].size());
+    return failures;
+}
+
 static int test_engram_layouts(const size_t seed, const ggml_log_level log_level) {
     const llm_arch arch = LLM_ARCH_DEEPSEEK41;
     const LLM_KV kv(arch);
@@ -1510,7 +1733,8 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
     gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_HEADS_PER_NGRAM).c_str(),        DSV41_ENGRAM_HEADS);
     gguf_set_val_u32 (ctx, kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER).c_str(), DSV41_ENGRAM_KEY_LENGTH);
     gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_NGRAM_SIZE).c_str(),             DSV41_ENGRAM_NGRAM);
-    gguf_set_val_u32 (ctx, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(),        2);
+    // ple.* names the pad by a token whose compressed id is the engram.* pad id: 63 % 61 = 2
+    gguf_set_val_u32 (ctx, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(),        63);
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, DSV41_ENGRAM_MULTIPLIERS.data(), DSV41_ENGRAM_MULTIPLIERS.size());
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(),  GGUF_TYPE_UINT64, DSV41_ENGRAM_PRIMES.data(),      DSV41_ENGRAM_PRIMES.size());
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(),      GGUF_TYPE_UINT64, offsets.data(),                  offsets.size());
@@ -1562,17 +1786,22 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
             throw std::runtime_error("failed to create llama context");
         }
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
-        logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
+        // the prompt crosses the tokens the map marks -1
+        std::vector<llama_token> tokens = get_tokens(32, n_vocab, seed);
+        tokens[4]  = DSV41_ENGRAM_DEAD_TOKENS[0];
+        tokens[20] = DSV41_ENGRAM_DEAD_TOKENS[1];
+        logits[i] = get_logits(model.get(), lctx.get(), tokens);
         if (i == 1) {
-            test_engram_files(model.get(), one_table.get(), model_params, ctx_params, get_tokens(32, n_vocab, seed), logits[i]);
+            test_engram_files(model.get(), one_table.get(), model_params, ctx_params, tokens, logits[i]);
         }
     }
+    const int readers = test_engram_readers(seed);
     llama_log_set(ld.callback, ld.user_data);
 
     const bool ok = logits[0] == logits[1];
     printf("%s: engram.* vs ple.* (MXFP8 table) layout: %s (nmse %.3g)\n", __func__,
            ok ? "identical" : "DIFFERENT", nmse(logits[0], logits[1]));
-    return ok ? 0 : 1;
+    return ok && readers == 0 ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
