@@ -2097,7 +2097,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
         bool allocated = false;
         if (cpu_sink_runtime) {
-            allocated = reserve_compute_graph(gf, prompt_pass, prefetch) &&
+            allocated = reserve_compute_graph(gf, prompt_pass, prefetch,
+                    prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0) &&
                 ggml_backend_sched_alloc_prepared(sched.get(), gf);
         } else {
             prefetch();
@@ -3259,7 +3260,8 @@ static bool llama_sched_runs_on_host(ggml_backend_sched_t sched, ggml_tensor * n
     return type == GGML_BACKEND_DEVICE_TYPE_CPU || type == GGML_BACKEND_DEVICE_TYPE_ACCEL;
 }
 
-bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted) {
+bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted,
+        uint32_t pass_tokens) {
     if (!cpu_sink_runtime) {
         if (admitted) { admitted(); }
         return ggml_backend_sched_reserve(sched.get(), graph);
@@ -3312,6 +3314,14 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
             ggml_backend_sched_reset(sched.get());
             return false;
         }
+    }
+    // A prompt pass's executors take memory of their own besides the graph's (the CUDA tier's batched engine: input and
+    // accumulator rows for each token). It is held now, with the tier still able to give blocks back, so the ubatch is
+    // sized for both; taken at the pass's first layer, after the graph took what was free, it could find nothing left.
+    // A pass that cannot have it refuses the graph, and the prompt takes a smaller ubatch (prefill_refit).
+    if (prefill && pass_tokens > 1 && !cpu_sink_runtime->reserve_pass(pass_tokens)) {
+        ggml_backend_sched_reset(sched.get());
+        return false;
     }
     uint64_t host_bytes = 0, device_bytes = 0;
     std::map<ggml_backend_dev_t, uint64_t> shared_bytes; // the growth on each device that shares the host's memory
@@ -3424,7 +3434,8 @@ ggml_cgraph * llama_context::graph_reserve(
         } else {
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
-    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active)) {
+    } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active, {},
+            cpu_prefill_reserve_pending && !cpu_sink_decode_active ? n_tokens : 0)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;

@@ -131,9 +131,9 @@ struct sink_vram {
         }
         if (configuration.gpu.elastic) {
             elastic = configuration.gpu.elastic;
-            if (!elastic || elastic->version != 7 || elastic->size != sizeof(*elastic) ||
+            if (!elastic || elastic->version != 8 || elastic->size != sizeof(*elastic) ||
                     !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve ||
-                    !elastic->preload_slots || !elastic->preload) {
+                    !elastic->preload_slots || !elastic->preload || !elastic->reserve_pass) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
             }
         }
@@ -257,6 +257,13 @@ struct sink_vram {
         if (!context || !elastic || !prefill_enabled) { return; }
         char error[512] = {};
         check(elastic->reserve_accumulate(context, tokens, error, sizeof(error)), error);
+    }
+    // The working memory a pass of `tokens` tokens cannot run without, held at that size while its prompt graph is
+    // reserved (ssd_vram_elastic_api reserve_pass).
+    void reserve_pass(int tokens) {
+        if (!context || !elastic || !prefill_enabled) { return; }
+        char error[512] = {};
+        check(elastic->reserve_pass(context, tokens, error, sizeof(error)), error);
     }
     // At load (unified memory): the tier's storage before any request, for the declared layout's experts.
     void reserve() {

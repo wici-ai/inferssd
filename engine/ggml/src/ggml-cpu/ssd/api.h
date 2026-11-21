@@ -11,7 +11,7 @@
 // borrow it only while that backend stays loaded, just as for its other procs.
 namespace ssd { namespace cpu {
 struct api_v2 {
-    uint32_t version;   // 8: the expert layout
+    uint32_t version;   // 9: the pass's GPU working memory with the prompt graph (vram_reserve_pass)
     size_t size;
     decltype(&create_configured) create;
     decltype(&ssd_cpu_sink_run) run;
@@ -41,12 +41,13 @@ struct api_v2 {
         uint64_t, uint64_t, uint64_t) noexcept;
     bool (*attach_services)(ggml_backend_t, const ssd::runtime_services *) noexcept;
     size_t runtime_services_size;
+    decltype(&ssd_cpu_sink_vram_reserve_pass) vram_reserve_pass;
 };
 using get_api_v2 = const api_v2 * (*)();
 
 // Check the prefix before accessing members from a possibly different build.
 inline bool valid(const api_v2 * api) noexcept {
-    return api && api->version == 8 && api->size == sizeof(api_v2) &&
+    return api && api->version == 9 && api->size == sizeof(api_v2) &&
         api->runtime_services_size == sizeof(runtime_services) &&
         api->create &&
         api->run &&
@@ -67,6 +68,6 @@ inline bool valid(const api_v2 * api) noexcept {
         api->prefill_run &&
         api->prefill_run_activation &&
         api->prefill_destroy &&
-        api->take_room && api->attach_services;
+        api->take_room && api->attach_services && api->vram_reserve_pass;
 }
 } } // namespace ssd::cpu

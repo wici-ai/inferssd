@@ -596,8 +596,11 @@ int elastic_preload(void *, const ssd_vram_request *, const void *, const void *
     *copied = 0;
     return 0;
 }
-const ssd_vram_elastic_api elastic_table = { 7, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
-    elastic_reserve, elastic_preload_slots, elastic_preload };
+// The lane's working memory is optional (a pass it cannot have runs on the CPU, reserve_pass): nothing a pass cannot
+// run without, so nothing to hold with the prompt's graph.
+int elastic_reserve_pass(void *, int, char *, size_t) { return 0; }
+const ssd_vram_elastic_api elastic_table = { 8, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+    elastic_reserve, elastic_preload_slots, elastic_preload, elastic_reserve_pass };
 
 int host_available(void *) { return 0; }
 int host_launch(void *, const ssd_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }

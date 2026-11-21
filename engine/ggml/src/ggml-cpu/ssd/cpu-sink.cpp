@@ -4539,6 +4539,15 @@ extern "C" bool ssd_cpu_sink_vram_reserve_accumulator(
     catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
 }
 
+extern "C" bool ssd_cpu_sink_vram_reserve_pass(
+        struct ssd_cpu_sink * sink, int tokens, char * error, size_t error_size) {
+    sink_error(error, error_size, "");
+    if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    try { sink->vram.reserve_pass(tokens); return true; }
+    catch (const std::exception & e) { sink_error(error, error_size, e.what()); return false; }
+}
+
 extern "C" bool ssd_cpu_sink_vram_reserve(struct ssd_cpu_sink * sink, int experts_used, char * error, size_t error_size) {
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }

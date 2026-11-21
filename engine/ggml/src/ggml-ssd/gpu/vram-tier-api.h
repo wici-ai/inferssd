@@ -270,7 +270,7 @@ struct ssd_vram_deferred_api {
 // reserve; phase_complete(true) runs only after the decode graph is reserved
 // and grows best-effort into currently free device memory.
 struct ssd_vram_elastic_api {
-    uint32_t version, size;   // 7 (the declared layout)
+    uint32_t version, size;   // 8 (the pass's working memory with the prompt graph)
     int (*phase_complete)(void * context, int decode, char * error, size_t error_size);
     // Reserve the actual grouped-prefill accumulator before starting streamed I/O.
     int (*reserve_accumulate)(void * context, int tokens, char * error, size_t error_size);
@@ -286,6 +286,12 @@ struct ssd_vram_elastic_api {
     int (*preload_slots)(void * context, int * slots, char * error, size_t error_size);
     int (*preload)(void * context, const struct ssd_vram_request * request, const void * up, const void * gate,
                    const void * down, int * copied, char * error, size_t error_size);
+    // A prompt graph of `tokens` tokens being reserved, before it takes its room and while the tier can still give
+    // memory back: the working memory a pass of that many tokens cannot run without, held at exactly that size (what
+    // a larger graph reserved before is given back). A failure refuses the graph, so the prompt takes a smaller ubatch
+    // instead of a pass that cannot get its memory. Memory a pass can do without (it runs on the CPU then) is not
+    // taken here.
+    int (*reserve_pass)(void * context, int tokens, char * error, size_t error_size);
 };
 // Optional decode extension: the GPU computes experts that sit in host memory (a RAM cache slot or a ring
 // buffer). How depends on the device, and costs2 says which:
