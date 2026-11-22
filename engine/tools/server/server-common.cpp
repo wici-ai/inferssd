@@ -1028,11 +1028,14 @@ struct generated_turn {
     std::vector<std::string> arguments; // tool-call arguments as generated, in call order
 };
 
+// Two turns can be alike in content and tool calls and differ in reasoning: a model that calls the same tool with the
+// same arguments twice thinks differently each time. A key keeps each such turn, in the order generated.
 struct turn_memory {
-    static constexpr size_t max_turns = 256;
-    std::mutex                                      mutex;
-    std::unordered_map<std::string, generated_turn> turns; // turn key -> turn
-    std::deque<std::string>                         order; // keys, oldest first
+    static constexpr size_t max_turns    = 256;
+    static constexpr size_t max_variants = 16; // turns kept under one key
+    std::mutex                                                   mutex;
+    std::unordered_map<std::string, std::vector<generated_turn>> turns; // turn key -> its turns, oldest first
+    std::deque<std::string>                                      order; // keys, oldest first
 };
 
 turn_memory g_turn_memory;
@@ -1060,48 +1063,86 @@ std::string turn_key(const std::string & content, const std::vector<std::pair<st
     return key;
 }
 
+std::string message_turn_key(const json & msg) {
+    const json content = msg.contains("content") ? msg.at("content") : json();
+    std::vector<std::pair<std::string, std::string>> calls;
+    for (const auto & call : json_value(msg, "tool_calls", json::array())) {
+        const json function  = json_value(call, "function", json::object());
+        const json arguments = json_value(function, "arguments", json());
+        calls.emplace_back(json_value(function, "name", std::string()),
+                           arguments.is_string() ? arguments.get<std::string>() : arguments.dump());
+    }
+    return turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls);
+}
+
+// The generated turn a message stands for, among the turns under its key: the one whose reasoning the client sent
+// back; for a message without reasoning, the only one, or, when the request holds as many messages of this key as
+// there are turns, the one at the message's place among them (a conversation sends its turns back in the order they
+// were generated). nullptr when none can be told: the message is then rendered as sent, rather than with the
+// reasoning of another turn.
+const generated_turn * turn_of_message(const std::vector<generated_turn> & turns, const std::string & sent_reasoning,
+                                       size_t place, size_t n_messages) {
+    if (!sent_reasoning.empty()) {
+        for (auto it = turns.rbegin(); it != turns.rend(); ++it) {
+            if (turn_trim(it->reasoning_content) == sent_reasoning) {
+                return &*it;
+            }
+        }
+        return &turns.back(); // reasoning the client changed: only content and arguments are restored
+    }
+    if (turns.size() == 1) {
+        return &turns.front();
+    }
+    return n_messages == turns.size() ? &turns[place] : nullptr;
+}
+
 void server_turn_memory_restore(json & messages) {
     std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
     if (g_turn_memory.turns.empty()) {
         return;
     }
-    for (auto & msg : messages) {
+    const auto generated = [](const json & msg) {
         if (json_value(msg, "role", std::string()) != "assistant") {
+            return false;
+        }
+        return !msg.contains("content") || msg.at("content").is_null() || msg.at("content").is_string();
+    };
+    std::unordered_map<std::string, size_t> n_messages; // key -> messages of the request with it
+    for (const auto & msg : messages) {
+        if (generated(msg)) {
+            n_messages[message_turn_key(msg)]++;
+        }
+    }
+    std::unordered_map<std::string, size_t> n_seen;
+    for (auto & msg : messages) {
+        if (!generated(msg)) {
             continue;
         }
-        const json content = msg.contains("content") ? msg.at("content") : json();
-        if (!content.is_null() && !content.is_string()) {
-            continue;
-        }
-        json tool_calls = json_value(msg, "tool_calls", json::array());
-        std::vector<std::pair<std::string, std::string>> calls;
-        for (const auto & call : tool_calls) {
-            const json function  = json_value(call, "function", json::object());
-            const json arguments = json_value(function, "arguments", json());
-            calls.emplace_back(json_value(function, "name", std::string()),
-                               arguments.is_string() ? arguments.get<std::string>() : arguments.dump());
-        }
-        const auto found = g_turn_memory.turns.find(
-            turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls));
+        const std::string key   = message_turn_key(msg);
+        const size_t      place = n_seen[key]++;
+        const auto found = g_turn_memory.turns.find(key);
         if (found == g_turn_memory.turns.end()) {
             continue;
-        }
-        const generated_turn & turn = found->second;
-
-        if (content.is_string() || !turn.content.empty()) {
-            msg["content"] = turn.content;
-        }
-        for (size_t i = 0; i < calls.size(); ++i) {
-            msg["tool_calls"][i]["function"]["arguments"] = turn.arguments[i];
         }
         // Reasoning the client left out, padded or sent back unchanged (up to whitespace) is the generated one;
         // reasoning the client changed is kept. Whether earlier reasoning is rendered is up to the template.
         const std::string sent = turn_trim(json_value(msg, "reasoning_content", std::string()));
-        if (sent.empty() || sent == turn_trim(turn.reasoning_content)) {
-            if (turn.reasoning_content.empty()) {
+        const generated_turn * turn = turn_of_message(found->second, sent, place, n_messages[key]);
+        if (turn == nullptr) {
+            continue;
+        }
+
+        if ((msg.contains("content") && msg.at("content").is_string()) || !turn->content.empty()) {
+            msg["content"] = turn->content;
+        }
+        for (size_t i = 0; i < turn->arguments.size(); ++i) {
+            msg["tool_calls"][i]["function"]["arguments"] = turn->arguments[i];
+        }
+        if (sent.empty() || sent == turn_trim(turn->reasoning_content)) {
+            if (turn->reasoning_content.empty()) {
                 msg.erase("reasoning_content");
             } else {
-                msg["reasoning_content"] = turn.reasoning_content;
+                msg["reasoning_content"] = turn->reasoning_content;
             }
         }
     }
@@ -1130,7 +1171,18 @@ void server_turn_memory_record(const common_chat_msg & msg) {
             memory.order.pop_front();
         }
     }
-    memory.turns[key] = std::move(turn);
+    // a turn generated again with the same reasoning is the same turn
+    auto & turns = memory.turns[key];
+    for (auto & kept : turns) {
+        if (kept.reasoning_content == turn.reasoning_content) {
+            kept = std::move(turn);
+            return;
+        }
+    }
+    if (turns.size() >= turn_memory::max_variants) {
+        turns.erase(turns.begin());
+    }
+    turns.push_back(std::move(turn));
 }
 
 // Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
