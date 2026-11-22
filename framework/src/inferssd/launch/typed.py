@@ -87,6 +87,12 @@ class LaunchSpec:
     # paths, any number of them): a per-layer embedding table kept apart from the model, say. The
     # engine's facts name the files the model loads from.
     shards: tuple[str, ...] = ()
+    # The prompt cache's size limit per model in MiB; None takes PROMPT_CACHE_MIB.
+    prompt_cache_mib: Optional[int] = None
+    # The engine's event for each layer and each prompt graph, which the benchmarks read
+    # (docs/architecture/native-observations.md). Without them the events file holds the
+    # settings alone, and a long run does not grow it.
+    layer_events: bool = True
 
 
 def listen_host(text: str) -> str:
@@ -113,8 +119,9 @@ AUTO_CONTEXT = 0
 # One pass a prompt with the context unset: a batch the engine bounds by the context it chose.
 ONE_PASS_BATCH = 1 << 20
 BATCH = 512
-# The disk prompt cache's size limit per model.
-PROMPT_CACHE_MIB = 16384
+# The disk prompt cache's size limit per model, unless the launch names one. A cache holds the
+# conversations someone may go on with; the least recently used are dropped past the limit.
+PROMPT_CACHE_MIB = 4096
 # DeepSeek-V4.1's template drops earlier turns' thinking by default, so a
 # history rendered again differs from the cached prompt; keep it.
 DSV_TEMPLATE_KWARGS = '{"drop_thinking": false}'
@@ -304,6 +311,7 @@ def _resolve(
         "--cache-ram",
         "--cache-disk",
         "--cache-disk-mib",
+        "--ssd-no-layer-events",
         "-ot",
         "--override-tensor",
         "-ts",
@@ -554,6 +562,8 @@ def _resolve(
     for shard in spec.shards:
         command += ["--shard", shard]
     command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    if not spec.layer_events:
+        command.append("--ssd-no-layer-events")
     for item in value.entries:
         if item.origin == "cli":
             command += [
@@ -602,11 +612,13 @@ def _resolve(
         name = match.group(1) if match else os_path.basename(model)
         if name.endswith(".gguf"):
             name = name[: -len(".gguf")]
+        if spec.prompt_cache_mib is not None and spec.prompt_cache_mib < 1:
+            raise ValueError("--prompt-cache-mib must be positive")
         command += [
             "--cache-disk",
             os_path.join(spec.prompt_cache, name),
             "--cache-disk-mib",
-            str(PROMPT_CACHE_MIB),
+            str(spec.prompt_cache_mib or PROMPT_CACHE_MIB),
         ]
     command += [
         "--host",

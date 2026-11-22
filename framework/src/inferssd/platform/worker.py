@@ -38,6 +38,35 @@ from inferssd.platform.process import Process
 from inferssd.platform.resources import scope_pids
 from inferssd.platform.windows.process import JobScope
 
+# The memory samples a run keeps. A server is sampled twice a second for as long as it runs, which
+# over a day is a file of hundreds of megabytes that says the same thing on almost every line.
+SAMPLES_DENSE_SECONDS = 60.0  # the load, where memory moves: every sample
+SAMPLES_SPARSE_SECONDS = 30.0  # after it: one sample this often,
+SAMPLES_CHANGE = 0.02  # and any sample whose memory moved by this share since the last one kept
+
+
+def keep_sample(
+    sample: Mapping[str, Any], started: float, written: Optional[Mapping[str, Any]]
+) -> bool:
+    """Whether SAMPLE goes into the run's memory samples, after the last one WRITTEN there.
+
+    Every sample of the first minute is kept, as the load's course is read from them. After that
+    one is kept every 30 seconds, and sooner when the server's memory or the host's available
+    memory has moved by 2%, so that a steady run writes little and a run that is running out of
+    memory still shows how.
+    """
+    now = float(sample["monotonic"])
+    if written is None or now - started <= SAMPLES_DENSE_SECONDS:
+        return True
+    if now - float(written["monotonic"]) >= SAMPLES_SPARSE_SECONDS:
+        return True
+    for name in ("rss_bytes", "available_bytes"):
+        before, after = written.get(name), sample.get(name)
+        if isinstance(before, (int, float)) and isinstance(after, (int, float)):
+            if abs(after - before) > SAMPLES_CHANGE * max(abs(before), 1):
+                return True
+    return False
+
 
 def save(path: Path, value: object) -> None:
     pending = path.with_name(path.name + ".pending")
@@ -284,14 +313,20 @@ def run_worker(args: argparse.Namespace, specification: dict[str, Any], policy: 
                 pass_fds=(lease.fd,),
             )
         save(out / "server-state.json", {"pid": child.pid, "returncode": None})
+        started = time.monotonic()
+        written: Optional[dict[str, Any]] = None
         while child.poll() is None:
             lease.check()
             if signals or Path(policy.stop_path).exists() or (out / "STOP").exists():
                 break
-            with (out / "memory-samples.jsonl").open("a", encoding="utf-8", newline="\n") as stream:
-                stream.write(
-                    json.dumps(dict(runtime.sample(child.pid), monotonic=time.monotonic())) + "\n"
-                )
+            # Every sample checks the host's reserve; only the ones worth keeping are written.
+            sample = dict(runtime.sample(child.pid), monotonic=time.monotonic())
+            if keep_sample(sample, started, written):
+                written = sample
+                with (out / "memory-samples.jsonl").open(
+                    "a", encoding="utf-8", newline="\n"
+                ) as stream:
+                    stream.write(json.dumps(sample) + "\n")
             time.sleep(0.5)
         if child.poll() is not None and not signals and not (out / "STOP").exists():
             if specification.get("command_mode") is not True:

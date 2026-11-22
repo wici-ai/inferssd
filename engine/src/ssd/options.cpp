@@ -98,6 +98,10 @@ llama_ssd_options * llama_ssd_options_create(const char * file,
     return nullptr;
 }
 
+void llama_ssd_options_set_layer_events(llama_ssd_options * options, bool enabled) {
+    if (options) { options->layer_events = enabled; }
+}
+
 void llama_ssd_options_free(llama_ssd_options * options) { delete options; }
 
 bool llama_ssd_check_environment(char * error, size_t size) {
@@ -151,12 +155,15 @@ llama_ssd_context::llama_ssd_context(const llama_ssd_options & options)
         const auto contract = events->event("ssd.controller.begin", "{\"schema\":1}");
         if (!contract) { throw std::runtime_error(contract.error); }
     }
-    const auto diagnostics_bound = diagnostics.bind(debug, events.get());
+    // Without layer events the writer has done its part: the settings and the contract line. The executors then get
+    // no writer, and skip the measuring that only their events use. A debug channel still writes what it traces.
+    auto * const observed = options.layer_events || debug.trace || debug.profile ? events.get() : nullptr;
+    const auto diagnostics_bound = diagnostics.bind(debug, observed);
     if (!diagnostics_bound) { throw std::runtime_error(diagnostics_bound.error); }
     const auto effective = settings.json();
     if (!effective) { throw std::runtime_error(effective.error); }
     std::fprintf(stderr, "[ssd.settings] %s\n", effective.value.c_str());
-    services = {events.get(), &debug, host.get()};
+    services = {observed, &debug, host.get()};
     services.source = &sources;
     const auto * reserve_mib = settings.integer("vram.reserve_mib");
     constexpr size_t mib = size_t{1} << 20;

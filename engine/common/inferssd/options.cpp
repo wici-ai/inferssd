@@ -25,6 +25,7 @@ void common_ssd_prepare(common_params & params) {
     auto * options = llama_ssd_options_create(params.ssd_settings_file.c_str(),
         overrides.data(), overrides.size(), params.ssd_telemetry_file.c_str(), error, sizeof(error));
     if (!options) { throw std::invalid_argument(error); }
+    llama_ssd_options_set_layer_events(options, params.ssd_layer_events);
     params.ssd_options = std::shared_ptr<llama_ssd_options>(options, llama_ssd_options_free);
 }
 

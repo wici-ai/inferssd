@@ -11,7 +11,8 @@
 - [Configuration](configuration.md): the typed `inferssd-settings 1` contract.
 - [Deployment resources](engine-resources.md): engine descriptors for installations outside a checkout.
 - [Machine profile](machine-profile.md): what `inferssd profile` measures, where it keeps the result, and its speed estimates.
-- [Usage events](usage-events.md): the request and token counts the server records for its host.
+- [Usage events](usage-events.md): each request the server records for its host: its route, its caller, its tokens and how it ended.
+- [Server log lines the desktop app reads](server-log.md): the log lines the desktop app matches by their text, to change together with it.
 - [DeepSeek-V4.1 Engram](deepseek-v41-engram.md): the Engram layouts of published GGUFs, and a table kept apart from the model (`--ple`).
 - [Framework commands](../framework/README.md): `serve`, `cli` and `profile`, typed settings and the owned launch.
 - [简体中文](README.zh-CN.md): the project README in Simplified Chinese.

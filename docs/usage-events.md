@@ -3,8 +3,8 @@
 
 [Back to documentation](README.md)
 
-The server can record how many inference requests it served and how many tokens they used, for the host that
-runs it. It writes nothing unless `INFERSSD_USAGE_DIR` names a directory. `inferssd serve` and `cli` pass the
+The server can record each inference request it served for the host that runs it: the route it came to, who
+sent it, how many tokens it used, how long it took and how it ended. It writes nothing unless `INFERSSD_USAGE_DIR` names a directory. `inferssd serve` and `cli` pass the
 variable through to the server unchanged.
 
 ## File
@@ -20,9 +20,11 @@ of the run and says so once in its log, so a partial line is never followed by a
 ## Records
 
 ```json
-{"event_id":"Xc2kq0RmB7aTn4Lw:1","type":"request_received","request_id":"req-8b1KfQ2s9mZ0aLx3cV7nT4yR","occurred_at":"2026-11-10T04:59:58Z"}
-{"event_id":"Xc2kq0RmB7aTn4Lw:2","type":"usage_finalized","request_id":"req-8b1KfQ2s9mZ0aLx3cV7nT4yR","occurred_at":"2026-11-10T05:00:03Z","token_count":840,"input_tokens":812,"output_tokens":28,"outcome":"completed"}
+{"event_id":"Xc2kq0RmB7aTn4Lw:1","type":"request_received","request_id":"req-8b1KfQ2s9mZ0aLx3cV7nT4yR","occurred_at":"2026-11-10T04:59:58Z","route":"/v1/responses","client":"codex","user_agent":"codex_cli_rs/0.169.0"}
+{"event_id":"Xc2kq0RmB7aTn4Lw:2","type":"usage_finalized","request_id":"req-8b1KfQ2s9mZ0aLx3cV7nT4yR","occurred_at":"2026-11-10T05:00:03Z","token_count":840,"input_tokens":812,"output_tokens":28,"cached_tokens":700,"prompt_ms":1234,"output_ms":2000,"outcome":"completed"}
 ```
+
+A reader takes the fields it knows and passes over the rest, so that a later version can add to them.
 
 | Field | Meaning |
 | --- | --- |
@@ -30,10 +32,49 @@ of the run and says so once in its log, so a partial line is never followed by a
 | `type` | `request_received` or `usage_finalized`. |
 | `request_id` | Random for each HTTP request; pairs its two records. |
 | `occurred_at` | UTC, to the second, when the request reached its route or when its usage was final. |
+| `route` | On `request_received`: the path the request came to, as the client wrote it, without its query. |
+| `client` | On `request_received`, when the request has an API key: the name in a key `inferssd-<name>`, else the key's first 10 characters. See [Who sent a request](#who-sent-a-request). |
+| `user_agent` | On `request_received`, when the request has a `User-Agent` header: its printable ASCII, cut to 120 characters. |
 | `input_tokens` | Prompt tokens, as the OpenAI-style `prompt_tokens` reports them: prompt-cache hits included. (Anthropic's `input_tokens` leaves the hits out.) |
 | `output_tokens` | Generated tokens, reasoning included. |
 | `token_count` | `input_tokens + output_tokens`. |
+| `cached_tokens` | The part of `input_tokens` the slot already held, so that the server did not read it again. |
+| `prompt_ms` | Milliseconds spent reading the rest of the prompt. |
+| `output_ms` | Milliseconds spent generating. |
 | `outcome` | `completed`, `failed` or `cancelled`. |
+| `error` | On a `failed` request: the reason, as the response's `message` gives it, cut to 300 characters. |
+
+`cached_tokens`, `prompt_ms` and `output_ms` are 0 for a request that ended before its prompt was read, whatever
+its outcome.
+
+## Who sent a request
+
+The server needs no API key, but most tools send one, and a host that points several tools at one server can
+tell them apart by it. The server reads the key from `Authorization: Bearer` or, without that header, from
+`X-Api-Key`, and writes `client` from it:
+
+- A host that names a tool sets the tool's key to `inferssd-<name>`. `client` is then the name, its printable
+  ASCII, cut to 64 characters.
+- Any other key may be a secret for another service. `client` is its first 10 characters, which tell one such
+  caller from another; the rest is written nowhere, not here and not in the server log.
+
+The key identifies nothing: any caller can send any key. With `--api-key`, a request is still checked against
+the keys given there before it reaches a route.
+
+## The server log
+
+The server log has the same request IDs, so that a record here can be read with the log lines of its request:
+
+```text
+srv         begin: usage events: request req-8b1KfQ2s9mZ0aLx3cV7nT4yR to /v1/responses
+slot launch_slot_: id  0 | task 12 | usage events: request req-8b1KfQ2s9mZ0aLx3cV7nT4yR
+```
+
+The desktop app reads these and other lines of the log by their text: [server log lines the desktop app
+reads](server-log.md) lists them.
+
+The first line is written when the request reaches its route, before anything else the route logs; the second
+when a slot takes one of the request's tasks, after that task's `processing task` line.
 
 ## What is counted
 

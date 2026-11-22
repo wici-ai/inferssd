@@ -18,6 +18,9 @@ struct llama_ssd_override {
 LLAMA_API struct llama_ssd_options * llama_ssd_options_create(
     const char * settings_file, const struct llama_ssd_override * overrides,
     size_t count, const char * telemetry_file, char * error, size_t error_size);
+// Whether the executors publish an event for each layer and each prompt graph to the telemetry file (the
+// default), or the file holds the settings and the contract line alone. Call before a context is created.
+LLAMA_API void llama_ssd_options_set_layer_events(struct llama_ssd_options * options, bool enabled);
 LLAMA_API void llama_ssd_options_free(struct llama_ssd_options * options);
 // Startup guard, including callers which did not request SSD execution.
 LLAMA_API bool llama_ssd_check_environment(char * error, size_t error_size);

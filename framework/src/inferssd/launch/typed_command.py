@@ -26,6 +26,7 @@ from inferssd.launch.typed import (
     BATCH,
     LOOPBACK,
     PROFILES,
+    PROMPT_CACHE_MIB,
     LaunchSpec,
     listen_host,
     resolve_typed,
@@ -127,6 +128,18 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "(default: inferssd/prompts in this user's cache directory); off runs without one",
     )
     launch.add_argument(
+        "--prompt-cache-mib",
+        type=int,
+        metavar="N",
+        help=f"the prompt cache's size limit per model in MiB (default: {PROMPT_CACHE_MIB})",
+    )
+    launch.add_argument(
+        "--no-layer-events",
+        action="store_true",
+        help="leave the engine's event for each layer out of the run's events file, which "
+        "then holds the settings alone (the benchmarks need them; a server left running does not)",
+    )
+    launch.add_argument(
         "--reprofile",
         action="store_true",
         help="measure this machine again before launching (the first launch measures it)",
@@ -171,6 +184,8 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
         tuple(args.shards),
+        args.prompt_cache_mib,
+        not args.no_layer_events,
     )
 
 

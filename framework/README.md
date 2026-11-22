@@ -60,7 +60,8 @@ replace.
 
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
-(`--cache-disk`, 16 GiB per model). With the `dsv` profile the DeepSeek-V4.1
+(`--cache-disk`, 4 GiB per model unless `--prompt-cache-mib` names another
+limit). With the `dsv` profile the DeepSeek-V4.1
 template keeps earlier turns' thinking (`drop_thinking` false), so a
 conversation's history renders as the server cached it.
 
@@ -164,7 +165,8 @@ An unrelated listener on the health port is never killed.
 `settings.ssd` records the file/generated settings and their receipts;
 `native-events.jsonl` is exclusively created by the context-owned native writer.
 `runtime.json` records server argv and scope, `memory-samples.jsonl` records
-resource samples, and `ownership.json` records final status and cleanup.
+resource samples (every one of the first minute, then one every 30 seconds and
+any whose memory moved by 2%), and `ownership.json` records final status and cleanup.
 Keep these artifacts private if arguments or paths contain private information.
 Server loader variables are carried in the process environment and restored
 only for the server, not serialized into the launch specification or applied to
