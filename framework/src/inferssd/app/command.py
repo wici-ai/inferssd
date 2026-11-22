@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from inferssd.app.hub import download, selection
-from inferssd.configuration.settings import host_platform
+from inferssd.configuration.settings import host_platform, schema
 from inferssd.launch import typed_command
 from inferssd.launch.resources import data_directory, installed_resources, read_resources
 from inferssd.launch.typed import LOOPBACK, connect_host, listen_host
@@ -20,11 +20,13 @@ from inferssd.platform.windows import win32
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    setting_names = ", ".join(schema()["properties"])
     for mode in ("cli", "serve"):
         parser = commands.add_parser(
             mode,
             help="download a tested GGUF and "
             + ("chat in the terminal" if mode == "cli" else "start the OpenAI-compatible API"),
+            epilog=f"Typed settings for --set: {setting_names}.",
         )
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument(

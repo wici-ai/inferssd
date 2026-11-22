@@ -80,6 +80,22 @@ void llama_memory_hybrid_idx::set_commit(const commit_cb & commit) {
     }
 }
 
+bool llama_memory_hybrid_idx::set_kv_spill(const std::string & directory, uint32_t resident,
+                                          const std::function<void(bool)> & synchronize) {
+    return llama_memory_hybrid::set_kv_spill(directory, resident, synchronize) &&
+           (!mem_idx || mem_idx->set_kv_spill(directory, resident, synchronize));
+}
+
+std::map<ggml_backend_dev_t, size_t> llama_memory_hybrid_idx::kv_stage_bytes() const {
+    auto result = llama_memory_hybrid::kv_stage_bytes();
+    if (mem_idx) {
+        for (const auto & [device, bytes] : mem_idx->kv_stage_bytes()) {
+            result[device] += bytes;
+        }
+    }
+    return result;
+}
+
 bool llama_memory_hybrid_idx::cells_short(uint32_t n_tokens) const {
     return llama_memory_hybrid::cells_short(n_tokens) || (mem_idx && mem_idx->cells_short(n_tokens));
 }

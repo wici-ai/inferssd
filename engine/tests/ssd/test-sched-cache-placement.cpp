@@ -12,6 +12,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -25,16 +27,19 @@ ggml_backend_buffer_type gpu_buffer_type;
 ggml_backend_buffer_type_t gpu_get_buffer_type(ggml_backend_dev_t) { return &gpu_buffer_type; }
 bool gpu_is_host(ggml_backend_buffer_type_t) { return false; }
 bool gpu_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) { return buft == &gpu_buffer_type; }
+bool shared_gpu_supports_buft(ggml_backend_dev_t, ggml_backend_buffer_type_t buft) {
+    return buft == &gpu_buffer_type || buft == ggml_backend_cpu_buffer_type();
+}
 enum ggml_backend_dev_type gpu_type(ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; }
 
 struct fake_gpu {
     ggml_backend_device device;
     ggml_backend backend;
 
-    explicit fake_gpu(ggml_backend_t cpu) {
+    explicit fake_gpu(ggml_backend_t cpu, bool shared = false) {
         device = *ggml_backend_get_device(cpu);
         device.iface.get_buffer_type = gpu_get_buffer_type;
-        device.iface.supports_buft = gpu_supports_buft;
+        device.iface.supports_buft = shared ? shared_gpu_supports_buft : gpu_supports_buft;
         device.iface.get_type = gpu_type;
         backend = *cpu;
         backend.device = &device;
@@ -112,6 +117,56 @@ ggml_tensor * make_cache(ggml_context * ctx, ggml_backend_buffer_type_t buft, gg
     return cache;
 }
 
+// A shared-memory GPU that can directly use regular host data must still stage the mapped KV.
+bool test_spilled_reads(ggml_backend_t cpu, ggml_tensor * resident, ggml_tensor * mapped) {
+    constexpr int view_channels = channels - 1; // leave a gap between rows
+    fake_gpu gpu(cpu, true);
+    ggml_backend_t backends[2] = { &gpu.backend, cpu };
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, nullptr, 2, 64, false, false);
+    ggml_context * ctx = ggml_init({
+        ggml_tensor_overhead() * 24 + ggml_graph_overhead_custom(16, false), nullptr, true,
+    });
+    auto * ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
+    ggml_set_input(ids);
+    auto * a = ggml_view_2d(ctx, mapped, view_channels, rows - 1, mapped->nb[1], 0);
+    auto * b = ggml_view_2d(ctx, mapped, view_channels, rows - 1, mapped->nb[1], mapped->nb[1]);
+    auto * resident_view = ggml_view_2d(ctx, resident, view_channels, rows, resident->nb[1], 0);
+    auto * read_resident = ggml_get_rows(ctx, resident_view, ids);
+    auto * read_a = ggml_get_rows(ctx, a, ids);
+    auto * read_b = ggml_get_rows(ctx, b, ids);
+    auto * first = ggml_add(ctx, read_resident, read_a);
+    auto * out = ggml_add(ctx, first, read_b);
+    auto * graph = ggml_new_graph_custom(ctx, 16, false);
+    ggml_build_forward_expand(graph, out);
+    for (auto * node : {read_resident, read_a, read_b, first, out}) {
+        ggml_backend_sched_set_tensor_backend(sched, node, &gpu.backend);
+    }
+
+    bool ok = require(ggml_backend_sched_alloc_graph(sched, graph), "spill graph was placed");
+    if (ok) {
+        ok = require(ggml_backend_sched_get_n_splits(sched) == 2, "new spilled view starts its own GPU split") && ok;
+        ok = require(read_resident->src[0] == resident_view, "resident read stays on its original GPU buffer") && ok;
+        for (const auto & [read, view] : {std::pair{read_a, a}, std::pair{read_b, b}}) {
+            const ggml_tensor * stage = read->src[0];
+            ok = require(stage != view && ggml_backend_buffer_get_type(stage->buffer) == &gpu_buffer_type,
+                "spilled view was staged into a GPU buffer") && ok;
+            ok = require(stage->type == view->type && ggml_are_same_shape(stage, view) &&
+                std::memcmp(stage->nb, view->nb, sizeof(stage->nb)) == 0, "staging preserves the view's layout") && ok;
+        }
+        const int32_t row = 1;
+        ggml_backend_tensor_set(ids, &row, 0, sizeof(row));
+        ok = require(ggml_backend_sched_graph_compute(sched, graph) == GGML_STATUS_SUCCESS, "spill graph ran") && ok;
+        float values[view_channels];
+        ggml_backend_tensor_get(out, values, 0, sizeof(values));
+        for (int c = 0; c < view_channels; ++c) {
+            ok = require(values[c] == float(400 + 3*c), "staged row values match the resident calculation") && ok;
+        }
+    }
+    ggml_backend_sched_free(sched);
+    ggml_free(ctx);
+    return ok;
+}
+
 } // namespace
 
 int main() {
@@ -138,6 +193,8 @@ int main() {
         // a cache in host memory is left to the neighbours: here the CPU's
         ok = require(place_and_run(sched, cpu, host_cache, ok) == cpu,
             "the row read of a host cache stays with its neighbours") && ok;
+        ggml_backend_buffer_set_usage(host_buffer, GGML_BACKEND_BUFFER_USAGE_SSD_KV);
+        ok = test_spilled_reads(cpu, gpu_cache, host_cache) && ok;
     }
 
     ggml_backend_sched_free(sched);

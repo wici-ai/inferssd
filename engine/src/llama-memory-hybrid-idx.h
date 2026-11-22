@@ -72,6 +72,9 @@ public:
 
     // the attention cache's cells, and the indexer's with them (idx_follow)
     void set_commit(const commit_cb & commit) override;
+    bool set_kv_spill(const std::string & directory, uint32_t resident,
+                      const std::function<void(bool)> & synchronize) override;
+    std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override;
     bool cells_short(uint32_t n_tokens) const override;
     bool reserve_cells(uint32_t n_tokens) override;
     bool fit_cells(uint32_t n_tokens) override;

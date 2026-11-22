@@ -50,6 +50,7 @@ extern "C" {
         GGML_BACKEND_BUFFER_USAGE_ANY = 0,
         GGML_BACKEND_BUFFER_USAGE_WEIGHTS = 1,
         GGML_BACKEND_BUFFER_USAGE_COMPUTE = 2,
+        GGML_BACKEND_BUFFER_USAGE_SSD_KV = 3, // CPU-mapped KV that accelerators must stage
     };
 
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
@@ -64,6 +65,7 @@ extern "C" {
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
+    GGML_API bool                           ggml_backend_tensor_is_ssd_kv     (const struct ggml_tensor * tensor);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 

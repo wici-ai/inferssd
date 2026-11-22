@@ -327,7 +327,11 @@ const uint64_t * snapshot::integer(const std::string & key) const noexcept {
 }
 
 const std::vector<std::string> * snapshot::sources() const noexcept {
-    const auto * v = find("expert.source");
+    return paths("expert.source");
+}
+
+const std::vector<std::string> * snapshot::paths(const std::string & key) const noexcept {
+    const auto * v = find(key);
     return v ? std::get_if<std::vector<std::string>>(&v->data) : nullptr;
 }
 

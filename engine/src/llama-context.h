@@ -310,7 +310,10 @@ private:
 
     // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
     // SSD experts, whose KV cache allocates its cells as they are used).
-    uint32_t fit_context(const llama_memory_params & params_mem) const;
+    uint32_t fit_context(const llama_memory_params & params_mem, const std::string & spill_directory,
+                         uint32_t & resident_cells) const;
+    uint32_t kv_spilled_caches = 0;
+    bool kv_default_pipeline = false;
 
     // The layers' matrices the model homes in host memory (llama_dense_homes) with an SSD context on a GPU that
     // streams: the GPU holds those its memory has room for once the graph is reserved, ahead of the expert caches, and

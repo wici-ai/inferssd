@@ -52,13 +52,16 @@ int main(int argc, char ** argv) {
         return 0;
     }
     using namespace ssd::settings;
-    assert(registry().size() == 13);
+    assert(registry().size() == 14);
     assert(parse("inferssd-settings 1\nmodel.engram_prefetch=1\nmodel.hc_fused=0\n", "model.ssd"));
     assert(!parse("inferssd-settings 1\nmodel.hc_fused=2\n", "model-invalid.ssd"));
     auto base = parse("", "");
     assert(base);
     assert(*base.value.integer("prefetch.depth") == 64);
     assert(base.value.integer("expert.source") == nullptr);
+    assert(base.value.paths("kv.spill_directory") && base.value.paths("kv.spill_directory")->empty());
+    auto spill = parse("inferssd-settings 1\nkv.spill_directory=[\"C:/Local KV\"]\n", "spill.ssd", {}, "windows");
+    assert(spill && *spill.value.paths("kv.spill_directory") == std::vector<std::string>{"C:/Local KV"});
     assert(base.value.find("unknown") == nullptr);
     const std::string text =
         "inferssd-settings 1\n"
