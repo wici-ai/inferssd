@@ -75,6 +75,12 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         )
         parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
+        parser.add_argument(
+            "--layer-events",
+            action="store_true",
+            help="record the engine's event for each layer in the run's events file, for "
+            "measuring; left out by default, since a server left running writes them without end",
+        )
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
             parser.add_argument("-n", "--max-tokens", type=int, default=512)
@@ -171,6 +177,9 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--set", value])
     if args.reprofile:
         command.append("--reprofile")
+    # serve and cli run for a person, for as long as they like: without the per-layer events.
+    if not args.layer_events:
+        command.append("--no-layer-events")
     launch = parser.parse_args(command)
     if args.command == "serve":
         print(f"Starting API at http://{connect_host(host)}:{args.port}/v1", file=sys.stderr)

@@ -16,6 +16,9 @@ struct llama_ssd_options {
     ssd::settings::snapshot settings;
     ssd::telemetry::debug_channels debug;
     std::string telemetry_file;
+    // The executors' events for each layer and each prompt graph go to the telemetry file. Without them the file
+    // holds the settings and the contract line alone.
+    bool layer_events = true;
 };
 
 struct llama_model;

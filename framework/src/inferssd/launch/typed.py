@@ -87,6 +87,10 @@ class LaunchSpec:
     # paths, any number of them): a per-layer embedding table kept apart from the model, say. The
     # engine's facts name the files the model loads from.
     shards: tuple[str, ...] = ()
+    # The engine's event for each layer and each prompt graph, which the benchmarks read
+    # (docs/architecture/native-observations.md). Without them the events file holds the
+    # settings alone, and a long run does not grow it.
+    layer_events: bool = True
 
 
 def listen_host(text: str) -> str:
@@ -304,6 +308,7 @@ def _resolve(
         "--cache-ram",
         "--cache-disk",
         "--cache-disk-mib",
+        "--ssd-no-layer-events",
         "-ot",
         "--override-tensor",
         "-ts",
@@ -554,6 +559,8 @@ def _resolve(
     for shard in spec.shards:
         command += ["--shard", shard]
     command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
+    if not spec.layer_events:
+        command.append("--ssd-no-layer-events")
     for item in value.entries:
         if item.origin == "cli":
             command += [

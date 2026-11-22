@@ -439,6 +439,7 @@ struct common_params {
     std::string ssd_model_facts; // --ssd-model-facts: print this model's facts once the arguments are parsed, and exit
     std::string ssd_settings_file;
     std::string ssd_telemetry_file;
+    bool ssd_layer_events = true; // an event for each layer and each prompt graph in the telemetry file
     std::vector<std::pair<std::string, std::string>> ssd_overrides;
     std::shared_ptr<llama_ssd_options> ssd_options;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit

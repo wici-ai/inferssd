@@ -522,6 +522,13 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     argv = list(result.argv)
     assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
     assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
+    # a launch records the engine's per-layer events unless it says not to
+    assert "--ssd-no-layer-events" not in argv
+    third = tmp_path / "third"
+    third.mkdir()
+    quiet = replace(spec, prompt_cache=cache, layer_events=False)
+    argv = list(resolve(inputs, quiet, adapter, third, platform).argv)
+    assert argv[argv.index("--ssd-telemetry") + 2] == "--ssd-no-layer-events"
 
 
 def test_sizes_default_to_the_context_and_batch():
