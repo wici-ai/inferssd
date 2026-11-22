@@ -14,13 +14,15 @@ from pathlib import Path, PurePosixPath
 from ci.contract import HASH, MODELS, revision
 
 LEGACY_REVISION = "f5e6e26ff26d2014cccef0118048039b88163f54"
-SETTING_KEYS = frozenset((
+# Benchmarks already bound to the earlier typed registry remain reproducible.
+PRE_SPILL_SETTING_KEYS = frozenset((
     "expert.source", "cpu.io_cpus", "cpu.decode_participants", "prefetch.depth",
     "place.costs", "prefill.lookahead", "vram.budget", "vram.max_slots",
     "vram.reserve_mib", "host.headroom_mib", "host.budget_mib",
     "model.engram_prefetch", "model.hc_fused",
 ))
-SETTING_GENERATIONS = (SETTING_KEYS,)
+SETTING_KEYS = PRE_SPILL_SETTING_KEYS | {"kv.spill_directory"}
+SETTING_GENERATIONS = (PRE_SPILL_SETTING_KEYS, SETTING_KEYS)
 
 
 def identity(value):
@@ -50,6 +52,8 @@ def validate_semantics(values):
         raise ValueError("reference adapter requires the explicit reviewed settings schema")
     if not set(values) <= set(properties):
         raise ValueError("installed settings registry cannot validate this binding generation")
+    if values.get("kv.spill_directory", []) != []:
+        raise ValueError("legacy reference comparisons require kv.spill_directory = []")
     for key, value in values.items():
         prop = properties[key]
         kind = prop["kind"]
