@@ -23,6 +23,17 @@ void configure_muse_caps(common_chat_template * default_template, common_chat_te
     }
 }
 
+void keep_history_stable(const std::string & source, json & extra_context) {
+    // A template that takes preserve_thinking and is not given it (Qwen3.6) writes the <think> block only of the
+    // assistant messages after the last user message, an empty one included. The next user message then changes how
+    // every earlier assistant message of the turn renders, and the prompt cache, which matches a token prefix,
+    // re-reads the whole turn. Given true, each assistant message renders the same wherever it stands: its own
+    // reasoning_content in the block, an empty block for none. Qwen3.8 templates already default to this.
+    if (source.find("preserve_thinking") != std::string::npos) {
+        extra_context["preserve_thinking"] = true;
+    }
+}
+
 // DeepSeek DSML tool calls. V3.2 writes <｜DSML｜function_calls>, <｜DSML｜invoke and <｜DSML｜parameter; V4.1 (v41)
 // names the block " calls" and puts a space before every tag name: <｜DSML｜ calls>, <｜DSML｜ invoke, <｜DSML｜ parameter.
 common_chat_params deepseek(const common_chat_template &    tmpl,

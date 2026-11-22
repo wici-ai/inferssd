@@ -16,6 +16,9 @@ using for_each_parameter = void (*)(const json &,
     const std::function<void(const std::string &, const json &, bool)> &);
 struct services { render apply; for_each functions; for_each_parameter parameters; };
 void configure_muse_caps(common_chat_template *, common_chat_template *);
+// Template variables that keep a sent assistant message rendering the same whatever follows it; set before the
+// launch's and the request's own kwargs, which override them.
+void keep_history_stable(const std::string & source, json & extra_context);
 common_chat_params deepseek(const common_chat_template &, const autoparser::generation_params &,
     bool v41, services);
 common_chat_params muse(const common_chat_template &, const autoparser::generation_params &, services);

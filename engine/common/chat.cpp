@@ -2126,6 +2126,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     // Derive the generation prefix with the same template kwargs as the real
     // prompt (e.g. K3 thinking=false changes the opener from think to response).
     params.extra_context = common_chat_extra_context();
+    inferssd::chat::keep_history_stable(src, params.extra_context);
     for (auto el : inputs.chat_template_kwargs) {
         params.extra_context[el.first] = json::parse(el.second);
     }
