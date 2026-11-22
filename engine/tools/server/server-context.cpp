@@ -1614,6 +1614,7 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        // The desktop app follows a request by this line and the slot lines after it (docs/server-log.md).
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
         if (slot.usage) {
             // ties this task's lines to the request's usage events

@@ -70,6 +70,9 @@ srv         begin: usage events: request req-8b1KfQ2s9mZ0aLx3cV7nT4yR to /v1/res
 slot launch_slot_: id  0 | task 12 | usage events: request req-8b1KfQ2s9mZ0aLx3cV7nT4yR
 ```
 
+The desktop app reads these and other lines of the log by their text: [server log lines the desktop app
+reads](server-log.md) lists them.
+
 The first line is written when the request reaches its route, before anything else the route logs; the second
 when a slot takes one of the request's tasks, after that task's `processing task` line.
 
