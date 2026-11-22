@@ -60,7 +60,8 @@ replace.
 
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
-(`--cache-disk`, 16 GiB per model). With the `dsv` profile the DeepSeek-V4.1
+(`--cache-disk`, 4 GiB per model unless `--prompt-cache-mib` names another
+limit). With the `dsv` profile the DeepSeek-V4.1
 template keeps earlier turns' thinking (`drop_thinking` false), so a
 conversation's history renders as the server cached it.
 

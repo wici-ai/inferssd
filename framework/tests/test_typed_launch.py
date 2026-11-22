@@ -521,7 +521,13 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second, platform)
     argv = list(result.argv)
     assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
-    assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
+    assert argv[argv.index("--cache-disk-mib") + 1] == "4096" and "--cache-ram" not in argv
+    # a launch may name its own limit
+    third = tmp_path / "third"
+    third.mkdir()
+    limited = replace(spec, prompt_cache=cache, prompt_cache_mib=1024)
+    argv = list(resolve(inputs, limited, adapter, third, platform).argv)
+    assert argv[argv.index("--cache-disk-mib") + 1] == "1024"
 
 
 def test_sizes_default_to_the_context_and_batch():

@@ -75,6 +75,12 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         )
         parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
+        parser.add_argument(
+            "--prompt-cache-mib",
+            type=int,
+            metavar="N",
+            help="size limit of each model's prompt cache on disk, in MiB",
+        )
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
             parser.add_argument("-n", "--max-tokens", type=int, default=512)
@@ -171,6 +177,8 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--set", value])
     if args.reprofile:
         command.append("--reprofile")
+    if args.prompt_cache_mib is not None:
+        command.extend(["--prompt-cache-mib", str(args.prompt_cache_mib)])
     launch = parser.parse_args(command)
     if args.command == "serve":
         print(f"Starting API at http://{connect_host(host)}:{args.port}/v1", file=sys.stderr)
