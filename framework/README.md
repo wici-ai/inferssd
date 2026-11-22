@@ -164,7 +164,8 @@ An unrelated listener on the health port is never killed.
 `settings.ssd` records the file/generated settings and their receipts;
 `native-events.jsonl` is exclusively created by the context-owned native writer.
 `runtime.json` records server argv and scope, `memory-samples.jsonl` records
-resource samples, and `ownership.json` records final status and cleanup.
+resource samples (every one of the first minute, then one every 30 seconds and
+any whose memory moved by 2%), and `ownership.json` records final status and cleanup.
 Keep these artifacts private if arguments or paths contain private information.
 Server loader variables are carried in the process environment and restored
 only for the server, not serialized into the launch specification or applied to
