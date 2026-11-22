@@ -76,6 +76,12 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
         parser.add_argument(
+            "--prompt-cache-mib",
+            type=int,
+            metavar="N",
+            help="size limit of each model's prompt cache on disk, in MiB",
+        )
+        parser.add_argument(
             "--layer-events",
             action="store_true",
             help="record the engine's event for each layer in the run's events file, for "
@@ -177,6 +183,8 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--set", value])
     if args.reprofile:
         command.append("--reprofile")
+    if args.prompt_cache_mib is not None:
+        command.extend(["--prompt-cache-mib", str(args.prompt_cache_mib)])
     # serve and cli run for a person, for as long as they like: without the per-layer events.
     if not args.layer_events:
         command.append("--no-layer-events")
