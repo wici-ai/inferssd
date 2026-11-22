@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // A usage event says which route a request came to and who sent it, and why it failed, so a host can show each
-// request without reading the server log. The caller's name comes only from an API key of the form
-// inferssd-<name>; any other key is the caller's secret and is never written. Writes the events of a few
-// requests to a temporary directory and reads them back; no model is loaded.
+// request without reading the server log. The caller is known by its API key: a name the host gave it, written
+// inferssd-<name>, or whatever other key it sends. Writes the events of a few requests to a temporary directory
+// and reads them back; no model is loaded.
 #include "inferssd/usage.h"
 
 #include <nlohmann/json.hpp>
@@ -33,12 +33,13 @@ static void test_caller() {
     require(caller({ { "authorization", "Bearer inferssd-claude-desktop" } }).client == "claude-desktop", "the header's case does not matter");
     require(caller({ { "x-api-key", "inferssd-my_tool2" } }).client == "my_tool2", "X-Api-Key names the caller too");
     require(caller({ { "Authorization", "Bearer inferssd-a" }, { "X-Api-Key", "inferssd-b" } }).client == "a", "Authorization comes first");
-    // a key that is not a name is a secret: none of it is kept
-    for (const char * key : { "Bearer sk-proj-abcdef0123456789", "Bearer inferssd", "Bearer inferssd-", "Bearer inferssd-Codex",
-                              "Bearer inferssd--x", "Bearer inferssd-a b", "Bearer inferssd-0123456789012345678901234567890123",
-                              "Bearer  inferssd-codex", "Basic inferssd-codex" }) {
-        require(caller({ { "Authorization", key } }).client.empty(), std::string("no name from the key ") + key);
-    }
+    // any other key is the caller's name as it stands
+    require(caller({ { "Authorization", "Bearer sk-proj-abcdef0123456789" } }).client == "sk-proj-abcdef0123456789", "another key is kept");
+    require(caller({ { "Authorization", "Bearer inferssd" } }).client == "inferssd", "the bare prefix is a key of its own");
+    require(caller({ { "Authorization", "Bearer inferssd-" } }).client == "inferssd-", "the prefix with no name too");
+    require(caller({ { "X-Api-Key", "My Tool" } }).client == "My Tool", "a key need not look like a name");
+    require(caller({ { "Authorization", "Bearer " + std::string(200, 'k') } }).client.size() == 64, "a long key is cut");
+    require(caller({ { "Authorization", "Bearer a\tb\x01" "c" } }).client == "abc", "only printable ASCII is kept");
     require(caller({ { "User-Agent", "codex_cli_rs/0.169.0 (Mac OS 26.2; arm64)" } }).user_agent == "codex_cli_rs/0.169.0 (Mac OS 26.2; arm64)",
             "the User-Agent is kept");
     require(caller({ { "user-agent", std::string(300, 'a') } }).user_agent.size() == 120, "a long User-Agent is cut");
@@ -74,8 +75,8 @@ static void test_events() {
         request->set_outcome(SERVER_USAGE_COMPLETED);
     }
     {
-        // failed before it ran, from a caller that names nothing: the first reason is the one kept
-        auto request = log->begin(server_usage_caller::from_request("/v1/chat/completions", { { "Authorization", "Bearer sk-secret" } }));
+        // failed before it ran, from a caller with no key: the first reason is the one kept
+        auto request = log->begin(server_usage_caller::from_request("/v1/chat/completions", {}));
         request->set_error("image input is not supported");
         request->set_error("a later reason");
     }
@@ -92,7 +93,6 @@ static void test_events() {
     require(lines[1].at("outcome") == "completed" && !lines[1].contains("error"), "a completed request has no error");
     require(lines[2].at("route") == "/v1/chat/completions" && !lines[2].contains("client") && !lines[2].contains("user_agent"),
             "an unnamed caller leaves the fields out: " + lines[2].dump());
-    require(lines[2].dump().find("sk-secret") == std::string::npos, "another key is never written");
     require(lines[3].at("outcome") == "failed" && lines[3].at("error") == "image input is not supported", "the first reason is kept");
     require(lines[3].at("cached_tokens") == 0 && lines[3].at("prompt_ms") == 0 && lines[3].at("output_ms") == 0, "nothing ran");
 }

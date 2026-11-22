@@ -102,29 +102,6 @@ std::string header_value(const std::map<std::string, std::string> & headers, con
     return {};
 }
 
-// The name in a key of the form inferssd-<name>: lowercase letters, digits, - and _, starting with a letter or
-// a digit, at most 32 characters. Anything else is a secret of the caller's and gives no name.
-std::string client_name(std::string key) {
-    static const std::string bearer = "Bearer ";
-    static const std::string prefix = "inferssd-";
-    if (key.compare(0, bearer.size(), bearer) == 0) {
-        key.erase(0, bearer.size());
-    }
-    if (key.compare(0, prefix.size(), prefix) != 0) {
-        return {};
-    }
-    const std::string name = key.substr(prefix.size());
-    if (name.empty() || name.size() > 32 || name[0] == '-' || name[0] == '_') {
-        return {};
-    }
-    for (const unsigned char c : name) {
-        if (!(std::islower(c) || std::isdigit(c) || c == '-' || c == '_')) {
-            return {};
-        }
-    }
-    return name;
-}
-
 // printable ASCII, cut to n characters
 std::string printable(const std::string & text, size_t n) {
     std::string result;
@@ -137,6 +114,20 @@ std::string printable(const std::string & text, size_t n) {
         }
     }
     return result;
+}
+
+// What a request's API key says of its caller: the key itself, as printable ASCII cut to 64 characters, without
+// the Bearer scheme and without the inferssd- prefix a host puts before the names it gives its tools.
+std::string client_name(std::string key) {
+    static const std::string bearer = "Bearer ";
+    static const std::string prefix = "inferssd-";
+    if (key.compare(0, bearer.size(), bearer) == 0) {
+        key.erase(0, bearer.size());
+    }
+    if (key.size() > prefix.size() && key.compare(0, prefix.size(), prefix) == 0) {
+        key.erase(0, prefix.size());
+    }
+    return printable(key, 64);
 }
 
 const char * outcome_name(server_usage_outcome outcome) {

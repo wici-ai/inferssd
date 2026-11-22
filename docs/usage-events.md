@@ -33,7 +33,7 @@ A reader takes the fields it knows and passes over the rest, so that a later ver
 | `request_id` | Random for each HTTP request; pairs its two records. |
 | `occurred_at` | UTC, to the second, when the request reached its route or when its usage was final. |
 | `route` | On `request_received`: the path the request came to, as the client wrote it, without its query. |
-| `client` | On `request_received`, when the request's API key has the form `inferssd-<name>`: that name. See [Who sent a request](#who-sent-a-request). |
+| `client` | On `request_received`, when the request has an API key: the key, less a leading `inferssd-`. See [Who sent a request](#who-sent-a-request). |
 | `user_agent` | On `request_received`, when the request has a `User-Agent` header: its printable ASCII, cut to 120 characters. |
 | `input_tokens` | Prompt tokens, as the OpenAI-style `prompt_tokens` reports them: prompt-cache hits included. (Anthropic's `input_tokens` leaves the hits out.) |
 | `output_tokens` | Generated tokens, reasoning included. |
@@ -49,13 +49,15 @@ its outcome.
 
 ## Who sent a request
 
-The server needs no API key, and it tells its callers apart by none. A host that points several tools at one
-server can still give each a name: it sets the tool's API key to `inferssd-<name>`, where the name is 1 to 32
-lowercase letters, digits, `-` or `_` and starts with a letter or a digit. The server reads the key from
-`Authorization: Bearer` or, without that header, from `X-Api-Key`, and writes the name as `client`. A key of any
-other form may be a secret for another service, so nothing of it is written here or in the server log.
+The server needs no API key, but most tools send one, and a host that points several tools at one server can
+tell them apart by it. The server reads the key from `Authorization: Bearer` or, without that header, from
+`X-Api-Key`, and writes it as `client`: its printable ASCII, cut to 64 characters. A host that names a tool sets
+the tool's key to `inferssd-<name>`, and `client` is then the name alone.
 
-The name identifies nothing: any caller can use any name. With `--api-key`, a request is still checked against
+The key is written as it was sent. A tool that sends a secret for another service here leaves that secret in
+the usage file, which is why the file is private to the user (mode 0600). The server log never has it.
+
+The key identifies nothing: any caller can send any key. With `--api-key`, a request is still checked against
 the keys given there before it reaches a route.
 
 ## The server log

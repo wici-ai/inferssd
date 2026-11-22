@@ -93,7 +93,7 @@ def test_request_names_its_route_and_caller(tmp_path):
     server.start()
     base = f"http://{server.server_host}:{server.server_port}"
     body = {"max_tokens": 4, "messages": [{"role": "user", "content": "What is the best book"}]}
-    # a key of the form inferssd-<name> names the caller; any other key is a secret and leaves no trace
+    # the key names the caller: a name the host gave, less its inferssd- prefix, or any other key as it stands
     requests.post(base + "/v1/chat/completions", json=body, headers={
         "Authorization": "Bearer inferssd-codex", "User-Agent": "codex_cli_rs/0.169.0"})
     requests.post(base + "/v1/messages", json={"model": "x", **body}, headers={"X-Api-Key": "sk-ant-secret", "User-Agent": ""})
@@ -101,8 +101,7 @@ def test_request_names_its_route_and_caller(tmp_path):
     received = [e for e in events if e["type"] == "request_received"]
     assert [e["route"] for e in received] == ["/v1/chat/completions", "/v1/messages"]
     assert (received[0]["client"], received[0]["user_agent"]) == ("codex", "codex_cli_rs/0.169.0")
-    assert "client" not in received[1]
-    assert "sk-ant-secret" not in usage_path(tmp_path).read_text(encoding="utf-8")
+    assert received[1]["client"] == "sk-ant-secret"
 
 
 def test_log_names_the_request(tmp_path):
