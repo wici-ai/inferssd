@@ -419,9 +419,13 @@ llama_context::llama_context(
 
         // n_ctx 0 in an SSD context: the largest context whose KV cache fits memory when full, with routed experts or
         // without (the expert caches and the layers a GPU holds give it room as it grows)
-        if ((params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1) || !spill_directory.empty()) {
+        // With kv.spill_directory the context is fitted too, and a context the SSD lets the cache grow to is taken in
+        // place of an explicit one; without a spill (a cache that cannot spill, or no room on the SSD) an explicit
+        // context stays as given.
+        const bool fit_requested = params.n_ctx == 0 && ssd_runtime && cparams.n_seq_max == 1;
+        if (fit_requested || !spill_directory.empty()) {
             const uint32_t fitted = fit_context(params_mem, spill_directory, resident_cells);
-            if (fitted && fitted < cparams.n_ctx) {
+            if (fitted && fitted < cparams.n_ctx && (fit_requested || resident_cells)) {
                 cparams.n_ctx = cparams.n_ctx_seq = fitted;
                 cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
                 cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
@@ -439,6 +443,10 @@ llama_context::llama_context(
                 }
                 if (gf_res_prev) { gf_res_prev->reset(); }
                 sched_need_reserve = true;
+                // Where decode runs each node was recorded for the cache's old storage: a spilled cache is written on
+                // the CPU and read through staging, a restored one on its devices again. A prompt graph is compared with
+                // the decode graph of the same storage, recorded again when the decode graph is next reserved.
+                decode_gpu_nodes.clear();
                 if (spilling) {
                     ++kv_spilled_caches;
                 } else {
@@ -705,7 +713,7 @@ llama_memory_context_ptr llama_context::memory_init_reserve() {
 // builds it, its tensors sized and no memory taken.
 static std::map<ggml_backend_buffer_type_t, size_t> llama_memory_size(const llama_model & model,
         const llama_memory_params & params_mem, llama_cparams cparams, uint32_t n, bool * can_grow = nullptr,
-        std::map<ggml_backend_dev_t, size_t> * staging = nullptr) {
+        std::map<ggml_backend_dev_t, size_t> * staging = nullptr, bool * can_spill = nullptr) {
     cparams.n_ctx = cparams.n_ctx_seq = n;
     cparams.n_batch = std::min(cparams.n_batch, n);
     cparams.n_ubatch = std::min(cparams.n_ubatch, n);
@@ -725,6 +733,9 @@ static std::map<ggml_backend_buffer_type_t, size_t> llama_memory_size(const llam
         if (staging && memory) {
             *staging = memory->kv_stage_bytes();
         }
+        if (can_spill) {
+            *can_spill = memory && memory->can_spill();
+        }
     } catch (...) {
         hparams.no_alloc = no_alloc;
         throw;
@@ -742,11 +753,11 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem, cons
     }
     std::map<ggml_backend_buffer_type_t, size_t> small, large;
     std::map<ggml_backend_dev_t, size_t> staging;
-    bool can_grow = false;
+    bool can_grow = false, can_spill = false;
     try {
         small = llama_memory_size(model, params_mem, cparams, step);
         large = llama_memory_size(model, params_mem, cparams, n_train, &can_grow,
-                spill_directory.empty() ? nullptr : &staging);
+                spill_directory.empty() ? nullptr : &staging, &can_spill);
     } catch (const std::exception & error) {
         LLAMA_LOG_WARN("%s: cannot size the KV cache: %s\n", __func__, error.what());
         return 0;
@@ -824,7 +835,11 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem, cons
                 device.second.fixed/1048576.0, device.second.cell/1048576.0, device.second.room/1048576.0);
     }
     LLAMA_LOG_CONT("\n");
-    if (!spill_directory.empty() && can_grow && fits(n)) {
+    if (!spill_directory.empty() && !can_spill) {
+        // a memory whose cells cannot move to the SSD (DeepSeek-V4.1's compressed caches) keeps the context that fits
+        LLAMA_LOG_INFO("%s: this model's KV cache cannot spill to kv.spill_directory; the context fits memory\n", __func__);
+    }
+    if (!spill_directory.empty() && can_grow && can_spill && fits(n)) {
         const auto path = std::filesystem::u8path(spill_directory);
         std::error_code error;
         const auto disk = std::filesystem::space(path, error);
@@ -837,10 +852,12 @@ uint32_t llama_context::fit_context(const llama_memory_params & params_mem, cons
             large_bytes += bytes;
             if (small.count(buft)) { small_bytes += small.at(buft); }
         }
-        // The layer staging only exists after the resident buffers are released. One split may also
-        // need its prefill mask on the host and the device. Leave both spaces before admitting a context.
+        // The layer staging only exists after the resident buffers are released: leave its room before admitting a
+        // context, with a token's row of the mask over every cell (decode's). A prompt's ubatch, and with it the rows of
+        // its mask, is sized to the room its graph finds (prefill_refit), as without a spill; budgeting the configured
+        // ubatch here (a whole context in one pass) would admit no spill at all.
         const auto spill_fits = [&](uint32_t logical) {
-            const double mask = double(logical)*cparams.n_ubatch*sizeof(float);
+            const double mask = double(logical)*sizeof(float);
             double host_scratch = mask;
             for (const auto & [dev, bytes] : staging) {
                 const double layer = double(bytes)*logical/n_train;
@@ -3421,7 +3438,11 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
         [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
     auto room = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
     if (!room) {
-        LLAMA_LOG_ERROR("%s: host budget refused: %s\n", __func__, room.error.c_str());
+        const auto & observed = room.value.observation();
+        LLAMA_LOG_ERROR("%s: host budget refused the graph's %.1f MiB on the host and %.1f MiB on devices (%.1f MiB short "
+                "of the limits, %.1f MiB left in the envelope): %s\n", __func__, host_bytes/1048576.0,
+                device_bytes/1048576.0, observed.limits_shortage/1048576.0, observed.cgroup_surplus/1048576.0,
+                room.error.c_str());
         ggml_backend_sched_reset(sched.get());
         return false;
     }

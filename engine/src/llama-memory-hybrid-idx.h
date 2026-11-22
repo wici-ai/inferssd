@@ -75,6 +75,9 @@ public:
     bool set_kv_spill(const std::string & directory, uint32_t resident,
                       const std::function<void(bool)> & synchronize) override;
     std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override;
+    bool can_spill() const override {
+        return llama_memory_hybrid::can_spill() && (!mem_idx || mem_idx->can_spill());
+    }
     bool cells_short(uint32_t n_tokens) const override;
     bool reserve_cells(uint32_t n_tokens) override;
     bool fit_cells(uint32_t n_tokens) override;

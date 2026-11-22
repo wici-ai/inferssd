@@ -84,6 +84,7 @@ public:
         return kv_base->set_kv_spill(directory, resident, synchronize) &&
                kv_swa->set_kv_spill(directory, resident, synchronize);
     }
+    bool can_spill() const override { return kv_base->can_spill() && kv_swa->can_spill(); }
     std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override {
         auto result = kv_base->kv_stage_bytes();
         for (const auto & [device, bytes] : kv_swa->kv_stage_bytes()) {

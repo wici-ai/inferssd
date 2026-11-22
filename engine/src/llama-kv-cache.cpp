@@ -402,8 +402,10 @@ bool llama_kv_cache::commit_cells(kv_store & store, uint32_t n_old, uint32_t n) 
     if (!spill && !llama_kv_set_committed(store.buf.get(), row*n)) {
         return false;
     }
-    if (n > n_old) {
-        // zeroed, which avoids NaNs in the cells graphs read before they are written
+    // zeroed, which avoids NaNs in the cells graphs read before they are written. A spilled cache's file is created
+    // zero, and its cells past those written hold zeros or the values written before a trim: writing zeros there would
+    // only dirty the mapping's pages, which count as the process's memory until they are written back.
+    if (n > n_old && !spill) {
         ggml_backend_tensor_memset(store.t, 0, row*n_old, row*(n - n_old));
     }
     return true;

@@ -175,6 +175,8 @@ public:
     bool set_kv_spill(const std::string & directory, uint32_t resident_cells,
                       const std::function<void(bool)> & synchronize) override;
     std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override;
+    // a cache that grows (or would, sized with no_alloc) spills as it grows past its resident cells
+    bool can_spill() const override { return get_can_grow(); }
     bool get_can_grow() const override;
     bool cells_short(uint32_t n_tokens) const override;
     bool reserve_cells(uint32_t n_tokens) override;

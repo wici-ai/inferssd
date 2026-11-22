@@ -180,6 +180,9 @@ struct llama_memory_i {
         return false;
     }
     virtual std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const { return {}; }
+    // whether set_kv_spill can move the memory's growing cells to the SSD: context fitting admits a context past
+    // memory only for a memory that can (a cache without it keeps the context that fits memory)
+    virtual bool can_spill() const { return false; }
 
     // whether the memory allocates its cells as they are used (or would, sized without allocating: no_alloc), so that
     // a larger context costs memory only once it is filled
