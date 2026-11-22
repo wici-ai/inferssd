@@ -33,7 +33,7 @@ A reader takes the fields it knows and passes over the rest, so that a later ver
 | `request_id` | Random for each HTTP request; pairs its two records. |
 | `occurred_at` | UTC, to the second, when the request reached its route or when its usage was final. |
 | `route` | On `request_received`: the path the request came to, as the client wrote it, without its query. |
-| `client` | On `request_received`, when the request has an API key: the key, less a leading `inferssd-`. See [Who sent a request](#who-sent-a-request). |
+| `client` | On `request_received`, when the request has an API key: the name in a key `inferssd-<name>`, else the key's first 10 characters. See [Who sent a request](#who-sent-a-request). |
 | `user_agent` | On `request_received`, when the request has a `User-Agent` header: its printable ASCII, cut to 120 characters. |
 | `input_tokens` | Prompt tokens, as the OpenAI-style `prompt_tokens` reports them: prompt-cache hits included. (Anthropic's `input_tokens` leaves the hits out.) |
 | `output_tokens` | Generated tokens, reasoning included. |
@@ -51,11 +51,12 @@ its outcome.
 
 The server needs no API key, but most tools send one, and a host that points several tools at one server can
 tell them apart by it. The server reads the key from `Authorization: Bearer` or, without that header, from
-`X-Api-Key`, and writes it as `client`: its printable ASCII, cut to 64 characters. A host that names a tool sets
-the tool's key to `inferssd-<name>`, and `client` is then the name alone.
+`X-Api-Key`, and writes `client` from it:
 
-The key is written as it was sent. A tool that sends a secret for another service here leaves that secret in
-the usage file, which is why the file is private to the user (mode 0600). The server log never has it.
+- A host that names a tool sets the tool's key to `inferssd-<name>`. `client` is then the name, its printable
+  ASCII, cut to 64 characters.
+- Any other key may be a secret for another service. `client` is its first 10 characters, which tell one such
+  caller from another; the rest is written nowhere, not here and not in the server log.
 
 The key identifies nothing: any caller can send any key. With `--api-key`, a request is still checked against
 the keys given there before it reaches a route.

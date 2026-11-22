@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // A usage event says which route a request came to and who sent it, and why it failed, so a host can show each
 // request without reading the server log. The caller is known by its API key: a name the host gave it, written
-// inferssd-<name>, or whatever other key it sends. Writes the events of a few requests to a temporary directory
-// and reads them back; no model is loaded.
+// inferssd-<name>, or the first 10 characters of any other key, which may be a secret. Writes the events of a few
+// requests to a temporary directory and reads them back; no model is loaded.
 #include "inferssd/usage.h"
 
 #include <nlohmann/json.hpp>
@@ -33,12 +33,12 @@ static void test_caller() {
     require(caller({ { "authorization", "Bearer inferssd-claude-desktop" } }).client == "claude-desktop", "the header's case does not matter");
     require(caller({ { "x-api-key", "inferssd-my_tool2" } }).client == "my_tool2", "X-Api-Key names the caller too");
     require(caller({ { "Authorization", "Bearer inferssd-a" }, { "X-Api-Key", "inferssd-b" } }).client == "a", "Authorization comes first");
-    // any other key is the caller's name as it stands
-    require(caller({ { "Authorization", "Bearer sk-proj-abcdef0123456789" } }).client == "sk-proj-abcdef0123456789", "another key is kept");
+    // any other key may be a secret: its first 10 characters name the caller, and no more is kept
+    require(caller({ { "Authorization", "Bearer sk-proj-abcdef0123456789" } }).client == "sk-proj-ab", "another key is cut to 10");
     require(caller({ { "Authorization", "Bearer inferssd" } }).client == "inferssd", "the bare prefix is a key of its own");
     require(caller({ { "Authorization", "Bearer inferssd-" } }).client == "inferssd-", "the prefix with no name too");
-    require(caller({ { "X-Api-Key", "My Tool" } }).client == "My Tool", "a key need not look like a name");
-    require(caller({ { "Authorization", "Bearer " + std::string(200, 'k') } }).client.size() == 64, "a long key is cut");
+    require(caller({ { "X-Api-Key", "My Tool" } }).client == "My Tool", "a short key need not look like a name");
+    require(caller({ { "Authorization", "Bearer inferssd-" + std::string(200, 'k') } }).client.size() == 64, "a long name is cut to 64");
     require(caller({ { "Authorization", "Bearer a\tb\x01" "c" } }).client == "abc", "only printable ASCII is kept");
     require(caller({ { "User-Agent", "codex_cli_rs/0.169.0 (Mac OS 26.2; arm64)" } }).user_agent == "codex_cli_rs/0.169.0 (Mac OS 26.2; arm64)",
             "the User-Agent is kept");

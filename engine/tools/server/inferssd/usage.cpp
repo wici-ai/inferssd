@@ -116,8 +116,9 @@ std::string printable(const std::string & text, size_t n) {
     return result;
 }
 
-// What a request's API key says of its caller: the key itself, as printable ASCII cut to 64 characters, without
-// the Bearer scheme and without the inferssd- prefix a host puts before the names it gives its tools.
+// What a request's API key says of its caller, without the Bearer scheme. A key inferssd-<name> is a name a host
+// gave one of its tools, and the name is kept whole, up to 64 characters. Any other key may be a secret for
+// another service: its first 10 characters tell callers apart and are all that is kept.
 std::string client_name(std::string key) {
     static const std::string bearer = "Bearer ";
     static const std::string prefix = "inferssd-";
@@ -125,9 +126,9 @@ std::string client_name(std::string key) {
         key.erase(0, bearer.size());
     }
     if (key.size() > prefix.size() && key.compare(0, prefix.size(), prefix) == 0) {
-        key.erase(0, prefix.size());
+        return printable(key.substr(prefix.size()), 64);
     }
-    return printable(key, 64);
+    return printable(key, 10);
 }
 
 const char * outcome_name(server_usage_outcome outcome) {

@@ -28,8 +28,8 @@ struct server_usage_log;
 // What a request says of itself: the route it came to and, from its headers, who sent it.
 struct server_usage_caller {
     std::string route;
-    // The request's API key, by which a host tells apart the tools it points at the server: as it was sent, less
-    // the inferssd- prefix of a name the host gave. Empty without a key.
+    // From the request's API key, by which a host tells apart the tools it points at the server: the name in a
+    // key inferssd-<name>, or the first 10 characters of any other key. Empty without a key.
     std::string client;
     // The User-Agent header, printable ASCII, cut to 120 characters; empty without one.
     std::string user_agent;
