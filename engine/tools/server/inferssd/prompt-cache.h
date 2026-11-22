@@ -53,6 +53,11 @@ struct server_prompt {
     size_t      file_data_offset = 0;
     size_t      file_data_size   = 0;
 
+    // how many of the tokens every state of this prompt's conversation starts with: the prefix other conversations
+    // share (the leading system messages and tools) and the user messages before the first reply; 0 if unknown
+    // (not a chat prompt, no system message, or a prompt as the cache found it on disk)
+    int64_t n_conversation = 0;
+
     size_t size() const {
         size_t res = file.empty() ? data.size() : file_data_size;
 
@@ -75,6 +80,7 @@ struct server_prompt {
             file,
             file_data_offset,
             file_data_size,
+            n_conversation,
         };
     }
 };
@@ -95,6 +101,20 @@ int64_t server_prompt_reuse_full(
 inline bool server_prompt_batch_stops(int64_t n_done, int64_t n_prompt, int64_t n_shared, int64_t n_batch) {
     const int64_t n_end = n_prompt - std::min<int64_t>(n_batch, 4);
     return n_done == n_end || (n_done == n_shared && n_done >= 64 && n_done < n_end);
+}
+
+// Whether `prompt` is a newer state of the conversation that the cached prompt `old` is a state of, and takes its
+// place in the prompt cache. The two are states of one conversation when they share the conversation's opening
+// (prompt.n_conversation tokens): the system messages, the tools and the user messages before the first reply. A
+// conversation that only starts behind the same system messages and tools parts from the prompt before that, and
+// the shared prefix kept for all of them is shorter than it. The newer state replaces only one that is not longer:
+// a short request made beside a long conversation, with the same opening, leaves the long state in place.
+inline bool server_prompt_supersedes(const server_prompt & prompt, const server_prompt & old) {
+    const int64_t n = prompt.n_conversation;
+    if (n <= 0 || n >= prompt.n_tokens() || old.n_tokens() > prompt.n_tokens()) {
+        return false;
+    }
+    return (int64_t) old.tokens.get_common_prefix(prompt.tokens) >= n;
 }
 
 inline const server_prompt_checkpoint * server_prompt_find_checkpoint_before_pos(
@@ -140,6 +160,8 @@ struct server_prompt_cache {
     size_t n_tokens() const;
 
     // Save the slot's state for `prompt`, with the prompt's checkpoints, unless the cache can already restore it.
+    // The older states of the same conversation go (server_prompt_supersedes): a conversation whose history is
+    // rendered or sent differently from one turn to the next leaves states that no later prompt extends.
     // The state is the current one (current = true) or the one the sequence had after prompt.tokens, which needs a
     // memory that can save an earlier state (llama_state_seq_can_save_at).
     void save(
@@ -164,6 +186,8 @@ struct server_prompt_cache {
 private:
     friend struct server_prompt_cache_testing; // Explicit metadata-only unit fixture; no production admission shortcut.
     void remove_obsolete(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
+    // removes the states `prompt` supersedes, except `saved`, the cache's own entry of it
+    void remove_superseded(const server_prompt & prompt, const server_prompt * saved);
     bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     void remove(std::list<server_prompt>::iterator it);
 };

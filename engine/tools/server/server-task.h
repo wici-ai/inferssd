@@ -177,6 +177,10 @@ struct server_task {
     // the tools (0 if unknown); the server keeps a state there that later conversations start from
     int64_t n_shared_prefix = 0;
 
+    // tokens of the prompt that every state of its conversation starts with: the shared prefix and the user
+    // messages before the first reply (0 if unknown); the prompt cache keeps one state per conversation by them
+    int64_t n_conversation_prefix = 0;
+
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
     bool                    cli = false;

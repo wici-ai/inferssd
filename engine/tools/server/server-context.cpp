@@ -50,10 +50,12 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// The number of tokens of the shared prompt prefix the chat template reported ("shared_prefix_chars", see
-// oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the prompt's tokens; 0 otherwise.
-static int64_t server_shared_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens) {
-    const size_t n_chars = json_value(data, "shared_prefix_chars", (size_t) 0);
+// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
+// "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
+// prompt's tokens; 0 otherwise.
+static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens,
+        const char * key) {
+    const size_t n_chars = json_value(data, key, (size_t) 0);
     const std::string prompt = json_value(data, "prompt", std::string());
     if (n_chars == 0 || n_chars >= prompt.size()) {
         return 0;
@@ -1316,6 +1318,11 @@ private:
             task.n_shared_prefix += delta;
         } else if (task.n_shared_prefix > int64_t(n_before)) {
             task.n_shared_prefix = int64_t(n_before);
+        }
+        if (task.n_conversation_prefix >= replaced_end) {
+            task.n_conversation_prefix += delta;
+        } else if (task.n_conversation_prefix > int64_t(n_before)) {
+            task.n_conversation_prefix = 0; // ends inside the replaced text: unknown
         }
         SLT_INF(slot, "prompt text continues the cached tokens: shared %zu -> %zu of %zu cached tokens, prompt %zu -> %zu tokens\n",
                 n_before, n_after, slot.prompt.tokens.size(), task.tokens.size(), tokens.size());
@@ -2674,6 +2681,9 @@ private:
 
                     slot.prompt.tokens.clear();
                     slot.prompt.tokens.insert(new_tokens);
+
+                    // the shift may have cut into the conversation's opening
+                    slot.prompt.n_conversation = 0;
                 }
 
                 slot.truncated = true;
@@ -3021,6 +3031,9 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+
+                        // from here on the slot holds a state of the task's conversation
+                        slot.prompt.n_conversation = slot.task->n_conversation_prefix;
 
                         // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
@@ -3800,6 +3813,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
+        int64_t n_conversation_prefix = 0;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
             // This is the case used by OAI compatible chat path with MTMD. TODO It can be moved to the path below.
@@ -3814,7 +3828,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             inputs.push_back(process_mtmd_prompt(ctx_server.mctx, prompt.get<std::string>(), files, spans));
         } else if (res_type != TASK_RESPONSE_TYPE_NONE && data.contains("chat_input_spans")) {
             inputs.emplace_back(tokenize_chat_prompt(ctx_server.vocab, data), false);
-            n_shared_prefix = server_shared_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens());
+            n_shared_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                    "shared_prefix_chars");
+            if (n_shared_prefix > 0) {
+                n_conversation_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                        "conversation_prefix_chars");
+            }
         } else {
             // Everything else, including multimodal completions.
             inputs = tokenize_input_prompts(ctx_server.vocab, ctx_server.mctx, prompt, true, true);
@@ -3829,6 +3848,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.n_shared_prefix = n_shared_prefix;
+            task.n_conversation_prefix = n_conversation_prefix;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
                     params,
