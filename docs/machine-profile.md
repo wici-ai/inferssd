@@ -36,6 +36,13 @@ inferssd profile --reprofile --model /models/model-00001-of-00004.gguf
 | `--model PATH` | A model file or directory whose drive is measured. Repeat it for models on other drives. A file named like `name-00001-of-00004.gguf` brings all shards of its set; a directory brings every file below it, and one without a file of 1 GiB is measured with a test file (see [drive measurement](#drive-measurement)). The [speed estimates](#speed-estimates) take the models to be on the drive that holds most of the given files, or with none, on the first directory's. |
 | `--resources FILE` | An [engine resource descriptor](engine-resources.md) whose `probes` map names the probe executables. |
 | `--build DIR` | An engine build directory; the probes are `DIR/bin/inferssd-*probe` (`inferssd-*probe.exe` on Windows). |
+| `--estimate-compute` | Measure single-token matrix throughput on idle CUDA/ROCm GPUs with synthetic weights. |
+| `--memory-gib`, `--host-work-mib`, `--gpu-work-mib` | Set the host budget and additional known working-memory reservations for estimation. |
+| `--estimate-gguf FILE` | Estimate a specific GGUF. The engine reads its headers and discovers standard shards. Pass extra tables or nonstandard shards with repeatable `--shard` or `--ple`. |
+| `--estimate-facts JSON` | Estimate exported native model facts against the current machine profile. Use `--model PATH` to select the target drive when the weights will spill. |
+| `--routing-events FILE` | Price a comparable MoE workload using observed cache hits from its last single-stream request. |
+| `--calibrate-from RESPONSE.json` | Derive a machine calibration from a resident reference model and its server response. Prints JSON. |
+| `--calibration FILE` | Use that machine calibration with any explicit target on the same visible devices. |
 | `--reprofile` | Ignore the saved file and measure every section. |
 | `--output PATH` | Use this file instead of the default location. |
 | `--show` | Print the saved file's summary and exit; with `--model`, also the estimates for that drive. Measures nothing. |
@@ -45,7 +52,7 @@ Without `--resources` or `--build`, the command uses the installed engine, as
 `cli` and `serve` do: `INFERSSD_RESOURCES` when nonempty (set by the one-command
 installer's wrapper), otherwise `current/engine-resources.json` in the data
 directory. Without an installed engine it exits with status 2. `--show` only
-reads the saved profile and needs none of these.
+reads the saved profile. Adding `--estimate-gguf` also needs the engine header reader. Adding `--estimate-facts` works offline.
 The command prints one progress line per step on stderr and one summary line per
 section on stdout, with `--model` one estimate line per supported model, then
 names the sections of this run that are partial or failed (on stderr with
@@ -214,26 +221,124 @@ substituted drives) are identified by filesystem type and mount point.
 
 ## Speed estimates
 
-With `--model`, `inferssd profile` estimates the decode speed of each supported
-model, before it is downloaded, from this machine's profile and the engine's
-facts of its tested quantization that the framework keeps. A token's time is the sum of:
+Estimate single-stream generation after prefill. The ordinary input is a GGUF
+that the engine can load. The engine supplies tensor roles, sizes, formats,
+layer counts and routed expert layouts. The same formulas apply to every
+checkpoint. The existing `--model /models --json` report still lists the catalog
+when no explicit target is given.
 
-- the dense weights a token reads, at the fastest measured memory read rate
-  (the token embeddings and DeepSeek-V4.1's engram tables, of which a token
-  reads one row, do not count);
-- each routed expert at the CPU cost a launch prices one route at;
-- the experts the RAM cache misses, read from the models' drive at the rate a
-  launch takes for the engine's reads.
+```sh
+inferssd profile --estimate-gguf /models/model.gguf --estimate-compute --json
+inferssd profile --show --estimate-gguf /models/model.gguf --ple /models/table.gguf --json
 
-Memory available now, as the engine measures it, less the host margin a launch
-keeps, holds the dense weights first, and what does not fit is read from the
-drive each token; the RAM cache gets the rest and finds an expert as often as the
-share of all experts that fits, as if routing were uniform. GPU time, prefetch
-and the skew of real routing are not measured, so an estimate is a guide: on an
-M5 MacBook Air (16 GB) and an M5 Max MacBook Pro (48 GB) the estimates came
-within about a third of the measured decode speeds. Without a CPU measurement
-of a model's expert formats or of its drive there is no estimate, and the
-reason is printed instead.
+# The GGUF can be on another machine. Select the target drive in the saved profile.
+inferssd-server --ssd-model-facts /models/model.gguf > model-facts.json
+inferssd profile --show --estimate-facts model-facts.json --model /models --json
+```
+
+The JSON row gives the reference speed in `decode_tokens_per_second` and its
+method in `reference_scenario`. `components` breaks down per-token service
+times, `assumptions` records proxies, and `scenarios` lets readers compare
+routing and overlap assumptions. The reported range spans those scenarios
+without assigning probabilities. `--memory-gib`, `--host-work-mib` and
+`--gpu-work-mib` set available host memory and known working allocations.
+
+**Routed experts.** The old capacity-only estimate treated a cache with space
+for 10% of the expert store as serving 10% of the routes. Hot experts can serve
+many more requests. The default `rank_serial` assumes that warmed cache slots
+hold popular experts. The share of accesses at rank `r` is
+`min(1/top_k, a/r)`, with `a` chosen so that the shares sum to one. A token can
+select an expert at most once. The estimate converts host and device bytes to
+whole aligned slots. Their distinct coverage lies between the larger cache's
+slot count and their sum capped at the full store. The reference uses the
+midpoint and exposes both endpoints. It charges the GPU for device hits, the CPU
+for the remaining routes, and the drive for misses in both tiers. Prefetch and
+changing working sets can move the actual miss rate substantially.
+
+Small expert products also have fixed dispatch cost. When the target is smaller
+than all measured shapes of its weight format, two different measured sizes
+can supply a fixed time and a per-byte time. The measured shape remains the
+fallback. Nearest-format proxies and the dense Q8_0 matvec proxy for MoE are
+identified in the report. `uniform_serial` retains the previous comparator.
+
+**Other expert layouts.** The native SSD store describes separate gate, up and
+down tensors. Fused gate/up and nongated experts can execute in the ordinary
+graph. For a recognized packed expert tensor, the full tensor consumes
+placement capacity, while one token uses only `top_k / expert_count` of its
+bytes. The GGUF count, tensor shape and role must agree. Otherwise the estimator
+charges a full scan and reports how many expert bytes lacked validated routing
+metadata. A model can contain both kinds of experts. A shared tensor is counted
+only once. These layout cases have regression coverage with synthetic headers.
+
+**Dense models.** The estimate counts full matrix scans, keeps a tied embedding
+when it serves as the output projection and excludes known row lookups and
+encoder-only blocks. It prices the quantization mix and allocates weights to
+VRAM, pinned RAM and the drive. Disk-sourced bytes also cross the host-to-device
+link. The steady pipeline costs the slowest of compute, transfer and storage.
+The serial scenario adds them. With no applicable single-GPU measurements the
+host reference uses measured host rates and prices spill when the target drive
+is known. Multi-GPU sharding, KV reads at long contexts, kernel fusion and
+whole-layer rounding can change the observed rate. Missing required measurements
+produce a reason alongside a null speed.
+
+**Two optional measurements.** On a workload with repeat prompts or a slow
+model drive, recorded hits can change the estimate much more than refinement
+of the arithmetic costs. Record a representative request with `serve --layer-events`,
+then use its `native-events.jsonl` on the same placement, memory budget and
+workload. Only complete decode tokens from the last recorded request contribute.
+The reader checks the routed topology. A single number from a cold request
+will age quickly during cache warm-up.
+
+```sh
+inferssd profile --show --estimate-gguf /models/model.gguf \
+  --routing-events /runs/previous/native-events.jsonl --json
+```
+
+To price work omitted by synthetic probes, use one warmed, resident reference
+on this machine. Save the server's final JSON response with the `timings` object
+(`predicted_n`, `predicted_ms`). Generation starts at the first emission, so
+`predicted_n - 1` intervals span that time. Match the reference's engine, visible devices
+and working-memory settings. Its positive excess milliseconds per token over
+the static prediction, divided by its layer count, gives a machine correction.
+Every target adds this value times its own layer count. The estimator keeps the
+uncalibrated cost in `components.uncalibrated_ms`. The calibration is bound to
+hardware, driver and visible devices. A substantial change in workload, thread
+settings or engine can warrant a new reference.
+
+```sh
+inferssd profile --show --estimate-gguf /models/reference.gguf \
+  --calibrate-from response.json > calibration.json
+inferssd profile --show --estimate-gguf /models/other.gguf \
+  --calibration calibration.json --json
+```
+
+**Measured accuracy.** The target was a predicted/actual ratio between 0.5 and
+2. Under the [benchmark decode window](benchmark.md#measurement-definitions), six
+4K single-GPU comparisons gave the following rates in tok/s. A single short
+Q2_0 reference supplied 0.204 ms per layer for all five MoE estimates on that
+machine. The separate dense host's fitted residual was zero.
+
+| Model | Measured | Previous | Static | With machine calibration |
+| --- | ---: | ---: | ---: | ---: |
+| DeepSeek-V4.1-Flash IQ2_XS | 10.61 | 3.49 | 11.16 | 10.23 |
+| Qwen3.8-Flash-Next Q2_0 | 32.26 | 137.08 | 50.74 | 33.92 |
+| Qwen3.8-Flash-Next IQ2_XS | 31.30 | 127.70 | 50.72 | 33.91 |
+| Qwen3.8-Flash-Next IQ3_XXS | 27.52 | 96.77 | 50.45 | 33.79 |
+| Qwen3.8-Flash-Next IQ3_S | 28.78 | 77.48 | 48.67 | 32.98 |
+| Qwen2.5-7B-Instruct Q8_0 | 152.06 | 123.42 | 123.09 | 123.09 |
+
+On the 4K DeepSeek run the static estimate charged 20.85% of routes to disk,
+while the engine observed 6.14% missing both caches. The close aggregate rate
+therefore masks countervailing errors in individual service times.
+
+On a mechanical model drive, four identical 19-token prompts in one server
+increased from 0.78 to 6.86 tok/s as the cache warmed. Static hardware and
+capacity inputs predicted 0.25 tok/s each time. Supplying measured hits from
+each request's first eight decode steps to forecast its remaining fifteen gave
+ratios of 0.65, 1.39, 1.46 and 0.90. Transferring hits from an entire preceding
+request instead gave 0.26, 0.79 and 0.70 for the three later requests. The
+first cold-to-warm transition exceeded the target. Raw rates, provenance and
+failed prefill attempts are in the [validation receipt](benchmarks/decode-estimate-rtx5090.json).
 
 ## Where the file lives
 

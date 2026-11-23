@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Pre-inference decode cost model, with explicit placement and routing assumptions.
 
-Synthetic matrix measurements price arithmetic; cache capacity is NOT a measured
-hit rate. The central estimate assumes uniform routing and inclusive host/VRAM
-caches. Scenario rates are conditional sensitivity estimates, not confidence
-bounds. Attention, graph overhead and cache warm-up are not measured here.
+Synthetic matrix measurements price arithmetic. The MoE reference uses one rank-based
+routing prior and whole expert-cache slots for every checkpoint. Hypothetical routing
+and overlap scenarios bound assumptions. Attention, graph overhead and cache warm-up
+remain outside the service-time estimate.
 """
 
 from __future__ import annotations
@@ -12,18 +12,23 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from statistics import median
 from typing import Optional
 
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow
 from inferssd.strategy.derive import (
     IN_FLIGHT,
+    SHARED_GPU_RESERVE_MIB,
     drive_rate,
     host_headroom_mib,
+    link_rates,
     placement,
     single_gpu,
     tier_gpus,
 )
 from inferssd.strategy.inputs import Experts, ModelFacts, RuntimeFacts
+from inferssd.strategy.routing import cache_slot_bytes, hit_at_slots, rank_hit_curve
+from inferssd.strategy.weights import DenseWeights
 
 GB = 1e9
 ENGINE_RESERVE_BYTES = 512 << 20
@@ -38,6 +43,7 @@ class Estimate:
     components: dict[str, float] = field(default_factory=dict)
     scenario_details: tuple[dict[str, object], ...] = ()
     scenario_range: Optional[tuple[float, float]] = None
+    reference_scenario: str = "uniform_serial"
 
 
 @dataclass(frozen=True)
@@ -105,9 +111,15 @@ def headroom_bytes(characteristics: Characteristics, runtime: RuntimeFacts, plat
 
 
 def matvec_rate(
-    rows: list[ComputeRow], name: str, outputs: int, inputs: int, timing: str = "median"
+    rows: list[ComputeRow],
+    name: str,
+    outputs: int,
+    inputs: int,
+    timing: str = "median",
+    *,
+    target_bytes: Optional[int] = None,
 ) -> Optional[float]:
-    """Use the closest measured shape, not the fastest measurement across shapes."""
+    """Closest timed shape, retaining measured fixed cost below the smallest profiled matrix."""
     candidates = [
         row
         for row in rows
@@ -120,16 +132,40 @@ def matvec_rate(
         candidates,
         key=lambda r: abs(math.log(r["rows"] / outputs)) + abs(math.log(r["cols"] / inputs)),
     )
-    point = next(p for p in row["points"] if p["tokens"] == 1 and p.get("weight_Bps", 0) > 0)
-    duration = (
-        point.get("us_q1", point["us"])
-        if timing == "q1"
-        else point.get("us_q3", point["us"])
-        if timing == "q3"
-        else point["us"]
-    )
+
+    def measured(r: ComputeRow) -> tuple[float, float]:
+        point = next(p for p in r["points"] if p["tokens"] == 1 and p.get("weight_Bps", 0) > 0)
+        duration = (
+            point.get("us_q1", point["us"])
+            if timing == "q1"
+            else point.get("us_q3", point["us"])
+            if timing == "q3"
+            else point["us"]
+        )
+        rate = point["weight_Bps"] * point["us"] / duration if duration > 0 else point["weight_Bps"]
+        return duration, rate
+
+    if (
+        target_bytes
+        and outputs * inputs < min(r["rows"] * r["cols"] for r in candidates)
+        and target_bytes < min(r["weight_bytes"] for r in candidates)
+    ):
+        # Probe graphs time a synchronized call. Extrapolating bandwidth alone shrinks
+        # its fixed cost in proportion to the payload. The two smallest measured sizes
+        # of this format identify T(B) = a + bB. Pool transposes at the same byte size.
+        by_bytes: dict[int, list[float]] = {}
+        for r in candidates:
+            by_bytes.setdefault(r["weight_bytes"], []).append(measured(r)[0])
+        sizes = sorted(by_bytes)
+        if len(sizes) >= 2:
+            first, second = sizes[:2]
+            t_first, t_second = median(by_bytes[first]), median(by_bytes[second])
+            slope = (t_second - t_first) / (second - first)
+            intercept = t_first - slope * first
+            if slope >= 0 and intercept > 0:
+                return target_bytes * 1e6 / (intercept + slope * target_bytes)
     # Older profiles lack quartiles; their median remains usable.
-    return point["weight_Bps"] * point["us"] / duration if duration > 0 else point["weight_Bps"]
+    return measured(row)[1]
 
 
 def model_bits(experts: Experts) -> dict[str, float]:
@@ -174,7 +210,12 @@ def proxy_note(where: str, proxies: dict[str, str]) -> Optional[str]:
 
 
 def cpu_decode_seconds(
-    c: Characteristics, experts: Experts, threads: int, timing: str = "median"
+    c: Characteristics,
+    experts: Experts,
+    threads: int,
+    timing: str = "median",
+    *,
+    small_matrix_cost: bool = False,
 ) -> tuple[Optional[float], str]:
     """One expert, using only one-token points and all of its quantization types."""
     rows = [row for row in c["compute"]["cpu"] if not row.get("cpus")]
@@ -187,9 +228,16 @@ def cpu_decode_seconds(
     for count in sorted({row["threads"] for row in rows}):
         selected = [row for row in rows if row["threads"] == count]
         values = [
-            matvec_rate(selected, proxies[name.upper()], role.rows, role.cols, timing)
+            matvec_rate(
+                selected,
+                proxies[name.upper()],
+                role.rows,
+                role.cols,
+                timing,
+                target_bytes=size if small_matrix_cost else None,
+            )
             for role in experts.roles
-            for name, _, _ in role.formats
+            for name, _, size in role.formats
         ]
         if all(rate is not None for rate in values):
             rates[count] = [rate or 0 for rate in values]
@@ -233,12 +281,15 @@ def decode_estimate(
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
     routing_patterns: tuple[RoutingPattern, ...] = ROUTING_PATTERNS,
+    observed_hits: Optional[tuple[float, float]] = None,
+    graph_weights: Optional[DenseWeights] = None,
 ) -> Estimate:
     """Estimate default placement, optionally reserving known KV/graph working memory.
 
     Work reserves are additional to the engine's host margin. They must come from
     the intended context/graph allocation, not fitting a measured tokens/s value.
-    Zero means unknown and makes cache capacities upper estimates.
+    Zero means unknown and makes cache capacities upper estimates. Observed hits optionally
+    provide the fraction hitting VRAM and the fraction missing both VRAM and host cache.
     """
     if not routing_patterns:
         raise ValueError("at least one routing pattern is required")
@@ -246,25 +297,24 @@ def decode_estimate(
         routing_hit(0, pattern.expert_fraction, pattern.traffic_fraction)
     if min(host_work_bytes, gpu_work_bytes, dense_read_bytes) < 0:
         raise ValueError("memory sizes must be nonnegative")
+    if observed_hits is not None and (
+        len(observed_hits) != 2
+        or not all(0 <= value <= 1 for value in observed_hits)
+        or sum(observed_hits) > 1
+    ):
+        raise ValueError("VRAM hit and two-tier miss fractions each require [0, 1] and sum <= 1")
     experts = model.experts
     if experts is None:
         return Estimate(None, "the model has no routed experts")
     if not experts.used or not experts.routed_bytes:
         return Estimate(None, "the model names no routed experts per token")
     memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
-    if memory_Bps <= 0:
-        return Estimate(None, "no memory read rate in the profile")
     try:
         threads, _, _ = placement(characteristics, model, runtime, [])
     except ValueError as error:
         return Estimate(None, str(error))
-    # Decode uses the decode pool; the previous implementation used the prefill pool.
-    cpu_expert_s, why = cpu_decode_seconds(characteristics, experts, threads.decode or 1)
-    if cpu_expert_s is None:
-        return Estimate(None, why)
     drive_gbps, why = drive_rate(characteristics, experts, drive_key)
-    if drive_gbps is None:
-        return Estimate(None, why)
+    drive_reason = why
     available = runtime.available_bytes
     if available is None:
         available = characteristics["memory"]["total_bytes"]
@@ -274,10 +324,15 @@ def decode_estimate(
     room = max(0, available - headroom_bytes(characteristics, runtime, platform) - host_work_bytes)
     gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
     assumptions = [
-        "Uniform expert routing; inclusive RAM/VRAM caches, not observed hit rates.",
+        "Warmed cache hits come from a shared 1/rank routing assumption, capped at one selection "
+        "per expert per token; hits are not observed on this machine.",
+        "Equal slots per layer. Distinct host/device coverage is the midpoint of completely "
+        "overlapping and disjoint slot counts.",
         "Serial I/O plus CPU/GPU service time; prefetch overlap is a separate scenario.",
         "Hot-set scenarios are hypotheses, not empirical probabilities or typical ranges.",
         "Hot experts are cached first, after warm-up; routing order and replacement are unknown.",
+        "Below the smallest profiled expert matrix, two same-format probe sizes estimate a "
+        "fixed call time plus time per weight byte when both terms are nonnegative.",
         "CPU/GPU timing and drive IQR describe profiling samples, not a confidence interval.",
         "Drive IQR covers profiling repetitions only, not future shared-storage stalls.",
         "Attention, non-matmul graph work, lookup I/O and cache warm-up are unpriced.",
@@ -289,6 +344,7 @@ def decode_estimate(
     # never substitute a GPU's peak bandwidth for measured quantized computation.
     dense_rate = matvec_rate(rows, "Q8_0", 4096, 4096)
     gpu_expert_s = 0.0
+    legacy_gpu_expert_s = 0.0
     gpu_fast_s = 0.0
     gpu_slow_s = 0.0
     missing = []
@@ -298,17 +354,26 @@ def decode_estimate(
     )
     gpu_proxies = format_proxies(rows, names)
     for role in experts.roles:
-        for name, layers, _ in role.formats:
+        for name, layers, size in role.formats:
             used = gpu_proxies.get(name.upper(), name)
             rate = matvec_rate(rows, used, role.rows, role.cols)
             if rate is None:
                 missing.append(name)
             else:
-                weight = layers * role.slice_bytes(name) / experts.layers
-                gpu_expert_s += weight / rate
-                gpu_fast_s += weight / (matvec_rate(rows, used, role.rows, role.cols, "q1") or rate)
-                gpu_slow_s += weight / (matvec_rate(rows, used, role.rows, role.cols, "q3") or rate)
-    use_gpu = bool(gpu and gpu_room >= dense_read_bytes and dense_rate and not missing)
+                weight = layers * size / experts.layers
+                legacy_gpu_expert_s += weight / rate
+                for_median = (
+                    matvec_rate(rows, used, role.rows, role.cols, target_bytes=size) or rate
+                )
+                fast = matvec_rate(rows, used, role.rows, role.cols, "q1", target_bytes=size)
+                slow = matvec_rate(rows, used, role.rows, role.cols, "q3", target_bytes=size)
+                gpu_expert_s += weight / for_median
+                gpu_fast_s += weight / (fast or for_median)
+                gpu_slow_s += weight / (slow or for_median)
+    placement_bytes = graph_weights.placement_bytes if graph_weights else dense_read_bytes
+    if graph_weights:
+        assumptions.extend(graph_weights.graph_assumptions())
+    use_gpu = bool(gpu and gpu_room >= placement_bytes and dense_rate and not missing)
     for note in (
         proxy_note("CPU", cpu_proxies),
         proxy_note("GPU", gpu_proxies) if use_gpu else None,
@@ -322,17 +387,52 @@ def decode_estimate(
     if use_gpu:
         resident = dense_read_bytes
         cache = room  # dense weights are in VRAM, not subtracted again from RAM
-        gpu_cache = max(0, gpu_room - dense_read_bytes)
+        gpu_cache = max(0, gpu_room - placement_bytes)
         dense_s = dense_read_bytes / (dense_rate or 1)
         assumptions.append(
             "Dense weights on one GPU; dense Q8_0 matvec proxy (actual types unknown)."
         )
     else:
-        resident = min(dense_read_bytes, room)
-        cache = room - resident
+        if graph_weights:
+            resident = dense_read_bytes - graph_weights.host_spill_bytes(room)
+        else:
+            resident = min(dense_read_bytes, room)
+        cache = max(0, room - placement_bytes)
         gpu_cache = 0
-        dense_s = resident / memory_Bps + (dense_read_bytes - resident) / (drive_gbps * GB)
     routed = experts.routed_bytes
+    total_slots = experts.layers * experts.count
+    host_slot_bytes, gpu_slot_bytes = cache_slot_bytes(experts)
+    host_slots = min(total_slots, cache // host_slot_bytes)
+    gpu_slots = min(total_slots, gpu_cache // gpu_slot_bytes)
+    if not use_gpu and memory_Bps <= 0:
+        return Estimate(None, "no memory read rate in the profile")
+    cpu_time, cpu_reason = cpu_decode_seconds(characteristics, experts, threads.decode or 1)
+    if cpu_time is None and (
+        gpu_slots < total_slots or (observed_hits is not None and observed_hits[0] < 1)
+    ):
+        return Estimate(None, cpu_reason)
+    # For full VRAM residency all reference and comparison routes execute on the GPU.
+    legacy_cpu_expert_s = cpu_time or 0.0
+    cpu_expert_s = (
+        cpu_decode_seconds(characteristics, experts, threads.decode or 1, small_matrix_cost=True)[0]
+        or legacy_cpu_expert_s
+    )
+    inclusive_slots = max(host_slots, gpu_slots)
+    disjoint_slots = min(total_slots, host_slots + gpu_slots)
+    spill = 0 if use_gpu else dense_read_bytes - resident
+    if drive_gbps is None and (
+        spill or inclusive_slots < total_slots or (observed_hits and observed_hits[1] > 0)
+    ):
+        return Estimate(None, drive_reason)
+    if observed_hits is not None and observed_hits[0] > 0 and not use_gpu:
+        return Estimate(
+            None, "observed VRAM hits require a GPU placement with measured matvec rates"
+        )
+    drive_Bps = (drive_gbps or 0.0) * GB
+    if not drive_Bps:
+        assumptions.append("The dense weights and routed store fit; no drive timing is needed.")
+    if not use_gpu:
+        dense_s = resident / memory_Bps + (spill / drive_Bps if spill else 0)
     ram_fraction = min(1.0, cache / routed)
     gpu_fraction = min(1.0, gpu_cache / routed)
     # A VRAM copy may also occupy RAM: summing the two capacities double-counts it.
@@ -340,12 +440,16 @@ def decode_estimate(
     routes = experts.layers * experts.used
     cpu_all_s = routes * cpu_expert_s
     gpu_all_s = routes * gpu_expert_s
-    io_all_s = routes * experts.mean_read_bytes / (drive_gbps * GB)
+    io_all_s = routes * experts.mean_read_bytes / drive_Bps if drive_Bps else 0.0
 
-    def terms(gpu_hit: float, storage_miss: float) -> tuple[float, float, float]:
-        return cpu_all_s * (1 - gpu_hit), gpu_all_s * gpu_hit, io_all_s * storage_miss
+    def terms(
+        gpu_hit: float, storage_miss: float, legacy: bool = False
+    ) -> tuple[float, float, float]:
+        ct = routes * legacy_cpu_expert_s if legacy else cpu_all_s
+        gt = routes * legacy_gpu_expert_s if legacy else gpu_all_s
+        return ct * (1 - gpu_hit), gt * gpu_hit, io_all_s * storage_miss
 
-    cpu_s, gpu_s, drive_s = terms(gpu_fraction, 1 - hit)
+    cpu_s, gpu_s, drive_s = terms(gpu_fraction, 1 - hit, legacy=True)
     seconds = dense_s + cpu_s + gpu_s + drive_s
     serial = 1 / seconds
     scenarios = {
@@ -354,9 +458,15 @@ def decode_estimate(
     }
     disjoint_miss = 1 - min(1.0, ram_fraction + gpu_fraction)
     scenarios["uniform_disjoint_serial"] = 1 / (dense_s + cpu_s + gpu_s + io_all_s * disjoint_miss)
-    io_low, io_high, io_samples = drive_iqr(characteristics, experts, drive_key, drive_gbps * GB)
-    cpu_fast, _ = cpu_decode_seconds(characteristics, experts, threads.decode or 1, "q1")
-    cpu_slow, _ = cpu_decode_seconds(characteristics, experts, threads.decode or 1, "q3")
+    io_low, io_high, io_samples = (
+        drive_iqr(characteristics, experts, drive_key, drive_Bps) if drive_Bps else (0.0, 0.0, 0)
+    )
+    cpu_fast, _ = cpu_decode_seconds(
+        characteristics, experts, threads.decode or 1, "q1", small_matrix_cost=True
+    )
+    cpu_slow, _ = cpu_decode_seconds(
+        characteristics, experts, threads.decode or 1, "q3", small_matrix_cost=True
+    )
     if use_gpu:
         dense_fast = dense_read_bytes / (
             matvec_rate(rows, "Q8_0", 4096, 4096, "q1") or dense_rate or 1
@@ -365,31 +475,74 @@ def decode_estimate(
             matvec_rate(rows, "Q8_0", 4096, 4096, "q3") or dense_rate or 1
         )
     else:
-        dense_fast = resident / memory_Bps + (dense_read_bytes - resident) / io_high
-        dense_slow = resident / memory_Bps + (dense_read_bytes - resident) / io_low
+        dense_fast = resident / memory_Bps + (spill / io_high if spill else 0)
+        dense_slow = resident / memory_Bps + (spill / io_low if spill else 0)
+    cases: list[tuple[str, float, float, bool, dict[str, object]]] = [
+        (
+            pattern.name,
+            routing_hit(gpu_fraction, pattern.expert_fraction, pattern.traffic_fraction),
+            1 - routing_hit(hit, pattern.expert_fraction, pattern.traffic_fraction),
+            True,
+            {
+                "hot_expert_fraction": pattern.expert_fraction,
+                "hot_traffic_fraction": pattern.traffic_fraction,
+            },
+        )
+        for pattern in routing_patterns
+    ]
+    hits = rank_hit_curve(experts.count, experts.used)
+    gpu_hit = hit_at_slots(hits, gpu_slots / experts.layers)
+    shared_slots = (inclusive_slots + disjoint_slots) / 2
+    disk_miss = 1 - hit_at_slots(hits, shared_slots / experts.layers)
+    for name, slots in (
+        ("rank", shared_slots),
+        ("rank_inclusive", inclusive_slots),
+        ("rank_disjoint", disjoint_slots),
+    ):
+        cases.append(
+            (
+                name,
+                gpu_hit,
+                1 - hit_at_slots(hits, slots / experts.layers),
+                False,
+                {
+                    "gpu_slots": gpu_slots,
+                    "host_slots": host_slots,
+                    "distinct_slots": slots,
+                },
+            )
+        )
+    reference = "rank_serial"
+    route_detail = "rank-based routing estimate"
+    if observed_hits is not None:
+        gpu_hit, disk_miss = observed_hits
+        cases.append(("observed", gpu_hit, disk_miss, False, {}))
+        reference = "observed_serial"
+        route_detail = "observed cache fractions"
+        assumptions.append(
+            "Reference VRAM hits and misses of both caches come from supplied observations; "
+            "the rank scenarios retain the uncalibrated routing prior."
+        )
     details: list[dict[str, object]] = []
     lows, highs = [], []
-    for pattern in routing_patterns:
-        gh = routing_hit(gpu_fraction, pattern.expert_fraction, pattern.traffic_fraction)
-        miss = 1 - routing_hit(hit, pattern.expert_fraction, pattern.traffic_fraction)
-        ct, gt, it = terms(gh, miss)
+    for name, gh, miss, legacy, parameters in cases:
+        ct, gt, it = terms(gh, miss, legacy=legacy)
         no_overlap = 1 / (dense_s + ct + gt + it)
         # Only half of the smaller I/O/compute service time is hidden in this
         # intermediate scenario; the optimistic endpoint allows full overlap.
         partial = 1 / (dense_s + ct + gt + it - 0.5 * min(it, ct + gt))
-        slow_io = it * drive_gbps * GB / io_low
-        fast_io = it * drive_gbps * GB / io_high
+        slow_io = it * drive_Bps / io_low if it else 0.0
+        fast_io = it * drive_Bps / io_high if it else 0.0
         slow_cpu = routes * (cpu_slow or cpu_expert_s) * (1 - gh)
         fast_cpu = routes * (cpu_fast or cpu_expert_s) * (1 - gh)
         slow_gpu, fast_gpu = routes * gpu_slow_s * gh, routes * gpu_fast_s * gh
         low = min(no_overlap, 1 / (dense_slow + slow_cpu + slow_gpu + slow_io))
         high = max(no_overlap, 1 / (dense_fast + max(fast_cpu, fast_gpu, fast_io)))
-        scenarios[pattern.name + "_serial"] = no_overlap
+        scenarios[name + "_serial"] = no_overlap
         details.append(
             {
-                "name": pattern.name,
-                "hot_expert_fraction": pattern.expert_fraction,
-                "hot_traffic_fraction": pattern.traffic_fraction,
+                "name": name,
+                **parameters,
                 "gpu_hit_fraction": gh,
                 "disk_miss_fraction": miss,
                 "cpu_experts_ms": ct * 1e3,
@@ -403,17 +556,23 @@ def decode_estimate(
         )
         lows.append(low)
         highs.append(high)
-    spill = 0 if use_gpu else dense_read_bytes - resident
+    cpu_s, gpu_s, drive_s = terms(gpu_hit, disk_miss)
+    seconds = dense_s + cpu_s + gpu_s + drive_s
+    drive_detail = (
+        f"{disk_miss:.0%} from the drive at {drive_gbps:.2f} GB/s {drive_s * 1e3:.0f} ms"
+        if drive_gbps is not None
+        else "fully resident; 0 ms from the drive"
+    )
     detail = (
         f"{seconds * 1e3:.0f} ms a token: dense {dense_s * 1e3:.0f} ms"
         + (f" ({spill / GB:.1f} GB of it from the drive)" if spill else "")
         + f", CPU experts {cpu_s * 1e3:.0f} ms, GPU experts {gpu_s * 1e3:.0f} ms, "
-        f"{1 - hit:.0%} from the drive at {drive_gbps:.2f} GB/s {drive_s * 1e3:.0f} ms "
+        f"{drive_detail} "
         f"(a {cache / GB:.1f} GB cache of {routed / GB:.0f} GB of experts); "
-        "uniform-routing estimate, not a measured hit rate"
+        f"{route_detail}"
     )
     return Estimate(
-        serial,
+        1 / seconds,
         detail,
         tuple(assumptions),
         scenarios,
@@ -424,17 +583,198 @@ def decode_estimate(
             "storage_ms": drive_s * 1e3,
             "host_cache_capacity_bytes": float(cache),
             "gpu_cache_capacity_bytes": float(gpu_cache),
+            "gpu_hit_fraction": gpu_hit,
+            "storage_miss_fraction": disk_miss,
             "uniform_gpu_hit_fraction": gpu_fraction,
             "uniform_storage_miss_fraction": 1 - hit,
             "decode_threads": float(threads.decode or 1),
             "memory_budget_bytes": float(available),
-            "drive_Bps": drive_gbps * GB,
+            "drive_Bps": drive_Bps,
             "drive_iqr_low_Bps": io_low,
             "drive_iqr_high_Bps": io_high,
             "drive_repetitions": float(io_samples),
+            **(graph_weights.graph_components() if graph_weights else {}),
         },
         tuple(details),
         (min(lows), max(highs)),
+        reference,
+    )
+
+
+def _dense_drive_rates(
+    c: Characteristics, drive_key: Optional[str], disk_bytes: int, *, max_depth: int = 8
+) -> Optional[tuple[float, float]]:
+    """Measured throughput range for possible chunk sizes at attainable queue depths."""
+    # ggml-cuda/ssd/transport.cpp: up to eight chunks of 16 MiB in flight.
+    drive = next((d for d in c["storage"] if d["drive_key"] == drive_key), None)
+    if drive is None:
+        return None
+    cap = min(max_depth, drive["qd_cap"] or max_depth)
+    by_size: dict[int, tuple[int, float]] = {}
+    for row in drive["random_read"]:
+        size, depth = row["bytes"], row["qd"]
+        if size > 16 << 20 or depth > min(cap, math.ceil(disk_bytes / size)) or row["Bps"] <= 0:
+            continue
+        if size not in by_size or depth > by_size[size][0]:
+            by_size[size] = (depth, row["Bps"])
+    if not by_size:
+        return None
+    speeds = [speed for _, speed in by_size.values()]
+    return min(speeds), max(speeds)
+
+
+def _dense_compute_times(
+    rows: list[ComputeRow],
+    formats: tuple[tuple[str, int], ...],
+    read_bytes: int,
+    *,
+    device: str = "GPU",
+    proxy: str = "Q8_0",
+    weights: Optional[DenseWeights] = None,
+) -> tuple[Optional[tuple[float, float, float]], list[str]]:
+    """Matvec seconds (median, fast, slow), including the non-layer output projection."""
+    known_bytes = sum(size for _, size in formats)
+    # Catalogs describe all repeating-layer tensors. If a caller excluded additional lookup
+    # weights, normalize that mix to the smaller number of bytes actually visited per token.
+    scale = min(1.0, read_bytes / known_bytes) if known_bytes else 1.0
+    mix = [(name, 4096, 4096, size * scale) for name, size in formats]
+    residual = read_bytes - min(read_bytes, known_bytes)
+    if residual:
+        mix.append(("outside catalogued layers", 4096, 4096, float(residual)))
+    if weights is not None:
+        mix = [
+            (name, rows or 4096, cols or 4096, float(size))
+            for name, rows, cols, size in weights.shapes
+        ]
+    times = [0.0, 0.0, 0.0]
+    borrowed = set()
+    for name, outputs, inputs, size in mix:
+        measured = name
+        median = matvec_rate(rows, measured, outputs, inputs)
+        if not median:
+            measured = proxy
+            borrowed.add(name)
+            median = matvec_rate(rows, measured, outputs, inputs)
+        if not median:
+            return None, []
+        times[0] += size / median
+        for i, timing in enumerate(("q1", "q3"), start=1):
+            rate = matvec_rate(rows, measured, outputs, inputs, timing) or median
+            times[i] += size / rate
+    notes = [
+        device + " timings use the profiled matvec nearest each GGUF matrix shape; "
+        "nonmatrix weights use a 4096 x 4096 bandwidth proxy."
+        if weights is not None
+        else device + " matvec timings use the profiled matrix nearest 4096 x 4096."
+    ]
+    if borrowed:
+        notes.append(f"Dense {proxy} matvec proxy for " + ", ".join(sorted(borrowed)) + ".")
+    return (times[0], times[1], times[2]), notes
+
+
+def _dense_host_estimate(
+    c: Characteristics,
+    read_bytes: int,
+    model: Optional[ModelFacts],
+    weights: Optional[DenseWeights],
+    runtime: RuntimeFacts,
+    host_room: int,
+    drive_key: Optional[str],
+    assumptions: list[str],
+) -> Estimate:
+    """Conditional CPU execution with a reusable page cache and mmap fault sensitivity."""
+    allowed = set(runtime.cpus) & {row["id"] for row in c["cpu"]["logical"]}
+    dram = max(
+        (row["Bps"] for row in c["memory"]["dram_read_Bps"] if row["threads"] <= len(allowed)),
+        default=0.0,
+    )
+    # Use one thread placement consistently across all formats. With no layer format facts
+    # the measured bulk DRAM scan remains a useful standalone bandwidth reference.
+    rows = [
+        row
+        for row in c["compute"]["cpu"]
+        if 0 < row["threads"] <= len(allowed) and set(row.get("cpus", ())) <= allowed
+    ]
+    times = None
+    if rows and (model or weights or not dram):
+        desired = len(allowed)
+        pinned: tuple[int, ...] = ()
+        if model:
+            threads, _, _ = placement(c, model, runtime, [])
+            desired = threads.decode or desired
+            pinned = threads.decode_cpus or threads.cpus
+        eligible = [r for r in rows if tuple(r.get("cpus", ())) == pinned]
+        if not eligible and pinned:
+            eligible = [r for r in rows if not r.get("cpus")]
+        if eligible:
+            count = min({r["threads"] for r in eligible}, key=lambda n: (abs(n - desired), n))
+            selected = [r for r in eligible if r["threads"] == count]
+            # When DRAM is missing, use a real one-token row as the bandwidth proxy for
+            # unknown formats, choosing the measured encoding closest to an 8-bit matrix.
+            proxy = "Q8_0" if dram else format_proxies(selected, {"Q8_0": 8.5}).get("Q8_0", "Q8_0")
+            times, notes = _dense_compute_times(
+                selected,
+                model.layer_format_bytes if model else (),
+                read_bytes,
+                device=f"{count}-thread CPU",
+                proxy=proxy,
+                weights=weights,
+            )
+            if times:
+                assumptions.extend(notes)
+    if not dram and not times:
+        return Estimate(None, "no usable CPU one-token matvec or RAM read rate in the profile")
+    memory_s = read_bytes / dram if dram else 0.0
+    median, fast, slow = (max(t, memory_s) for t in (times or (0.0, 0.0, 0.0)))
+    resident = min(weights.placement_bytes if weights else read_bytes, host_room)
+    disk = weights.host_spill_bytes(host_room) if weights else read_bytes - resident
+    disk_s = disk_fast = disk_slow = 0.0
+    scenarios = {}
+    if disk:
+        speeds = _dense_drive_rates(c, drive_key, disk, max_depth=1)
+        if not speeds:
+            return Estimate(None, "CPU dense paging requires a matching model-drive measurement")
+        low, high = speeds
+        disk_fast, disk_slow = disk / high, read_bytes / low
+        disk_s = disk / math.sqrt(low * high)
+        scenarios["dense_host_full_reread"] = 1 / (median + read_bytes / math.sqrt(low * high))
+        if weights and weights.graph_store_bytes:
+            hot_miss = max(0, read_bytes - host_room)
+            scenarios["dense_host_hot_experts"] = 1 / (median + hot_miss / math.sqrt(low * high))
+            disk_fast = hot_miss / high
+        assumptions.append(
+            "CPU paging reference keeps useful resident pages and serializes misses with compute. "
+            "One-outstanding-read measurements proxy mmap faults. The full-reread scenario allows "
+            "cyclic scans to evict the entire prior token's pages."
+        )
+    seconds = median + disk_s
+    scenarios["dense_host_serial"] = 1 / seconds
+    low_tps, high_tps = 1 / (slow + disk_slow), 1 / max(fast, disk_fast)
+    if dram:
+        detail = f"{read_bytes / GB:.2f} GB of dense weights from RAM at {dram / GB:.0f} GB/s"
+    else:
+        detail = f"{read_bytes / GB:.2f} GB of dense weights at the measured CPU matvec rate"
+    if disk:
+        detail += f", including {disk / GB:.2f} GB first paged from disk"
+    assumptions.append(
+        "Host execution reference. GPU execution and multi-device splits are unpriced."
+    )
+    return Estimate(
+        1 / seconds,
+        f"{seconds * 1e3:.1f} ms a token: {detail}",
+        tuple(assumptions),
+        scenarios,
+        {
+            "dense_ms": seconds * 1e3,
+            "dense_read_bytes": float(read_bytes),
+            "host_resident_bytes": float(resident),
+            "dense_drive_bytes": float(disk),
+            "cpu_compute_ms": median * 1e3,
+            "storage_ms": disk_s * 1e3,
+            **(weights.graph_components() if weights else {}),
+        },
+        scenario_range=(low_tps, high_tps) if low_tps != high_tps else None,
+        reference_scenario="dense_host_serial",
     )
 
 
@@ -443,44 +783,146 @@ def dense_decode_estimate(
     dense_read_bytes: int,
     runtime: RuntimeFacts,
     *,
+    model: Optional[ModelFacts] = None,
+    weights: Optional[DenseWeights] = None,
+    platform: Optional[str] = None,
+    drive_key: Optional[str] = None,
+    host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
 ) -> Estimate:
-    """A model without routed experts, which runs from memory: a token reads each dense weight once,
-    on one GPU with the VRAM tier when they fit the memory free on it, else from RAM at the fastest
-    measured read rate. A default, as an expert model's dense weights are priced: the Q8_0 matvec
-    measurement stands for the weights' own types, and nothing calibrates it against a run yet."""
+    """One-stream dense decode with VRAM residency and pipelined H2D and disk transfers."""
+    if min(host_work_bytes, gpu_work_bytes) < 0:
+        raise ValueError("memory sizes must be nonnegative")
     if dense_read_bytes <= 0:
         return Estimate(None, "the model's dense weight bytes are not known")
-    gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
-    rate = matvec_rate(rows, "Q8_0", 4096, 4096) if gpu and gpu_room >= dense_read_bytes else None
     assumptions = [
-        "Dense model: a token reads each weight once; one-row lookup tables do not count.",
-        "Attention, KV reads, non-matmul graph work and kernel launches are unpriced.",
-        "A default estimate, not calibrated against a measured run.",
+        "One read of active non-lookup weights per token. Attention, active KV reads, lookup "
+        "I/O and graph execution overhead are unpriced.",
     ]
-    if rate:
-        seconds = dense_read_bytes / rate
-        fast = dense_read_bytes / (matvec_rate(rows, "Q8_0", 4096, 4096, "q1") or rate)
-        slow = dense_read_bytes / (matvec_rate(rows, "Q8_0", 4096, 4096, "q3") or rate)
-        where = f"one GPU at {rate / GB:.0f} GB/s"
-        assumptions.append("Weights on one GPU; dense Q8_0 matvec proxy (actual types unknown).")
-    else:
-        memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
-        if memory_Bps <= 0:
-            return Estimate(None, "no memory read rate in the profile")
-        seconds = fast = slow = dense_read_bytes / memory_Bps
-        where = f"RAM at {memory_Bps / GB:.0f} GB/s"
-        assumptions.append("Weights read from RAM at the fastest measured read rate.")
-    detail = (
-        f"{seconds * 1e3:.1f} ms a token: {dense_read_bytes / GB:.2f} GB of dense weights from "
-        f"{where}; default estimate, not calibrated"
+    if weights:
+        assumptions.extend(weights.graph_assumptions())
+    total = characteristics["memory"]["total_bytes"]
+    available = min(total, total if runtime.available_bytes is None else runtime.available_bytes)
+    if runtime.memory_budget_bytes is not None:
+        available = min(available, runtime.memory_budget_bytes)
+    platform = platform or characteristics["identity"]["hard"]["platform"]
+    host_room = max(
+        0, available - headroom_bytes(characteristics, runtime, platform) - host_work_bytes
     )
+    gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
+    formats = model.layer_format_bytes if model else ()
+    compute, notes = _dense_compute_times(rows, formats, dense_read_bytes, weights=weights)
+    # tier_gpu selected the only usable discrete, profiled GPU. Dense layer placement in
+    # llama_context::hold_dense_layers also leaves the typed launch's VRAM reserve free.
+    devices = tier_gpus(runtime, characteristics)
+    if not gpu or not compute or not devices or devices[0].free_bytes is None:
+        if devices and len(devices) > 1:
+            assumptions.append("Multiple GPUs are visible; the per-device layer split is unknown.")
+        elif gpu and devices and devices[0].free_bytes is None:
+            assumptions.append("Free VRAM is unknown for dense layer placement.")
+        elif gpu and not compute:
+            assumptions.append("GPU matvec timing unavailable; run profile --estimate-compute.")
+        return _dense_host_estimate(
+            characteristics,
+            dense_read_bytes,
+            model,
+            weights,
+            runtime,
+            host_room,
+            drive_key,
+            assumptions,
+        )
+    if devices[0].processes:
+        gpu_room = max(0, gpu_room - (SHARED_GPU_RESERVE_MIB << 20))
+        assumptions.append(f"A busy GPU leaves the launch reserve of {SHARED_GPU_RESERVE_MIB} MiB.")
+    # The engine streams the repeating layers' matrices. The catalog groups their bytes by
+    # type, so round-off to whole layers and the transport ring are outside this byte model.
+    layer_bytes = (
+        min(dense_read_bytes, sum(size for _, size in formats)) if formats else dense_read_bytes
+    )
+    if weights is not None:
+        layer_bytes = weights.layer_matrix_bytes
+    placement_bytes = weights.placement_bytes if weights else dense_read_bytes
+    # The native loader enables bit-reversed layer streaming only for models with n_expert=0.
+    # A packed ordinary-graph MoE needs its entire expert tensor to fit the execution device.
+    fixed = (
+        placement_bytes if weights and weights.graph_store_bytes else dense_read_bytes - layer_bytes
+    )
+    if gpu_room < fixed:
+        assumptions.append("Free VRAM falls below the estimated non-streamable dense weights.")
+        return _dense_host_estimate(
+            characteristics,
+            dense_read_bytes,
+            model,
+            weights,
+            runtime,
+            host_room,
+            drive_key,
+            assumptions,
+        )
+    assumptions.extend(notes)
+    resident = min(gpu_room, placement_bytes)
+    streamed = placement_bytes - resident
+    pinned = min(streamed, host_room)
+    disk = streamed - pinned
+    assumptions.append(
+        "Byte-level placement after work reserves. Supply GPU/host work bytes "
+        "for KV, graph and staging allocations. Whole-layer rounding is omitted."
+    )
+    link_s = drive_s = drive_slow = drive_fast = 0.0
+    if streamed:
+        rates, why = link_rates(characteristics, runtime)
+        pinned_gbps = rates.get("link_gbps")
+        if not pinned_gbps:
+            return Estimate(None, "no pinned H2D measurement for dense streaming: " + why)
+        link_s = streamed / (pinned_gbps * GB)
+    if disk:
+        drive_rates = _dense_drive_rates(characteristics, drive_key, disk)
+        if not drive_rates:
+            return Estimate(None, "no matching model-drive measurement for dense streaming")
+        low_bps, high_bps = drive_rates
+        drive_fast, drive_slow = disk / high_bps, disk / low_bps
+        # The catalog omits the distribution of chunk sizes. The geometric center gives
+        # equal multiplicative error against the two measured size endpoints.
+        drive_s = math.sqrt(drive_fast * drive_slow)
+        assumptions.append(
+            "Dense read sizes are unknown. Timed sizes up to 16 MiB and depth 8 span "
+            f"{low_bps / GB:.2f}–{high_bps / GB:.2f} GB/s; the reference uses the geometric mean."
+        )
+    median, fast, slow = compute
+    # Every streamed byte crosses the link, including bytes the drive worker puts into its
+    # pinned ring. After pipeline fill the limiting service time sets the steady-state rate.
+    seconds = max(median, link_s, drive_s)
+    serial = median + link_s + drive_s
+    detail = (
+        f"{seconds * 1e3:.1f} ms a token from one GPU at {dense_read_bytes / median / GB:.0f} GB/s"
+    )
+    if streamed:
+        detail += (
+            f" effective matvec; per token {pinned / GB:.2f} GB from pinned RAM and "
+            f"{disk / GB:.2f} GB from disk, {streamed / GB:.2f} GB over H2D"
+        )
+        assumptions.append(
+            "Steady streaming overlaps drive, H2D and GPU compute; "
+            "dense_serial prices the same work without overlap."
+        )
+    low, high = 1 / (slow + link_s + drive_slow), 1 / max(fast, link_s, drive_fast)
     return Estimate(
         1 / seconds,
         detail,
         tuple(assumptions),
-        {"dense_serial": 1 / seconds},
-        {"dense_ms": seconds * 1e3, "dense_read_bytes": float(dense_read_bytes)},
-        (),
-        (1 / slow, 1 / fast) if slow != fast else None,  # the GPU measurement's quartiles
+        {"dense_pipeline": 1 / seconds, "dense_serial": 1 / serial},
+        {
+            "dense_ms": seconds * 1e3,
+            "dense_read_bytes": float(dense_read_bytes),
+            "dense_resident_bytes": float(resident),
+            "dense_pinned_bytes": float(pinned),
+            "dense_drive_bytes": float(disk),
+            "gpu_compute_ms": median * 1e3,
+            "h2d_ms": link_s * 1e3,
+            "storage_ms": drive_s * 1e3,
+            **(weights.graph_components() if weights else {}),
+        },
+        scenario_range=(low, high) if low != high else None,
+        reference_scenario="dense_pipeline",
     )

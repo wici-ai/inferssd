@@ -10,12 +10,14 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional
 
 from inferssd.app import catalog
 from inferssd.contracts import ContractError
-from inferssd.launch.resources import installed_resources
+from inferssd.engine import model as engine_model
+from inferssd.launch.resources import executable, installed_resources, read_resources
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
     STORAGE_PREFIX,
@@ -35,8 +37,11 @@ from inferssd.machine.profile import (
     survey,
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
+from inferssd.strategy import calibration
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
-from inferssd.strategy.inputs import RuntimeFacts, read_runtime
+from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine, read_runtime
+from inferssd.strategy.weights import DenseWeights, dense_weights
+from inferssd.telemetry.routing import last_request_hits
 
 GIB = float(1 << 30)
 
@@ -68,6 +73,47 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         "--build", type=Path, help="engine build directory holding bin/inferssd-*probe"
     )
     command.add_argument("--memory-gib", type=float, help="host memory budget for estimation only")
+    target = command.add_mutually_exclusive_group()
+    target.add_argument(
+        "--estimate-gguf",
+        type=Path,
+        metavar="FILE",
+        help="estimate this GGUF using the engine's header reader",
+    )
+    target.add_argument(
+        "--estimate-facts",
+        type=Path,
+        metavar="JSON",
+        help="estimate exported --ssd-model-facts on this machine",
+    )
+    command.add_argument(
+        "--shard",
+        "--ple",
+        dest="shards",
+        action="append",
+        default=[],
+        metavar="FILE,...",
+        help="additional GGUF files for --estimate-gguf",
+    )
+    command.add_argument(
+        "--routing-events",
+        type=Path,
+        metavar="NATIVE-EVENTS.jsonl",
+        help="use cache hits from the last request in a representative single-stream run",
+    )
+    calibration_args = command.add_mutually_exclusive_group()
+    calibration_args.add_argument(
+        "--calibrate-from",
+        type=Path,
+        metavar="RESPONSE.json",
+        help="derive a machine calibration from a resident reference model's response timings",
+    )
+    calibration_args.add_argument(
+        "--calibration",
+        type=Path,
+        metavar="PROFILE.json",
+        help="apply an existing machine calibration to the requested GGUF",
+    )
     command.add_argument(
         "--host-work-mib",
         type=float,
@@ -181,10 +227,14 @@ def estimates(
     *,
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
+    target: Optional[catalog.Model] = None,
+    weights: Optional[DenseWeights] = None,
+    observed_hits: Optional[tuple[float, float]] = None,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
     reason = "pass --model with the directory that holds the models"
-    if drive_key is not None:
+    models = (target,) if target else catalog.MODELS
+    if drive_key is not None or target is not None:
         try:
             facts = runtime()
         except UnsupportedPlatform as error:
@@ -202,15 +252,25 @@ def estimates(
                         drive_key,
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
+                        observed_hits=observed_hits,
+                        graph_weights=weights if weights and weights.graph_store_bytes else None,
                     )
                     if model.facts.experts is not None
                     else dense_decode_estimate(
-                        value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
+                        value,
+                        model.dense_read_bytes,
+                        facts,
+                        model=model.facts,
+                        weights=weights,
+                        platform=platform,
+                        drive_key=drive_key,
+                        host_work_bytes=host_work_bytes,
+                        gpu_work_bytes=gpu_work_bytes,
                     ),
                 )
-                for model in catalog.MODELS
+                for model in models
             ]
-    return [(model, Estimate(None, reason)) for model in catalog.MODELS]
+    return [(model, Estimate(None, reason)) for model in models]
 
 
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
@@ -219,11 +279,12 @@ def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
         + (
             (
                 f"{estimate.scenario_range[0]:.1f}–{estimate.scenario_range[1]:.1f} tok/s "
-                "decode across routing/overlap scenarios (not a confidence interval); "
+                "across timing scenarios; "
                 if estimate.scenario_range
                 else ""
             )
-            + f"uniform serial reference {estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
+            + f"{estimate.reference_scenario.replace('_', ' ')} reference "
+            + f"{estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
             if estimate.tokens_per_second is not None
             else f"none: {estimate.detail}"
         )
@@ -263,7 +324,10 @@ def report(
                 "model": model.repo,
                 "quantization": model.quantization,
                 "decode_tokens_per_second": estimate.tokens_per_second,
-                "reference_scenario": "uniform_serial",
+                "reference_scenario": estimate.reference_scenario
+                if estimate.tokens_per_second is not None
+                else None,
+                "estimator_version": 2,
                 "detail": estimate.detail,
                 "assumptions": estimate.assumptions,
                 "scenarios": estimate.scenarios,
@@ -295,6 +359,8 @@ def run(
     emit: Callable[[str], None] = print,
     runtime: Callable[[], RuntimeFacts] = read_runtime,
 ) -> int:
+    if args.shards and args.estimate_gguf is None:
+        raise ValueError("--shard/--ple requires --estimate-gguf")
     for name in ("memory_gib", "host_work_mib", "gpu_work_mib"):
         number = getattr(args, name)
         if number is not None and (not math.isfinite(number) or number < 0):
@@ -309,27 +375,108 @@ def run(
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
+    resources = args.resources
+    if resources is None and args.build is None and (not args.show or args.estimate_gguf):
+        resources = installed_resources(environ, home)
+        if not resources.is_file():
+            raise ValueError(
+                "engine not installed; run scripts/install.sh "
+                "or pass --build DIR or --resources FILE"
+            )
+    target = None
+    weights = None
+    observed_hits = None
+    target_layers = 0
+    if (args.calibrate_from or args.calibration) and not (
+        args.estimate_gguf or args.estimate_facts
+    ):
+        raise ValueError("calibration requires --estimate-gguf or --estimate-facts")
+    if args.routing_events and not (args.estimate_gguf or args.estimate_facts):
+        raise ValueError("--routing-events requires --estimate-gguf or --estimate-facts")
+    if args.estimate_gguf is not None or args.estimate_facts is not None:
+        if args.estimate_gguf is not None:
+            binary = (
+                read_resources(resources).binary
+                if resources is not None
+                else str(args.build / "bin" / executable(host.platform(), "inferssd-server"))
+            )
+            raw = engine_model.query(
+                binary,
+                str(args.estimate_gguf),
+                lambda argv: (runner or run_process)(argv, engine_model.TIMEOUT_S, environ),
+                args.shards,
+            )
+            if not paths:
+                paths = raw["files"]
+        else:
+            raw = engine_model.validate(json.loads(args.estimate_facts.read_text(encoding="utf-8")))
+        if args.routing_events:
+            layout = raw["experts"]
+            if not layout or not layout["used"]:
+                raise ValueError("--routing-events requires a model with known routed experts")
+            with args.routing_events.open(encoding="utf-8") as stream:
+                observed_hits = last_request_hits(
+                    stream,
+                    {layer for layer, _ in layout["layers"]},
+                    layout["count"],
+                    layout["used"],
+                )
+        target_layers = raw["layers"]
+        facts = facts_from_engine(raw)
+        weights = dense_weights(raw)
+        read_bytes = weights.active_bytes
+        # Report the actual GGUF types. Mixed checkpoints need not have a canonical quant label.
+        formats = facts.experts.format_bytes if facts.experts else facts.layer_format_bytes
+        target = catalog.Model(
+            facts.paths[0],
+            "+".join(name for name, _ in formats),
+            "",
+            facts,
+            facts.dense_bytes - read_bytes,
+        )
 
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
-        if args.json or args.model:
+        if args.json or args.model or target:
+            sample = None
+            estimate_runtime = lru_cache(maxsize=1)(runtime)
             rows = estimates(
                 value,
                 drive_key,
                 host.platform(),
-                runtime,
+                estimate_runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
+                target=target,
+                weights=weights,
+                observed_hits=observed_hits,
             )
-            if args.json:
-                emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
+            if args.calibrate_from or args.calibration:
+                key = calibration.machine_key(value, estimate_runtime())
+                if args.calibrate_from:
+                    response = json.loads(args.calibrate_from.read_text(encoding="utf-8"))
+                    sample = calibration.fit(response, rows[0][1], target_layers, key)
+                else:
+                    saved_calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
+                    sample = calibration.load(saved_calibration, key)
+                    rows = [(m, calibration.apply(e, sample, target_layers)) for m, e in rows]
+            if args.json or args.calibrate_from:
+                result = report(value, path, drive_key, rows)
+                if sample is not None:
+                    result["calibration"] = sample
+                    result["calibration_applied"] = bool(args.calibration)
+                emit(json.dumps(result, separators=(",", ":")))
                 return
             lines += estimate_lines(rows)
         for line in lines:
             emit(line)
 
     if args.show:
-        if args.reprofile or args.resources or args.build or args.estimate_compute:
+        if (
+            args.reprofile
+            or args.estimate_compute
+            or ((args.resources or args.build) and args.estimate_gguf is None)
+        ):
             raise ValueError(
                 "--show measures nothing; omit --reprofile, --resources, "
                 "--build and --estimate-compute"
@@ -340,14 +487,6 @@ def run(
         output(saved, models_drive(model_drives(host, paths)) if paths else None)
         return 0
     suffix = ".exe" if host.platform() == "windows" else ""
-    resources = args.resources
-    if resources is None and args.build is None:
-        resources = installed_resources(environ, home)
-        if not resources.is_file():
-            raise ValueError(
-                "engine not installed; run scripts/install.sh "
-                "or pass --build DIR or --resources FILE"
-            )
     probes = Probes(
         tuple(locate(resources, args.build, suffix=suffix).items()), runner or run_process
     )
@@ -378,7 +517,7 @@ def run(
     partial = [name for name, rec in changed.items() if rec["status"] == "partial"]
     failed = [name for name, rec in changed.items() if rec["status"] == "failed"]
     # With --json, stdout holds the one JSON object; the run's problems go to stderr.
-    note = progress if args.json else emit
+    note = progress if args.json or args.calibrate_from else emit
     if partial:
         note(f"{len(partial)} section(s) partial: {', '.join(partial)}")
     if failed:

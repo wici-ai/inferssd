@@ -110,8 +110,8 @@ class ModelFacts:
     paths: tuple[str, ...]
     architecture: Optional[str]
     dense_bytes: int  # every tensor that is not a routed expert
-    # The layers' tensors (blk.N.*) that are not routed experts: bytes per ggml type, the most
-    # first. The lookup tables outside the layers (token and per-layer embeddings) are not in it.
+    # Repeating dense tensor bytes by ggml type, the largest share first. When the native
+    # model has layers but lacks conventional block names, use its aggregate dense types.
     layer_format_bytes: tuple[tuple[str, int], ...]
     experts: Optional[Experts]  # None for a model without routed experts
 
@@ -174,9 +174,16 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
         )
     dense = [t for t in model["tensors"] if t["name"] not in routed]
     per_type: Counter[str] = Counter()
+    has_decoder = any(t["name"].startswith("dec.blk.") for t in dense)
     for t in dense:
-        if t["name"].startswith("blk."):
+        if t["name"].startswith(("blk.", "dec.blk.")) or (
+            not has_decoder and t["name"].startswith("enc.blk.")
+        ):
             per_type[t["type"].upper()] += t["bytes"]
+    if not per_type and model["layers"] > 0:
+        for t in dense:
+            if t["bytes"] > 0:
+                per_type[t["type"].upper()] += t["bytes"]
     if not per_type:
         raise ValueError(f"{model['files'][0]}: the model has no layer tensors")
     return ModelFacts(

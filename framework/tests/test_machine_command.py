@@ -7,17 +7,20 @@ import argparse
 import json
 import os
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
 from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
+from test_strategy_inputs import Q4_K, Q8_0, engine_facts
 
 from inferssd.app import catalog
 from inferssd.cli import main
 from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
+from inferssd.machine.probes import Completed
 from inferssd.machine.store import exclusive
 from inferssd.strategy.inputs import RuntimeFacts
 
@@ -310,6 +313,9 @@ def test_json_prints_one_object_with_the_machine_and_the_estimates(tmp_path):
     ]
     # Q4_K alone was measured: the other formats take its rate, so every model has an estimate.
     assert all(row["decode_tokens_per_second"] > 0 for row in value["estimates"])
+    for row in value["estimates"]:
+        assert row["estimator_version"] == 2
+        assert row["scenarios"][row["reference_scenario"]] == row["decode_tokens_per_second"]
     # Without --model the estimates have no drive, and the machine no models drive.
     code, out, _ = execute(["--show", "--json"], host, FakeRunner({}), tmp_path)
     value = json.loads(out[0])
@@ -333,6 +339,122 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     assert error.value.code == 2 and "no machine profile" in capsys.readouterr().err
     with pytest.raises(SystemExit) as error:
         main(["profile", "--build", str(build), "--resources", str(output)])
+    assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
+
+
+def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(
+    tmp_path, monkeypatch, capsys
+):
+    host, files, build = machine(tmp_path)
+    raw = engine_facts(
+        [
+            ("token_embd.weight", (256, 256), Q8_0),
+            ("output.weight", (256, 256), Q8_0),
+            ("blk.0.ffn_up.weight", (256, 256), Q4_K),
+        ],
+        {"general.architecture": "unlisted-test-decoder"},
+        path=files[0],
+    )
+    raw["files"] = files
+    raw["tensors"][-1]["file"] = 1
+    runner = FakeRunner(replies(**{"inferssd-server": Completed(0, json.dumps(raw))}))
+    monkeypatch.setattr(
+        "inferssd.cli.run_profile",
+        partial(
+            command.run,
+            host=host,
+            runner=runner,
+            runtime=lambda: RUNTIME,
+        ),
+    )
+    saved = tmp_path / "machine.json"
+    args = ["profile", "--output", str(saved), "--json"]
+    target = ["--estimate-gguf", files[0], "--ple", files[1], "--build", str(build)]
+    assert main([*args, *target]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert runner.calls[0][0] == [
+        str(build / "bin/inferssd-server"),
+        "--ssd-model-facts",
+        files[0],
+        "--shard",
+        files[1],
+    ]
+    assert report["machine"]["models_drive"]["model"] == "Example NVMe 2TB"
+    (row,) = report["estimates"]
+    assert row["model"] == files[0] and row["quantization"] == "Q4_K"
+    assert row["decode_tokens_per_second"] == row["scenarios"][row["reference_scenario"]] > 0
+    assert row["components"]["dense_read_bytes"] == sum(t["bytes"] for t in raw["tensors"][1:])
+    original_profile = saved.read_bytes()
+    runner.calls.clear()
+    assert main([*args, "--show", *target]) == 0
+    assert json.loads(capsys.readouterr().out)["estimates"] == [row]
+    assert len(runner.calls) == 1 and "--ssd-model-facts" in runner.calls[0][0]
+    exported = tmp_path / "facts.json"
+    exported.write_text(json.dumps(raw))
+    runner.calls.clear()
+    assert main([*args, "--show", "--estimate-facts", str(exported)]) == 0
+    assert json.loads(capsys.readouterr().out)["estimates"] == [row]
+    assert saved.read_bytes() == original_profile and not runner.calls
+
+
+@pytest.mark.parametrize(
+    ("data", "message"),
+    [(None, "absent.json"), ("bad json", "Expecting value"), ('{"version":1}', "model.")],
+)
+def test_cli_diagnoses_missing_and_invalid_exported_facts(tmp_path, capsys, data, message):
+    path = tmp_path / "absent.json"
+    if data is not None:
+        path.write_text(data)
+    with pytest.raises(SystemExit) as error:
+        main(["profile", "--show", "--estimate-facts", str(path)])
+    assert error.value.code == 2 and message in capsys.readouterr().err
+
+
+def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
+    host, paths, build = machine(tmp_path)
+    raw = engine_facts(
+        [
+            ("blk.0.ffn_gate_up_exps.weight", (256, 512, 8), Q4_K),
+            ("blk.0.ffn_down_exps.weight", (256, 256, 8), Q4_K),
+        ],
+        {
+            "general.architecture": "test-moe",
+            "test-moe.expert_count": 8,
+            "test-moe.expert_used_count": 2,
+        },
+        path=paths[0],
+    )
+    assert raw["experts"] is None
+    export = tmp_path / "graph-facts.json"
+    export.write_text(json.dumps(raw))
+    code, out, _ = execute(
+        ["--build", str(build), "--estimate-facts", str(export), "--json"],
+        host,
+        FakeRunner(replies()),
+        tmp_path,
+    )
+    (result,) = json.loads(out[0])["estimates"]
+    assert code == 0 and result["decode_tokens_per_second"] > 0
+    full = sum(t["bytes"] for t in raw["tensors"])
+    assert result["components"]["graph_expert_store_bytes"] == full
+    assert result["components"]["dense_read_bytes"] == full // 4
+
+
+def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):
+    _, _, build = machine(tmp_path)
+    runner = FakeRunner({"inferssd-server": Completed(1, "", "error: file does not exist")})
+    monkeypatch.setattr(command, "run_process", runner)
+    with pytest.raises(SystemExit) as error:
+        main(["profile", "--estimate-gguf", "missing.gguf", "--build", str(build)])
+    assert error.value.code == 2 and "missing.gguf: file does not exist" in capsys.readouterr().err
+    with pytest.raises(SystemExit) as error:
+        main(["profile", "--show", "--estimate-facts", "export.json", "--shard", "extra.gguf"])
+    assert (
+        error.value.code == 2
+        and "--shard/--ple requires --estimate-gguf" in capsys.readouterr().err
+    )
+    with pytest.raises(SystemExit) as error:
+        main(["profile", "--estimate-facts", "export.json", "--estimate-gguf", "model.gguf"])
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
 
 
