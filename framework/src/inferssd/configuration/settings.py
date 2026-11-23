@@ -188,6 +188,10 @@ def parse(
 
     def apply(key: str, literal: str, origin: str, location: str, receipt: str) -> None:
         try:
+            if origin == "file" and key == "prefill.cpu_max_tokens":
+                integer(literal.strip(" \t\r\n"), 0, 4294967295)
+                print(f"{key} ({location}): ignoring retired setting", file=sys.stderr)
+                return
             prop = properties.get(key)
             if prop is None:
                 raise ValueError("unknown key")
