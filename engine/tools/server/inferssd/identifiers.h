@@ -13,7 +13,8 @@
 // A prompt is cached as a prefix: the state of an app's leading context (its system prompt and tools, 10k-50k tokens)
 // is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the
 // home directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop
-// app the skill folders under the home directory and the conversation's folder. A new project, session or user
+// app the skill folders under the home directory and the project's or the conversation's folder. A new project,
+// session or user
 // would process all of the context after them again. The server gives the model stand-ins for these
 // identifiers wherever they occur in a request, and puts the request's identifiers back in place of the stand-ins in
 // what the model writes. The model only copies such strings into paths, so it does the same work, and the client

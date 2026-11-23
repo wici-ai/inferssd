@@ -199,6 +199,40 @@ static void test_chatgpt_conversations_share_their_context() {
                                                       text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
 }
 
+static void test_codex_projects_share_their_context() {
+    const auto request = [](const std::string & roots, const std::string & cwd) {
+        const std::string developer = "<permissions instructions>\nApproval policy is currently never.\n The writable "
+                                      "roots are " + roots + ".\n</permissions instructions>";
+        return json{{"messages", json::array({
+            {{"role", "developer"}, {"content", developer}},
+            {{"role", "user"}, {"content", "<environment_context>\n  <cwd>" + cwd + "</cwd>\n</environment_context>"}},
+        })}};
+    };
+    const server_identifier_env alice = mac_env(users("alice"), "/var/folders/ab/abc123/T");
+    const server_identifier_env bob   = mac_env(users("bob"), "/var/folders/cd/def456/T");
+    const std::string a_cwd = alice.home + "/code/app", b_cwd = bob.home + "/work/site";
+    json a = request("`" + a_cwd + "`, `/private/tmp`", a_cwd);
+    json b = request("`" + b_cwd + "`, `/private/tmp`", b_cwd);
+    const server_identifier_map map_a = server_identifiers_apply(a, alice);
+    server_identifiers_apply(b, bob);
+    require(a["messages"][0] == b["messages"][0], "two users and projects get the same developer message: " +
+                                                      text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
+    const std::string project = STAND_IN + "/project";
+    require(text_of(a["messages"][0]).find("`" + project + "`, `/private/tmp`.") != std::string::npos,
+            "the project's folder has a stand-in, /tmp does not: " + text_of(a["messages"][0]));
+    require(text_of(a["messages"][1]).find("<cwd>" + project + "</cwd>") != std::string::npos,
+            "and the same one in the environment: " + text_of(a["messages"][1]));
+    require(map_a.to_identifiers("Wrote " + project + "/src/main.c", false) == "Wrote " + a_cwd + "/src/main.c",
+            "what the model writes goes back to alice's project");
+
+    // an added folder is the second project folder; the temporary directory and the home directory keep their own
+    json c = request("`" + alice.temp + "`, `" + a_cwd + "`, `" + alice.home + "/notes`, `" + alice.home + "`", a_cwd);
+    server_identifiers_apply(c, alice);
+    require(text_of(c["messages"][0]).find("`/var/folders/00/inferssd/T`, `" + project + "`, `" + project + "-2`, `" +
+                                           STAND_IN + "`.") != std::string::npos,
+            "several roots: " + text_of(c["messages"][0]));
+}
+
 static void test_matches_stop_at_name_boundaries() {
     const std::string al  = users("al");
     const server_identifier_env env = mac_env(al, "");
@@ -306,6 +340,7 @@ int main() {
     test_claude_code_shares_its_context();
     test_claude_desktop_sessions_share_their_context();
     test_chatgpt_conversations_share_their_context();
+    test_codex_projects_share_their_context();
     test_matches_stop_at_name_boundaries();
     test_a_request_that_cannot_be_mapped_exactly_stays();
     test_streamed_text_only_grows();
