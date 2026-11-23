@@ -8,6 +8,7 @@
 #include "base64.hpp"
 
 #include "server-common.h"
+#include "inferssd/identifiers.h"
 
 #include <deque>
 #include <mutex>
@@ -1198,6 +1199,16 @@ json oaicompat_chat_params_parse(
     std::vector<raw_buffer> & out_files)
 {
     json llama_params;
+
+    // The line Claude Code bills by goes, and stand-ins take the place of the identifiers of the user and the session,
+    // so that the context an app starts every conversation with is the same prompt (see inferssd/identifiers.h).
+    if (body.contains("messages")) {
+        server_strip_anthropic_billing_header(body.at("messages"));
+    }
+    const server_identifier_map identifiers = server_identifiers_apply(body, server_identifier_env::current());
+    if (!identifiers.empty()) {
+        llama_params["prompt_identifiers"] = identifiers.to_json();
+    }
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();

@@ -154,6 +154,28 @@ json task_params::to_json(bool only_metrics) const {
 //
 // task_result_state
 //
+
+// The message as it goes to the client: the request's identifiers in place of the stand-ins (see
+// inferssd/identifiers.h). Only the part being written can still grow: the reasoning until content or a tool call
+// follows, the content until a tool call follows, and the last tool call's arguments.
+static common_chat_msg msg_with_identifiers(const server_identifier_map & identifiers, const common_chat_msg & msg,
+                                            bool is_partial) {
+    common_chat_msg out = msg;
+    const bool content_grows   = is_partial && msg.tool_calls.empty();
+    const bool reasoning_grows = content_grows && msg.content.empty() && msg.content_parts.empty();
+    out.reasoning_content = identifiers.to_identifiers(msg.reasoning_content, reasoning_grows);
+    out.content           = identifiers.to_identifiers(msg.content, content_grows);
+    for (size_t i = 0; i < out.content_parts.size(); ++i) {
+        out.content_parts[i].text =
+            identifiers.to_identifiers(msg.content_parts[i].text, content_grows && i + 1 == out.content_parts.size());
+    }
+    for (size_t i = 0; i < out.tool_calls.size(); ++i) {
+        out.tool_calls[i].arguments =
+            identifiers.to_identifiers(msg.tool_calls[i].arguments, is_partial && i + 1 == out.tool_calls.size());
+    }
+    return out;
+}
+
 common_chat_msg task_result_state::update_chat_msg(
         const std::string & text_added,
         bool is_partial,
@@ -166,7 +188,8 @@ common_chat_msg task_result_state::update_chat_msg(
         // Offsets always refer to generated_text, never to the last token.
         output_source = *source;
     }
-    auto msg_prv_copy = chat_msg;
+    // the diffs go to the client: they are taken between the messages as sent
+    auto msg_prv_copy = chat_msg_sent;
     //SRV_DBG("Parsing chat message: %s\n", generated_text.c_str());
     common_chat_msg new_msg;
 
@@ -274,7 +297,7 @@ common_chat_msg task_result_state::update_chat_msg(
                 // msg_prv_copy stays the original empty chat_msg on the
                 // next call and the diff invariant is preserved.
                 diffs.clear();
-                return chat_msg;
+                return chat_msg_sent;
             }
 
             // Compute the strip count once.
@@ -325,8 +348,9 @@ common_chat_msg task_result_state::update_chat_msg(
         }
 
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
-        chat_msg = new_msg;
-        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg);
+        chat_msg      = new_msg;
+        chat_msg_sent = identifiers.empty() ? chat_msg : msg_with_identifiers(identifiers, chat_msg, is_partial);
+        auto all_diffs = common_chat_msg_diff::compute_diffs(msg_prv_copy, chat_msg_sent);
 
         if (!filter_tool_calls) {
             diffs = std::move(all_diffs);
@@ -385,7 +409,7 @@ common_chat_msg task_result_state::update_chat_msg(
             }
         }
     }
-    return chat_msg;
+    return chat_msg_sent;
 }
 
 //
@@ -589,6 +613,7 @@ task_params server_task::params_from_json_cmpl(
         if (data.contains("chat_parser")) {
             params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
         }
+        params.identifiers = server_identifier_map::from_json(json_value(data, "prompt_identifiers", json()));
     }
 
     {
@@ -1567,7 +1592,7 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
     oai_resp_fc_id         = state.oai_resp_fc_id;
 
     // track if the accumulated message has any reasoning content
-    anthropic_has_reasoning = !state.chat_msg.reasoning_content.empty();
+    anthropic_has_reasoning = !state.chat_msg_sent.reasoning_content.empty();
 
     // Pre-compute state updates based on diffs (for next chunk)
     for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
