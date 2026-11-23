@@ -1,7 +1,12 @@
 # Native observations
 
-Every launch writes the engine's events to `native-events.jsonl` in its run
-directory. `inferssd.telemetry.observations.NativeObservationSession` reads the
+A launch writes the engine's events to `native-events.jsonl` in its run
+directory. `inferssd launch`, which the benchmarks use, records an event for each
+layer and each prompt graph. `inferssd serve` and `cli` run for a person for as
+long as they like, at up to hundreds of megabytes of such events an hour, so they
+leave them out unless given `--layer-events`: the file then holds the settings and
+the contract line alone (`--no-layer-events` on `launch`, `--ssd-no-layer-events`
+on the server). `inferssd.telemetry.observations.NativeObservationSession` reads the
 routes, layer costs and prefill summaries in it; the benchmark CI uses it to
 record what each run did. Human-readable server logs and `INFERSSD_DEBUG` are
 optional diagnostics.

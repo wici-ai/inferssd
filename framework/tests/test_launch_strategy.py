@@ -52,7 +52,8 @@ X86_FILE = MACHINES / "linux-x86-rtx5090.json"
 X86 = json.loads(X86_FILE.read_text())
 X86_GPU = "GPU-00000000-0000-4000-8000-000000000016"
 X86_DRIVE = X86["storage"][0]["drive_key"]
-STRATEGY_FACTS = {"machine_characteristics", "model_facts", "model_drive_key", "runtime_facts"}
+# What only a strategy asks; every launch asks the model's facts.
+STRATEGY_FACTS = {"machine_characteristics", "model_drive_key", "runtime_facts"}
 
 
 def runtime_record(cpus=range(61), gpus=((X86_GPU, 30 << 30, 0),)):
@@ -359,8 +360,8 @@ def test_recorded_model_runtime_and_drive_facts(tmp_path):
     assert recorded({"model_facts": stored})(Fact("model_facts", ("/bin/server", model))).value == (
         stored
     )
-    partial = {key: value for key, value in facts.items() if key != "roles"}
-    with pytest.raises(ValueError, match="model_facts.roles is required"):
+    partial = {key: value for key, value in facts.items() if key != "layer_format_bytes"}
+    with pytest.raises(ValueError, match="model_facts.layer_format_bytes is required"):
         recorded({"model_facts": partial})(Fact("model_facts", ("/bin/server", model)))
     runtime_value = recorded({"runtime_facts": runtime_record()})(Fact("runtime_facts")).value
     # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
@@ -432,6 +433,16 @@ def test_live_model_facts_are_the_engines(tmp_path):
         *deepseek_like(), path=model
     )
     assert asked == [(["/bin/server", "--ssd-model-facts", model], 120.0)]
+    # the model's --shard/--ple values reach the engine as the server takes them
+    asked.clear()
+    adapter(Fact("model_facts", ("/bin/server", model, "/t/table.gguf", "a.gguf,b.gguf")))
+    assert asked == [
+        (
+            ["/bin/server", "--ssd-model-facts", model]
+            + ["--shard", "/t/table.gguf", "--shard", "a.gguf,b.gguf"],
+            120.0,
+        )
+    ]
     printed["model"] = None
     with pytest.raises(ValueError, match="the engine cannot read the model .*: no such file"):
         adapter(Fact("model_facts", ("/bin/server", model)))
@@ -585,7 +596,6 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
     monkeypatch.setattr(runtime, "OwnedProcess", lambda *a, **k: owner)
     monkeypatch.setattr(effects, "reservation", object(), raising=False)
     source = MachineSource(reprofile=True)
-    # The engine reads the model: an expert model, so the machine is measured.
     host = EngineHost(engine_facts(*deepseek_like(), path=spec.model))
     value = runtime.Runtime(
         inputs,
@@ -601,7 +611,8 @@ def test_runtime_measures_once_before_the_run_directory(tmp_path, monkeypatch):
     ((given, platform, model, probes, events),) = calls
     assert (given, platform, model, probes, events) == (source, "linux", spec.model, {}, [])
     assert adapters and all(options["machine"] == dumps(load(X86_FILE)) for options in adapters)
-    assert [argv[1:] for argv in host.asked] == [["--ssd-model-facts", spec.model]]
+    # Every model's launch measures the machine: the runtime asks the engine nothing first.
+    assert host.asked == []
     engine.stop()
     plain = runtime.Runtime(
         inputs, policy(tmp_path, "linux"), host=object(), emit=lambda _: None, machine=source

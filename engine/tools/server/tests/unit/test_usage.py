@@ -46,10 +46,13 @@ def single_request(events: list[dict]) -> tuple[dict, dict]:
     assert [e["type"] for e in events] == ["request_received", "usage_finalized"], events
     received, finalized = events
     assert received["request_id"] == finalized["request_id"]
-    assert set(received) == {"event_id", "type", "request_id", "occurred_at"}
-    assert set(finalized) == {
-        "event_id", "type", "request_id", "occurred_at", "token_count", "input_tokens", "output_tokens", "outcome"
+    # the caller's fields are there when the request names them, and the error when it failed
+    assert set(received) - {"client", "user_agent"} == {"event_id", "type", "request_id", "occurred_at", "route"}
+    assert set(finalized) - {"error"} == {
+        "event_id", "type", "request_id", "occurred_at", "token_count", "input_tokens", "output_tokens",
+        "cached_tokens", "prompt_ms", "output_ms", "outcome",
     }
+    assert ("error" in finalized) == (finalized["outcome"] == "failed")
     run, seq = received["event_id"].rsplit(":", 1)
     assert finalized["event_id"] == f"{run}:{int(seq) + 1}"
     for event in events:
@@ -86,6 +89,34 @@ def test_streamed_chat_counts_its_usage(tmp_path):
     assert finalized["output_tokens"] == usage["completion_tokens"] == 8
 
 
+def test_request_names_its_route_and_caller(tmp_path):
+    server.start()
+    base = f"http://{server.server_host}:{server.server_port}"
+    body = {"max_tokens": 4, "messages": [{"role": "user", "content": "What is the best book"}]}
+    # the key names the caller: a name the host gave, less its inferssd- prefix, or another key's first 10 characters
+    requests.post(base + "/v1/chat/completions", json=body, headers={
+        "Authorization": "Bearer inferssd-codex", "User-Agent": "codex_cli_rs/0.169.0"})
+    requests.post(base + "/v1/messages", json={"model": "x", **body}, headers={"X-Api-Key": "sk-ant-secret", "User-Agent": ""})
+    events = wait_finalized(tmp_path, 2)
+    received = [e for e in events if e["type"] == "request_received"]
+    assert [e["route"] for e in received] == ["/v1/chat/completions", "/v1/messages"]
+    assert (received[0]["client"], received[0]["user_agent"]) == ("codex", "codex_cli_rs/0.169.0")
+    assert received[1]["client"] == "sk-ant-sec"
+    assert "sk-ant-secret" not in usage_path(tmp_path).read_text(encoding="utf-8")
+
+
+def test_log_names_the_request(tmp_path):
+    server.log_path = str(tmp_path / "server.log")
+    server.start()
+    res = server.make_request("POST", "/completion", data={"prompt": "I believe the meaning of life is", "n_predict": 4})
+    assert res.status_code == 200
+    received, _ = single_request(wait_finalized(tmp_path, 1))
+    # where the request starts, and on the slot that took its task
+    log = (tmp_path / "server.log").read_text(encoding="utf-8", errors="replace")
+    assert f"usage events: request {received['request_id']} to /completion" in log
+    assert f"| usage events: request {received['request_id']}" in log
+
+
 def test_messages_count_cached_prompt_tokens_as_input(tmp_path):
     server.start()
     body = {"model": "x", "max_tokens": 8, "messages": [{"role": "user", "content": "What is the best book"}]}
@@ -98,6 +129,9 @@ def test_messages_count_cached_prompt_tokens_as_input(tmp_path):
     # Anthropic's input_tokens leaves out the cache hits; the event counts the whole prompt
     assert finalized[-1]["input_tokens"] == usage["input_tokens"] + usage.get("cache_read_input_tokens", 0)
     assert finalized[-1]["output_tokens"] == usage["output_tokens"]
+    # what the slot already held of the second prompt, as the response reports it
+    assert finalized[0]["cached_tokens"] == 0
+    assert finalized[-1]["cached_tokens"] == usage.get("cache_read_input_tokens", 0) > 0
 
 
 def test_responses_are_counted(tmp_path):
@@ -148,6 +182,8 @@ def test_unreadable_request_counts_with_no_tokens(tmp_path):
     _, finalized = single_request(wait_finalized(tmp_path, 1))
     assert finalized["outcome"] == "failed"
     assert finalized["input_tokens"] == finalized["output_tokens"] == 0
+    # why, in the words the response gave
+    assert finalized["error"] and finalized["error"] in res.json()["error"]["message"]
 
 
 def test_other_routes_are_not_counted(tmp_path):

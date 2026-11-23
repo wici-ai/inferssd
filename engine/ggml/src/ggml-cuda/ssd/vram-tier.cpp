@@ -1053,6 +1053,16 @@ struct tier {
         group_wanted_rows=ntokens>vector_tokens?ntokens:0;
         if(ntokens>vector_tokens && group)reserve_group(ntokens);
     }
+    // The engine for a pass of ntokens as the prompt's graph is reserved (ssd_vram_elastic_api reserve_pass): its
+    // buffers then come from the room the graph's ubatch is sized in, while the tier can still give blocks back;
+    // reserved at the pass's first layer instead, after the graph has taken what was free, they can find none left.
+    // Held at exactly this size: a smaller ubatch tried after a larger one was refused gives the larger's rows back.
+    void reserve_prefill_pass(int ntokens){
+        if(ntokens<1)throw std::runtime_error("invalid grouped prefill pass reserve");
+        const int rows=ntokens>vector_tokens?ntokens:0;
+        if(group && group_rows>rows){drain();release_group();}
+        reserve_prefill_engine(ntokens);
+    }
     // rows input rows a layer (and up to 16 routes a row); grows only (release frees it). Made room for like the
     // transient scratch: the pass's buffers, against what is free and the pass buffers the engine frees to grow (it
     // keeps its fixed scratch). An engine without its fixed scratch reserves it again, priced at what its previous
@@ -2441,6 +2451,7 @@ int deferred_collect(void * p,int32_t wait_layer,ssd_vram_request * out,int32_t 
 int deferred_wait(void * p,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->wait_deferred();return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_phase_complete(void * p,int decode,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->phase_complete(decode!=0);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_reserve_accumulate(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_prefill_engine(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int elastic_reserve_pass(void * p,int tokens,char * e,size_t n){auto * t=static_cast<tier *>(p);try{t->reserve_prefill_pass(tokens);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_reserve(void * p,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->reserve();return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int elastic_preload_slots(void * p,int * slots,char * e,size_t n){
@@ -2623,8 +2634,8 @@ extern "C" const ssd_vram_deferred_api * ssd_vram_deferred_get_api(){
     static const ssd_vram_deferred_api api={3,sizeof(ssd_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;
 }
 extern "C" const ssd_vram_elastic_api * ssd_vram_elastic_get_api(){
-    static const ssd_vram_elastic_api api={7,sizeof(ssd_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
-        elastic_preload_slots,elastic_preload};return &api;
+    static const ssd_vram_elastic_api api={8,sizeof(ssd_vram_elastic_api),elastic_phase_complete,elastic_reserve_accumulate,elastic_reserve,
+        elastic_preload_slots,elastic_preload,elastic_reserve_pass};return &api;
 }
 extern "C" const ssd_vram_format_api * ssd_vram_format_get_api(){
     static const ssd_vram_format_api api={4,sizeof(ssd_vram_format_api),format_prepare,format_launch};return &api;

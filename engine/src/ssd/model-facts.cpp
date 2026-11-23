@@ -197,9 +197,11 @@ void experts(std::string & out, llama_model_loader & ml, const llama_hparams & h
 #endif
 }
 
-std::string model_facts(const char * path) {
+std::string model_facts(const char * const * paths, size_t n_paths) {
+    // as llama_model_load_from_file takes one path and llama_model_load_from_splits several
     std::vector<std::string> splits;
-    llama_model_loader ml(nullptr, nullptr, nullptr, path, splits, nullptr, /* use_mmap */ false,
+    if (n_paths > 1) { splits.assign(paths, paths + n_paths); }
+    llama_model_loader ml(nullptr, nullptr, nullptr, paths[0], splits, nullptr, /* use_mmap */ false,
         /* use_direct_io */ false, /* check_tensors */ false, /* defer_experts */ false, /* no_alloc */ true,
         nullptr, nullptr);
     llama_model_params params = llama_model_default_params();
@@ -252,12 +254,15 @@ std::string model_facts(const char * path) {
 }
 } // namespace
 
-bool llama_ssd_model_facts(const char * path, void (*write)(const char * text, size_t size, void * user), void * user,
-        char * error, size_t error_size) {
+bool llama_ssd_model_facts(const char * const * paths, size_t n_paths,
+        void (*write)(const char * text, size_t size, void * user), void * user, char * error, size_t error_size) {
     if (error && error_size) { error[0] = '\0'; }
+    const char * path = paths && n_paths ? paths[0] : nullptr;
     try {
-        if (!path || !write) { throw std::invalid_argument("model facts need a model path and a writer"); }
-        const std::string facts = model_facts(path);
+        if (!path || !write || std::find(paths, paths + n_paths, nullptr) != paths + n_paths) {
+            throw std::invalid_argument("model facts need a model path and a writer");
+        }
+        const std::string facts = model_facts(paths, n_paths);
         write(facts.data(), facts.size(), user);
         return true;
     } catch (const std::exception & exception) {

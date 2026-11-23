@@ -14,5 +14,6 @@ SSD_SETTING("vram.max_slots", integer, 0, 4294967295, "0", "slots", "plan", scop
 SSD_SETTING("vram.reserve_mib", integer, 0, 8192, "0", "MiB", "launch", scope_all, "CUDA,ROCm", "VRAM in MiB that prefill and decode leave free for other processes")
 SSD_SETTING("host.headroom_mib", integer, 0, 4294967295, "512", "MiB", "plan", scope_all, "", "Host memory in MiB the expert caches leave free")
 SSD_SETTING("host.budget_mib", integer, 0, 17592186044415, "0", "MiB", "plan", scope_darwin | scope_windows, "", "Host memory envelope in MiB against this process's own memory; zero leaves the machine's physical memory")
+SSD_SETTING("kv.spill_directory", paths, 0, 0, "[]", "path", "launch", scope_all, "", "One local SSD directory for attention KV spill; empty keeps the cache in memory")
 SSD_SETTING("model.engram_prefetch", integer, 0, 1, "0", "boolean", "model", scope_all, "", "Read ahead DeepSeek Engram rows; changes I/O timing only")
 SSD_SETTING("model.hc_fused", integer, 0, 1, "1", "boolean", "model", scope_all, "", "Use the fused hyper connection operations of DeepSeek-V4.1 and Qwen3.8-Flash-Next")

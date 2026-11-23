@@ -687,8 +687,11 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
         ? (op->ne[0] % NRA != 0 || op->ne[1] % NRB != 0)
         : (op->ne[0] % 64  != 0 || op->ne[1] % 32  != 0);
 
+    // the tensor API kernel needs a dynamic K extent only for a last partial K tile
+    const bool bc_k = op->src[0]->ne[0] % N_MM_NK_TOTAL != 0;
+
     snprintf(base, 256, "kernel_mul_mm_%s_%s", ggml_type_name(tsrc0), ggml_type_name(tsrc1));
-    snprintf(name, 256, "%s_bci=%d_bco=%d", base, bc_inp, bc_out);
+    snprintf(name, 256, "%s_bci=%d_bco=%d_bck=%d", base, bc_inp, bc_out, bc_k);
 
     ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
     if (!res.pipeline) {
@@ -696,6 +699,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mm(ggml_meta
 
         ggml_metal_cv_set_bool(cv, bc_inp, FC_MUL_MM + 0);
         ggml_metal_cv_set_bool(cv, bc_out, FC_MUL_MM + 1);
+        ggml_metal_cv_set_bool(cv, bc_k,   FC_MUL_MM + 2);
 
         res = ggml_metal_library_compile_pipeline(lib, base, name, cv);
 

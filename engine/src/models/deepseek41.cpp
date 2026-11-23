@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "models.h"
 #include "deepseek41-candidate.h"
+#include "deepseek41-engram.h"
 
 #include "llama-engram.h"
 #include "llama-impl.h"
@@ -178,10 +179,9 @@ void dsv41_engram_decode_op(ggml_tensor * dst, int ith, int nth, void *) {
     }
 }
 
-// Engram n-gram hash: each token gathers n_cols rows of this layer's table.
-//   rolling_i = (t[0]*m[0]) ^ ... ^ (t[i]*m[i]);  row = rolling_i % prime[i][h] + offset[i][h]
-// The hash runs host-side because ggml has no 64 bit integers and no xor. Look-back stops at the
-// start of the sequence, and the compressed token map folds case and accents together first.
+// Engram n-gram hash: each token gathers n_cols rows of this layer's table (llama_dsv41_engram_hash). The hash runs
+// host-side because ggml has no 64 bit integers and no xor. Look-back stops at the start of the sequence and at the
+// tokens the compressed token map marks -1, and the map folds case and accents together first.
 class llm_graph_input_engram : public llm_graph_input_i {
 public:
     llm_graph_input_engram(const llama_model & model,
@@ -250,18 +250,13 @@ void llm_graph_input_engram::compute_rows(const llama_ubatch * ubatch) {
     const int64_t n_cols   = (n_gram - 1) * n_heads;
     const int64_t n_prev   = n_gram - 1;
 
-    const uint64_t * mult   = model.engram_multipliers.data() + (size_t) eg*n_gram;
-    const uint64_t * prime  = model.engram_primes.data()      + (size_t) eg*n_cols;
-    const uint64_t * offset = model.engram_offsets.data()     + (size_t) eg*n_cols;
-
-    // an image arrives as an embd batch, so ubatch->token is null; the reference gives those
-    // positions no engram contribution at all, which the padding token stands in for here
-    const int32_t pad = (int32_t) model.engram_pad_id;
-    auto map_of = [&](llama_token t) -> uint64_t {
-        if (t < 0 || (size_t) t >= model.engram_token_map.size()) {
-            return (uint64_t) pad;
-        }
-        return (uint64_t) model.engram_token_map[t];
+    const llama_dsv41_engram_hash_params params = {
+        n_gram, n_heads,
+        model.engram_multipliers.data() + (size_t) eg*n_gram,
+        model.engram_primes.data()      + (size_t) eg*n_cols,
+        model.engram_offsets.data()     + (size_t) eg*n_cols,
+        model.engram_token_map.data(), model.engram_token_map.size(),
+        model.engram_pad_id,
     };
 
     idx.assign(size_t(n_cols * n_tokens), 0);
@@ -276,29 +271,7 @@ void llm_graph_input_engram::compute_rows(const llama_ubatch * ubatch) {
     // predecessors come from the KV cells (ext.tok); apply_ubatch() already stored this ubatch
     mctx->get_prev_tokens(*ubatch, n_prev, prev);
 
-    std::vector<uint64_t> ctx(n_gram);
-    for (int64_t i = 0; i < n_tokens; ++i) {
-        // look-back stops at the start of the sequence; everything from there on reads as padding
-        ctx[0] = ubatch->token ? map_of(ubatch->token[i]) : (uint64_t) pad;
-        bool blocked = false;
-        for (int64_t s = 1; s < n_gram; ++s) {
-            // predecessor s positions back; prev[] is oldest-first, missing entries are LLAMA_TOKEN_NULL
-            const llama_token t = blocked ? LLAMA_TOKEN_NULL : prev[i*n_prev + (n_prev - s)];
-            blocked = blocked || t < 0;
-            ctx[s] = blocked ? (uint64_t) pad : map_of(t);
-        }
-
-        // compressed ids stay under 2^17 and the multipliers under 2^37, so no product overflows
-        uint64_t rolling = ctx[0] * mult[0];
-        for (int64_t s = 1; s < n_gram; ++s) {
-            rolling ^= ctx[s] * mult[s];
-
-            for (int64_t h = 0; h < n_heads; ++h) {
-                const int64_t b = (s - 1)*n_heads + h;
-                idx[i*n_cols + b] = (int32_t) (rolling % prime[b] + offset[b]);
-            }
-        }
-    }
+    llama_dsv41_engram_hash(params, n_tokens, ubatch->token, ubatch->pos, prev.data(), idx.data());
 }
 
 } // namespace
@@ -547,11 +520,8 @@ ggml_tensor * llm_build_deepseek41::build_engram(
     ggml_tensor * s = ggml_sum_rows(ctx0, ggml_mul(ctx0, k, q));
     s = ggml_scale(ctx0, s, 1.0f/sqrtf((float) n_embd));
 
-    // signed square root before the sigmoid, matching the training kernel. The reference uses
-    // copysign, which treats +0 as positive where ggml_sgn gives 0, so a dot product of exactly
-    // zero gates 0.5 here against 0.50025 there.
-    ggml_tensor * mag  = ggml_sqrt(ctx0, ggml_clamp(ctx0, ggml_abs(ctx0, s), 1e-6f, INFINITY));
-    ggml_tensor * gate = ggml_sigmoid(ctx0, ggml_mul(ctx0, ggml_sgn(ctx0, s), mag));
+    // the signed square root before the sigmoid, as the reference's copysign: a zero dot gates 0.50025
+    ggml_tensor * gate = llama_dsv41_engram_gate(ctx0, s);
     cb(gate, "engram_gate", il);
 
     // the value is shared across the copies, only the gate differs
@@ -1154,8 +1124,9 @@ llm_build_deepseek41::llm_build_deepseek41(const llama_model & model, const llm_
     cb(pre_mix, "hc_pre_init", -1);
 
     for (int il = 0; il < n_layer; ++il) {
-        // the engram sits before the block and writes straight into the stream
-        if (model.engram_index(il) >= 0) {
+        // the engram sits before the block and writes straight into the stream; embedding input has no token ids,
+        // so it skips the Engram, like the reference's masked (image) positions
+        if (model.engram_index(il) >= 0 && ubatch.token) {
             inpL = build_engram(inpL, build_inp_engram(il), il);
             cb(inpL, "engram_out", il);
         }

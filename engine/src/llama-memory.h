@@ -6,6 +6,7 @@
 #include <memory>
 #include <functional>
 #include <stdexcept>
+#include <string>
 
 struct llama_ubatch;
 
@@ -168,6 +169,20 @@ struct llama_memory_i {
     // the cells fails. Without one, the cells are just allocated.
     using commit_cb = std::function<bool(size_t host_bytes, size_t device_bytes, const std::function<bool()> & allocate)>;
     virtual void set_commit(const commit_cb & commit) { (void) commit; }
+
+    // Use the chosen resident boundary from context fitting. Synchronize before
+    // rebinding storage, with true for a spill and false for resident restoration.
+    virtual bool set_kv_spill(const std::string & directory, uint32_t resident_cells,
+                              const std::function<void(bool)> & synchronize) {
+        (void) directory;
+        (void) resident_cells;
+        (void) synchronize;
+        return false;
+    }
+    virtual std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const { return {}; }
+    // whether set_kv_spill can move the memory's growing cells to the SSD: context fitting admits a context past
+    // memory only for a memory that can (a cache without it keeps the context that fits memory)
+    virtual bool can_spill() const { return false; }
 
     // whether the memory allocates its cells as they are used (or would, sized without allocating: no_alloc), so that
     // a larger context costs memory only once it is filled

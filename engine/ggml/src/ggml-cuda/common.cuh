@@ -1609,12 +1609,27 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
-    cublasHandle_t cublas_handle(int device) {
-        if (cublas_handles[device] == nullptr) {
-            ggml_cuda_set_device(device);
-            CUBLAS_CHECK(ggml_cuda_cublas_create_reclaiming(&cublas_handles[device], device));
-            CUBLAS_CHECK(cublasSetMathMode(cublas_handles[device], CUBLAS_TF32_TENSOR_OP_MATH));
+    cublasStatus_t ensure_cublas_handle(int device) {
+        if (cublas_handles[device]) {
+            return CUBLAS_STATUS_SUCCESS;
         }
+        ggml_cuda_set_device(device);
+        cublasHandle_t handle = nullptr;
+        cublasStatus_t status = ggml_cuda_cublas_create_reclaiming(&handle, device);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            return status;
+        }
+        status = cublasSetMathMode(handle, CUBLAS_TF32_TENSOR_OP_MATH);
+        if (status != CUBLAS_STATUS_SUCCESS) {
+            cublasDestroy(handle);
+            return status;
+        }
+        cublas_handles[device] = handle;
+        return CUBLAS_STATUS_SUCCESS;
+    }
+
+    cublasHandle_t cublas_handle(int device) {
+        CUBLAS_CHECK(ensure_cublas_handle(device));
         return cublas_handles[device];
     }
 

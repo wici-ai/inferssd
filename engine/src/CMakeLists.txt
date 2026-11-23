@@ -16,6 +16,8 @@ add_library(llama
             ssd/model-source.cpp
             ssd/model-facts.cpp
             ssd/model-pages.cpp
+            ssd/dense-homes.cpp
+            ssd/kv-backing.cpp
             llama.cpp
             llama-adapter.cpp
             llama-arch.cpp

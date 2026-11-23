@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <optional>
 #include <sstream>
 #include <unordered_set>
 
@@ -19,6 +20,82 @@ static std::string responses_output_text(const json & output) {
                                                               : "[Unsupported " + type + "]";
     }
     return text;
+}
+
+// The text of a system or developer message that holds only text, its parts joined by a blank line.
+static std::optional<std::string> responses_system_text(const json & message) {
+    const std::string role = json_value(message, "role", std::string());
+    if (role != "system" && role != "developer") {
+        return std::nullopt;
+    }
+    const json content = json_value(message, "content", json());
+    if (content.is_string()) {
+        return content.get<std::string>();
+    }
+    if (!content.is_array()) {
+        return std::nullopt;
+    }
+    std::string text;
+    for (const json & part : content) {
+        if (json_value(part, "type", std::string()) != "text") {
+            return std::nullopt;
+        }
+        const std::string part_text = json_value(part, "text", std::string());
+        if (!part_text.empty()) {
+            text += (text.empty() ? "" : "\n\n") + part_text;
+        }
+    }
+    return text;
+}
+
+// Codex sends its instructions and several developer messages at the start, another developer message at the start
+// of a later turn, and now and then one inside a tool-call loop. Chat templates often take one system message at
+// the start and raise on the others or drop them. As CC Switch's Codex proxy converts them for Chat Completions:
+// - the leading ones (the instructions and the first developer messages) become one system message;
+// - a later one whose next message other than a system message is a user message becomes a user message where it
+//   stands, so the request sent before stays a prefix of this one;
+// - any other later one joins the first system message, so a tool-call loop stays one turn.
+// Texts are joined by a blank line; an empty one is dropped.
+static std::vector<json> responses_collapse_system_messages(std::vector<json> messages) {
+    std::vector<bool> followed_by_user(messages.size(), false);
+    bool next_is_user = false;
+    for (size_t i = messages.size(); i-- > 0;) {
+        followed_by_user[i] = next_is_user;
+        if (!responses_system_text(messages[i])) {
+            next_is_user = json_value(messages[i], "role", std::string()) == "user";
+        }
+    }
+
+    std::vector<std::string> system_texts;
+    std::vector<json> rest;
+    bool seen_non_system = false;
+    for (size_t i = 0; i < messages.size(); i++) {
+        const auto text = responses_system_text(messages[i]);
+        if (!text) {
+            seen_non_system = true;
+            rest.push_back(std::move(messages[i]));
+            continue;
+        }
+        if (text->find_first_not_of(" \t\r\n") == std::string::npos) {
+            continue;
+        }
+        if (seen_non_system && followed_by_user[i]) {
+            rest.push_back({ { "role", "user" }, { "content", *text } });
+        } else {
+            system_texts.push_back(*text);
+        }
+    }
+
+    std::vector<json> out;
+    if (!system_texts.empty()) {
+        std::string joined;
+        for (const auto & text : system_texts) {
+            joined += (joined.empty() ? "" : "\n\n") + text;
+        }
+        out.push_back({ { "role", "system" }, { "content", joined } });
+    }
+    out.insert(out.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
+    return out;
 }
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -301,7 +378,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
-    chatcmpl_body["messages"] = chatcmpl_messages;
+    chatcmpl_body["messages"] = responses_collapse_system_messages(std::move(chatcmpl_messages));
 
     if (response_body.contains("tools") && !response_body.at("tools").is_array()) {
         throw std::invalid_argument("'tools' must be an array of objects");
@@ -417,6 +494,59 @@ static void normalize_anthropic_billing_header(std::string & system_text) {
     } else {
         LOG_ERR("anthropic string not as expected: %s", system_text.c_str());
     }
+}
+
+// Claude Code puts system messages in the conversation too, such as its system reminders after the user's message.
+// Chat templates often take one system message at the start and raise on the others or drop them. As CC Switch
+// converts Claude requests for models that take no system message mid-conversation
+// (demote_mid_conversation_system_messages): the leading ones stay, a later one becomes a user message where it
+// stands, so the request stays append-only across turns, and one between an assistant's tool calls and their
+// results moves right after the results. An empty one is dropped.
+static void anthropic_demote_mid_conversation_system_messages(json & messages) {
+    const auto is_role = [](const json & message, const char * role) {
+        return json_value(message, "role", std::string()) == role;
+    };
+    size_t leading = 0;
+    while (leading < messages.size() && is_role(messages[leading], "system")) {
+        leading++;
+    }
+    bool later = false;
+    for (size_t i = leading; i < messages.size() && !later; i++) {
+        later = is_role(messages[i], "system");
+    }
+    if (!later) {
+        return;
+    }
+
+    json out = json::array();
+    for (size_t i = 0; i < leading; i++) {
+        out.push_back(std::move(messages[i]));
+    }
+    std::vector<json> deferred;
+    for (size_t i = leading; i < messages.size(); i++) {
+        json & message = messages[i];
+        if (is_role(message, "system")) {
+            const json content = json_value(message, "content", json());
+            const bool empty   = content.is_null() || (content.is_string() && content.get<std::string>().empty()) ||
+                               (content.is_array() && content.empty());
+            if (!empty) {
+                message["role"] = "user";
+                deferred.push_back(std::move(message));
+            }
+            continue;
+        }
+        if (!is_role(message, "tool")) {
+            for (auto & d : deferred) {
+                out.push_back(std::move(d));
+            }
+            deferred.clear();
+        }
+        out.push_back(std::move(message));
+    }
+    for (auto & d : deferred) {
+        out.push_back(std::move(d));
+    }
+    messages = std::move(out);
 }
 
 json server_chat_convert_anthropic_to_oai(const json & body) {
@@ -569,6 +699,7 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    anthropic_demote_mid_conversation_system_messages(oai_messages);
     oai_body["messages"] = oai_messages;
 
     // Convert tools

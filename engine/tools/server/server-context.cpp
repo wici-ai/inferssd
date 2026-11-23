@@ -480,6 +480,11 @@ struct server_slot {
         if (task && is_processing()) {
             const bool decoding = state == SLOT_STATE_DONE_PROMPT || state == SLOT_STATE_GENERATING;
             usage->add(task->is_child() ? 0 : task->n_tokens(), decoding ? n_decoded : 0);
+            // the cache hits and the times are this task's own once its prompt is done
+            if (decoding) {
+                usage->add_work(task->is_child() ? 0 : n_prompt_tokens_cache, task->is_child() ? 0 : t_prompt_processing,
+                                t_token_generation);
+            }
         }
         usage.reset();
     }
@@ -1609,7 +1614,12 @@ private:
         // reset server kill-switch counter
         n_empty_consecutive = 0;
 
+        // The desktop app follows a request by this line and the slot lines after it (docs/server-log.md).
         SLT_INF(slot, "processing task, is_child = %d\n", slot.task->is_child());
+        if (slot.usage) {
+            // ties this task's lines to the request's usage events
+            SLT_INF(slot, "usage events: request %s\n", slot.usage->id().c_str());
+        }
         return true;
     }
 
@@ -3777,6 +3787,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             usage->set_outcome(outcome);
         }
     };
+    const auto set_error = [&usage](const json & error) {
+        if (usage) {
+            usage->set_error(json_value(error, "message", std::string()));
+        }
+    };
 
     try {
         std::vector<server_task> tasks;
@@ -3843,6 +3858,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // from here a request that does not reach its end was cancelled
         set_outcome(SERVER_USAGE_CANCELLED);
     } catch (const std::exception & e) {
+        if (usage) {
+            usage->set_error(e.what());
+        }
         res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
         return res;
     }
@@ -3856,6 +3874,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             return res; // connection is closed
         } else if (all_results.error) {
             set_outcome(SERVER_USAGE_FAILED);
+            set_error(all_results.error->to_json());
             res->error(all_results.error->to_json());
             return res;
         } else {
@@ -3971,10 +3990,11 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
                 // send the results
                 if (result->is_error()) {
+                    json res_json = result->to_json();
                     if (res_this->usage) {
                         res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                        res_this->usage->set_error(json_value(res_json, "message", std::string()));
                     }
-                    json res_json = result->to_json();
                     output = format_error(res_type, res_json);
                     SRV_DBG("%s", "error received during streaming, terminating stream\n");
                     return false; // terminate on error
@@ -3999,6 +4019,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             } catch (const std::exception & e) {
                 if (res_this->usage) {
                     res_this->usage->set_outcome(SERVER_USAGE_FAILED);
+                    res_this->usage->set_error(e.what());
                 }
                 json error_json = format_error_response(e.what(), ERROR_TYPE_SERVER);
                 output = format_error(res_type, error_json);
@@ -4012,8 +4033,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     return res;
 }
 
-server_usage_request_ptr server_routes::begin_usage() const {
-    return ctx_server.usage_log ? ctx_server.usage_log->begin() : nullptr;
+server_usage_request_ptr server_routes::begin_usage(const server_http_req & req) const {
+    return ctx_server.usage_log ? ctx_server.usage_log->begin(server_usage_caller::from_request(req.path, req.headers)) : nullptr;
 }
 
 std::unique_ptr<server_res_generator> server_routes::create_response(bool bypass_sleep) {
@@ -4379,7 +4400,7 @@ void server_routes::init_routes() {
     this->post_completions = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4389,12 +4410,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_NONE,
             usage);
+        });
     };
 
     this->post_completions_oai = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files; // dummy
         const json body = json::parse(req.body);
         return handle_completions_impl(
@@ -4404,12 +4426,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_CMPL,
             usage);
+        });
     };
 
     this->post_chat_completions = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = json::parse(req.body);
         json body_parsed = oaicompat_chat_params_parse(
@@ -4423,12 +4446,13 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_CHAT,
             usage);
+        });
     };
 
     this->post_responses_oai = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = server_chat_convert_responses_to_chatcmpl(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: OpenAI Responses -> OpenAI Chat Completions");
@@ -4444,6 +4468,7 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_OAI_RESP,
             usage);
+        });
     };
 
     this->post_transcriptions_oai = [this](const server_http_req & req) {
@@ -4477,7 +4502,7 @@ void server_routes::init_routes() {
     this->post_anthropic_messages = [this](const server_http_req & req) {
         auto res = create_response();
         // counted before the body is read, so a request that fails to parse still counts
-        auto usage = begin_usage();
+        return counted(req, [&](const server_usage_request_ptr & usage) {
         std::vector<raw_buffer> files;
         json body = server_chat_convert_anthropic_to_oai(json::parse(req.body));
         SRV_DBG("%s\n", "Request converted: Anthropic -> OpenAI Chat Completions");
@@ -4493,6 +4518,7 @@ void server_routes::init_routes() {
             files,
             TASK_RESPONSE_TYPE_ANTHROPIC,
             usage);
+        });
     };
 
     this->post_anthropic_count_tokens = [this](const server_http_req & req) {

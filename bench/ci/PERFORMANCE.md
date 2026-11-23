@@ -309,7 +309,8 @@ The protected runner config may carry `comparison_bindings` with exactly `tiny`,
 
 - `schema_version: 1`, `kind: "legacy-to-typed"`.
 - `semantic_settings`: all keys of the reviewed registry generation, including inapplicable platform
-  defaults. Values must have the registry's actual JSON types.
+  defaults. Values must have the registry's actual JSON types. The generation that added
+  `kv.spill_directory` must bind it to `[]` because the pinned legacy engine cannot spill KV.
 - `sides.base` and `sides.candidate`: full `revision`, `profile_sha256`, complete
   `launch_policy`, `images` and `build` objects. The base must be exactly
   `LEGACY_REVISION`; candidate must match the plan's **merge candidate**, not merely

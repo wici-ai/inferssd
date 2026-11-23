@@ -25,6 +25,9 @@ int main() {
     require(*context->settings.integer("prefetch.depth") == 4, "context borrowed freed options");
     require(context->services.events == context->events.get() && context->services.debug == &context->debug,
         "context service pointers differ from owned objects");
+    // A context without routed experts measures host memory too: the engine fits its context to it.
+    require(context->settings.sources()->empty() && context->host && context->services.host == context->host.get(),
+        "a context without an expert source has no host memory client");
 
     const llama_ssd_override other[] = {{"prefetch.depth", "3"}};
     options = llama_ssd_options_create(nullptr, other, 1, second.c_str(), error, sizeof(error));
@@ -37,6 +40,25 @@ int main() {
     context.reset();
     require(bool(independent->events->event("ssd.io.read", "{\"bytes\":8192}")), "other context closed this writer");
     independent.reset();
+
+    // Without layer events the file still gets the settings and the contract line, and the executors get no writer.
+    const std::string quiet = std::string(directory) + "/quiet.jsonl";
+    options = llama_ssd_options_create(nullptr, initial, 1, quiet.c_str(), error, sizeof(error));
+    require(options, error);
+    llama_ssd_options_set_layer_events(options, false);
+    auto unobserved = std::make_unique<llama_ssd_context>(*options);
+    llama_ssd_options_free(options);
+    require(unobserved->events && !unobserved->services.events, "a context without layer events still hands out its writer");
+    unobserved.reset();
+    {
+        std::ifstream stream(quiet);
+        std::string settings, contract, extra;
+        require(bool(std::getline(stream, settings)) && bool(std::getline(stream, contract)) && !std::getline(stream, extra),
+            "a context without layer events wrote more than its settings and contract");
+        require(settings.find("\"ev\":\"ssd.settings\"") != std::string::npos &&
+                contract.find("\"ev\":\"ssd.controller.begin\"") != std::string::npos,
+            "a context without layer events did not write its settings and contract");
+    }
 
     // Creation validates settings but does not truncate an existing event file.
     options = llama_ssd_options_create(nullptr, initial, 1, first.c_str(), error, sizeof(error));

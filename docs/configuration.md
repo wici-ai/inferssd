@@ -18,6 +18,7 @@ Python resource. There are no environment mirrors or legacy-name aliases.
 | `vram.reserve_mib` | integer / MiB | `0` | launch | all | CUDA, ROCm |
 | `host.headroom_mib` | integer / MiB | `512` | plan | all |  |
 | `host.budget_mib` | integer / MiB | `0` | plan | darwin, windows |  |
+| `kv.spill_directory` | paths / path | `[]` | launch | all |  |
 | `model.engram_prefetch` | integer / boolean | `0` | model | all |  |
 | `model.hc_fused` | integer / boolean | `1` | model | all |  |
 
@@ -49,6 +50,22 @@ On a CPU-only build, or with another GPU backend, the GPU runs the dense layers
 while the CPU sink computes every routed expert, and an explicit nonzero budget
 is an error. The lane holds no expert across layers, so for it a nonzero budget,
 like auto, only turns it on.
+
+`kv.spill_directory` accepts one existing local SSD directory. With a growable attention
+cache and one sequence, context fitting admits a larger logical window when the SSD
+has room for the cache and the original devices can stage the active layers. The
+cache starts resident. Crossing the fitted resident boundary backs it with private
+temporary storage and stages attention inputs to their existing devices. Existing
+backends that cannot grow their cache keep their normal fitted context.
+
+```sh
+inferssd serve -m /path/to/model.gguf --set 'kv.spill_directory=["/path/to/kv-ssd"]'
+```
+
+Dense attention can read the entire active KV on each decode token, so generation
+throughput after spill depends on how much of the mapping stays cached in memory.
+The temporary file is released when the engine exits or the remaining cache fits
+back in resident memory.
 
 `vram.reserve_mib` is VRAM that prefill and decode leave free for other processes.
 On a discrete GPU it is kept against what this process holds, not against what the

@@ -545,6 +545,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // parse the first time to get -hf option (used for remote preset)
     parse_cli_args();
 
+    // the model's facts take its extra shards from the arguments and the environment, so they are answered once
+    // both are read, before anything is downloaded
+    if (!params.ssd_model_facts.empty()) {
+        exit(common_ssd_print_model_facts(params.ssd_model_facts, params.model.shards) ? 0 : 1);
+    }
+
     // TODO: Remove later
     try {
         hf_cache::migrate_old_cache_to_hf_cache(params.hf_token, params.offline);
@@ -900,7 +906,38 @@ bool common_params_to_map(int argc, char ** argv, llama_example ex, std::map<com
     return true;
 }
 
+static void common_print_version() {
+    fprintf(stderr, "%s\n", inferssd_build_name());
+    fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
+}
+
+// The queries that answer from the engine's own facts and exit (the settings schema, a model's facts from its headers,
+// the version) need no compute backend. Given alone they are answered here, before the parser loads every backend, which
+// starts each GPU's driver; given with other arguments they are parsed as usual, where one can be another option's value.
+static void common_params_answer_query(int argc, char ** argv) {
+    if (argc < 2 || argc > 3) {
+        return;
+    }
+    std::string arg = argv[1];
+    if (arg.rfind("--", 0) == 0) {
+        std::replace(arg.begin(), arg.end(), '_', '-'); // as the parser spells long options
+    }
+    if (argc == 2 && arg == "--ssd-schema") {
+        common_ssd_print_schema();
+        exit(0);
+    }
+    // the model's extra shards may come from LLAMA_ARG_SHARD, which the parser reads
+    if (argc == 3 && arg == "--ssd-model-facts" && !getenv("LLAMA_ARG_SHARD")) {
+        exit(common_ssd_print_model_facts(argv[2]) ? 0 : 1);
+    }
+    if (argc == 2 && arg == "--version") {
+        common_print_version();
+        exit(0);
+    }
+}
+
 bool common_params_parse(int argc, char ** argv, common_params & params, llama_example ex, void(*print_usage)(int, char **)) {
+    common_params_answer_query(argc, argv);
     auto ctx_arg = common_params_parser_init(params, ex, print_usage);
     const common_params params_org = ctx_arg.params; // the example can modify the default params
 
@@ -1059,12 +1096,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         exit(0);
     }));
     add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
-        "print the facts of the GGUF model FNAME as the engine would load it, as JSON, and exit: no weight is read and no backend starts",
-        [](common_params &, const std::string & value) { exit(common_ssd_print_model_facts(value) ? 0 : 1); }));
+        "print the facts of the GGUF model FNAME, with its --shard/--ple files, as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
+        [](common_params & p, const std::string & value) { p.ssd_model_facts = value; }));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_telemetry_file = value; }));
+    add_opt(common_arg({"--ssd-no-layer-events"},
+        "leave the event for each layer and each prompt graph out of the SSD telemetry, which then holds the settings alone",
+        [](common_params & p) { p.ssd_layer_events = false; }));
     // Each block owns the spelling for common_arg's borrowed char pointers.
     // No SSD option has an environment mirror.
 #define SSD_SETTING(key, type, min, max, default_value, unit, producer, scope, backend, description) \
@@ -1089,8 +1129,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--version"},
         "show version and build info",
         [](common_params &) {
-            fprintf(stderr, "%s\n", inferssd_build_name());
-            fprintf(stderr, "built with %s for %s\n", llama_compiler(), llama_build_target());
+            common_print_version();
             exit(0);
         }
     ));
@@ -2629,6 +2668,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.model.path = value;
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA}).set_env("LLAMA_ARG_MODEL"));
+    add_opt(common_arg(
+        {"--ple", "--shard"}, "FNAME,...",
+        "extra GGUF shards for the model, comma separated; may be given more than once\n"
+        "paths may live anywhere, including on different drives; --ple is an alias for --shard",
+        [](common_params & params, const std::string & value) {
+            for (const auto & item : parse_csv_row(value)) {
+                params.model.shards.push_back(item);
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_SHARD"));
     add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",

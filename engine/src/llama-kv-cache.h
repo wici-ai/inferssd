@@ -1,5 +1,7 @@
 #pragma once
 
+#include "ssd/kv-backing.h"
+
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "llama-kv-cells.h"
@@ -170,6 +172,11 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void set_commit(const commit_cb & commit) override;
+    bool set_kv_spill(const std::string & directory, uint32_t resident_cells,
+                      const std::function<void(bool)> & synchronize) override;
+    std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override;
+    // a cache that grows (or would, sized with no_alloc) spills as it grows past its resident cells
+    bool can_spill() const override { return get_can_grow(); }
     bool get_can_grow() const override;
     bool cells_short(uint32_t n_tokens) const override;
     bool reserve_cells(uint32_t n_tokens) override;
@@ -371,6 +378,13 @@ private:
     bool can_grow = false;
 
     commit_cb commit;
+    std::string spill_directory;
+    uint32_t resident_cells = 0;
+    std::function<void(bool)> synchronize_spill;
+    std::unique_ptr<ssd::kv_backing> spill;
+
+    bool spill_cells(uint32_t n_old);
+    bool restore_cells(uint32_t n);
 
     // the tensor of `store`, of every cell, in a buffer of its own; false when there is no memory for it
     bool alloc_tensor(kv_store & store) const;

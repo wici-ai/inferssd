@@ -133,6 +133,36 @@ add_test(NAME q2_0 COMMAND test-q2_0)
 set_property(TEST q2_0 PROPERTY LABELS unit)
 inferssd_ci_test(test-q2_0 q2_0)
 
+# The queries answered before the parser loads backends (common_params_answer_query): the real parser, compiled here with
+# its backend loader turned into a tripwire, so the test needs no GPU. The parser's --license reads LICENSES, which
+# llama-common does not export from its DLL on Windows, so the test compiles its own copy.
+add_executable(test-ssd-backend-free-query ssd/test-backend-free-query.cpp ../common/arg.cpp ${CMAKE_BINARY_DIR}/license.cpp)
+target_link_libraries(test-ssd-backend-free-query PRIVATE llama-common)
+if (MSVC)
+    target_compile_options(test-ssd-backend-free-query PRIVATE
+        /FI${CMAKE_CURRENT_SOURCE_DIR}/ssd/backend-free-query-loader.h)
+else()
+    target_compile_options(test-ssd-backend-free-query PRIVATE
+        -include ${CMAKE_CURRENT_SOURCE_DIR}/ssd/backend-free-query-loader.h)
+endif()
+set(query_absent_model ${CMAKE_CURRENT_BINARY_DIR}/absent.gguf)
+add_test(NAME ssd_query_schema COMMAND test-ssd-backend-free-query --ssd-schema)
+add_test(NAME ssd_query_schema_underscore COMMAND test-ssd-backend-free-query --ssd_schema)
+add_test(NAME ssd_query_model_facts COMMAND test-ssd-backend-free-query --ssd-model-facts ${query_absent_model})
+add_test(NAME ssd_query_version COMMAND test-ssd-backend-free-query --version)
+set_tests_properties(ssd_query_schema ssd_query_schema_underscore PROPERTIES PASS_REGULAR_EXPRESSION "InferSSD settings v1")
+set_tests_properties(ssd_query_model_facts PROPERTIES PASS_REGULAR_EXPRESSION "absent[.]gguf: ")
+set_tests_properties(ssd_query_version PROPERTIES PASS_REGULAR_EXPRESSION "built with ")
+set_tests_properties(ssd_query_schema ssd_query_schema_underscore ssd_query_model_facts ssd_query_version PROPERTIES
+    FAIL_REGULAR_EXPRESSION "attempted to load;unexpected backend")
+# with other arguments, the same options reach the parser, which loads the backends first
+add_test(NAME ssd_query_option_value COMMAND test-ssd-backend-free-query --expect-backend --model --ssd-schema)
+add_test(NAME ssd_query_mixed_args COMMAND test-ssd-backend-free-query --expect-backend --ssd-schema --help)
+add_test(NAME ssd_query_facts_mixed COMMAND test-ssd-backend-free-query --expect-backend --ssd-model-facts absent.gguf -v)
+inferssd_ci_test(test-ssd-backend-free-query
+    ssd_query_schema ssd_query_schema_underscore ssd_query_model_facts ssd_query_version
+    ssd_query_option_value ssd_query_mixed_args ssd_query_facts_mixed)
+
 add_executable(test-moe-common-dynamic-tier ssd/test-moe-common-dynamic-tier.cpp)
 target_link_libraries(test-moe-common-dynamic-tier PRIVATE Threads::Threads)
 add_test(NAME moe_common_dynamic_tier COMMAND test-moe-common-dynamic-tier)
@@ -155,6 +185,38 @@ target_link_libraries(test-sched-inplace PRIVATE ggml)
 add_test(NAME sched_inplace COMMAND test-sched-inplace)
 set_property(TEST sched_inplace PROPERTY LABELS main)
 inferssd_ci_test(test-sched-inplace sched_inplace)
+
+add_executable(test-sched-unplaceable ssd/test-sched-unplaceable.cpp)
+target_compile_features(test-sched-unplaceable PRIVATE cxx_std_17)
+target_include_directories(test-sched-unplaceable PRIVATE ../ggml/src)
+target_link_libraries(test-sched-unplaceable PRIVATE ggml)
+add_test(NAME sched_unplaceable COMMAND test-sched-unplaceable)
+set_property(TEST sched_unplaceable PROPERTY LABELS main)
+inferssd_ci_test(test-sched-unplaceable sched_unplaceable)
+
+add_executable(test-sched-cache-placement ssd/test-sched-cache-placement.cpp)
+target_compile_features(test-sched-cache-placement PRIVATE cxx_std_17)
+target_include_directories(test-sched-cache-placement PRIVATE ../ggml/src)
+target_link_libraries(test-sched-cache-placement PRIVATE ggml)
+add_test(NAME sched_cache_placement COMMAND test-sched-cache-placement)
+set_property(TEST sched_cache_placement PROPERTY LABELS main)
+inferssd_ci_test(test-sched-cache-placement sched_cache_placement)
+
+add_executable(test-node-name ssd/test-node-name.cpp)
+target_compile_features(test-node-name PRIVATE cxx_std_17)
+target_include_directories(test-node-name PRIVATE ../src)
+target_link_libraries(test-node-name PRIVATE ggml)
+add_test(NAME node_name COMMAND test-node-name)
+set_property(TEST node_name PROPERTY LABELS main)
+inferssd_ci_test(test-node-name node_name)
+
+add_executable(test-gallocr-shared-size ssd/test-gallocr-shared-size.cpp)
+target_compile_features(test-gallocr-shared-size PRIVATE cxx_std_17)
+target_include_directories(test-gallocr-shared-size PRIVATE ../ggml/src)
+target_link_libraries(test-gallocr-shared-size PRIVATE ggml)
+add_test(NAME gallocr_shared_size COMMAND test-gallocr-shared-size)
+set_property(TEST gallocr_shared_size PROPERTY LABELS main)
+inferssd_ci_test(test-gallocr-shared-size gallocr_shared_size)
 
 add_executable(test-ssd-runtime-policy ssd/test-ssd-runtime-policy.cpp)
 target_compile_features(test-ssd-runtime-policy PRIVATE cxx_std_17)
@@ -318,6 +380,13 @@ if (TARGET ggml-cpu)
         target_link_libraries(test-ssd-precompute-memory PRIVATE llama)
         add_test(NAME ssd_precompute_memory COMMAND test-ssd-precompute-memory)
         inferssd_ci_test(test-ssd-precompute-memory ssd_precompute_memory)
+
+        add_executable(test-ssd-kv-spill ssd/test-kv-spill.cpp)
+        target_compile_features(test-ssd-kv-spill PRIVATE cxx_std_17)
+        target_include_directories(test-ssd-kv-spill PRIVATE ../src ../ggml/src)
+        target_link_libraries(test-ssd-kv-spill PRIVATE llama)
+        add_test(NAME ssd_kv_spill COMMAND test-ssd-kv-spill)
+        inferssd_ci_test(test-ssd-kv-spill ssd_kv_spill)
     endif()
     add_executable(test-ssd-settings-telemetry ssd/test-settings-telemetry.cpp)
     target_compile_options(test-ssd-settings-telemetry PRIVATE -UNDEBUG)
@@ -431,6 +500,10 @@ if (TARGET ggml-cpu AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
             target_link_libraries(test-ssd-cublas-retry PRIVATE ssd-vram-tier-gpu)
             if (NOT tier_language STREQUAL "HIP")
                 target_link_libraries(test-ssd-cublas-retry PRIVATE CUDA::cublas)
+                add_executable(test-ssd-cublas-reserve ssd/test-ssd-cublas-reserve.cpp)
+                target_compile_features(test-ssd-cublas-reserve PRIVATE cxx_std_17)
+                target_include_directories(test-ssd-cublas-reserve PRIVATE ../ggml/src)
+                target_link_libraries(test-ssd-cublas-reserve PRIVATE ssd-vram-tier-gpu ggml-base CUDA::cublas ${CMAKE_DL_LIBS})
             endif()
         endif()
         # The error fixture explicitly injects callbacks around the real linked component.
@@ -463,6 +536,10 @@ if (TARGET ggml-cpu)
     add_test(NAME ssd_cpu_sink COMMAND test-ssd-cpu-sink)
     add_test(NAME dsv41_q2_cpu_sink_decode COMMAND test-ssd-cpu-sink
         --q2-activation-test --threads 9 --ring-experts 8)
+
+    add_test(NAME dsv41_mixed_iq_cpu_sink_decode COMMAND test-ssd-cpu-sink
+        --dsv41-iq-test --threads 9 --ring-experts 8)
+    set_tests_properties(dsv41_mixed_iq_cpu_sink_decode PROPERTIES LABELS device SKIP_RETURN_CODE 77)
 
     add_test(NAME ssd_cpu_sink_schedule_invalid COMMAND test-ssd-cpu-sink --schedule-invalid)
     # Sink nodes in ggml graphs on a ggml threadpool of 1, 2, 3 and all CPUs: the production schedule, and a
@@ -781,6 +858,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     target_include_directories(test-server-reasoning-effort PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-reasoning-effort PRIVATE server-context)
     inferssd_ci_test(test-server-reasoning-effort test-server-reasoning-effort)
+    llama_build_and_test(ssd/test-server-usage-events.cpp)
+    target_include_directories(test-server-usage-events PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-usage-events PRIVATE server-context)
+    inferssd_ci_test(test-server-usage-events test-server-usage-events)
     if (TARGET ggml-cpu AND NOT WIN32)
         add_executable(test-kv-cache-iswa-state-at ssd/test-kv-cache-iswa-state-at.cpp)
         target_include_directories(test-kv-cache-iswa-state-at PRIVATE ../src ../ggml/src)
@@ -830,9 +911,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     llama_build_and_test(test-llama-archs.cpp)
     llama_test(test-llama-archs NAME test-kv-cache-grow ARGS --kv-grow -s 42)
     llama_test(test-llama-archs NAME test-dsv41-engram-layouts ARGS --engram-layouts -s 42)
+    llama_test(test-llama-archs NAME test-llama-archs-dense-ssd ARGS --dense-ssd -s 42)
     # On the hosted macOS runner's paravirtual GPU it aborts on a MUL_MAT the Metal backend does not encode.
     if (NOT APPLE)
-        inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts)
+        inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts test-llama-archs-dense-ssd)
     endif()
     # NextN blocks: every architecture, on the CPU alone
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)
@@ -892,6 +974,8 @@ set_tests_properties(test-thread-safety PROPERTIES
     ENVIRONMENT "CUDA_VISIBLE_DEVICES=0")
 
 llama_build_and_test(test-arg-parser.cpp)
+llama_test(test-arg-parser NAME test-ple-args ARGS --ple-only)
+inferssd_ci_test(test-arg-parser test-ple-args)
 
 if (NOT LLAMA_SANITIZE_ADDRESS AND NOT GGML_SCHED_NO_REALLOC)
   # TODO: repair known memory leaks
@@ -903,6 +987,15 @@ llama_build_and_test(ssd/test-moe-router-norm.cpp LABEL unit)
 target_include_directories(test-moe-router-norm PRIVATE ../src)
 inferssd_ci_test(test-cpu-softplus test-cpu-softplus)
 inferssd_ci_test(test-moe-router-norm test-moe-router-norm)
+llama_build(ssd/test-model-mlock-buffers.cpp)
+target_include_directories(test-model-mlock-buffers PRIVATE ../src ../ggml/src)
+target_compile_features(test-model-mlock-buffers PRIVATE cxx_std_17)
+foreach(mlock_case single split unlocked no-alloc)
+    llama_test(test-model-mlock-buffers NAME model_mlock_${mlock_case}
+        ARGS ${mlock_case} "${CMAKE_CURRENT_BINARY_DIR}/test-model-mlock-${mlock_case}.gguf")
+endforeach()
+inferssd_ci_test(test-model-mlock-buffers
+    model_mlock_single model_mlock_split model_mlock_unlocked model_mlock_no-alloc)
 llama_build_and_test(ssd/test-dsv41-engram.cpp)
 target_include_directories(test-dsv41-engram PRIVATE ../src)
 inferssd_ci_test(test-dsv41-engram test-dsv41-engram)
@@ -1007,7 +1100,8 @@ endif()
 # unit: model-free tests that require neither a GPU nor cgroup setup.
 # Keep this list explicit: other synthetic tests may still require Linux I/O facilities.
 foreach(unit_test ssd_prefill_cost test-reasoning-budget
-                  test-server-runtime-routing test-server-reasoning-effort test-dsv41-engram
+                  test-server-runtime-routing test-server-reasoning-effort test-server-usage-events
+                  test-dsv41-engram
                   kv_cache_iswa_state_at)
     if (TEST ${unit_test})
         set_property(TEST ${unit_test} APPEND PROPERTY LABELS unit)

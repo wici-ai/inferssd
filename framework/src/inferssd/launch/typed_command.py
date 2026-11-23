@@ -24,9 +24,9 @@ from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cache_directory, read_resources
 from inferssd.launch.typed import (
     BATCH,
-    CONTEXT,
     LOOPBACK,
     PROFILES,
+    PROMPT_CACHE_MIB,
     LaunchSpec,
     listen_host,
     resolve_typed,
@@ -56,6 +56,16 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
     launch.add_argument("--resources", type=Path, help="inferssd-engine 1 deployment descriptor")
     launch.add_argument("--template", type=Path, help="explicit chat template, overrides resources")
     launch.add_argument("--model", type=Path, required=True)
+    launch.add_argument(
+        "--ple",
+        "--shard",
+        dest="shards",
+        action="append",
+        default=[],
+        metavar="FNAME,...",
+        help="extra GGUF shards of the model, as the server takes them: comma separated, "
+        "repeatable (a per-layer embedding table kept apart from the model, say)",
+    )
     launch.add_argument("--runtime-policy", type=Path, required=True)
     launch.add_argument(
         "--output-dir",
@@ -86,7 +96,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         "--context",
         type=int,
         help="-c (default: the largest multiple of 8192, up to the model's trained context, "
-        f"that memory holds when full; up to {CONTEXT} for a RAM-only model)",
+        "that memory holds when full)",
     )
     launch.add_argument(
         "--batch",
@@ -116,6 +126,18 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         metavar="DIR|off",
         help="keep each model's prompt cache on disk under DIR, across restarts "
         "(default: inferssd/prompts in this user's cache directory); off runs without one",
+    )
+    launch.add_argument(
+        "--prompt-cache-mib",
+        type=int,
+        metavar="N",
+        help=f"the prompt cache's size limit per model in MiB (default: {PROMPT_CACHE_MIB})",
+    )
+    launch.add_argument(
+        "--no-layer-events",
+        action="store_true",
+        help="leave the engine's event for each layer out of the run's events file, which "
+        "then holds the settings alone (the benchmarks need them; a server left running does not)",
     )
     launch.add_argument(
         "--reprofile",
@@ -161,6 +183,9 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         if args.prompt_cache == "off"
         else str(Path(args.prompt_cache or prompt_cache_directory()).resolve()),
         listen_host(args.host),
+        tuple(args.shards),
+        args.prompt_cache_mib,
+        not args.no_layer_events,
     )
 
 
@@ -223,7 +248,6 @@ def run(args: argparse.Namespace) -> int:
             platform=args.platform,
             directory=str(claim.directory),
             memory=policy.memory_budget_bytes,
-            reserve=policy.host_reserve_bytes or 0,
         ),
         observe=adapter,
         emit=emit,

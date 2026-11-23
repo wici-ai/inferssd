@@ -8,6 +8,7 @@
 #include "ggml-opt.h"
 #include "ggml.h"
 
+#include <algorithm>
 #include <set>
 #include <sstream>
 #include <string>
@@ -296,6 +297,18 @@ struct common_params_model {
     std::string hf_file     = ""; // HF file                                                // NOLINT
     std::string docker_repo = ""; // Docker repo                                            // NOLINT
     std::string name        = ""; // in format <user>/<model>[:<tag>] (tag is optional)     // NOLINT
+
+    std::vector<std::string> shards;
+
+    std::vector<std::string> get_paths() const {
+        std::vector<std::string> paths = { path };
+        for (const auto & shard : shards) {
+            if (std::find(paths.begin(), paths.end(), shard) == paths.end()) {
+                paths.push_back(shard);
+            }
+        }
+        return paths;
+    }
 };
 
 struct common_ngram_mod;
@@ -423,8 +436,10 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 
 struct common_params {
     bool ssd_enabled = false;
+    std::string ssd_model_facts; // --ssd-model-facts: print this model's facts once the arguments are parsed, and exit
     std::string ssd_settings_file;
     std::string ssd_telemetry_file;
+    bool ssd_layer_events = true; // an event for each layer and each prompt graph in the telemetry file
     std::vector<std::pair<std::string, std::string>> ssd_overrides;
     std::shared_ptr<llama_ssd_options> ssd_options;
     int32_t n_predict             =    -1; // max. number of new tokens to predict, -1 == no limit
@@ -878,6 +893,9 @@ common_init_result_ptr common_init_from_params(common_params & params);
 struct llama_model_params     common_model_params_to_llama  (      common_params & params);
 struct llama_context_params   common_context_params_to_llama(const common_params & params);
 struct ggml_threadpool_params ggml_threadpool_params_from_cpu_params(const common_cpu_params & params);
+
+// loads the model from PATHS: the model, then its extra shards (common_params_model::get_paths)
+struct llama_model * common_model_load(const std::vector<std::string> & paths, const struct llama_model_params & mparams);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

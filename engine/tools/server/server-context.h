@@ -134,7 +134,21 @@ private:
             task_response_type res_type,
             server_usage_request_ptr usage = nullptr);
     // the usage record of a request to a counted route, or nullptr when usage events are off
-    server_usage_request_ptr begin_usage() const;
+    server_usage_request_ptr begin_usage(const server_http_req & req) const;
+    // Runs a counted route with its usage record. A reason it throws is kept on the record before it goes on
+    // to the caller, which answers with it.
+    template <typename F>
+    auto counted(const server_http_req & req, F && route) const {
+        const server_usage_request_ptr usage = begin_usage(req);
+        try {
+            return route(usage);
+        } catch (const std::exception & e) {
+            if (usage) {
+                usage->set_error(e.what());
+            }
+            throw;
+        }
+    }
     std::unique_ptr<server_res_generator> handle_slots_save(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_restore(const server_http_req & req, int id_slot);
     std::unique_ptr<server_res_generator> handle_slots_erase(const server_http_req &, int id_slot);

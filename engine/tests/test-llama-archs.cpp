@@ -11,14 +11,20 @@
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
 #include "../src/llama-model.h"
+#include "../src/llama-model-loader.h"
+#include "../src/ssd/dense-homes.h"
 #include "../src/llama-model-saver.h"
+#include "../src/models/deepseek41-engram.h"
 
 #include <algorithm>
+#include <functional>
 #include <array>
 #include <cinttypes>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <cstdint>
+#include <filesystem>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -71,7 +77,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts] [--dense-ssd]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -95,6 +101,8 @@ static const std::vector<uint64_t>   DSV41_ENGRAM_MULTIPLIERS = { 76632096046245
                                                                   67716810739261ull, 51510806800915ull, 30921347202721ull };
 static const std::vector<uint64_t>   DSV41_ENGRAM_PRIMES     = { 101, 103, 107, 109,   113, 127, 131, 137 };
 static const std::vector<uint64_t>   DSV41_ENGRAM_OFFSETS    = {   0, 101, 204, 311,     0, 113, 240, 371 };
+// the tokens the compressed token map marks -1; the pad token is 2, compressed 2
+static const std::array<llama_token, 2> DSV41_ENGRAM_DEAD_TOKENS = { 5, 70 };
 
 // n_nextn NextN blocks follow the model's blocks in the file, which counts them in block_count and
 // sizes its per-block metadata for them too.
@@ -261,6 +269,10 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         std::vector<int32_t> token_map(n_vocab);
         for (uint32_t i = 0; i < n_vocab; ++i) {
             token_map[i] = (int32_t) (i % 61);
+        }
+        // tokens no n-gram reaches across
+        for (const llama_token dead : DSV41_ENGRAM_DEAD_TOKENS) {
+            token_map[dead] = -1;
         }
         const LLM_KV kv(arch);
         ms.add_kv(LLM_KV_ENGRAM_LAYER_IDS,     std::vector<uint32_t>(DSV41_ENGRAM_LAYERS.begin(), DSV41_ENGRAM_LAYERS.end()));
@@ -946,7 +958,7 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
 
     int failures = 0;
     for (ggml_backend_dev_t device : devices)
-    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35MOE, LLM_ARCH_DEEPSEEK41 }) {
+    for (const llm_arch arch : { LLM_ARCH_LLAMA, LLM_ARCH_QWEN35MOE, LLM_ARCH_DEEPSEEK41, LLM_ARCH_QWEN4EXP }) {
         if (target_arch != LLM_ARCH_UNKNOWN && arch != target_arch) {
             continue;
         }
@@ -1045,10 +1057,188 @@ static int test_kv_grow(const llm_arch target_arch, const size_t seed, const ggm
             const bool same_trimmed = logits_trimmed == decode_range(small.get(), tokens, n0, n0 + 1);
             LOG_INF("%s: %s: trimmed vs never grown: %s\n", __func__, name, same_trimmed ? "identical" : "DIFFERENT");
             ok = ok && same_trimmed;
+        } else {
+            // a memory that cannot drop part of a sequence (a recurrent state) starts over: a request of n0 tokens
+            // gives back the cells past 8192, and the cache decodes them as one that never grew
+            llama_memory_clear(llama_get_memory(grown.get()), true);
+            ud.trims = 0;
+            if (!llama_ssd_prefill_phase(grown.get(), true, n0, n0)) {
+                throw std::runtime_error("failed to begin a request");
+            }
+            LOG_INF("%s: %s: trimmed: %s\n", __func__, name, ud.trims > 0 ? "yes" : "no");
+            ok = ok && (ud.trims > 0) == grows;
+            decode_range(grown.get(), tokens, 0, n0);
+            const std::vector<float> logits_trimmed = decode_range(grown.get(), tokens, n0, n0 + 1);
+            llama_context_ptr small = make_ctx(1);
+            decode_range(small.get(), tokens, 0, n0);
+            const bool same_trimmed = logits_trimmed == decode_range(small.get(), tokens, n0, n0 + 1);
+            LOG_INF("%s: %s: trimmed vs never grown: %s\n", __func__, name, same_trimmed ? "identical" : "DIFFERENT");
+            ok = ok && same_trimmed;
         }
 
         printf("%s: %s: %s\n", __func__, name, ok ? "OK" : "FAIL");
         failures += ok ? 0 : 1;
+    }
+
+    llama_log_set(ud.callback, ud.user_data);
+    return failures == 0 ? 0 : 1;
+}
+
+// A model without routed experts in an SSD context (settings, no expert source) computes as it does without one: its
+// prompt and its next tokens give the same logits, the CPU's work memory taken from the context's host budget, the
+// prompt's graph holding the one output the request asks for.
+static int test_dense_ssd(const size_t seed, const ggml_log_level log_level) {
+    struct user_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+    };
+    user_data_t ud;
+    llama_log_get(&ud.callback, &ud.user_data);
+    ud.min_level = log_level;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        user_data_t * ud = (user_data_t *) user_data;
+        ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+    }, &ud);
+
+    const uint32_t n_ctx    = 1024;
+    const uint32_t n_prompt = 600; // more than one batch
+    const uint32_t n_next   = 4;
+
+    char error[512] = {};
+    std::unique_ptr<llama_ssd_options, decltype(&llama_ssd_options_free)> options(
+        llama_ssd_options_create(nullptr, nullptr, 0, nullptr, error, sizeof(error)), llama_ssd_options_free);
+    if (!options) {
+        throw std::runtime_error(std::string("failed to create SSD options: ") + error);
+    }
+
+    // every GPU with the model and its cache on it; the CPU where there is none (with a GPU the SSD context runs the
+    // layers on it, wherever the model keeps their weights)
+    std::vector<ggml_backend_dev_t> devices;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_GPU || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            devices.push_back(dev);
+        }
+    }
+    if (devices.empty()) {
+        devices.push_back(ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU));
+    }
+
+    int failures = 0;
+    for (ggml_backend_dev_t device : devices) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(LLM_ARCH_LLAMA, false, n_ctx);
+        // F16 layer matrices: the CPU converts their activations first, in the work memory it takes from the
+        // context's host budget (F32 ones need none)
+        const LLM_KV kv(LLM_ARCH_LLAMA);
+        const uint32_t n_layer = gguf_get_val_u32(gguf_ctx.get(), gguf_find_key(gguf_ctx.get(), kv(LLM_KV_BLOCK_COUNT).c_str()));
+        for (uint32_t il = 0; il < n_layer; il++) {
+            for (const char * name : { "attn_q", "attn_k", "attn_v", "attn_output", "ffn_gate", "ffn_down", "ffn_up" }) {
+                ggml_tensor t;
+                memset(&t, 0, sizeof(ggml_tensor));
+                t.type = GGML_TYPE_F16;
+                ggml_format_name(&t, "blk.%" PRIu32 ".%s.weight", il, name);
+                gguf_add_tensor(gguf_ctx.get(), &t);
+            }
+        }
+        const bool on_cpu = ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+        // the model, its layers' matrices homed in buft when there is one, or homed for the SSD context to place
+        const auto load = [&](ggml_backend_buffer_type_t buft, const char * pattern, bool ssd_homes = false) {
+            llama_model_params model_params = llama_model_default_params();
+            model_params.progress_callback = silent_model_load_progress;
+            model_params.ssd_homes = ssd_homes;
+            // the CPU as a CPU-only server has it: no device list, the context's own CPU backend running the graph
+            std::vector<ggml_backend_dev_t> devs = { device, nullptr };
+            model_params.devices = on_cpu ? nullptr : devs.data();
+            model_params.n_gpu_layers = on_cpu ? 0 : 999;
+            const llama_model_tensor_buft_override homes[] = { { pattern, buft }, { nullptr, nullptr } };
+            model_params.tensor_buft_overrides = buft ? homes : nullptr;
+            size_t tmp = seed;
+            llama_model_ptr loaded(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+            if (!loaded) {
+                throw std::runtime_error("failed to create llama model");
+            }
+            return loaded;
+        };
+        llama_model_ptr model = load(nullptr, nullptr);
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(n_prompt + n_next, n_vocab, seed);
+
+        // a request as the server makes it: its prompt between the phase's begin and the prefill's end, then its
+        // next tokens one at a time; placed: after the context is made, before its first batch
+        const auto run = [&](const llama_model * m, const llama_ssd_options * ssd,
+                             const std::function<void()> & placed = {}) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = n_ctx;
+            ctx_params.n_batch         = 256;
+            ctx_params.n_ubatch        = 256;
+            ctx_params.n_seq_max       = 1;
+            ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            ctx_params.ssd_options     = ssd;
+            llama_context_ptr lctx(llama_init_from_model(const_cast<llama_model *>(m), ctx_params));
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            if (placed) {
+                placed();
+            }
+            if (!llama_ssd_prefill_phase(lctx.get(), true, n_prompt, n_prompt)) {
+                throw std::runtime_error("failed to begin a request");
+            }
+            std::vector<float> logits = decode_range(lctx.get(), tokens, 0, n_prompt);
+            if (!llama_ssd_prefill_phase(lctx.get(), false, 0, 0)) {
+                throw std::runtime_error("failed to end the prompt");
+            }
+            for (uint32_t p = n_prompt; p < n_prompt + n_next; ++p) {
+                const std::vector<float> next = decode_range(lctx.get(), tokens, p, p + 1);
+                logits.insert(logits.end(), next.begin(), next.end());
+            }
+            return logits;
+        };
+        const std::vector<float> plain = run(model.get(), nullptr);
+        const auto check = [&](const char * what, const std::vector<float> & got) {
+            const bool ok = plain == got;
+            printf("%s: llama on %s: %s vs no SSD context: %s (nmse %.3g)\n", __func__, ggml_backend_dev_name(device),
+                    what, ok ? "identical" : "DIFFERENT", nmse(plain, got));
+            failures += ok ? 0 : 1;
+        };
+        check("SSD context", run(model.get(), options.get()));
+        if (!on_cpu) {
+            // the second layer's matrices in host memory, plain and pinned: the GPU runs their products, their
+            // bytes streamed in for each graph, and gives the logits it gives with them in its memory
+            const char * layer = "blk\\.1\\.(attn_q|attn_k|attn_v|attn_output|ffn_gate|ffn_down|ffn_up)\\.weight";
+            check("matrices streamed from host memory",
+                    run(load(ggml_backend_cpu_buffer_type(), layer).get(), options.get()));
+            ggml_backend_buffer_type_t pinned = ggml_backend_dev_host_buffer_type(device);
+            if (pinned) {
+                check("matrices streamed from pinned memory", run(load(pinned, layer).get(), options.get()));
+            }
+            // the layers' matrices homed for the SSD context: the GPU holds every layer its memory has room for (all
+            // of them here), and streams the ones it gives back
+            llama_model_ptr homed = load(nullptr, nullptr, true);
+            llama_dense_homes * homes = homed->dense_homes();
+            if (llama_ssd_device_streams(device)) {
+                if (!homes || homes->held_bytes() != 0 || homes->streamed_bytes() == 0) {
+                    throw std::runtime_error("the layers' matrices were not homed in host memory");
+                }
+                check("matrices homed and held", run(homed.get(), options.get(), [&] {
+                    if (homes->streamed_bytes() != 0) {
+                        throw std::runtime_error("the GPU did not hold every layer");
+                    }
+                }));
+                check("one layer given back", run(homed.get(), options.get(), [&] { homes->give_back(1); }));
+                check("every layer given back", run(homed.get(), options.get(), [&] {
+                    homes->give_back(SIZE_MAX);
+                    if (homes->held_bytes() != 0) {
+                        throw std::runtime_error("a layer was not given back");
+                    }
+                }));
+            } else if (homes) {
+                throw std::runtime_error("layers homed for a GPU that does not stream");
+            }
+        }
     }
 
     llama_log_set(ud.callback, ud.user_data);
@@ -1109,6 +1299,400 @@ static void set_engram_layouts_data(struct ggml_tensor * tensor, void * userdata
     set_tensor_data_named(tensor, source, ud.seed);
 }
 
+// The model's files as llama_model_load_from_splits takes them (the model, then its --shard/--ple files), with the
+// extra-shard rules of upstream llama.cpp 9581154a: a PLE-only file (one tensor, per_layer_token_embd.weight) replaces
+// the model's table or stands for a numbered shard holding only the table, which is then skipped, present or missing,
+// as long as the declared tensor count accounts for it; a given file named as a numbered shard replaces that shard
+// wherever it lies; any other extra is appended; an extra's split numbering is ignored; a tensor found twice, but for
+// the table an extra replaces, is refused. Every load that succeeds gives the logits of the model in one file.
+static void test_engram_files(const llama_model * model, const gguf_context * kv,
+                              llama_model_params model_params, llama_context_params ctx_params,
+                              const std::vector<llama_token> & tokens, const std::vector<float> & logits) {
+    namespace fs = std::filesystem;
+    struct files_t {
+        fs::path directory;
+        files_t() {
+            std::random_device entropy;
+            do {
+                directory = fs::temp_directory_path() / ("test-dsv41-ple-" + std::to_string(entropy()));
+            } while (!fs::create_directory(directory));
+        }
+        ~files_t() {
+            std::error_code ignored;
+            fs::remove_all(directory, ignored);
+        }
+    } files;
+    fs::create_directory(files.directory / "tables");
+    fs::create_directory(files.directory / "elsewhere");
+
+    std::vector<const ggml_tensor *> all, backbone;
+    const ggml_tensor * ple = nullptr;
+    for (const auto & named : model->tensors_by_name) {
+        if (std::find(all.begin(), all.end(), named.second) != all.end()) {
+            continue;
+        }
+        all.push_back(named.second);
+        if (named.first == "per_layer_token_embd.weight") {
+            ple = named.second;
+        } else {
+            backbone.push_back(named.second);
+        }
+    }
+    GGML_ASSERT(ple && backbone.size() > 1);
+
+    // NAME: TENSORS, the model's KV with METADATA, and the split keys with SPLIT_NO >= 0
+    auto write = [&](const std::string & name, const std::vector<const ggml_tensor *> & tensors,
+                     bool metadata, int split_no = -1, int split_count = 2, int tensor_count = -1) {
+        gguf_context_ptr out(gguf_init_empty());
+        if (metadata) {
+            gguf_set_kv(out.get(), kv);
+        }
+        if (split_no >= 0) {
+            gguf_set_val_u16(out.get(), "split.no", split_no);
+            gguf_set_val_u16(out.get(), "split.count", split_count);
+            gguf_set_val_i32(out.get(), "split.tensors.count", tensor_count < 0 ? (int) all.size() : tensor_count);
+        }
+        for (const ggml_tensor * tensor : tensors) {
+            gguf_add_tensor(out.get(), tensor);
+        }
+        const std::string path = (files.directory / name).string();
+        if (!gguf_write_to_file(out.get(), path.c_str(), false)) {
+            throw std::runtime_error("failed to write " + path);
+        }
+        return path;
+    };
+    // PATH cut to its header and the first byte of its data: what it holds cannot be read
+    auto truncate = [](const std::string & path) {
+        gguf_init_params read_params = { true, nullptr };
+        gguf_context_ptr meta(gguf_init_from_file(path.c_str(), read_params));
+        GGML_ASSERT(meta);
+        fs::resize_file(path, gguf_get_data_offset(meta.get()) + 1);
+    };
+
+    int accepted = 0, rejected = 0;
+    // mode: 0 mmap, 1 no mmap, 2 mlock, 3 whole-tensor checks
+    auto check = [&](const char * label, const std::vector<std::string> & paths, bool valid, int mode = 0,
+                     ggml_type type = GGML_TYPE_MXFP8) {
+        std::vector<const char *> c_paths;
+        for (const auto & path : paths) {
+            c_paths.push_back(path.c_str());
+        }
+        auto params = model_params;
+        params.use_mmap = mode != 1;
+        params.use_mlock = mode == 2;
+        params.check_tensors = mode == 3;
+        llama_model_ptr loaded(c_paths.size() == 1 ? llama_model_load_from_file(c_paths[0], params)
+                                                   : llama_model_load_from_splits(c_paths.data(), c_paths.size(), params));
+        if (bool(loaded) != valid) {
+            throw std::runtime_error(std::string(label) + (valid ? ": load failed" : ": invalid input accepted"));
+        }
+        if (!valid) {
+            ++rejected;
+            return;
+        }
+        if (!loaded->per_layer_tok_embd || loaded->per_layer_tok_embd->type != type) {
+            throw std::runtime_error(std::string(label) + ": the table is not the one expected");
+        }
+        llama_context_ptr loaded_ctx(llama_init_from_model(loaded.get(), ctx_params));
+        if (!loaded_ctx || get_logits(loaded.get(), loaded_ctx.get(), tokens) != logits) {
+            throw std::runtime_error(std::string(label) + ": logits changed in mode " + std::to_string(mode));
+        }
+        ++accepted;
+    };
+
+    const std::string full = write("embedded.gguf", all, true);
+    const std::string base = write("backbone.gguf", backbone, true);
+    // ISTA-DASLab's table keeps the numbering of the shard it stands for, and no architecture
+    const std::string table = write("tables/arbitrary-name.gguf", {ple}, false, 5, 6);
+
+    // a table of other bytes with the same values: an F32 decode, and one with rows past the last bucket's
+    // room for the tables below: 1 + (1 and 7 rows) + 1/2 + 1 of the table's values
+    const size_t table_bytes = ggml_nelements(ple)*sizeof(float);
+    const ggml_init_params init = { 4*table_bytes + 8*ple->ne[0]*sizeof(float) + 8*ggml_tensor_overhead(), nullptr, false };
+    ggml_context_ptr tensor_ctx(ggml_init(init));
+    auto make_table = [&](int64_t width, int64_t rows) {
+        ggml_tensor * tensor = ggml_new_tensor_2d(tensor_ctx.get(), GGML_TYPE_F32, width, rows);
+        ggml_set_name(tensor, "per_layer_token_embd.weight");
+        memset(tensor->data, 0, ggml_nbytes(tensor));
+        return tensor;
+    };
+    ggml_tensor * f32 = make_table(ple->ne[0], ple->ne[1]);
+    ggml_get_type_traits(ple->type)->to_float(ple->data, (float *) f32->data, ggml_nelements(ple));
+    const std::string f32_table = write("tables/decoded.gguf", {f32}, false);
+    ggml_tensor * padded = make_table(ple->ne[0], ple->ne[1] + 7);
+    memcpy(padded->data, f32->data, ggml_nbytes(f32));
+    const std::string padded_table = write("tables/padded.gguf", {padded}, false);
+
+    for (int mode = 0; mode < 4; ++mode) {
+        check("embedded", {full}, true, mode);
+        check("single file plus its table", {base, table}, true, mode);
+        check("table replaced by an extra", {full, f32_table}, true, mode, GGML_TYPE_F32);
+    }
+    check("table with rows past the last bucket", {base, padded_table}, true, 0, GGML_TYPE_F32);
+    check("single file without its table", {base}, false);
+
+    // a numbered model whose second shard holds only the table
+    const std::string first = write("split-00001-of-00002.gguf", backbone, true, 0);
+    const std::string second = write("split-00002-of-00002.gguf", {ple}, false, 1);
+    check("complete numbered model", {first}, true);
+    check("numbered shard given by its own name", {first, second}, true);
+    check("numbered table replaced by an extra", {first, f32_table}, true, 0, GGML_TYPE_F32);
+    truncate(second);
+    check("numbered table shard unreadable", {first}, false);
+    check("numbered table shard skipped for an extra", {first, table}, true);
+    fs::remove(second);
+    for (int mode = 0; mode < 4; ++mode) {
+        check("numbered table shard missing", {first, table}, true, mode);
+    }
+    check("numbered table shard missing without an extra", {first}, false);
+    write("split-00001-of-00002.gguf", backbone, true, 0, 2, (int) all.size() + 1);
+    check("missing shard the tensor count does not account for", {first, table}, false);
+    const std::string three = write("three-00001-of-00003.gguf", backbone, true, 0, 3);
+    check("two missing shards", {three, table}, false);
+
+    // a numbered model whose table sits in the middle shard, and whose last shard lies in another directory
+    auto most = backbone;
+    most.pop_back();
+    const std::string middle = write("middle-00001-of-00003.gguf", most, true, 0, 3);
+    const std::string last = write("elsewhere/middle-00003-of-00003.gguf", {backbone.back()}, false, 2, 3);
+    check("shard elsewhere not given", {middle, table}, false);
+    check("shard elsewhere given by its name", {middle, last, table}, true);
+    check("shard elsewhere given by its name, without mmap", {middle, last, table}, true, 1);
+    check("shard elsewhere given, table missing", {middle, last}, false);
+
+    // other extras are appended to the model: a tensor the model lacks, but no tensor twice
+    check("single file plus an extra with its last tensor", {write("most.gguf", most, true),
+          write("extra.gguf", {backbone.back()}, false), table}, true);
+    check("extra repeating a model tensor", {base, write("other.gguf", {backbone.front()}, false), table}, false);
+    check("table and another tensor in one extra", {base, write("mixed.gguf", {ple, backbone.front()}, false)}, false);
+    check("two tables", {base, table, f32_table}, false);
+    check("one table given twice", {base, table, (files.directory / "tables" / "." / "arbitrary-name.gguf").string()},
+          false);
+    check("model given as its own extra", {full, (files.directory / "." / "embedded.gguf").string()}, false);
+    check("missing extra", {base, (files.directory / "absent.gguf").string()}, false);
+
+    check("table too narrow", {base, write("width.gguf", {make_table(ple->ne[0] / 2, ple->ne[1])}, false)}, false);
+    check("table too short", {base, write("rows.gguf", {make_table(ple->ne[0], ple->ne[1] - 1)}, false)}, false);
+    const std::string cut = write("tables/cut.gguf", {ple}, false);
+    truncate(cut);
+    check("table cut short", {base, cut}, false);
+    printf("%s: %d identical-logit loads, %d invalid inputs refused\n", __func__, accepted, rejected);
+}
+
+// One Engram in each layout a GGUF stores: engram.*, ple.* (one table, offsets running on across the layers, the pad
+// named by its token) and antirez's e4m3_e8m0_32_row264 (8 heads of 256 over 4-grams in two layers, U32 arrays, each
+// layer's offsets from its prime sums). Each reader gives the same parameters, and the one hash the same rows: ple.*'s
+// offset by the rows of the layers before.
+static int test_engram_readers(const size_t seed) {
+    const llm_arch arch = LLM_ARCH_DEEPSEEK41;
+    const LLM_KV kv(arch);
+    const uint32_t n_gram = 4, n_head = 8, key = 256, n_cols = (n_gram - 1)*n_head;
+    const std::array<uint32_t, 2> layers = { 1, 3 };
+    const uint32_t vocab = 128, compressed = 97, pad = 2;
+
+    std::mt19937_64 gen(seed);
+    std::vector<int32_t> token_map(vocab);
+    for (auto & id : token_map) {
+        id = int32_t(gen() % compressed);
+    }
+    uint32_t pad_token = vocab - 1; // a token other than the pad's compressed id stands for it
+    token_map[pad_token] = (int32_t) pad;
+    std::vector<uint64_t> mult(layers.size()*n_gram);
+    for (auto & m : mult) {
+        m = (gen() % (uint64_t(1) << 37)) | 1; // odd, and below INT64_MAX / compressed
+    }
+    std::vector<uint64_t> primes(layers.size()*n_cols), offsets(primes.size()), global(primes.size());
+    std::vector<uint32_t> rows(layers.size());
+    uint64_t base = 0;
+    for (size_t e = 0; e < layers.size(); ++e) {
+        uint64_t offset = 0;
+        for (uint32_t c = 0; c < n_cols; ++c) {
+            const size_t k = e*n_cols + c;
+            primes[k]  = 1009 + gen() % 50000;
+            offsets[k] = offset;
+            global[k]  = base + offset;
+            offset    += primes[k];
+        }
+        rows[e] = (uint32_t) offset;
+        base   += offset;
+    }
+
+    auto layout = [&](int which) {
+        gguf_context_ptr g = get_gguf_ctx(arch, moe_mandatory(arch));
+        for (const llm_kv k : { LLM_KV_ENGRAM_LAYER_IDS, LLM_KV_ENGRAM_HEAD_COUNT, LLM_KV_ENGRAM_KEY_LENGTH,
+                                LLM_KV_ENGRAM_MAX_NGRAM_SIZE, LLM_KV_ENGRAM_PAD_ID, LLM_KV_ENGRAM_MULTIPLIERS,
+                                LLM_KV_ENGRAM_PRIMES, LLM_KV_ENGRAM_OFFSETS, LLM_KV_ENGRAM_TOKEN_MAP }) {
+            GGML_ASSERT(gguf_remove_key(g.get(), kv(k).c_str()) >= 0);
+        }
+        gguf_context * c = g.get();
+        const std::vector<uint32_t> ids(layers.begin(), layers.end());
+        if (which == 1) {
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_LAYERS).c_str(), GGUF_TYPE_UINT32, ids.data(), ids.size());
+            gguf_set_val_u32 (c, kv(LLM_KV_PLE_HEADS_PER_NGRAM).c_str(), n_head);
+            gguf_set_val_u32 (c, kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER).c_str(), key);
+            gguf_set_val_u32 (c, kv(LLM_KV_PLE_NGRAM_SIZE).c_str(), n_gram);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(), pad_token);
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, mult.data(), mult.size());
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(), GGUF_TYPE_UINT64, primes.data(), primes.size());
+            gguf_set_arr_data(c, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(), GGUF_TYPE_UINT64, global.data(), global.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_INT32, token_map.data(), token_map.size());
+            return g;
+        }
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_LAYER_IDS).c_str(), GGUF_TYPE_UINT32, ids.data(), ids.size());
+        gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_PAD_ID).c_str(), pad);
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, mult.data(), mult.size());
+        if (which == 0) {
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_HEAD_COUNT).c_str(), n_head);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_KEY_LENGTH).c_str(), key);
+            gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_MAX_NGRAM_SIZE).c_str(), n_gram);
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_PRIMES).c_str(), GGUF_TYPE_UINT64, primes.data(), primes.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_OFFSETS).c_str(), GGUF_TYPE_UINT64, offsets.data(), offsets.size());
+            gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_INT32, token_map.data(), token_map.size());
+            return g;
+        }
+        // antirez's files name the model's other hyperparameters after its config.json
+        auto value = [&](llm_kv from, double fallback) -> double {
+            const int64_t id = gguf_find_key(c, kv(from).c_str());
+            if (id < 0) {
+                GGML_ASSERT(!std::isnan(fallback));
+                return fallback;
+            }
+            gguf_type type = gguf_get_kv_type(c, id);
+            const void * data = gguf_get_val_data(c, id);
+            if (type == GGUF_TYPE_ARRAY) {
+                type = gguf_get_arr_type(c, id);
+                data = gguf_get_arr_data(c, id);
+            }
+            switch (type) {
+                case GGUF_TYPE_UINT32:  return *(const uint32_t *) data;
+                case GGUF_TYPE_INT32:   return *(const int32_t *) data;
+                case GGUF_TYPE_FLOAT32: return *(const float *) data;
+                case GGUF_TYPE_BOOL:    return *(const int8_t *) data;
+                default:                GGML_ABORT("unexpected type of %s", kv(from).c_str());
+            }
+        };
+        const struct { const char * name; llm_kv from; gguf_type type; double fallback; } renamed[] = {
+            { "max_position_embeddings", LLM_KV_CONTEXT_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "hidden_size", LLM_KV_EMBEDDING_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "num_hidden_layers", LLM_KV_BLOCK_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "n_routed_experts", LLM_KV_EXPERT_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_experts_per_tok", LLM_KV_EXPERT_USED_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_attention_heads", LLM_KV_ATTENTION_HEAD_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "num_key_value_heads", LLM_KV_ATTENTION_HEAD_COUNT_KV, GGUF_TYPE_UINT32, 1 },
+            { "rope_scaling.original_max_position_embeddings", LLM_KV_CONTEXT_LENGTH, GGUF_TYPE_FLOAT32, NAN },
+            { "rope_theta", LLM_KV_ROPE_FREQ_BASE, GGUF_TYPE_UINT32, 10000 },
+            { "rope_scaling.factor", LLM_KV_ROPE_SCALING_FACTOR, GGUF_TYPE_FLOAT32, 1 },
+            { "head_dim", LLM_KV_ATTENTION_KEY_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "qk_rope_head_dim", LLM_KV_ROPE_DIMENSION_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "rms_norm_eps", LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, GGUF_TYPE_FLOAT32, NAN },
+            { "q_lora_rank", LLM_KV_ATTENTION_Q_LORA_RANK, GGUF_TYPE_UINT32, NAN },
+            { "sliding_window", LLM_KV_ATTENTION_SLIDING_WINDOW, GGUF_TYPE_UINT32, NAN },
+            { "moe_intermediate_size", LLM_KV_EXPERT_FEED_FORWARD_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "n_shared_experts", LLM_KV_EXPERT_SHARED_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "routed_scaling_factor", LLM_KV_EXPERT_WEIGHTS_SCALE, GGUF_TYPE_FLOAT32, 1 },
+            { "norm_topk_prob", LLM_KV_EXPERT_WEIGHTS_NORM, GGUF_TYPE_BOOL, 1 },
+            { "swiglu_limit", LLM_KV_SWIGLU_CLAMP_EXP, GGUF_TYPE_FLOAT32, NAN },
+            { "index_n_heads", LLM_KV_ATTENTION_INDEXER_HEAD_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "index_head_dim", LLM_KV_ATTENTION_INDEXER_KEY_LENGTH, GGUF_TYPE_UINT32, NAN },
+            { "index_topk", LLM_KV_ATTENTION_INDEXER_TOP_K, GGUF_TYPE_UINT32, NAN },
+            { "o_groups", LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "o_lora_rank", LLM_KV_ATTENTION_OUTPUT_LORA_RANK, GGUF_TYPE_UINT32, NAN },
+            { "hc_mult", LLM_KV_HYPER_CONNECTION_COUNT, GGUF_TYPE_UINT32, NAN },
+            { "hc_sinkhorn_iters", LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, GGUF_TYPE_UINT32, NAN },
+            { "hc_eps", LLM_KV_HYPER_CONNECTION_EPSILON, GGUF_TYPE_FLOAT32, NAN },
+            { "compress_rope_theta", LLM_KV_ATTENTION_COMPRESS_ROPE_FREQ_BASE, GGUF_TYPE_UINT32, NAN },
+            { "rope_scaling.beta_fast", LLM_KV_ROPE_SCALING_YARN_BETA_FAST, GGUF_TYPE_FLOAT32, 32 },
+            { "rope_scaling.beta_slow", LLM_KV_ROPE_SCALING_YARN_BETA_SLOW, GGUF_TYPE_FLOAT32, 1 },
+        };
+        for (const auto & r : renamed) {
+            const std::string name = std::string("deepseek41.") + r.name;
+            const double v = value(r.from, r.fallback);
+            switch (r.type) {
+                case GGUF_TYPE_UINT32:  gguf_set_val_u32 (c, name.c_str(), (uint32_t) v); break;
+                case GGUF_TYPE_FLOAT32: gguf_set_val_f32 (c, name.c_str(), (float) v); break;
+                default:                gguf_set_val_bool(c, name.c_str(), v != 0); break;
+            }
+        }
+        const int64_t ratios = gguf_find_key(c, kv(LLM_KV_ATTENTION_COMPRESS_RATIOS).c_str());
+        GGML_ASSERT(ratios >= 0);
+        gguf_set_arr_data(c, "deepseek41.compress_ratios", gguf_get_arr_type(c, ratios), gguf_get_arr_data(c, ratios),
+                          gguf_get_arr_n(c, ratios));
+        gguf_set_val_str(c, "deepseek41.scoring_func", "sqrtsoftplus");
+
+        const std::vector<uint32_t> primes32(primes.begin(), primes.end());
+        const std::vector<uint32_t> map32(token_map.begin(), token_map.end());
+        gguf_set_val_str (c, kv(LLM_KV_ENGRAM_ENCODING).c_str(), "e4m3_e8m0_32_row264");
+        gguf_set_val_u32 (c, kv(LLM_KV_ENGRAM_COMPRESSED_VOCAB_SIZE).c_str(), compressed);
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_ROWS).c_str(), GGUF_TYPE_UINT32, rows.data(), rows.size());
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_PRIMES).c_str(), GGUF_TYPE_UINT32, primes32.data(), primes32.size());
+        gguf_set_arr_data(c, kv(LLM_KV_ENGRAM_TOKEN_MAP).c_str(), GGUF_TYPE_UINT32, map32.data(), map32.size());
+        return g;
+    };
+
+    // a prompt of two sequences' worth of positions; its predecessors are its own tokens
+    const uint32_t n_tokens = 40;
+    std::vector<llama_token> tokens(n_tokens);
+    std::vector<llama_pos> pos(n_tokens);
+    std::vector<llama_token> prev(n_tokens*(n_gram - 1));
+    for (uint32_t i = 0; i < n_tokens; ++i) {
+        tokens[i] = llama_token(gen() % vocab);
+        pos[i]    = llama_pos(i < 25 ? i : i - 25);
+        for (uint32_t s = 1; s < n_gram; ++s) {
+            prev[i*(n_gram - 1) + (n_gram - 1 - s)] = pos[i] >= (llama_pos) s ? tokens[i - s] : LLAMA_TOKEN_NULL;
+        }
+    }
+
+    const char * names[3] = { "engram.*", "ple.*", "e4m3_e8m0_32_row264" };
+    std::vector<int32_t> found[3];
+    int failures = 0;
+    for (int which = 0; which < 3; ++which) {
+        // the metadata read as a load reads it, up to the hyperparameters (as llama_ssd_model_facts does)
+        gguf_context_ptr g = layout(which);
+        std::vector<std::string> splits;
+        llama_model_loader ml(g.get(), nullptr, nullptr, "", splits, nullptr, /* use_mmap */ false,
+            /* use_direct_io */ false, /* check_tensors */ false, /* defer_experts */ false, /* no_alloc */ true,
+            nullptr, nullptr);
+        llama_model m(llama_model_default_params());
+        try {
+            m.load_arch(ml);
+            m.load_hparams(ml);
+        } catch (const std::exception & error) {
+            printf("%s: the %s reader refused its metadata: %s\n", __func__, names[which], error.what());
+            return 1;
+        }
+        const bool same = m.engram_n_layer == layers.size() && m.engram_pad_id == pad && m.engram_token_map == token_map &&
+            m.engram_multipliers == mult && m.engram_primes == primes &&
+            m.engram_offsets == (which == 1 ? global : offsets) &&
+            m.hparams.engram_n_head == n_head && m.hparams.engram_key_length == key &&
+            m.hparams.engram_max_ngram_size == n_gram;
+        if (!same) {
+            printf("%s: the %s reader's parameters differ\n", __func__, names[which]);
+            ++failures;
+        }
+        for (uint32_t e = 0; e < m.engram_n_layer; ++e) {
+            const llama_dsv41_engram_hash_params hp = {
+                n_gram, n_head, m.engram_multipliers.data() + e*n_gram, m.engram_primes.data() + e*n_cols,
+                m.engram_offsets.data() + e*n_cols, m.engram_token_map.data(), m.engram_token_map.size(), m.engram_pad_id,
+            };
+            std::vector<int32_t> out(n_tokens*n_cols);
+            llama_dsv41_engram_hash(hp, n_tokens, tokens.data(), pos.data(), prev.data(), out.data());
+            const uint64_t first = which == 1 ? global[e*n_cols] : 0; // ple.*: the rows of the layers before
+            for (auto & row : out) {
+                found[which].push_back(row - (int32_t) first);
+            }
+        }
+    }
+    for (int which = 1; which < 3; ++which) {
+        if (found[which] != found[0]) {
+            printf("%s: the %s rows differ from the engram.* rows\n", __func__, names[which]);
+            ++failures;
+        }
+    }
+    printf("%s: engram.*, ple.* and e4m3_e8m0_32_row264 readers: %s (%zu rows each)\n", __func__,
+           failures ? "DIFFERENT" : "identical", found[0].size());
+    return failures;
+}
+
 static int test_engram_layouts(const size_t seed, const ggml_log_level log_level) {
     const llm_arch arch = LLM_ARCH_DEEPSEEK41;
     const LLM_KV kv(arch);
@@ -1149,7 +1733,8 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
     gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_HEADS_PER_NGRAM).c_str(),        DSV41_ENGRAM_HEADS);
     gguf_set_val_u32 (ctx, kv(LLM_KV_EMBEDDING_LENGTH_PER_LAYER).c_str(), DSV41_ENGRAM_KEY_LENGTH);
     gguf_set_val_u32 (ctx, kv(LLM_KV_PLE_NGRAM_SIZE).c_str(),             DSV41_ENGRAM_NGRAM);
-    gguf_set_val_u32 (ctx, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(),        2);
+    // ple.* names the pad by a token whose compressed id is the engram.* pad id: 63 % 61 = 2
+    gguf_set_val_u32 (ctx, kv(LLM_KV_ENGRAM_PAD_TOKEN_ID).c_str(),        63);
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_LAYER_MULTIPLIERS).c_str(), GGUF_TYPE_UINT64, DSV41_ENGRAM_MULTIPLIERS.data(), DSV41_ENGRAM_MULTIPLIERS.size());
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_VOCAB_SIZES).c_str(),  GGUF_TYPE_UINT64, DSV41_ENGRAM_PRIMES.data(),      DSV41_ENGRAM_PRIMES.size());
     gguf_set_arr_data(ctx, kv(LLM_KV_PLE_HEAD_OFFSETS).c_str(),      GGUF_TYPE_UINT64, offsets.data(),                  offsets.size());
@@ -1201,14 +1786,22 @@ static int test_engram_layouts(const size_t seed, const ggml_log_level log_level
             throw std::runtime_error("failed to create llama context");
         }
         const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
-        logits[i] = get_logits(model.get(), lctx.get(), get_tokens(32, n_vocab, seed));
+        // the prompt crosses the tokens the map marks -1
+        std::vector<llama_token> tokens = get_tokens(32, n_vocab, seed);
+        tokens[4]  = DSV41_ENGRAM_DEAD_TOKENS[0];
+        tokens[20] = DSV41_ENGRAM_DEAD_TOKENS[1];
+        logits[i] = get_logits(model.get(), lctx.get(), tokens);
+        if (i == 1) {
+            test_engram_files(model.get(), one_table.get(), model_params, ctx_params, tokens, logits[i]);
+        }
     }
+    const int readers = test_engram_readers(seed);
     llama_log_set(ld.callback, ld.user_data);
 
     const bool ok = logits[0] == logits[1];
     printf("%s: engram.* vs ple.* (MXFP8 table) layout: %s (nmse %.3g)\n", __func__,
            ok ? "identical" : "DIFFERENT", nmse(logits[0], logits[1]));
-    return ok ? 0 : 1;
+    return ok && readers == 0 ? 0 : 1;
 }
 
 int main(int argc, char ** argv) {
@@ -1223,6 +1816,7 @@ int main(int argc, char ** argv) {
     bool kv_grow = false;
     bool nextn = false;
     bool engram_layouts = false;
+    bool dense_ssd = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
@@ -1235,6 +1829,10 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--engram-layouts") == 0) {
             engram_layouts = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--dense-ssd") == 0) {
+            dense_ssd = true;
             continue;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -1285,6 +1883,9 @@ int main(int argc, char ** argv) {
         }
         if (engram_layouts) {
             return test_engram_layouts(seed, log_level);
+        }
+        if (dense_ssd) {
+            return test_dense_ssd(seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

@@ -25,7 +25,8 @@ templates = {
     "dsv": (engine / "models/templates/deepseek-ai-DeepSeek-V4.1.jinja").resolve(strict=True),
     "muse": (engine / "models/templates/muse-spark.jinja").resolve(strict=True),
 }
-# Only inspect the schema; never start inference or probe a device.
+# The standalone --ssd-schema query exits before loading compute backends.
+# Keep it standalone: mixed argument lists use normal backend-aware parsing.
 subprocess.run([str(binary), "--ssd-schema"], check=True, stdout=subprocess.DEVNULL)
 # A source archive has no Git metadata to name the version, the revision, the build number (the
 # commit count, which needs the history the installer's blobless clone has), the day or the branch.

@@ -233,6 +233,34 @@ int main() {
             std::printf("case=engine_reserve_reclaim status=PASS slots=%zu->%zu\n",before,t.table->slots.size());
         }
     }
+
+    // A prompt graph's reserve holds the pass's engine at exactly the graph's tokens (reserve_pass): a larger ubatch
+    // grows it, a smaller one tried after a larger was refused gives the larger's rows back, and a pass the vector
+    // engine runs holds none.
+    {
+        tier t(20*stride, inputs.tier_policy());int slot=-1;
+        t.begin(20,1,true);lifecycle_prepare(t,&key,1,&slot);t.finish(output.data(),256);
+        if(unified)t.begin(20,2,true);
+        if(!t.group){
+            std::printf("case=engine_pass_exact status=SKIP reason=no_grouped_engine_for_the_fixture_format\n");
+        }else{
+            t.prepare_prefill_reclaim();
+            t.reserve_prefill_pass(128);
+            const size_t large=t.group_api->device_bytes(t.group);
+            require(t.group_rows==128 && large>0,"a pass reserve did not size the engine for the graph's tokens");
+            t.reserve_prefill_pass(64);
+            const size_t small=t.group_api->device_bytes(t.group);
+            require(t.group_rows==64 && small<large,"a smaller pass kept the larger pass's engine rows");
+            t.reserve_prefill_pass(96);
+            require(t.group_rows==96 && t.group_api->device_bytes(t.group)>small,"a larger pass did not grow the engine");
+            t.reserve_prefill_engine(64);
+            require(t.group_rows==96,"a layer's announcement shrank the engine the graph's reserve sized");
+            t.reserve_prefill_pass(1);
+            require(t.group_rows==0 && t.group_api->device_bytes(t.group)==0,"a vector-engine pass kept engine memory");
+            t.phase_complete(false);
+            std::printf("case=engine_pass_exact status=PASS device_bytes=%zu->%zu\n",large,small);
+        }
+    }
     inputs.set("tier.demand_reclaim", "0");
     inputs.set("tier.max_slots", "53");
 

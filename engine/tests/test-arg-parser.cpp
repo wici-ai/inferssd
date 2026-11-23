@@ -10,7 +10,59 @@
 #undef NDEBUG
 #include <cassert>
 
-int main(void) {
+static std::vector<char *> list_str_to_char(std::vector<std::string> & argv) {
+    std::vector<char *> res;
+    for (auto & arg : argv) {
+        res.push_back(const_cast<char *>(arg.data()));
+    }
+    return res;
+}
+
+// --shard/--ple (upstream llama.cpp 9581154a): every value is kept, in order, across the alias, repeated options,
+// comma separated and quoted values and LLAMA_ARG_SHARD; the model loads from the model path, then each shard once.
+static void test_ple_args() {
+    std::vector<std::string> argv;
+#ifndef _WIN32
+    const char * previous = getenv("LLAMA_ARG_SHARD");
+    const bool had_previous = previous != nullptr;
+    const std::string saved_shards = previous ? previous : "";
+    unsetenv("LLAMA_ARG_SHARD");
+#endif
+    printf("test-arg-parser: test extra GGUF shards\n\n");
+    common_params shard_params;
+    argv = {"binary_name", "-m", "model.gguf", "--shard", "first.gguf,\"table,quant.gguf\"",
+            "--ple", "third.gguf", "--shard", "first.gguf", "--ple", "model.gguf"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), shard_params, LLAMA_EXAMPLE_COMMON));
+    const std::vector<std::string> expected_shards = {"first.gguf", "table,quant.gguf", "third.gguf", "first.gguf", "model.gguf"};
+    assert(shard_params.model.shards == expected_shards);
+    const std::vector<std::string> expected_paths = {"model.gguf", "first.gguf", "table,quant.gguf", "third.gguf"};
+    assert(shard_params.model.get_paths() == expected_paths);
+
+    common_params no_shards;
+    argv = {"binary_name", "-m", "model.gguf"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), no_shards, LLAMA_EXAMPLE_COMMON));
+    assert(no_shards.model.get_paths() == std::vector<std::string>{"model.gguf"});
+
+#ifndef _WIN32
+    printf("test-arg-parser: test extra GGUF shards from the environment and the command line\n\n");
+    setenv("LLAMA_ARG_SHARD", "env.gguf,\"env,quant.gguf\"", true);
+    common_params env_shards;
+    argv = {"binary_name", "-m", "model.gguf", "--ple", "cli.gguf"};
+    assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), env_shards, LLAMA_EXAMPLE_COMMON));
+    const std::vector<std::string> expected_env_shards = {"env.gguf", "env,quant.gguf", "cli.gguf"};
+    assert(env_shards.model.shards == expected_env_shards);
+    unsetenv("LLAMA_ARG_SHARD");
+    if (had_previous) {
+        setenv("LLAMA_ARG_SHARD", saved_shards.c_str(), true);
+    }
+#endif
+}
+
+int main(int argc, char ** args) {
+    test_ple_args();
+    if (argc == 2 && std::string(args[1]) == "--ple-only") {
+        return 0;
+    }
     common_params params;
 
     printf("test-arg-parser: make sure there is no duplicated arguments in any examples\n\n");
@@ -73,14 +125,6 @@ int main(void) {
             assert(false);
         }
     }
-
-    auto list_str_to_char = [](std::vector<std::string> & argv) -> std::vector<char *> {
-        std::vector<char *> res;
-        for (auto & arg : argv) {
-            res.push_back(const_cast<char *>(arg.data()));
-        }
-        return res;
-    };
 
     std::vector<std::string> argv;
 

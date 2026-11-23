@@ -60,7 +60,8 @@ replace.
 
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
-(`--cache-disk`, 16 GiB per model). With the `dsv` profile the DeepSeek-V4.1
+(`--cache-disk`, 4 GiB per model unless `--prompt-cache-mib` names another
+limit). With the `dsv` profile the DeepSeek-V4.1
 template keeps earlier turns' thinking (`drop_thinking` false), so a
 conversation's history renders as the server cached it.
 
@@ -71,8 +72,11 @@ host.headroom_mib = 3072 # operator resource reserve
 vram.budget = auto # use admitted capacity
 ```
 
-A model must be a local GGUF or the first shard of a complete set. An omitted
-`expert.source` names that set, and the engine indexes the routed experts from the
+A model must be a local GGUF or the first shard of a split set. `--ple FILE`
+(or `--shard`, repeatable, comma separated) adds its extra shards, such as a
+per-layer embedding table kept apart from it ([DeepSeek-V4.1
+Engram](../docs/deepseek-v41-engram.md)). An omitted `expert.source` names the
+files the engine loads the model from, and the engine indexes the routed experts from the
 GGUF headers; explicit sources must be nonempty existing paths (GGUF files, expert
 packs or alias indexes). Native source validation remains a separate boundary. `serve` and `cli` download a tested model with `-hf`, or take
 a local one with `-m`. Other compute processes on the GPU do not stop a launch:
@@ -80,7 +84,7 @@ it leaves them VRAM (`vram.reserve_mib` in the [settings](../docs/configuration.
 
 The framework reads no GGUF file itself. Before it starts a server, a launch
 asks that server for the model's facts (`inferssd-server --ssd-model-facts
-MODEL`): the engine reads the headers as its load does, without reading a weight
+MODEL`, with the model's `--shard` values): the engine reads the headers as its load does, without reading a weight
 or starting a backend, and prints its files, metadata, tensors and the layout of
 the routed experts as JSON (`inferssd.engine.model`). The strategy and the RAM
 admission take their model facts from it, and a recorded dry run takes them from
@@ -161,7 +165,8 @@ An unrelated listener on the health port is never killed.
 `settings.ssd` records the file/generated settings and their receipts;
 `native-events.jsonl` is exclusively created by the context-owned native writer.
 `runtime.json` records server argv and scope, `memory-samples.jsonl` records
-resource samples, and `ownership.json` records final status and cleanup.
+resource samples (every one of the first minute, then one every 30 seconds and
+any whose memory moved by 2%), and `ownership.json` records final status and cleanup.
 Keep these artifacts private if arguments or paths contain private information.
 Server loader variables are carried in the process environment and restored
 only for the server, not serialized into the launch specification or applied to
@@ -262,8 +267,8 @@ A different quantization needs matching model facts before its estimate is valid
 
 Two defaults stand in for measurements the profile lacks. An expert format the
 probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight
-bytes per second) of the measured format nearest it in bits per weight. A RAM-only
-model without routed experts, such as Gemma 4 E4B, reads its dense weights once a
+bytes per second) of the measured format nearest it in bits per weight. A model
+without routed experts, such as Gemma 4 E4B, reads its dense weights once a
 token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
 measured RAM read rate. Each estimate names the default it used in its
 assumptions; neither is calibrated against a run.

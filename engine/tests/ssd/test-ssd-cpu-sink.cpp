@@ -2441,6 +2441,39 @@ static void q2_activation_test(fixture_inputs & inputs, int threads, int depth) 
     std::printf("DSV41_Q2_CPU_SINK_DECODE_OK threads=%d ring_experts=%d\n", threads, depth);
 }
 
+// GSQ-RCO IQ2_XS is a mixed-format checkpoint: all four routed-expert
+// formats must retain the ordinary graph's clamped SwiGLU result. Different
+// up/gate and down types also exercise distinct row strides and input traits.
+static void dsv41_iq_activation_test(fixture_inputs & inputs, int threads, int depth) {
+    const std::array<ggml_type, 4> types = {
+        GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS, GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS
+    };
+    const ssd_cpu_sink_activation clamp = {
+        SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f
+    };
+    const std::vector<int32_t> top6 = { 7, 0, 5, 2, 6, 4 };
+    const std::vector<float> weights = { .3f, .25f, .15f, .12f, .1f, .08f };
+    for (size_t i = 0; i < types.size(); ++i) {
+        fixture f;
+        f.type = types[i];
+        f.down_type = types[(i + 1) % types.size()];
+        f.latent = 512;
+        f.hidden = 256;
+        f.experts = 8;
+        f.layer_ids = { 1 };
+        make_synthetic(f, 20261117 + uint32_t(i));
+        std::mt19937 rng(4101);
+        std::normal_distribution<float> sample(0.0f, 1.5f);
+        std::vector<float> input(f.latent);
+        for (auto & value : input) { value = sample(rng); }
+        auto sink = make_sink(inputs, f, threads, depth);
+        const std::string name = std::string("dsv41_") + ggml_type_name(f.type) + "_" + ggml_type_name(f.down_type);
+        activation_case(inputs, name.c_str(), f, sink.get(), 1, input, top6, weights, clamp);
+    }
+    std::printf("DSV41_MIXED_IQ_CPU_SINK_DECODE_OK formats=%zu threads=%d ring_experts=%d\n",
+        types.size(), threads, depth);
+}
+
 // The RAM cache's storage at load (ssd_cpu_sink_vram_reserve; without a unified-memory GPU, as here, the cache's
 // part runs): the geometry from the tensors' strides is the one the first decode token learns, and the slots the
 // ledger admits are committed and paged in, so decode commits no new slot. A sink without the load step is the
@@ -4314,7 +4347,7 @@ int main(int argc, char ** argv) {
         bool role_major_mode = false, nonblocking_down_mode = false;
         bool poll_mode = false, poll_early_mode = false;
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
-        bool activation_mode = false, q2_activation_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
+        bool activation_mode = false, q2_activation_mode = false, dsv41_iq_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
         bool swiglu_mode = false, swiglu_q2_mode = false, lookahead_mode = false;
         std::string pack, prefix;
@@ -4357,6 +4390,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--muse-bf16-test")) { muse_bf16_mode = true; }
             else if (!std::strcmp(argv[i], "--activation-tests")) { activation_mode = true; }
             else if (!std::strcmp(argv[i], "--q2-activation-test")) { q2_activation_mode = true; }
+            else if (!std::strcmp(argv[i], "--dsv41-iq-test")) { dsv41_iq_mode = true; }
             else if (!std::strcmp(argv[i], "--threadpool-tests")) { threadpool_mode = true; }
             else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
             else if (!std::strcmp(argv[i], "--swiglu-q2-tests")) { swiglu_q2_mode = true; }
@@ -4401,6 +4435,7 @@ int main(int argc, char ** argv) {
         }
         if (activation_mode) { activation_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (q2_activation_mode) { q2_activation_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (dsv41_iq_mode) { dsv41_iq_activation_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (hitrate_mode) { cache_hitrate_tests(inputs, options.threads, options.ring_experts); return 0; }
         if (elastic_cache_mode) { elastic_cache_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_load_mode) { cache_load_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

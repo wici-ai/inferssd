@@ -37,6 +37,12 @@ source tree.
    under the same MIT license, using log1pf(expf(x)) to retain the negative
    tail while preserving the existing positive-input fast path.
 
+   A model's extra GGUF shards (--shard, --ple) are ported from that same
+   upstream revision: the option in engine/common/arg.cpp, the model's paths in
+   engine/common/common.h, common.cpp and fit.cpp, and the loading of shards
+   given by path, including a table kept outside a split model, in
+   engine/src/llama-model-loader.cpp.
+
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026
@@ -52,6 +58,18 @@ source tree.
    latter two originate in upstream llama.cpp pull requests 24162 and 25585.
    Copyright (c) 2023-2026 The ggml authors. The MIT permission notice below
    applies.
+
+   The DeepSeek-V4.1 Engram hash (its stops at the start of a sequence and at
+   tokens the token map marks -1) and gate in
+   engine/src/models/deepseek41-engram.h, the skipped Engram of an embedding
+   batch in engine/src/models/deepseek41.cpp and the shared table's row count
+   in engine/src/llama-model.cpp are ported from src/models/deepseek41.cpp in
+   upstream ggml-org/llama.cpp revision
+   9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e, whose file SHA-256 is
+   73916d555f7d664c43e54eecb0da8392693d940271a5268d0291ab98b0f8283d. One
+   reader per GGUF layout maps its metadata onto them.
+   engine/tests/ssd/test-dsv41-engram.cpp keeps a transcription of the
+   upstream hash as the reference it is tested against.
 
    DeepSeek-V4.1 router normalization in engine/src/llama-graph.h also follows
    src/llama-graph.cpp at that revision: the selected scores use a sum-plus-

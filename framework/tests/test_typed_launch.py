@@ -1,5 +1,6 @@
 """Typed preparation/ownership contracts; synthetic metadata is not GPU evidence."""
 
+import argparse
 import json
 import os
 import re
@@ -10,10 +11,11 @@ from pathlib import Path
 
 import pytest
 from test_engine_runtime import Effects, Owner, policy
-from test_strategy_inputs import Q8_0, deepseek_like, moe, muse_like, recorded_facts
+from test_strategy_inputs import F32, Q8_0, deepseek_like, moe, muse_like, recorded_facts
 
 from inferssd.configuration.settings import parse
 from inferssd.engine import runtime
+from inferssd.launch import typed_command
 from inferssd.launch.prepare import prepare
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import LaunchSpec, reject_legacy_environment, resolve_typed
@@ -54,6 +56,7 @@ def setup(tmp_path, platform="linux", automatic=False):
         "engine_gpu_backends": ["Metal"] if platform == "darwin" else ["CUDA"],
     }
     tensors = [(f"blk.0.ffn_{r}_exps.weight", (32, 32, 256), Q8_0) for r in ("up", "gate", "down")]
+    tensors.append(("blk.0.attn_norm.weight", (32,), F32))
     model = model_file(root / "model.gguf", host, tensors, {})
     spec = LaunchSpec(model, 8080, str(settings), (("prefetch.depth", "2"),), str(binary))
     inputs = LaunchInput(str(root), (("PATH", "/bin"), ("PRIVATE_TOKEN", "never-persist")))
@@ -154,6 +157,61 @@ def test_the_engine_reads_the_experts_from_the_model_files_by_default(tmp_path):
     assert value.at("expert.source").value == (str(Path(spec.model).resolve()),)
     assert "source=model" in value.at("expert.source").receipt
     assert not (out / "artifacts").exists()  # no index is built
+
+
+def test_extra_shards_reach_the_facts_and_the_server(tmp_path):
+    # A model whose per-layer embedding table lies apart from it: the engine, given the table as
+    # a --shard, names it among the files the model loads from, and so does the launch.
+    inputs, spec, host, adapter, out = setup(tmp_path, automatic=True)
+    table = tmp_path / "tables" / "engram table.gguf"
+    table.parent.mkdir()
+    table.write_bytes(b"GGUF")
+    facts = dict(host["model_facts"], paths=[spec.model, str(table)])
+    host["model_facts"] = facts
+    asked = []
+
+    def observe(fact):
+        asked.append(fact)
+        return adapter(fact)
+
+    values = (str(table), "a.gguf,b.gguf")
+    result = resolve(inputs, replace(spec, shards=values), observe, out)
+    assert result.code == 0
+    binary = next(fact.arguments[0] for fact in asked if fact.name == "model_facts")
+    assert [fact.arguments for fact in asked if fact.name == "model_facts"] == [
+        (binary, spec.model, *values)
+    ]
+    start = result.argv.index("-m")
+    assert list(result.argv[start : start + 6]) == ["-m", spec.model] + [
+        "--shard",
+        values[0],
+        "--shard",
+        values[1],
+    ]
+    value = parse((out / "settings.ssd").read_text(), str(out / "settings.ssd"))
+    assert value.at("expert.source").value == (spec.model, str(table))
+
+    table.unlink()
+    with pytest.raises(ValueError, match="missing GGUF file: .*engram table.gguf"):
+        resolve(inputs, replace(spec, shards=values), adapter, tmp_path / "other")
+
+
+@pytest.mark.parametrize("option", ["--shard", "--ple", "--ple=t.gguf", "--shard=t.gguf"])
+def test_extra_shards_are_a_typed_launch_option(tmp_path, option):
+    inputs, spec, _, adapter, out = setup(tmp_path)
+    with pytest.raises(ValueError, match="explicit typed launch options"):
+        resolve(replace(inputs, extra=(option, "t.gguf")), spec, adapter, out)
+
+
+def test_the_launch_command_takes_extra_shards_as_given():
+    parser = argparse.ArgumentParser()
+    typed_command.add_arguments(parser)
+    args = parser.parse_args(
+        ["--dry-run", "--model", "m.gguf", "--runtime-policy", "p.json"]
+        + ["--ple", "t.gguf", "--shard", 'a.gguf,"b,c.gguf"']
+    )
+    assert args.shards == ["t.gguf", 'a.gguf,"b,c.gguf"']
+    assert typed_command.specification(args).shards == ("t.gguf", 'a.gguf,"b,c.gguf"')
 
 
 @pytest.mark.parametrize(
@@ -463,7 +521,20 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     result = resolve(inputs, replace(spec, prompt_cache=cache), adapter, second, platform)
     argv = list(result.argv)
     assert argv[argv.index("--cache-disk") + 1] == str(Path(cache) / "model")
-    assert argv[argv.index("--cache-disk-mib") + 1] == "16384" and "--cache-ram" not in argv
+    assert argv[argv.index("--cache-disk-mib") + 1] == "4096" and "--cache-ram" not in argv
+    # a launch may name its own limit
+    third = tmp_path / "third"
+    third.mkdir()
+    limited = replace(spec, prompt_cache=cache, prompt_cache_mib=1024)
+    argv = list(resolve(inputs, limited, adapter, third, platform).argv)
+    assert argv[argv.index("--cache-disk-mib") + 1] == "1024"
+    # a launch records the engine's per-layer events unless it says not to
+    assert "--ssd-no-layer-events" not in argv
+    fourth = tmp_path / "fourth"
+    fourth.mkdir()
+    quiet = replace(spec, prompt_cache=cache, layer_events=False)
+    argv = list(resolve(inputs, quiet, adapter, fourth, platform).argv)
+    assert argv[argv.index("--ssd-telemetry") + 2] == "--ssd-no-layer-events"
 
 
 def test_sizes_default_to_the_context_and_batch():

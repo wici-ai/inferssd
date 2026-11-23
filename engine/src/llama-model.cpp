@@ -1,6 +1,7 @@
 #include "llama-model.h"
 #include "ssd/model-adapter.h"
 #include "ssd/model-pages.h"
+#include "ssd/dense-homes.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -29,6 +30,7 @@
 #include <unistd.h>
 #endif
 
+#include <algorithm>
 #include <cassert>
 #include <cfloat>
 #include <climits>
@@ -696,6 +698,9 @@ struct llama_model::impl {
     std::vector<layer_dev> dev_layer;
 
     bool has_tensor_overrides;
+
+    // after ctxs_bufs: its device copies go before the host buffers its matrices return to
+    std::unique_ptr<llama_dense_homes> dense_homes;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -740,7 +745,8 @@ static void qwen4exp_require_arr_len(llama_model_loader & ml, llm_kv kid, uint32
     }
 }
 
-// The names of DeepSeek-V4.1's Engram metadata: engram.*, or ple.* (unsloth's GGUFs) with the same values.
+// The names of DeepSeek-V4.1's Engram metadata: engram.*, or ple.* (unsloth's and ISTA-DASLab's GGUFs) with the same
+// values but the pad, which ple.* files give as a token id rather than a compressed one.
 struct dsv41_engram_names {
     llm_kv layers, heads, key_length, max_ngram_size, pad, multipliers, primes, offsets;
 };
@@ -2290,10 +2296,11 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 hparams.rope_freq_base_train_swa  = hparams.rope_freq_base_train;
                 hparams.rope_freq_scale_train_swa = hparams.rope_freq_scale_train;
 
-                // Files lay the Engram out one of two ways: engram.* metadata with a table, q and k per layer,
-                // or (unsloth's GGUFs) ple.* metadata with every layer's table in one per_layer_token_embd,
-                // whose head offsets run on across the layers, and engram_gate = engram_q * engram_k per
-                // layer. The values mean the same either way.
+                // Files lay the Engram out one of three ways: engram.* metadata with a table, q and k per layer;
+                // the same with antirez's e4m3_e8m0_32_row264 tables; or (unsloth's and ISTA-DASLab's GGUFs) ple.*
+                // metadata with every layer's table in one per_layer_token_embd, whose head offsets run on across the
+                // layers, and engram_gate = engram_q * engram_k per layer. Each layout is read into the same
+                // parameters below, which one hash and one graph run for all of them.
                 engram_ple_layout = !dsv41_antirez_layout && ml.get_arr_n(LLM_KV_PLE_LAYERS, engram_n_layer, false);
                 const dsv41_engram_names & names = engram_ple_layout ? DSV41_ENGRAM_PLE_NAMES : DSV41_ENGRAM_NAMES;
 
@@ -2336,12 +2343,18 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                 }
                 ml.get_key(names.pad, engram_pad_id);
 
-                if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2) {
-                    throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head and a 2-gram");
+                if (hparams.engram_n_head == 0 || hparams.engram_max_ngram_size < 2 || hparams.engram_key_length == 0) {
+                    throw std::runtime_error("DeepSeek-V4.1 engram needs at least one head, a 2-gram and a key");
                 }
                 for (uint32_t e = 0; e < engram_n_layer; ++e) {
                     if (hparams.engram_layer_ids[e] >= hparams.n_layer) {
                         throw std::runtime_error(format("engram layer %u is out of range", hparams.engram_layer_ids[e]));
+                    }
+                    // engram_index() finds a layer's constants by its place in the list
+                    for (uint32_t f = 0; f < e; ++f) {
+                        if (hparams.engram_layer_ids[f] == hparams.engram_layer_ids[e]) {
+                            throw std::runtime_error(format("engram layer %u is listed twice", hparams.engram_layer_ids[e]));
+                        }
                     }
                 }
 
@@ -2413,10 +2426,26 @@ void llama_model::load_hparams(llama_model_loader & ml) {
                         throw std::runtime_error("engram offset count does not match layers * buckets");
                     }
                 }
-                for (uint64_t p : engram_primes) {
-                    if (p < (hparams.engram_e4m3_e8m0_32_row264 ? 2u : 1u)) {
-                        throw std::runtime_error("engram prime is below the supported minimum");
+                // a bucket count below 2 traps or degenerates in the hash; row ids are int32 (upstream's bounds)
+                for (size_t k = 0; k < engram_primes.size(); ++k) {
+                    if (engram_primes[k] < 2 || engram_offsets[k] > (uint64_t) INT32_MAX ||
+                            engram_primes[k] > (uint64_t) INT32_MAX - engram_offsets[k]) {
+                        throw std::runtime_error(format("DeepSeek-V4.1 engram bucket %zu: range out of range", k));
                     }
+                }
+                // -1 marks a token no n-gram reaches across; any other entry is a compressed id
+                for (int32_t token : engram_token_map) {
+                    if (token < -1) {
+                        throw std::runtime_error("engram token map entry is negative");
+                    }
+                }
+                // The hash pads with a compressed id. engram.pad_id is one; ple.* files name the pad token instead
+                // (engram.pad_token_id), whose compressed id the map gives.
+                if (engram_ple_layout) {
+                    if (engram_pad_id >= engram_token_map.size() || engram_token_map[engram_pad_id] < 0) {
+                        throw std::runtime_error("engram pad token has no compressed id");
+                    }
+                    engram_pad_id = (uint32_t) engram_token_map[engram_pad_id];
                 }
 
                 type = LLM_TYPE_UNKNOWN;
@@ -6090,9 +6119,18 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                     output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM, "weight"), {n_embd}, 0);
                     output      = create_tensor(tn(LLM_TENSOR_OUTPUT,      "weight"), {n_embd, n_vocab}, 0);
 
-                    // the one table every Engram layer reads, where the file keeps them together: every bucket's
+                    // the one table every Engram layer reads, where the file keeps them together; as upstream
+                    // llama.cpp 9581154a, it covers the last bucket and has the rows the file gives it
                     if (engram_ple_layout) {
-                        const int64_t n_rows = dsv41_engram_table_rows(engram_offsets, engram_primes, 0, engram_offsets.size());
+                        int64_t n_rows = dsv41_engram_table_rows(engram_offsets, engram_primes, 0, engram_offsets.size());
+                        const std::string name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
+                        if (const auto * w = ml.get_weight(name.c_str())) {
+                            if (w->tensor->ne[1] < n_rows) {
+                                throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the Engram heads (%" PRId64 ")",
+                                                                name.c_str(), w->tensor->ne[1], n_rows));
+                            }
+                            n_rows = w->tensor->ne[1];
+                        }
                         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                                            {(int64_t) hparams.engram_key_length, n_rows}, 0);
                     }
@@ -8939,7 +8977,8 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(!defer_expert_mmap, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // homed layers are read where they go (into the GPU, a pinned copy, or from the drive): no file read ahead
+    ml.init_mappings(!defer_expert_mmap && ml.homed_matrices.empty(), use_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
     if (defer_expert_mmap) {
         pimpl->expert_mmap_ranges = ml.expert_tensor_index.file_ranges;
@@ -9060,11 +9099,20 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
             }
-            if (use_mlock && ggml_backend_buffer_is_host(buf)) {
-                pimpl->mlock_bufs.emplace_back(new llama_mlock);
-                auto & mlock_buf = pimpl->mlock_bufs.back();
-                mlock_buf->init   (ggml_backend_buffer_get_base(buf));
-                mlock_buf->grow_to(ggml_backend_buffer_get_size(buf));
+            // lock the buffers that hold the tensors: a multi_buffer has no base, and its parts are pageable memory when pinning fails
+            if (use_mlock && !ml.no_alloc && ggml_backend_buffer_is_host(buf)) {
+                std::vector<ggml_backend_buffer_t> lock_bufs;
+                for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                    if (t->buffer != nullptr && std::find(lock_bufs.begin(), lock_bufs.end(), t->buffer) == lock_bufs.end()) {
+                        lock_bufs.push_back(t->buffer);
+                    }
+                }
+                for (ggml_backend_buffer_t lock_buf : lock_bufs) {
+                    pimpl->mlock_bufs.emplace_back(new llama_mlock);
+                    auto & mlock_buf = pimpl->mlock_bufs.back();
+                    mlock_buf->init   (ggml_backend_buffer_get_base(lock_buf));
+                    mlock_buf->grow_to(ggml_backend_buffer_get_size(lock_buf));
+                }
             }
             bufs.emplace_back(buf);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
@@ -9189,7 +9237,40 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the layers' matrices homed in host memory: the SSD context moves into the GPU what its memory holds
+    if (!ml.homed_matrices.empty() && !ml.no_alloc) {
+        auto homes = std::make_unique<llama_dense_homes>();
+        size_t bytes = 0;
+        for (const auto & [il, matrix] : ml.homed_matrices) {
+            homes->add(il, dev_layer(il), matrix);
+            bytes += ggml_nbytes(matrix);
+        }
+        homes->finish();
+        for (size_t i = 0; i < pimpl->mappings.size() && i < ml.paths.size(); ++i) {
+            if (pimpl->mappings[i]) {
+                homes->add_file(ml.paths[i], pimpl->mappings[i]->addr(), pimpl->mappings[i]->size());
+            }
+        }
+        homes->set_drop_pages([this](const void * data, size_t bytes) {
+            for (const auto & mapping : pimpl->mappings) {
+                const auto * base = static_cast<const uint8_t *>(mapping->addr());
+                const auto * at = static_cast<const uint8_t *>(data);
+                if (at >= base && at + bytes <= base + mapping->size()) {
+                    (void) mapping->dontneed_fragment(size_t(at - base), size_t(at - base) + bytes);
+                    return;
+                }
+            }
+        });
+        LLAMA_LOG_INFO("%s: %zu layer matrices (%.2f GiB) homed in host memory for the SSD context to place\n",
+                __func__, ml.homed_matrices.size(), bytes / 1024.0 / 1024.0 / 1024.0);
+        pimpl->dense_homes = std::move(homes);
+    }
+
     return true;
+}
+
+llama_dense_homes * llama_model::dense_homes() const {
+    return pimpl->dense_homes.get();
 }
 
 std::string llama_model::arch_name() const {
@@ -10304,6 +10385,7 @@ llama_model_params llama_model_default_params() {
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.defer_experts               =*/ false,
+        /*.ssd_homes                   =*/ false,
         /*.no_alloc                    =*/ false,
     };
 

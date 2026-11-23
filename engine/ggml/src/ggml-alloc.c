@@ -982,6 +982,15 @@ void ggml_gallocr_reserve_n_size(
     GGML_ASSERT(ggml_gallocr_reserve_n_impl(galloc, graph, node_buffer_ids, leaf_buffer_ids, /*no_alloc =*/ true));
     for (int i = 0; i < galloc->n_buffers; i++) {
         sizes[i] = 0;
+        // backends of one buffer type share one buffer (the CPU and BLAS backends): its size is the first one's, as
+        // ggml_gallocr_get_buffer_size reports it, so that a caller adding the sizes asks for that buffer once
+        bool shared = false;
+        for (int j = 0; j < i && !shared; j++) {
+            shared = galloc->buf_tallocs[j] == galloc->buf_tallocs[i];
+        }
+        if (shared) {
+            continue;
+        }
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             sizes[i] += galloc->buf_tallocs[i]->chunks[c]->max_size;
         }

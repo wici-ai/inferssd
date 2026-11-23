@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Grouped prefill over a ggml backend, for a GPU that shares host memory: see graph-lane.h.
 #include "graph-lane.h"
+#include "shared-memory.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -595,8 +596,11 @@ int elastic_preload(void *, const ssd_vram_request *, const void *, const void *
     *copied = 0;
     return 0;
 }
-const ssd_vram_elastic_api elastic_table = { 7, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
-    elastic_reserve, elastic_preload_slots, elastic_preload };
+// The lane's working memory is optional (a pass it cannot have runs on the CPU, reserve_pass): nothing a pass cannot
+// run without, so nothing to hold with the prompt's graph.
+int elastic_reserve_pass(void *, int, char *, size_t) { return 0; }
+const ssd_vram_elastic_api elastic_table = { 8, sizeof(ssd_vram_elastic_api), elastic_phase_complete, elastic_reserve_accumulate,
+    elastic_reserve, elastic_preload_slots, elastic_preload, elastic_reserve_pass };
 
 int host_available(void *) { return 0; }
 int host_launch(void *, const ssd_vram_host_job *, int, int * accepted, char *, size_t) { *accepted = 0; return 0; }
@@ -646,9 +650,8 @@ const ssd_vram_host_api host_table = { 3, sizeof(ssd_vram_host_api), host_availa
 
 const settings_api settings_table = { 2, sizeof(settings_api), sizeof(runtime_services), create_lane };
 
-// Whether the device's memory is the host's DRAM, which the host ledger then prices its buffers out of: an
-// integrated GPU, or a device whose backend says it shares host memory (Metal on Apple silicon). The lane is no GPU
-// tier either way: it holds no expert across layers.
+// Whether the device's memory is the host's DRAM, which the host ledger then prices its buffers out of
+// (shared-memory.h). The lane is no GPU tier either way: it holds no expert across layers.
 bool device_is_unified(int ordinal) {
     ggml_backend_dev_t device;
     {
@@ -656,10 +659,7 @@ bool device_is_unified(int ordinal) {
         if (ordinal < 0 || size_t(ordinal) >= devices.size()) { return false; }
         device = devices[size_t(ordinal)];
     }
-    if (ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_IGPU) { return true; }
-    const auto shares = reinterpret_cast<bool (*)(ggml_backend_dev_t)>(ggml_backend_reg_get_proc_address(
-        ggml_backend_dev_backend_reg(device), "ggml_backend_ssd_dev_shares_host_memory"));
-    return shares && shares(device);
+    return shares_host_memory(device);
 }
 bool attach_services(ggml_backend_t, const runtime_services *, char *, size_t) noexcept { return true; }
 void * no_stream(ggml_backend_t) { return nullptr; }

@@ -219,6 +219,21 @@
             "maximum": 17592186044415,
             "default": 0
         },
+        "kv.spill_directory": {
+            "description": "One local SSD directory for attention KV spill; empty keeps the cache in memory",
+            "kind": "paths",
+            "unit": "path",
+            "producer": "launch",
+            "scope": "all",
+            "cli": "--ssd-kv-spill-directory",
+            "default_literal": "[]",
+            "type": "array",
+            "items": {
+                "type": "string",
+                "minLength": 1
+            },
+            "default": []
+        },
         "model.engram_prefetch": {
             "description": "Read ahead DeepSeek Engram rows; changes I/O timing only",
             "kind": "integer",

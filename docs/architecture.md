@@ -58,10 +58,10 @@ The runtime extends the llama.cpp snapshot bundled under `engine/`: commit `8884
 | Core | `engine/ggml/src/ggml-ssd/io` | One read ring per OS (io_uring through system calls, IoRing, reader threads), an instance per reader; portable pread |
 | Core | `engine/ggml/src/ggml-ssd/host` | Process host arbiter, per-context leases, expert cache and page accounting |
 | Core | `engine/ggml/src/ggml-ssd/place` | Shared placement cost evaluation, learning state and prefetch decisions |
-| Core | `engine/ggml/src/ggml-ssd/stream` | Copies of the dense weights homed on the drive, their lookahead and observations |
+| Core | `engine/ggml/src/ggml-ssd/stream` | The weights a context keeps in host memory or on the drive, streamed to its GPU for each graph: the device ring their copies land in, ahead of their use, and their counters |
 | Core | `engine/ggml/src/ggml-ssd/settings`, `telemetry` | Immutable validated settings, source receipts and owned JSONL writers |
 | Executors | `engine/ggml/src/ggml-cpu/ssd`, `engine/ggml/src/ggml-cuda/ssd` | CPU scheduling and compute; the VRAM tier, staging, events and format kernels, built into the CUDA backend and, from the same sources, the HIP backend for AMD GPUs |
-| Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics; a model's facts from its headers alone (`--ssd-model-facts`), which the launch strategy reads |
+| Runtime | `engine/src/ssd` | Context assembly, backend registry binding, model sources, model adaptation, graph admission and diagnostics; a model's facts from its headers alone (`--ssd-model-facts`), which the launch strategy reads; where a model without routed experts keeps its layers (the GPU's memory as far as it has room, else pinned host memory within the host budget, else the drive) |
 | llama extensions | `engine/src/inferssd` | KV state codecs and positional state serialization |
 | Common | `engine/common/inferssd` | CLI glue, model chat parsing, reasoning budgets |
 | Server | `engine/tools/server/inferssd` | Prompt cache, checkpoints and request lifecycle |

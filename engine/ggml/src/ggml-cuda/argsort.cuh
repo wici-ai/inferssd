@@ -6,6 +6,7 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 size_t ggml_cuda_op_argsort_pool_size(const ggml_tensor * dst);
 
 #ifdef GGML_CUDA_USE_CUB
+bool ggml_cuda_reclaim_cub_query_oom();
 void argsort_f32_i32_cuda_cub(ggml_cuda_pool & pool,
                               const float *    x,
                               int *            dst,

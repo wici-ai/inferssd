@@ -70,6 +70,20 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    // the attention cache's cells, and the indexer's with them (idx_follow)
+    void set_commit(const commit_cb & commit) override;
+    bool set_kv_spill(const std::string & directory, uint32_t resident,
+                      const std::function<void(bool)> & synchronize) override;
+    std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override;
+    bool can_spill() const override {
+        return llama_memory_hybrid::can_spill() && (!mem_idx || mem_idx->can_spill());
+    }
+    bool cells_short(uint32_t n_tokens) const override;
+    bool reserve_cells(uint32_t n_tokens) override;
+    bool fit_cells(uint32_t n_tokens) override;
+    bool get_can_grow() const override;
+    uint32_t get_generation() const override;
+
     // state write/load
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -111,6 +125,10 @@ public:
     void mem_idx_stale_clear() { mem_idx_stale.fill(POS_CLEAN); }
 
 private:
+    // the indexer cache's cells set to the attention cache's; false (the attention cache back to the indexer's) when
+    // there is no memory for them
+    bool idx_follow();
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

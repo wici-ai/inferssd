@@ -50,6 +50,7 @@ extern "C" {
         GGML_BACKEND_BUFFER_USAGE_ANY = 0,
         GGML_BACKEND_BUFFER_USAGE_WEIGHTS = 1,
         GGML_BACKEND_BUFFER_USAGE_COMPUTE = 2,
+        GGML_BACKEND_BUFFER_USAGE_SSD_KV = 3, // CPU-mapped KV that accelerators must stage
     };
 
     GGML_API const char *                   ggml_backend_buffer_name          (ggml_backend_buffer_t buffer);
@@ -64,6 +65,7 @@ extern "C" {
     GGML_API bool                           ggml_backend_buffer_is_host       (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_set_usage     (ggml_backend_buffer_t buffer, enum ggml_backend_buffer_usage usage);
     GGML_API enum ggml_backend_buffer_usage ggml_backend_buffer_get_usage     (ggml_backend_buffer_t buffer);
+    GGML_API bool                           ggml_backend_tensor_is_ssd_kv     (const struct ggml_tensor * tensor);
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
@@ -317,7 +319,9 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
-    // Initialize backend buffers from a measure graph
+    // Initialize backend buffers from a measure graph. A graph with a pre-allocated tensor that no backend of its
+    // buffer can run is refused: reserve, prepare_graph and alloc_graph return false (reserve_size and split_graph,
+    // which return nothing, abort)
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success
 
@@ -360,28 +364,34 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_synchronize(ggml_backend_sched_t sched);
     GGML_API void                 ggml_backend_sched_ssd_set_profile_phase(ggml_backend_sched_t sched, int phase);
     GGML_API void                 ggml_backend_sched_ssd_set_dense_decode(ggml_backend_sched_t sched, bool decode);
-    // The copies of this context's weights homed on the drive (counters survive graph rebuilds): tensors, bytes, the
-    // time in the transport's copy (of it, in the copies not read ahead), the time waiting for the device before it,
-    // the copies whose blocks had been read ahead, the copies left to the mapped weight
+    // The copies of this context's streamed weights (counters survive graph rebuilds): tensors, bytes, the host time in
+    // the transport's calls that order them before their use, and the copies issued before their use
     struct ggml_backend_sched_ssd_copy_stats {
         uint64_t dense_tensors;
         uint64_t dense_bytes;
         uint64_t dense_read_us;
-        uint64_t dense_first_us;
-        uint64_t dense_wait_us;
         uint64_t dense_readahead;
-        uint64_t dense_fallbacks;
     };
     GGML_API void                 ggml_backend_sched_ssd_copy_stats_get(ggml_backend_sched_t sched, struct ggml_backend_sched_ssd_copy_stats * stats);
 
     // Same-build extension: borrowed from the owning context until the scheduler
     // is destroyed. ggml-base has no dependency on any SSD implementation/backend.
+    //
+    // A streamed weight is a weight in host memory whose matrix products a GPU runs at any batch size, its bytes
+    // copied in for each graph. stream_home: whether the weight (a matrix in a host buffer) is one. stream_place: the
+    // input copies of the graph's streamed weights, in the order the splits copy them, placed by the runtime (it
+    // allocates each one in memory of its own, which ggml-alloc then leaves alone); false leaves them to ggml-alloc and
+    // stream_copy is not called for them. stream_copy: the weight's bytes in its copy (item: its index in that order)
+    // before the work the backend queues next. stream_release: the work queued on the backend that reads the item's
+    // copy is all queued.
     struct ggml_backend_sched_ssd_hooks {
         uint32_t version;
         size_t size;
-        bool (*drive_home)(void *, const struct ggml_tensor *);
-        bool (*copy_dense)(void *, ggml_backend_t, const struct ggml_tensor *, struct ggml_tensor *,
-                           const struct ggml_tensor *, uint64_t);
+        bool (*stream_home)(void *, const struct ggml_tensor *);
+        bool (*stream_place)(void *, ggml_backend_t, const struct ggml_tensor * const *, struct ggml_tensor * const *,
+                             int);
+        bool (*stream_copy)(void *, ggml_backend_t, int);
+        void (*stream_release)(void *, ggml_backend_t, int);
         void (*phase)(void *, int);
         void (*stats)(void *, struct ggml_backend_sched_ssd_copy_stats *);
         void (*reset)(void *);

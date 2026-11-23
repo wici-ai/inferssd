@@ -2,6 +2,9 @@
 
 #include "ggml.h"
 
+#include <string>
+#include <vector>
+
 enum common_params_fit_status {
     COMMON_PARAMS_FIT_STATUS_SUCCESS = 0, // found allocations that are projected to fit
     COMMON_PARAMS_FIT_STATUS_FAILURE = 1, // could not find allocations that are projected to fit
@@ -14,7 +17,7 @@ enum common_params_fit_status {
 //   - only parameters that have the same value as in llama_default_model_params are modified
 //     with the exception of the context size which is modified if and only if equal to 0
 enum common_params_fit_status common_fit_params(
-                               const char   * path_model,
+    const std::vector<std::string>          & paths_model,
                 struct llama_model_params   * mparams,
                 struct llama_context_params * cparams,
                                       float * tensor_split,          // writable buffer for tensor split, needs at least llama_max_devices elements
@@ -25,7 +28,7 @@ enum common_params_fit_status common_fit_params(
 
 // print estimated memory to stdout
 void common_fit_print(
-                               const char   * path_model,
+    const std::vector<std::string>          & paths_model,
                 struct llama_model_params   * mparams,
                 struct llama_context_params * cparams);
 

@@ -91,7 +91,7 @@ for CUDA 12.9), and pass `-Backend cuda`; its archive ends in `-windows-x64-cuda
 
 The check extracts under a different path containing spaces and removes developer tools from
 PATH. It audits PE imports, loads the packaged Python's native dependencies, checks CLI/schema
-and CPU execution, exercises Gemma's RAM-admission contract, and starts/stops an owned local
+and CPU execution, and starts/stops an owned local
 HTTP fixture through the packaged Windows guardian/job runtime. It then installs the ZIP using
 the normal installer and verifies the installed command. No model weights are downloaded by
 these packaging checks, and they do not claim GPU/model quality or throughput validation.

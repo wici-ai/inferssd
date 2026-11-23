@@ -66,6 +66,11 @@ static void prefetch_contract() {
     check(near(prefetch_read_value(.6, 1000, 2000, 1000, {{500, 1}}), 0), "a read the window ends before its issue costs nothing");
     check(near(prefetch_read_value(.9, 0, 1000, 1000, {{500, 1}, {1500, 1}, {2500, 1}}), (-.1 + .4 + .9) / 3),
           "a read in flight behind others: queued, half read and read windows");
+    check(near(prefetch_read_value(.25, 0, 0, 1000, {{600, 1}}, .6), .03), "a partial wrong read competes only when the target has demand");
+    check(near(prefetch_read_value(.25, 0, 1000, 1000, {{500, 1}}, .6), -.3), "a queued wrong read competes at its full remaining length when there is demand");
+    check(near(prefetch_read_value(1, 0, 0, 1000, {{600, 1}}, 1), .6), "a sure hit saves the completed part");
+    check(near(prefetch_read_value(.25, 0, 0, 1000, long_windows, 1), .25), "a finished read gets its original benefit");
+    check(near(prefetch_read_value(.25, 1000, 1000, 1000, {{500, 1}}, 1), 0), "an unissued read costs nothing");
     check(best_read_run({.5, -.2, -.2, .6}) == 4 && best_read_run({.5, -.4, .1}) == 1 && best_read_run({-.1, .3}) == 2 &&
           best_read_run({-.1}) == 0 && best_read_run({}) == 0, "a plan keeps the run of reads worth the most");
     check(near(prefetch_use_probability(0, 0), .5) && near(prefetch_use_probability(9, 10), 10.0 / 12),
@@ -119,13 +124,15 @@ static void calibration_contract() {
     prefill_feedback f = {}; f.gpu.add(1,20); f.gpu.add(2,30); f.ntokens = 32;
     f.read_bytes = 1000000; f.read_us = 100; f.engine_overhead_us = 10; f.output_add_us = 3; f.transient_wait_us = 7;
     auto fit = observe_prefill_lines(s,cost,prior,f);
-    check(fit.gpu_lane_us == 57 && fit.gpu_overhead_us == 13 && s.samples.size() == 1 && s.calibrations == 0,
+    check(fit.gpu_lane_us == 57 && fit.gpu_overhead_us == 13 && s.cpu.items.size() == 1 && s.gpu.items.size() == 1 &&
+        s.calibrations == 0,
         "event overhead excludes transient waits and defers publication count until overhead fit");
     observe_prefill_overhead(s,cost,fit.overhead,.1);
     check(s.calibrations == 1 && near(cost.gpu_overhead_fixed_us,9.8) && cost.gpu_token_us == .1, "one row count keeps transfer prior and fits fixed part");
     f.ntokens = 64; f.engine_overhead_us = 20; fit = observe_prefill_lines(s,cost,prior,f); observe_prefill_overhead(s,cost,fit.overhead,.1);
     f.ntokens = 128; f.engine_overhead_us = 40; fit = observe_prefill_lines(s,cost,prior,f); observe_prefill_overhead(s,cost,fit.overhead,.1);
-    check(s.samples.size() == 2 && s.next == 1 && fit.overhead.min_tokens == 64 && fit.overhead.max_tokens == 128,
+    check(s.gpu.items.size() == 2 && s.gpu.next == 1 && s.overhead.items.size() == 2 && fit.overhead.min_tokens == 64 &&
+        fit.overhead.max_tokens == 128,
         "calibration expiry is the existing per-pass circular window");
     f.gpu = {}; f.engine_overhead_us = 0; f.upload_us = 4; f.ssd_upload_us = 6; f.total_worker_us = 50; f.read_wait_us = 10;
     fit = observe_prefill_lines(s,cost,prior,f);
@@ -142,10 +149,33 @@ static void calibration_contract() {
     lane_measurement measured = {2, 3, 4, 5, 1, 100, 200, 7, true};
     lane_geometry lane = {4096, 2048, true, true};
     const auto t = make_table(none, prior, idle, d, measured, lane, 32, 0);
-    check(d.samples.size() == 4 && near(t.drive_us_per_mb, 100) && t.drive_fixed_us == 0,
+    check(d.reads.us == 1e5 && near(t.drive_us_per_mb, 100) && t.drive_fixed_us == 0,
         "the drive's line follows the newest grouped-prefill layer with reads");
 }
+// A line learns only from the layers that measured it. A request's last short pass keeps every expert on the CPU,
+// layer after layer; counted as samples, its layers pushed the GPU lane's out of the window, and the next layers that
+// ran one-route experts on the lane were left to price it alone: the prior's shape scaled to 450 us an expert, about
+// 100 us a route, so the next prompt kept its experts on the CPU.
+static void lane_window_contract() {
+    prefill_learning s; s.window = 4; cost_lines prior, cost;
+    prefill_feedback wide = {}; wide.ntokens = 2048;
+    for (const double x : {100.0, 300.0, 1000.0, 3000.0}) { wide.host.add(x, 100 + 0.94 * x); }
+    for (int i = 0; i < 4; ++i) { s.cpu_fit = {}; s.cpu_fit.add(10, 200); (void) observe_prefill_lines(s, cost, prior, wide); }
+    check(std::fabs(cost.gpu_host_route_us - 0.94) < 0.02 && std::fabs(cost.gpu_host_fixed_us - 100) < 20,
+        "a wide pass fits the lane's line");
+    const double fixed = cost.gpu_host_fixed_us, route = cost.gpu_host_route_us;
+    prefill_feedback tail = {}; tail.ntokens = 4;
+    for (int i = 0; i < 4; ++i) { s.cpu_fit = {}; s.cpu_fit.add(1, 50); (void) observe_prefill_lines(s, cost, prior, tail); }
+    check(cost.gpu_host_fixed_us == fixed && cost.gpu_host_route_us == route && s.gpu_host.items.size() == 4,
+        "a pass without lane work leaves the lane's line and samples");
+    prefill_feedback one = {}; one.ntokens = 1;
+    for (int i = 0; i < 8; ++i) { one.host.add(1, 450); }
+    s.cpu_fit = {}; (void) observe_prefill_lines(s, cost, prior, one);
+    check(cost.gpu_host_route_us > 0.5 && cost.gpu_host_route_us < 1.5 &&
+        cost.gpu_host_fixed_us + 300 * cost.gpu_host_route_us < 1000,
+        "a layer of one-route experts after it does not set the lane's slope");
+}
 int main() {
-    learning_contract(); prefetch_contract(); placement_contract(); calibration_contract();
+    learning_contract(); prefetch_contract(); placement_contract(); calibration_contract(); lane_window_contract();
     std::puts("RUNTIME_POLICY_PASS learning placement prefetch calibration");
 }

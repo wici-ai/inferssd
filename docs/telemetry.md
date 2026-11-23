@@ -34,6 +34,11 @@ The SSD core reads only two environment variables, both in
 never placement, numerical kernels or policy. There is no process-global mutable
 settings or telemetry owner.
 
+With `--ssd-no-layer-events` the writer publishes the two lines below and the
+executors get no writer: they publish no `ssd.place.layer`, `ssd.prefill.layer` or
+`ssd.prefill.graph`, and skip the measuring that only those events use. A debug
+channel that traces or profiles still writes its events.
+
 The server option `--ssd-telemetry FILE` creates the context-owned writer; all
 publishers are joined before it is destroyed. The writer publishes the effective
 settings first, then `ssd.controller.begin` (see

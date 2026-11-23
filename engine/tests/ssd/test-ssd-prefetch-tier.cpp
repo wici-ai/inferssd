@@ -55,12 +55,13 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
         [](void *, const int32_t *, int, char *, size_t) { return 0; },
         [](void *, int32_t, const void *, const void *, const void *, char *, size_t) { return 0; },
         [](void *, int32_t, char *, size_t) { return 0; } };
-    static const ssd_vram_elastic_api elastic = { 7, sizeof(ssd_vram_elastic_api),
+    static const ssd_vram_elastic_api elastic = { 8, sizeof(ssd_vram_elastic_api),
         [](void *, int, char *, size_t) { return 0; }, [](void *, int, char *, size_t) { return 0; },
         [](void *, char *, size_t) { return 0; },
         [](void *, int * slots, char *, size_t) { *slots = 0; return 0; },
         [](void *, const ssd_vram_request *, const void *, const void *, const void *, int * copied, char *, size_t) {
-            *copied = 0; return 0; } };
+            *copied = 0; return 0; },
+        [](void *, int, char *, size_t) { return 0; } };
     static const ssd_vram_deferred_api deferred = { 3, sizeof(ssd_vram_deferred_api),
         [](void *, const ssd_vram_request *, const void *, const void *, const void *, int * queued, char * e, size_t n) {
             *queued = 0; return refuse(nullptr, e, n); },
@@ -79,7 +80,7 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
     static const ssd::gpu::testing::api testing = { 3, sizeof(ssd::gpu::testing::api),
         [](uint64_t, const ssd::gpu::testing::tier_options *, char *, size_t) noexcept -> void * {
             return &tier_context; } };
-    static const ssd::gpu::transport_v1 transport = {};
+    static const ssd::gpu::transport_v2 transport = {};
     static const ssd::gpu::provider_v1 provider = { 2, sizeof(ssd::gpu::provider_v1), &api, &residency, &format,
         &prefill, &elastic, &deferred, &host, &policy, &settings, &testing, &transport,
         [](int) { return false; }, [](ggml_backend_t) { return 0; },

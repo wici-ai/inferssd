@@ -80,8 +80,8 @@ def test_decode_pool_not_prefill_pool_prices_cpu_work():
     c, rt = setup()
     rt = replace(rt, gpus=())
     threads, _, _ = placement(c, MODEL.facts, rt, [])
-    line, _ = cpu_line(c, MODEL.facts, threads.decode)
-    expected = MODEL.facts.layers * MODEL.facts.experts_used * sum(line) / 1000
+    line, _ = cpu_line(c, MODEL.facts.experts, threads.decode)
+    expected = MODEL.facts.experts.layers * MODEL.facts.experts.used * sum(line) / 1000
     assert estimate(c, rt).components["cpu_experts_ms"] == pytest.approx(expected)
 
 
@@ -91,7 +91,7 @@ def test_inclusive_caches_are_not_added_and_reserves_reduce_capacity():
     comp = value.components
     coverage = max(comp["host_cache_capacity_bytes"], comp["gpu_cache_capacity_bytes"])
     assert comp["uniform_storage_miss_fraction"] == pytest.approx(
-        1 - coverage / MODEL.facts.routed_bytes
+        1 - coverage / MODEL.facts.experts.routed_bytes
     )
     reserved = estimate(c, rt, host_work_bytes=2 * GIB, gpu_work_bytes=4 * GIB)
     assert (
@@ -183,7 +183,7 @@ def test_cpu_decode_does_not_need_prefill_measurements_and_prices_mixed_types():
     c, _ = setup()
     rows = [synthetic_row("MXFP4", rate=100e9), synthetic_row("Q8_0", rate=50e9)]
     c["compute"]["cpu"] = rows
-    facts = MODEL.facts
+    facts = MODEL.facts.experts
     q8_0 = facts.gate.rows * facts.gate.cols // 32 * 34
     mixed_gate = replace(
         facts.gate,
@@ -264,9 +264,9 @@ def test_flash_next_is_priced_with_the_formats_it_borrows_named():
     )
 
 
-def test_a_ram_only_model_reads_its_dense_weights_once_a_token():
+def test_a_dense_model_reads_its_dense_weights_once_a_token():
     c, rt = setup()
-    gemma = next(model for model in catalog.MODELS if model.facts is None)
+    gemma = next(model for model in catalog.MODELS if model.facts.experts is None)
     on_gpu = dense_decode_estimate(c, gemma.dense_read_bytes, rt)
     assert on_gpu.tokens_per_second == pytest.approx(500e9 / gemma.dense_read_bytes)
     low, high = on_gpu.scenario_range

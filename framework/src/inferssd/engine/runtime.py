@@ -11,10 +11,8 @@ from functools import partial
 from typing import Optional
 
 from inferssd.configuration.settings import Snapshot
-from inferssd.engine import model as engine_model
 from inferssd.engine.core import Engine, NativeEffects
 from inferssd.engine.owned import OwnedProcess
-from inferssd.launch import ram
 from inferssd.launch.live import Host, LiveArtifacts
 from inferssd.launch.machine import MachineSource
 from inferssd.launch.machine import characteristics as machine_characteristics
@@ -60,24 +58,10 @@ class Runtime:
             resources = specification.resources
             binary = server_binary(platform, specification.binary, resources, repo, os.path.isfile)
             binary = os.path.realpath(binary) if binary else None
-            if binary and self.ordinary(binary, specification.model):
-                # Ordinary models need a live RAM check, not expert/SSD calibration.
-                self.characteristics_text = (None,)
-                return None
             probes = probe_paths(platform, binary, resources, repo, os.path.isfile)
             text = machine_characteristics(self.machine, platform, specification.model, probes)
             self.characteristics_text = (text,)
         return self.characteristics_text[0]
-
-    def ordinary(self, binary: str, model: str) -> bool:
-        """Whether MODEL is an ordinary RAM profile, as the engine BINARY reads it."""
-        try:
-            facts = engine_model.query(
-                binary, model, lambda argv: self.host.command(argv, timeout=engine_model.TIMEOUT_S)
-            )
-        except ValueError:
-            return False  # Normal preparation reports invalid/missing model inputs.
-        return bool(facts["architecture"] == ram.ARCHITECTURE)
 
     def resolve(
         self,
@@ -112,7 +96,6 @@ class Runtime:
                 directory=directory,
                 memory=self.policy.memory_budget_bytes,
                 configured=configured,
-                reserve=self.policy.host_reserve_bytes or 0,
             ),
             observe=adapter,
             emit=self.emit,

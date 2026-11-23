@@ -12,7 +12,8 @@
   <a href="https://wici.ai/research"><b>Blog</b></a> &nbsp;·&nbsp;
   <a href="https://discord.gg/wici"><b>Discord</b></a> &nbsp;·&nbsp;
   <a href="https://join.slack.com/t/wici-ai/shared_invite/zt-4f2e7ob2s-9nUg35Phqyqt4EI6qUjw5w"><b>Slack</b></a> &nbsp;·&nbsp;
-  <a href="LICENSE">Apache-2.0</a>
+  <a href="LICENSE">Apache-2.0</a> &nbsp;·&nbsp;
+  <a href="docs/README.zh-CN.md">简体中文</a>
 </p>
 <p align="center">macOS (Metal) &nbsp;·&nbsp; Windows 10/11 (CUDA · Vulkan · ROCm in progress) &nbsp;·&nbsp; Linux (CUDA · ROCm · Vulkan in progress)</p>
 
@@ -52,16 +53,20 @@ mrfakename's Q8_0 keeps the official bit widths: routed experts stay native 4-bi
 </details>
 
 <details>
-<summary><b>Qwen3.8 Flash Next</b> · 177B total / A3B · 10 GGUFs</summary>
+<summary><b>Qwen3.8 Flash Next</b> · 177B total / A3B · 14 GGUFs</summary>
 
 | Quantization | Publisher | Size (GB) |
 | --- | --- | ---: |
 | [UD-IQ1_S](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_S) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 66.4 |
+| [Q2_0](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/Q2_0) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 66.4 |
 | [UD-IQ1_M](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ1_M) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 68.0 |
+| [IQ2_XS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ2_XS) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 68.0 |
 | [UD-Q2_0](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q2_0) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 70.5 |
 | [UD-IQ2_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ2_XS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 75.8 |
+| [IQ3_XXS](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_XXS) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 75.8 |
 | [UD-Q2_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q2_K_XL) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 79.6 |
 | [UD-IQ3_XXS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ3_XXS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 83.6 |
+| [IQ3_S](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF/tree/main/IQ3_S) | [ISTA-DASLab](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | 83.6 |
 | [UD-Q3_K_XL](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-Q3_K_XL) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 89.5 |
 | [UD-IQ4_XS](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/tree/main/UD-IQ4_XS) | [Unsloth](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | 93.7 |
 | [IQ4_XS](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF/tree/main/Qwen3.8-Flash-Next-IQ4_XS) | [Bartowski](https://huggingface.co/bartowski/Qwen3.8-Flash-Next-GGUF) | 97.7 |

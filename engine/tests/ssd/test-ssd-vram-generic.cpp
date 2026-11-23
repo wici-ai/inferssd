@@ -139,9 +139,11 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
 
 } // namespace
 
-int main() {
+int main(int argc, char ** argv) {
     fixture_inputs inputs; inputs.set_runtime_services(test_gpu_services());
     try {
+        const bool dsv41_iq = argc == 2 && std::string(argv[1]) == "--dsv41-iq";
+        require(argc == 1 || dsv41_iq, "usage: test-ssd-vram-generic [--dsv41-iq]");
         ggml_cpu_init();
         inputs.set("ready_first", "1");
         inputs.set("cache_policy", "lru");
@@ -155,6 +157,18 @@ int main() {
         size_t checks = 0;
         double worst_rel = 0.0;
         double worst_abs = 0.0;
+        if (dsv41_iq) {
+            // Check the decode MMVQ adapter through the actual sink and tier,
+            // including cache hits, mixed CPU/GPU reduction and mixed roles.
+            for (const ggml_type type : {GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+                    GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS}) {
+                run_shape(inputs, 512, 256, 8, {true, "deepseek-mixed-iq"}, checks, worst_rel,
+                    worst_abs, GGML_TYPE_IQ2_XS, type);
+            }
+            std::printf("DSV41_IQ_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",
+                checks, worst_rel, worst_abs);
+            return 0;
+        }
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K);
         run_shape(inputs, 512, 256, 8, {true, "production-generic"}, checks, worst_rel, worst_abs, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0);
         // Qwen3.8-Flash-Next: a hidden of 640, whole Q8_0 blocks but not whole K-quant super-blocks.

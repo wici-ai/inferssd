@@ -215,6 +215,9 @@ int main() {
         return 0;
     }
     if (provider->prefill->transient_available(lane)) { fail("no expert may move before the pass reserved its memory"); }
+    // the lane's working memory is optional, so a prompt graph's reserve holds none of it for the pass
+    if (provider->elastic->reserve_pass(lane, tokens, error, sizeof(error))) { fail(error); }
+    if (provider->prefill->transient_available(lane)) { fail("a prompt graph's reserve took the lane's optional memory"); }
     if (provider->elastic->reserve_accumulate(lane, tokens, error, sizeof(error))) { fail(error); }
     if (!provider->prefill->transient_available(lane)) { fail("the pass's memory was not reserved"); }
 

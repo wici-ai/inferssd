@@ -97,6 +97,10 @@ GGML_BACKEND_API bool ssd_cpu_sink_vram_phase_complete(
 // Reserve the GPU batch accumulator for this actual ubatch before streamed I/O begins.
 GGML_BACKEND_API bool ssd_cpu_sink_vram_reserve_accumulator(
         struct ssd_cpu_sink * sink, int tokens, char * error, size_t error_size);
+// As a prompt graph of `tokens` tokens is reserved, before it takes its room: the GPU tier's working memory a pass of
+// that many tokens cannot run without, held at that size. False refuses the graph (a smaller ubatch is tried).
+GGML_BACKEND_API bool ssd_cpu_sink_vram_reserve_pass(
+        struct ssd_cpu_sink * sink, int tokens, char * error, size_t error_size);
 // At load, after the context reserved its worst-case graph: on unified memory the GPU tier takes its storage for the
 // routed experts (slots of the largest format) and grows into what the host-memory ledger leaves, after the RAM
 // cache's demand; elsewhere (with a GPU tier or without) a RAM cache kept across requests that can give room back

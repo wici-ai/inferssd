@@ -14,6 +14,7 @@
 #include <functional>
 #include <map>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 struct llama_model;
@@ -27,7 +28,7 @@ struct llama_memory_i;
 struct llama_memory_context_i;
 struct llama_memory_params;
 
-// The copies of the weights homed on the drive in one phase of a request (the [dense_stream] line): the prefill from
+// The copies of the streamed weights in one phase of a request (the [dense_stream] line): the prefill from
 // the request's start to its end, the decode from there to the request's end.  begin when the phase starts, add the
 // tokens of each ubatch, end when it ends with the scheduler's counters then.  end returns the line, without a
 // newline, and nothing for a phase that copied no such weight.
@@ -285,7 +286,9 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     // `admitted`: what runs once the host ledger has given the graph its room, before its buffers are allocated.
-    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {});
+    // pass_tokens: the tokens of the prompt pass the graph is reserved for, whose executor memory is held with it (0: none)
+    bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {},
+        uint32_t pass_tokens = 0);
 
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);
@@ -307,7 +310,18 @@ private:
 
     // The context, a multiple of 8192 up to the trained one, whose KV cache memory still fits when full (n_ctx 0 with
     // SSD experts, whose KV cache allocates its cells as they are used).
-    uint32_t fit_context(const llama_memory_params & params_mem) const;
+    uint32_t fit_context(const llama_memory_params & params_mem, const std::string & spill_directory,
+                         uint32_t & resident_cells) const;
+    uint32_t kv_spilled_caches = 0;
+    bool kv_default_pipeline = false;
+
+    // The layers' matrices the model homes in host memory (llama_dense_homes) with an SSD context on a GPU that
+    // streams: the GPU holds those its memory has room for once the graph is reserved, ahead of the expert caches, and
+    // gives layers back when the KV cache grows past what the expert caches can give (they stream from then on).
+    void hold_dense_layers();
+    bool give_dense_layers(size_t bytes);
+    // the streamed layers' pinned host copies, as far as the context's host budget has room
+    void pin_dense_layers();
     // the memory's generation the reserved graphs were sized for (llama_memory_i::get_generation)
     uint32_t memory_generation_reserved = 0;
     // smallest reserve horizon (n_ubatch times a power of two, at most n_ctx) that holds n_pos
@@ -351,6 +365,9 @@ private:
     uint32_t cpu_prefill_configured_ubatch = 0;
     uint32_t cpu_prefill_selected_ubatch = 0;
     uint32_t cpu_prefill_graph_granularity = 1;
+    // The names of the decode graph's nodes the scheduler runs on a GPU, and nowhere else: a prompt's graph has to run
+    // them on the GPU as well (reserve_compute_graph).
+    std::unordered_set<std::string> decode_gpu_nodes;
     // A prefill phase's graph not yet reserved: its first ubatch reserves it (process_ubatch), over this horizon, for
     // a prompt of this many tokens.
     bool cpu_prefill_reserve_pending = false;

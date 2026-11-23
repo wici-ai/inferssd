@@ -127,13 +127,34 @@ def test_build_layout_is_revision_bound_and_copied(binding):
 
 def test_the_reviewed_generation_is_exactly_the_installed_registry(binding, monkeypatch):
     properties = settings_registry.schema()["properties"]
-    assert reference.SETTING_GENERATIONS == (frozenset(properties),)
+    current = frozenset(properties)
+    assert reference.SETTING_GENERATIONS == (current - {"kv.spill_directory"}, current)
     assert set(binding["semantic_settings"]) == reference.SETTING_KEYS
     unreviewed = copy.deepcopy(settings_registry.schema())
     del unreviewed["properties"]["host.budget_mib"]
     monkeypatch.setattr(settings_registry, "schema", lambda: unreviewed)
     with pytest.raises(ValueError, match="reviewed settings schema"):
         reference.validate_semantics(binding["semantic_settings"])
+
+
+def test_reviewed_pre_spill_binding_can_still_compare(bound_pair, binding, policy):
+    key = "kv.spill_directory"
+    del binding["semantic_settings"][key]
+    del binding["legacy_mapping"][key]
+    del binding["sides"]["candidate"]["launch_policy"]["typed_values"][key]
+    del bound_pair[3]["host"]["effective_settings"]["native_launch_policy"]["typed_values"][key]
+    assert compare.compare_pair(*bound_pair, policy, comparison_binding=binding)["passed"]
+
+
+def test_legacy_binding_requires_spill_disabled(binding):
+    key = "kv.spill_directory"
+    assert binding["semantic_settings"][key] == []
+    enabled = ["/ssd"]
+    binding["semantic_settings"][key] = enabled
+    binding["sides"]["candidate"]["launch_policy"]["typed_values"][key] = enabled
+    binding["legacy_mapping"][key]["value"] = enabled
+    with pytest.raises(ValueError, match=r"require kv\.spill_directory = \[\]"):
+        reference.validate_binding(binding)
 
 
 def test_muse_checkpoint_binding_keeps_the_complete_typed_snapshot(binding, bound_pair, policy):

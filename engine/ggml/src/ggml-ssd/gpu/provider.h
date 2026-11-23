@@ -22,7 +22,7 @@ struct provider_v1 {
     const ssd_vram_policy_api * policy;
     const settings_api * settings;
     const testing::api * testing;
-    const transport_v1 * transport;
+    const transport_v2 * transport;
     bool (*device_is_unified)(int);
     int (*device_ordinal)(ggml_backend_t);
     bool (*attach_services)(ggml_backend_t, const runtime_services *, char *, size_t) noexcept;

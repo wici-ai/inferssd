@@ -44,10 +44,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         type_k, type_v, v_trans, kv_size, n_pad, n_swa, swa_type,
         type_r, type_s, rs_size,
         n_seq_max, offload, unified,
-        filter_attn, filter_recr,
-        // the indexer cache takes the attention cache's cells (mirrored slot layouts) and sizes its pools by them,
-        // so both hold all of their cells from the start
-        /*attn_n_grow =*/ 0),
+        filter_attn, filter_recr),
     hparams_idx(model.hparams),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
@@ -65,11 +62,76 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
 
         LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
 
+        // The indexer takes the attention cache's cells (mirrored slot layouts), so it holds at least as many: it grows
+        // with the attention cache (idx_follow), and holds every cell from the start when that cache does.
         return new llama_kv_cache(
             model, hparams_idx, type_k, type_v, v_trans, offload, unified,
             kv_size, n_seq_max, n_pad, n_swa, swa_type,
-            filter_idx, nullptr, "idx_", /*n_grow =*/ 0);
-    }()) {}
+            filter_idx, nullptr, "idx_",
+            get_mem_attn()->get_can_grow() ? llama_kv_cache::n_grow_default : 0);
+    }()) {
+    GGML_ASSERT(!mem_idx || mem_idx->get_size() >= get_mem_attn()->get_size());
+}
+
+void llama_memory_hybrid_idx::set_commit(const commit_cb & commit) {
+    llama_memory_hybrid::set_commit(commit);
+    if (mem_idx) {
+        mem_idx->set_commit(commit);
+    }
+}
+
+bool llama_memory_hybrid_idx::set_kv_spill(const std::string & directory, uint32_t resident,
+                                          const std::function<void(bool)> & synchronize) {
+    return llama_memory_hybrid::set_kv_spill(directory, resident, synchronize) &&
+           (!mem_idx || mem_idx->set_kv_spill(directory, resident, synchronize));
+}
+
+std::map<ggml_backend_dev_t, size_t> llama_memory_hybrid_idx::kv_stage_bytes() const {
+    auto result = llama_memory_hybrid::kv_stage_bytes();
+    if (mem_idx) {
+        for (const auto & [device, bytes] : mem_idx->kv_stage_bytes()) {
+            result[device] += bytes;
+        }
+    }
+    return result;
+}
+
+bool llama_memory_hybrid_idx::cells_short(uint32_t n_tokens) const {
+    return llama_memory_hybrid::cells_short(n_tokens) || (mem_idx && mem_idx->cells_short(n_tokens));
+}
+
+bool llama_memory_hybrid_idx::reserve_cells(uint32_t n_tokens) {
+    const bool attn = llama_memory_hybrid::reserve_cells(n_tokens);
+    return idx_follow() && attn;
+}
+
+bool llama_memory_hybrid_idx::fit_cells(uint32_t n_tokens) {
+    const bool attn = llama_memory_hybrid::fit_cells(n_tokens);
+    return idx_follow() && attn;
+}
+
+bool llama_memory_hybrid_idx::get_can_grow() const {
+    return llama_memory_hybrid::get_can_grow() && (!mem_idx || mem_idx->get_can_grow());
+}
+
+uint32_t llama_memory_hybrid_idx::get_generation() const {
+    return llama_memory_hybrid::get_generation() + (mem_idx ? mem_idx->get_generation() : 0);
+}
+
+// The indexer holds the cells the attention cache holds, cell j one token in both: grown to them, and the ones past them
+// given back. Without memory for its growth, the attention cache gives back the cells it just took, which hold nothing.
+bool llama_memory_hybrid_idx::idx_follow() {
+    if (!mem_idx) {
+        return true;
+    }
+    const uint32_t n = get_mem_attn()->get_size();
+    mem_idx->trim_cells(n);
+    if (mem_idx->grow_cells(n)) {
+        return true;
+    }
+    get_mem_attn()->trim_cells(mem_idx->get_size());
+    return false;
+}
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -278,6 +340,10 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
+                // the attention restore may have grown its cells, which the mirrored layout points into
+                if (!idx_follow()) {
+                    throw std::runtime_error("no memory for the indexer cache's cells");
+                }
                 mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
                 // a restore that rewrites cells does it behind the pool layout's back
                 if (!sinfos_attn.empty()) {

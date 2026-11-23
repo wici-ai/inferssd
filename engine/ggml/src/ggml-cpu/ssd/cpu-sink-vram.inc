@@ -131,9 +131,9 @@ struct sink_vram {
         }
         if (configuration.gpu.elastic) {
             elastic = configuration.gpu.elastic;
-            if (!elastic || elastic->version != 7 || elastic->size != sizeof(*elastic) ||
+            if (!elastic || elastic->version != 8 || elastic->size != sizeof(*elastic) ||
                     !elastic->phase_complete || !elastic->reserve_accumulate || !elastic->reserve ||
-                    !elastic->preload_slots || !elastic->preload) {
+                    !elastic->preload_slots || !elastic->preload || !elastic->reserve_pass) {
                 throw std::runtime_error("GPU tier elastic lifecycle ABI mismatch");
             }
         }
@@ -257,6 +257,13 @@ struct sink_vram {
         if (!context || !elastic || !prefill_enabled) { return; }
         char error[512] = {};
         check(elastic->reserve_accumulate(context, tokens, error, sizeof(error)), error);
+    }
+    // The working memory a pass of `tokens` tokens cannot run without, held at that size while its prompt graph is
+    // reserved (ssd_vram_elastic_api reserve_pass).
+    void reserve_pass(int tokens) {
+        if (!context || !elastic || !prefill_enabled) { return; }
+        char error[512] = {};
+        check(elastic->reserve_pass(context, tokens, error, sizeof(error)), error);
     }
     // At load (unified memory): the tier's storage before any request, for the declared layout's experts.
     void reserve() {
@@ -713,13 +720,15 @@ struct sink_vram {
         ssd::place::observe_prefill_overhead(learning, cost, overhead, overhead_row_prior(table().locked_us_per_mb));
         const ssd_place_table t = table();
         std::fprintf(stderr,
-            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu cpu_fixed_us=%.3f cpu_route_us=%.3f "
+            "[ssd_cpu_prefill_cost] calibrated=%llu tokens=%d samples=%zu gpu_samples=%zu gpu_host_samples=%zu "
+            "cpu_fixed_us=%.3f cpu_route_us=%.3f "
             "gpu_fixed_us=%.3f gpu_route_us=%.3f gpu_host_fixed_us=%.3f gpu_host_route_us=%.3f link_gbps=%.3f "
             "pageable_gbps=%.3f drive_gbps=%.3f drive_fixed_us=%.3f gpu_overhead_fixed_us=%.3f gpu_token_us=%.3f "
             "gpu_overhead_samples=%.0f gpu_overhead_min_tokens=%d gpu_overhead_max_tokens=%d cpu_one_us=%.1f "
             "predicted_us=%.1f measured_us=%.1f cpu_predicted_us=%.1f cpu_us=%.1f gpu_predicted_us=%.1f gpu_us=%.1f "
             "drive_predicted_us=%.1f drive_us=%.1f gpu_overhead_predicted_us=%.1f gpu_overhead_us=%.1f\n",
-            (unsigned long long) learning.calibrations, plan.ntokens, learning.samples.size(),
+            (unsigned long long) learning.calibrations, plan.ntokens, learning.cpu.items.size(),
+            learning.gpu.items.size(), learning.gpu_host.items.size(),
             cost.cpu_fixed_us, cost.cpu_route_us, cost.gpu_fixed_us, cost.gpu_route_us, cost.gpu_host_fixed_us,
             cost.gpu_host_route_us, t.locked_us_per_mb > 0 ? 1e3 / t.locked_us_per_mb : 0.0,
             t.pageable_us_per_mb > 0 ? 1e3 / t.pageable_us_per_mb : 0.0, t.drive_us_per_mb > 0 ? 1e3 / t.drive_us_per_mb : 0.0,

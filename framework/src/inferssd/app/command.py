@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from inferssd.app.hub import download, selection
-from inferssd.configuration.settings import host_platform
+from inferssd.configuration.settings import host_platform, schema
 from inferssd.launch import typed_command
 from inferssd.launch.resources import data_directory, installed_resources, read_resources
 from inferssd.launch.typed import LOOPBACK, connect_host, listen_host
@@ -20,17 +20,29 @@ from inferssd.platform.windows import win32
 
 
 def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    setting_names = ", ".join(schema()["properties"])
     for mode in ("cli", "serve"):
         parser = commands.add_parser(
             mode,
             help="download a tested GGUF and "
             + ("chat in the terminal" if mode == "cli" else "start the OpenAI-compatible API"),
+            epilog=f"Typed settings for --set: {setting_names}.",
         )
         source = parser.add_mutually_exclusive_group(required=True)
         source.add_argument(
             "-hf", "--hf-repo", help="README Hugging Face repository[:quantization]"
         )
         source.add_argument("-m", "--model", type=Path, help="local first GGUF shard (no download)")
+        parser.add_argument(
+            "--ple",
+            "--shard",
+            dest="shards",
+            action="append",
+            default=[],
+            metavar="FNAME,...",
+            help="extra GGUF shards of the model, comma separated, repeatable: a per-layer "
+            "embedding table kept apart from the model, say",
+        )
         parser.add_argument("--revision", default="main", help="Hugging Face revision")
         parser.add_argument("--model-dir", type=Path, default=data_directory() / "models")
         parser.add_argument(
@@ -65,6 +77,18 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
         )
         parser.add_argument("--machine", type=Path, help=argparse.SUPPRESS)
         parser.add_argument("--reprofile", action="store_true")
+        parser.add_argument(
+            "--prompt-cache-mib",
+            type=int,
+            metavar="N",
+            help="size limit of each model's prompt cache on disk, in MiB",
+        )
+        parser.add_argument(
+            "--layer-events",
+            action="store_true",
+            help="record the engine's event for each layer in the run's events file, for "
+            "measuring; left out by default, since a server left running writes them without end",
+        )
         if mode == "cli":
             parser.add_argument("-p", "--prompt", help="answer one prompt and exit")
             parser.add_argument("-n", "--max-tokens", type=int, default=512)
@@ -150,6 +174,8 @@ def run(args: argparse.Namespace) -> int:
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
+    for shard in args.shards:
+        command.extend(["--shard", shard])
     if args.context is not None:
         command.extend(["--context", str(args.context)])
     for name in ("settings", "machine"):
@@ -159,6 +185,11 @@ def run(args: argparse.Namespace) -> int:
         command.extend(["--set", value])
     if args.reprofile:
         command.append("--reprofile")
+    if args.prompt_cache_mib is not None:
+        command.extend(["--prompt-cache-mib", str(args.prompt_cache_mib)])
+    # serve and cli run for a person, for as long as they like: without the per-layer events.
+    if not args.layer_events:
+        command.append("--no-layer-events")
     launch = parser.parse_args(command)
     if args.command == "serve":
         print(f"Starting API at http://{connect_host(host)}:{args.port}/v1", file=sys.stderr)

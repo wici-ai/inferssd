@@ -73,6 +73,12 @@ public:
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void set_commit(const commit_cb & commit) override { mem_attn->set_commit(commit); }
+    bool set_kv_spill(const std::string & directory, uint32_t resident,
+                      const std::function<void(bool)> & synchronize) override {
+        return mem_attn->set_kv_spill(directory, resident, synchronize);
+    }
+    std::map<ggml_backend_dev_t, size_t> kv_stage_bytes() const override { return mem_attn->kv_stage_bytes(); }
+    bool can_spill() const override { return mem_attn->can_spill(); }
     bool cells_short(uint32_t n_tokens) const override { return mem_attn->cells_short(n_tokens); }
     bool reserve_cells(uint32_t n_tokens) override { return mem_attn->reserve_cells(n_tokens); }
     bool fit_cells(uint32_t n_tokens) override { return mem_attn->fit_cells(n_tokens); }
