@@ -14,11 +14,12 @@
 // is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the
 // home directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop
 // app the skill folders under the home directory and the project's or the conversation's folder. A new project,
-// session or user
-// would process all of the context after them again. The server gives the model stand-ins for these
+// session or user would process all of the context after them again. The server gives the model stand-ins for these
 // identifiers wherever they occur in a request, and puts the request's identifiers back in place of the stand-ins in
 // what the model writes. The model only copies such strings into paths, so it does the same work, and the client
-// sees its own paths.
+// sees its own paths. The user name in the stand-ins is infer: with inferssd, three tokens to Qwen3.6,
+// Qwen3.6-35B-A3B left out the .claude after it in 3 of 4 copies of Claude Code's memory folder, with infer in none
+// of 6.
 //
 // The identifiers are the home directory, the user's temporary directory, and the folders the apps name in their
 // system and developer messages (see identifiers.cpp). A match must start and end at a name boundary. A request whose
@@ -44,8 +45,8 @@ struct server_identifier_map {
 struct server_identifier_env {
     std::string home;             // the user's home directory, e.g. C:\Users\name
     std::string temp;             // the user's temporary directory if it is outside the home directory (macOS)
-    std::string home_stand_in;    // a home directory of a user named inferssd: C:\Users\inferssd on Windows
-    std::string temp_stand_in;    // /var/folders/00/inferssd/T
+    std::string home_stand_in;    // a home directory of a user named infer: C:\Users\infer on Windows
+    std::string temp_stand_in;    // /var/folders/00/infer/T
     bool        windows = false;  // paths are spelled with '\' as well as '/'
 
     static const server_identifier_env & current();

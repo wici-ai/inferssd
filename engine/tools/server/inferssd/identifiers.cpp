@@ -430,16 +430,16 @@ const server_identifier_env & server_identifier_env::current() {
         e.windows            = true;
         const wchar_t * home = _wgetenv(L"USERPROFILE");
         e.home               = home ? std::filesystem::path(home).u8string() : std::string();
-        e.home_stand_in      = "C:\\Users\\inferssd";
+        e.home_stand_in      = "C:\\Users\\infer";
 #else
         const char * home = std::getenv("HOME");
         e.home            = home ? home : "";
         // the paths are split in two literals: written out, a home directory is a personal path to the
         // repository's public scan (scripts/public-scan.py)
 #    if defined(__APPLE__)
-        e.home_stand_in = "/Users" "/inferssd";
+        e.home_stand_in = "/Users" "/infer";
 #    else
-        e.home_stand_in = "/home" "/inferssd";
+        e.home_stand_in = "/home" "/infer";
 #    endif
 #endif
         while (e.home.size() > 1 && is_separator(e.home.back())) {
@@ -454,7 +454,7 @@ const server_identifier_env & server_identifier_env::current() {
             while (e.temp.size() > 1 && e.temp.back() == '/') {
                 e.temp.pop_back();
             }
-            e.temp_stand_in = "/var/folders/00/inferssd/T";
+            e.temp_stand_in = "/var/folders/00/infer/T";
         }
 #endif
         return e;

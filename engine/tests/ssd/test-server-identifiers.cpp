@@ -15,7 +15,7 @@ static std::string users(const std::string & name) {
     return std::string("/Users") + "/" + name;
 }
 
-static const std::string STAND_IN = users("inferssd");
+static const std::string STAND_IN = users("infer");
 
 static void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -29,7 +29,7 @@ static server_identifier_env mac_env(const std::string & home, const std::string
     env.home          = home;
     env.temp          = temp;
     env.home_stand_in = STAND_IN;
-    env.temp_stand_in = "/var/folders/00/inferssd/T";
+    env.temp_stand_in = "/var/folders/00/infer/T";
     return env;
 }
 
@@ -118,7 +118,7 @@ static void test_claude_code_shares_its_context() {
     require(a["messages"][0] == b["messages"][0], "two users and projects get the same system message: " +
                                                       text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
     require(a["tools"] == b["tools"], "and the same tools");
-    const std::string memory = STAND_IN + "/.claude/projects/-Users-inferssd-project/memory/";
+    const std::string memory = STAND_IN + "/.claude/projects/-Users-infer-project/memory/";
     require(text_of(a["messages"][0]).find(memory) != std::string::npos,
             "the memory folder has the stand-ins: " + text_of(a["messages"][0]));
     require(text_of(a["messages"][1]) == "Primary working directory: " + STAND_IN + "/code/app\nlist the files",
@@ -228,7 +228,7 @@ static void test_codex_projects_share_their_context() {
     // an added folder is the second project folder; the temporary directory and the home directory keep their own
     json c = request("`" + alice.temp + "`, `" + a_cwd + "`, `" + alice.home + "/notes`, `" + alice.home + "`", a_cwd);
     server_identifiers_apply(c, alice);
-    require(text_of(c["messages"][0]).find("`/var/folders/00/inferssd/T`, `" + project + "`, `" + project + "-2`, `" +
+    require(text_of(c["messages"][0]).find("`/var/folders/00/infer/T`, `" + project + "`, `" + project + "-2`, `" +
                                            STAND_IN + "`.") != std::string::npos,
             "several roots: " + text_of(c["messages"][0]));
 }
@@ -263,7 +263,7 @@ static void test_streamed_text_only_grows() {
     const server_identifier_env env = mac_env(users("alice"), "");
     json body = {{"messages", json::array({{{"role", "user"}, {"content", "look in " + env.home}}})}};
     const server_identifier_map map = server_identifiers_apply(body, env);
-    const std::string written = "Saved " + STAND_IN + "/notes.md, not " + STAND_IN + "x or " + users("infer") +
+    const std::string written = "Saved " + STAND_IN + "/notes.md, not " + STAND_IN + "x or " + users("inf") +
                                 "; at " + STAND_IN;
     std::string last;
     for (size_t n = 0; n <= written.size(); ++n) {
@@ -274,7 +274,7 @@ static void test_streamed_text_only_grows() {
     }
     const std::string final_text = map.to_identifiers(written, false);
     require(final_text.compare(0, last.size(), last) == 0, "the final text extends the partial ones");
-    require(final_text == "Saved " + env.home + "/notes.md, not " + STAND_IN + "x or " + users("infer") + "; at " +
+    require(final_text == "Saved " + env.home + "/notes.md, not " + STAND_IN + "x or " + users("inf") + "; at " +
                               env.home,
             "the final text: " + final_text);
 }
@@ -309,7 +309,7 @@ static void test_the_client_gets_its_own_paths() {
 static void test_windows_spellings() {
     server_identifier_env env;
     env.home          = "C:\\Users\\bob";
-    env.home_stand_in = "C:\\Users\\inferssd";
+    env.home_stand_in = "C:\\Users\\infer";
     env.windows       = true;
     // C:/Users/... and /c/Users/... are the same folders with '/'
     const std::string slash          = std::string("C:") + users("bob");
@@ -324,13 +324,13 @@ static void test_windows_spellings() {
     const json before = body;
     const server_identifier_map map = server_identifiers_apply(body, env);
     require(text_of(body["messages"][0]) ==
-                "Memory: C:\\Users\\inferssd\\.claude\\projects\\C--Users-inferssd-project\\memory\\",
+                "Memory: C:\\Users\\infer\\.claude\\projects\\C--Users-infer-project\\memory\\",
             "the Windows memory folder: " + text_of(body["messages"][0]));
-    require(text_of(body["messages"][1]) == "C:\\Users\\inferssd\\app, " + slash_stand_in +
-                                                "/app, c:\\Users\\inferssd, " + bash_stand_in + "/app",
+    require(text_of(body["messages"][1]) == "C:\\Users\\infer\\app, " + slash_stand_in +
+                                                "/app, c:\\Users\\infer, " + bash_stand_in + "/app",
             "each spelling of the home folder: " + text_of(body["messages"][1]));
     const std::string args = body["messages"][2]["tool_calls"][0]["function"]["arguments"];
-    require(args == json({{"path", "C:\\Users\\inferssd\\app\\a.txt"}}).dump(), "JSON-escaped arguments: " + args);
+    require(args == json({{"path", "C:\\Users\\infer\\app\\a.txt"}}).dump(), "JSON-escaped arguments: " + args);
     require(map.to_identifiers(args, false) == before["messages"][2]["tool_calls"][0]["function"]["arguments"],
             "the arguments come back");
 }
