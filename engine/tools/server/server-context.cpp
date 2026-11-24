@@ -108,6 +108,9 @@ struct server_slot {
     llama_context * ctx = nullptr;
 
     common_context_seq_rm_type ctx_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+    // how the prompt cache takes the slot's states: as ones that go back only to their end or a checkpoint for a
+    // sliding window too, which can drop the end of a sequence only within its window
+    common_context_seq_rm_type cache_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     // multimodal
     mtmd_context * mctx = nullptr;
@@ -176,13 +179,13 @@ struct server_slot {
     void prompt_save(server_prompt_cache & prompt_cache) const {
         GGML_ASSERT(prompt.data.size() == 0);
 
-        prompt_cache.save(prompt, true, ctx, id, ctx_seq_rm_type);
+        prompt_cache.save(prompt, true, ctx, id, cache_seq_rm_type);
     }
 
     // how many tokens of `tokens` the slot's own state lets it skip (a state that cannot be rolled back is reused up
     // to its end or one of its checkpoints)
     int64_t prompt_reuse(const server_tokens & tokens) const {
-        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (cache_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
             return prompt.tokens.get_common_prefix(tokens);
         }
         const server_prompt_checkpoint * checkpoint = nullptr;
@@ -190,7 +193,7 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, ctx_seq_rm_type);
+        bool res = prompt_cache.load(prompt, tokens, prompt_reuse(tokens), ctx, id, cache_seq_rm_type);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
         }
@@ -1083,7 +1086,9 @@ private:
             slot.ctx   = ctx;
             slot.n_ctx = n_ctx_slot;
 
-            slot.ctx_seq_rm_type = ctx_seq_rm_type;
+            slot.ctx_seq_rm_type   = ctx_seq_rm_type;
+            slot.cache_seq_rm_type = ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0 ?
+                COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1409,10 +1414,11 @@ private:
 
             update_cache = update_cache && cache_task;
 
-            // A state that cannot be rolled back reuses the slot's prompt only up to its end or one of its
-            // checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may do better even when
-            // the slot's prompt is similar: look whenever the new prompt does not just extend the slot's.
-            const bool look = cache_task && ret->ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+            // A state that cannot be rolled back, or only within a sliding window, reuses the slot's prompt only up
+            // to its end or one of its checkpoints, so a cached prompt (a shared prefix, an earlier conversation) may
+            // do better even when the slot's prompt is similar: look whenever the new prompt does not just extend the
+            // slot's.
+            const bool look = cache_task && ret->cache_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
                 tokens.get_common_prefix(task.tokens) < tokens.size();
 
             if (update_cache || look) {
@@ -2185,7 +2191,7 @@ private:
         prefix.tokens = slot.prompt.tokens.clone();
         prefix.tokens.keep_first(n);
         SLT_INF(slot, "keeping the shared prompt prefix of %" PRId64 " tokens\n", n);
-        prompt_cache->save(prefix, current, ctx, slot.id, slot.ctx_seq_rm_type);
+        prompt_cache->save(prefix, current, ctx, slot.id, slot.cache_seq_rm_type);
         llama_ssd_host_note_memory_change(ctx);
         prompt_cache->update();
     }
