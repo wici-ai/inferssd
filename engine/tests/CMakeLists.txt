@@ -915,6 +915,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # On the hosted macOS runner's paravirtual GPU it aborts on a MUL_MAT the Metal backend does not encode.
     if (NOT APPLE)
         inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts test-llama-archs-dense-ssd)
+        llama_test(test-llama-archs NAME test-kimi-k3-roundtrip ARGS -a kimi-k3 -s 42)
+        inferssd_ci_test(test-llama-archs test-kimi-k3-roundtrip)
     endif()
     # NextN blocks: every architecture, on the CPU alone
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)

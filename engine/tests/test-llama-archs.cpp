@@ -247,6 +247,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     if (arch == LLM_ARCH_KIMI_K3) {
         ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,         uint32_t(2));
         ms.add_kv(LLM_KV_EXPERT_LATENT_LENGTH,        n_embd/2);
+        ms.add_kv(LLM_KV_KDA_GATE_LOWER_BOUND,        -5.0f);
         ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        4.0f);
         ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 25.0f);
     }
