@@ -4,8 +4,8 @@ This directory prepares and measures one fixed base/candidate pair on a single
 local Linux device: the predecessor codebase's `v0.1.13` release against the
 current engine, using the same DeepSeek V4.1 GGUF files and the fixed 512/256
 protocol.
-It does not register a runner, claim a device CI gate, or populate the formal
-benchmark described in [FINAL.md](../FINAL.md).
+It does not register a runner or populate the formal benchmark described in
+[FINAL.md](../FINAL.md).
 
 ## Reference build
 

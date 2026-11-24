@@ -120,9 +120,6 @@ and a failure there is fixed or reverted. The macOS and Windows packages are bui
 and by hand (**Actions > Package macOS** or **Package Windows**, on any branch) for a change to how they are
 built.
 
-Device performance checks are triggered by maintainers after review and run only for pull requests from
-branches in this repository; fork pull requests receive hosted CI only. See [device CI](bench/ci/README.md).
-
 ## Review checklist
 
 - Explain the concrete behavior, its cause and the evidence for the change.
