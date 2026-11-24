@@ -321,8 +321,9 @@ json oaicompat_completion_params_parse(const json & body);
 // used by /chat/completions endpoint
 // Recent assistant turns as this server generated them (content, reasoning, tool-call arguments). Clients send
 // earlier turns back re-serialized, often without the reasoning; oaicompat_chat_params_parse renders the turns it
-// recognizes as generated, so the prompt matches the cache and the model sees what it actually wrote.
-void server_turn_memory_record(const common_chat_msg & msg);
+// recognizes as generated, so the prompt matches the cache and the model sees what it actually wrote. `context` is
+// the request's "turn_context" (set by oaicompat_chat_params_parse): the turn is found after the same messages.
+void server_turn_memory_record(const common_chat_msg & msg, const std::string & context);
 
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */

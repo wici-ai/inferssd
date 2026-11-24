@@ -614,6 +614,7 @@ task_params server_task::params_from_json_cmpl(
             params.chat_parser_params.parser.load(data.at("chat_parser").get<std::string>());
         }
         params.identifiers = server_identifier_map::from_json(json_value(data, "prompt_identifiers", json()));
+        params.turn_context = json_value(data, "turn_context", std::string());
     }
 
     {

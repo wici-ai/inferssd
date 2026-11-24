@@ -10,7 +10,10 @@
 #include "server-common.h"
 #include "inferssd/identifiers.h"
 
+#include <cinttypes>
+#include <cstdio>
 #include <deque>
+#include <list>
 #include <mutex>
 #include <random>
 #include <unordered_map>
@@ -1021,22 +1024,35 @@ namespace {
 // An assistant turn as this server generated it. Clients send earlier turns back re-serialized: content trimmed,
 // tool-call arguments re-encoded (sorted keys, other spacing and escaping), reasoning left out or an empty one
 // padded. The template then renders a history that differs from the tokens in the cache, and a cache that cannot
-// roll back processes the whole conversation again. A turn is found by what survives the re-serialization: its
-// trimmed content and its tool calls with arguments compared as JSON values.
+// roll back processes the whole conversation again. A turn is found by what survives the re-serialization: the
+// messages before it (turn_context) and its trimmed content and tool calls with arguments compared as JSON values.
+// The messages before it tell apart turns alike in content and tool calls, which differ in reasoning: a model
+// that reads the same file twice in a conversation, or the same file in two conversations, thinks differently
+// each time.
 struct generated_turn {
     std::string              content;
     std::string              reasoning_content;
     std::vector<std::string> arguments; // tool-call arguments as generated, in call order
+
+    size_t bytes() const {
+        size_t n = content.size() + reasoning_content.size();
+        for (const auto & a : arguments) {
+            n += a.size();
+        }
+        return n;
+    }
 };
 
-// Two turns can be alike in content and tool calls and differ in reasoning: a model that calls the same tool with the
-// same arguments twice thinks differently each time. A key keeps each such turn, in the order generated.
+// The turns, least recently generated or restored first: the turns of a conversation still going on are restored
+// by each of its requests and stay, however long it gets.
 struct turn_memory {
-    static constexpr size_t max_turns    = 256;
-    static constexpr size_t max_variants = 16; // turns kept under one key
-    std::mutex                                                   mutex;
-    std::unordered_map<std::string, std::vector<generated_turn>> turns; // turn key -> its turns, oldest first
-    std::deque<std::string>                                      order; // keys, oldest first
+    static constexpr size_t max_bytes = 64u << 20; // keys, content, reasoning and arguments of all turns
+
+    using entry = std::pair<std::string, generated_turn>; // key, turn
+    std::mutex                                                         mutex;
+    std::list<entry>                                                   turns;
+    std::unordered_map<std::string, std::list<entry>::iterator>        by_key;
+    size_t                                                             bytes = 0;
 };
 
 turn_memory g_turn_memory;
@@ -1076,84 +1092,89 @@ std::string message_turn_key(const json & msg) {
     return turn_key(content.is_string() ? content.get<std::string>() : std::string(), calls);
 }
 
-// The generated turn a message stands for, among the turns under its key: the one whose reasoning the client sent
-// back; for a message without reasoning, the only one, or, when the request holds as many messages of this key as
-// there are turns, the one at the message's place among them (a conversation sends its turns back in the order they
-// were generated). nullptr when none can be told: the message is then rendered as sent, rather than with the
-// reasoning of another turn.
-const generated_turn * turn_of_message(const std::vector<generated_turn> & turns, const std::string & sent_reasoning,
-                                       size_t place, size_t n_messages) {
-    if (!sent_reasoning.empty()) {
-        for (auto it = turns.rbegin(); it != turns.rend(); ++it) {
-            if (turn_trim(it->reasoning_content) == sent_reasoning) {
-                return &*it;
+// The history up to a message, as far as finding turns goes: each message's role, content and tool calls (with
+// arguments compared as JSON values), chained by FNV-1a. Reasoning is left out, since clients leave it out or send
+// it back changed, and so are cache_control marks, which clients move from one request to the next.
+struct turn_context {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+
+    void add(const std::string & part) {
+        for (const unsigned char c : part) {
+            hash ^= c;
+            hash *= 0x100000001b3ULL;
+        }
+        hash ^= 0xff; // ends the part: "ab" + "c" differs from "a" + "bc"
+        hash *= 0x100000001b3ULL;
+    }
+
+    void add(const json & msg) {
+        add(json_value(msg, "role", std::string()));
+        add(message_turn_key(msg));
+        const json content = msg.contains("content") ? msg.at("content") : json();
+        if (content.is_array()) {
+            for (json part : content) {
+                if (part.is_object()) {
+                    part.erase("cache_control");
+                }
+                add(part.dump());
             }
         }
-        return &turns.back(); // reasoning the client changed: only content and arguments are restored
     }
-    if (turns.size() == 1) {
-        return &turns.front();
+
+    std::string str() const {
+        char buf[17];
+        std::snprintf(buf, sizeof(buf), "%016" PRIx64, hash);
+        return buf;
     }
-    return n_messages == turns.size() ? &turns[place] : nullptr;
+};
+
+std::string turn_memory_key(const std::string & context, const std::string & message_key) {
+    return context + '\x1d' + message_key;
 }
 
-void server_turn_memory_restore(json & messages) {
+// Renders the request's assistant turns this server generated as it generated them; returns the turn_context of the
+// whole request, which the turn generated for it is recorded under.
+std::string server_turn_memory_restore(json & messages) {
     std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
-    if (g_turn_memory.turns.empty()) {
-        return;
-    }
-    const auto generated = [](const json & msg) {
-        if (json_value(msg, "role", std::string()) != "assistant") {
-            return false;
-        }
-        return !msg.contains("content") || msg.at("content").is_null() || msg.at("content").is_string();
-    };
-    std::unordered_map<std::string, size_t> n_messages; // key -> messages of the request with it
-    for (const auto & msg : messages) {
-        if (generated(msg)) {
-            n_messages[message_turn_key(msg)]++;
-        }
-    }
-    std::unordered_map<std::string, size_t> n_seen;
+    auto & memory = g_turn_memory;
+    turn_context context;
     for (auto & msg : messages) {
-        if (!generated(msg)) {
+        const bool generated = json_value(msg, "role", std::string()) == "assistant" &&
+            (!msg.contains("content") || msg.at("content").is_null() || msg.at("content").is_string());
+        const auto found = generated ? memory.by_key.find(turn_memory_key(context.str(), message_turn_key(msg)))
+                                     : memory.by_key.end();
+        context.add(msg);
+        if (found == memory.by_key.end()) {
             continue;
         }
-        const std::string key   = message_turn_key(msg);
-        const size_t      place = n_seen[key]++;
-        const auto found = g_turn_memory.turns.find(key);
-        if (found == g_turn_memory.turns.end()) {
-            continue;
+        memory.turns.splice(memory.turns.end(), memory.turns, found->second);
+        const generated_turn & turn = found->second->second;
+
+        if ((msg.contains("content") && msg.at("content").is_string()) || !turn.content.empty()) {
+            msg["content"] = turn.content;
+        }
+        for (size_t i = 0; i < turn.arguments.size(); ++i) {
+            msg["tool_calls"][i]["function"]["arguments"] = turn.arguments[i];
         }
         // Reasoning the client left out, padded or sent back unchanged (up to whitespace) is the generated one;
         // reasoning the client changed is kept. Whether earlier reasoning is rendered is up to the template.
         const std::string sent = turn_trim(json_value(msg, "reasoning_content", std::string()));
-        const generated_turn * turn = turn_of_message(found->second, sent, place, n_messages[key]);
-        if (turn == nullptr) {
-            continue;
-        }
-
-        if ((msg.contains("content") && msg.at("content").is_string()) || !turn->content.empty()) {
-            msg["content"] = turn->content;
-        }
-        for (size_t i = 0; i < turn->arguments.size(); ++i) {
-            msg["tool_calls"][i]["function"]["arguments"] = turn->arguments[i];
-        }
-        if (sent.empty() || sent == turn_trim(turn->reasoning_content)) {
-            if (turn->reasoning_content.empty()) {
+        if (sent.empty() || sent == turn_trim(turn.reasoning_content)) {
+            if (turn.reasoning_content.empty()) {
                 msg.erase("reasoning_content");
             } else {
-                msg["reasoning_content"] = turn->reasoning_content;
+                msg["reasoning_content"] = turn.reasoning_content;
             }
         }
     }
+    return context.str();
 }
 
 } // namespace
 
-void server_turn_memory_record(const common_chat_msg & msg) {
+void server_turn_memory_record(const common_chat_msg & msg, const std::string & context) {
     // a turn without content and tool calls has no identity to find it by
-    if (turn_trim(msg.content).empty() && msg.tool_calls.empty()) {
+    if (context.empty() || (turn_trim(msg.content).empty() && msg.tool_calls.empty())) {
         return;
     }
     std::vector<std::pair<std::string, std::string>> calls;
@@ -1162,28 +1183,24 @@ void server_turn_memory_record(const common_chat_msg & msg) {
         calls.emplace_back(call.name, call.arguments);
         turn.arguments.push_back(call.arguments);
     }
-    std::string key = turn_key(msg.content, calls);
+    std::string key = turn_memory_key(context, turn_key(msg.content, calls));
     std::lock_guard<std::mutex> lock(g_turn_memory.mutex);
     auto & memory = g_turn_memory;
-    if (memory.turns.find(key) == memory.turns.end()) {
-        memory.order.push_back(key);
-        if (memory.order.size() > turn_memory::max_turns) {
-            memory.turns.erase(memory.order.front());
-            memory.order.pop_front();
-        }
+    // a turn generated again after the same messages (a retry) takes the place of the earlier one
+    if (const auto found = memory.by_key.find(key); found != memory.by_key.end()) {
+        memory.bytes -= found->first.size() + found->second->second.bytes();
+        memory.turns.erase(found->second);
+        memory.by_key.erase(found);
     }
-    // a turn generated again with the same reasoning is the same turn
-    auto & turns = memory.turns[key];
-    for (auto & kept : turns) {
-        if (kept.reasoning_content == turn.reasoning_content) {
-            kept = std::move(turn);
-            return;
-        }
+    memory.bytes += key.size() + turn.bytes();
+    memory.turns.emplace_back(key, std::move(turn));
+    memory.by_key.emplace(std::move(key), std::prev(memory.turns.end()));
+    while (memory.bytes > turn_memory::max_bytes && memory.turns.size() > 1) {
+        const auto & [old_key, old_turn] = memory.turns.front();
+        memory.bytes -= old_key.size() + old_turn.bytes();
+        memory.by_key.erase(old_key);
+        memory.turns.pop_front();
     }
-    if (turns.size() >= turn_memory::max_variants) {
-        turns.erase(turns.begin());
-    }
-    turns.push_back(std::move(turn));
 }
 
 // Where an effort stands among the ones clients name, least first: OpenAI's and Codex's minimal to xhigh, and max,
@@ -1378,8 +1395,9 @@ json oaicompat_chat_params_parse(
 
     auto caps = common_chat_templates_get_caps(opt.tmpls.get());
 
-    // Render the assistant turns this server generated as they were generated (see server_turn_memory_record).
-    server_turn_memory_restore(messages);
+    // Render the assistant turns this server generated as they were generated (see server_turn_memory_record); the
+    // turn generated for this request is recorded under its messages.
+    llama_params["turn_context"] = server_turn_memory_restore(messages);
 
     common_chat_templates_inputs inputs;
     inputs.messages              = common_chat_msgs_parse_oaicompat(messages);
