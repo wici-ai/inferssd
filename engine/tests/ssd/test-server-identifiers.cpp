@@ -199,38 +199,80 @@ static void test_chatgpt_conversations_share_their_context() {
                                                       text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
 }
 
+// a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
+// `roots`, and the environment
+static json codex_request(const std::string & roots, const std::string & cwd) {
+    const std::string developer = "<permissions instructions>\nApproval policy is currently never." + roots +
+                                  "\n</permissions instructions>";
+    return json{{"messages", json::array({
+        {{"role", "developer"}, {"content", developer}},
+        {{"role", "user"}, {"content", "<environment_context>\n  <cwd>" + cwd + "</cwd>\n</environment_context>"}},
+    })}};
+}
+
+static server_identifier_map prepare(json & body, const server_identifier_env & env) {
+    server_drop_codex_cwd_root(body.at("messages"));
+    return server_identifiers_apply(body, env);
+}
+
 static void test_codex_projects_share_their_context() {
-    const auto request = [](const std::string & roots, const std::string & cwd) {
-        const std::string developer = "<permissions instructions>\nApproval policy is currently never.\n The writable "
-                                      "roots are " + roots + ".\n</permissions instructions>";
-        return json{{"messages", json::array({
-            {{"role", "developer"}, {"content", developer}},
-            {{"role", "user"}, {"content", "<environment_context>\n  <cwd>" + cwd + "</cwd>\n</environment_context>"}},
-        })}};
-    };
     const server_identifier_env alice = mac_env(users("alice"), "/var/folders/ab/abc123/T");
     const server_identifier_env bob   = mac_env(users("bob"), "/var/folders/cd/def456/T");
     const std::string a_cwd = alice.home + "/code/app", b_cwd = bob.home + "/work/site";
-    json a = request("`" + a_cwd + "`, `/private/tmp`", a_cwd);
-    json b = request("`" + b_cwd + "`, `/private/tmp`", b_cwd);
-    const server_identifier_map map_a = server_identifiers_apply(a, alice);
-    server_identifiers_apply(b, bob);
+    json a = codex_request("\n The writable roots are `" + a_cwd + "`, `/private/tmp`.", a_cwd);
+    json b = codex_request("\n The writable roots are `" + b_cwd + "`, `/private/tmp`.", b_cwd);
+    const server_identifier_map map_a = prepare(a, alice);
+    prepare(b, bob);
     require(a["messages"][0] == b["messages"][0], "two users and projects get the same developer message: " +
                                                       text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
-    const std::string project = STAND_IN + "/project";
-    require(text_of(a["messages"][0]).find("`" + project + "`, `/private/tmp`.") != std::string::npos,
-            "the project's folder has a stand-in, /tmp does not: " + text_of(a["messages"][0]));
-    require(text_of(a["messages"][1]).find("<cwd>" + project + "</cwd>") != std::string::npos,
-            "and the same one in the environment: " + text_of(a["messages"][1]));
-    require(map_a.to_identifiers("Wrote " + project + "/src/main.c", false) == "Wrote " + a_cwd + "/src/main.c",
-            "what the model writes goes back to alice's project");
+    require(text_of(a["messages"][0]) == "<permissions instructions>\nApproval policy is currently never.\n The "
+                                         "writable root is `/private/tmp`.\n</permissions instructions>",
+            "the cwd goes from the roots: " + text_of(a["messages"][0]));
+    const std::string seen = STAND_IN + "/code/app";
+    require(text_of(a["messages"][1]).find("<cwd>" + seen + "</cwd>") != std::string::npos,
+            "the environment names the project in its place under the stand-in home: " + text_of(a["messages"][1]));
+    require(map_a.to_identifiers("Wrote " + seen + "/src/main.c and read " + STAND_IN + "/code/other/README.md",
+                                 false) ==
+                "Wrote " + a_cwd + "/src/main.c and read " + alice.home + "/code/other/README.md",
+            "what the model writes goes back to alice's folders, the one next to the project too");
 
-    // an added folder is the second project folder; the temporary directory and the home directory keep their own
-    json c = request("`" + alice.temp + "`, `" + a_cwd + "`, `" + alice.home + "/notes`, `" + alice.home + "`", a_cwd);
-    server_identifiers_apply(c, alice);
-    require(text_of(c["messages"][0]).find("`/var/folders/00/infer/T`, `" + project + "`, `" + project + "-2`, `" +
-                                           STAND_IN + "`.") != std::string::npos,
+    // the only root: the sentence goes with its line, as Codex writes the instructions without writable roots
+    json one = codex_request("\n The writable root is `" + a_cwd + "`.", a_cwd);
+    prepare(one, alice);
+    require(text_of(one["messages"][0]) ==
+                "<permissions instructions>\nApproval policy is currently never.\n</permissions instructions>",
+            "the only root: " + text_of(one["messages"][0]));
+
+    // several roots: the others stay, with the stand-ins of the home and the temporary directory
+    json c = codex_request("\n The writable roots are `" + alice.temp + "`, `" + a_cwd + "`, `" + alice.home +
+                               "/notes`, `" + alice.home + "`.", a_cwd);
+    prepare(c, alice);
+    require(text_of(c["messages"][0]).find("\n The writable roots are `/var/folders/00/infer/T`, `" + STAND_IN +
+                                           "/notes`, `" + STAND_IN + "`.\n") != std::string::npos,
             "several roots: " + text_of(c["messages"][0]));
+
+    // no root is the cwd, or there is no cwd: the sentence stays
+    json d = codex_request("\n The writable root is `" + a_cwd + "`.", alice.home + "/code");
+    prepare(d, alice);
+    require(text_of(d["messages"][0]).find(" The writable root is `" + seen + "`.") != std::string::npos,
+            "a root that is not the cwd: " + text_of(d["messages"][0]));
+    json e = codex_request("\n The writable root is `" + a_cwd + "`.", a_cwd);
+    e["messages"].erase(1);
+    prepare(e, alice);
+    require(text_of(e["messages"][0]).find(" The writable root is `" + seen + "`.") != std::string::npos,
+            "no cwd: " + text_of(e["messages"][0]));
+
+    // Windows folders
+    server_identifier_env win;
+    win.home          = "C:\\Users\\bob";
+    win.home_stand_in = "C:\\Users\\infer";
+    win.windows       = true;
+    json w = codex_request("\n The writable roots are `C:\\Users\\bob\\app`, `C:\\Users\\bob\\AppData\\Local\\Temp`.",
+                           "C:\\Users\\bob\\app");
+    prepare(w, win);
+    require(text_of(w["messages"][0]).find("\n The writable root is `C:\\Users\\infer\\AppData\\Local\\Temp`.\n") !=
+                std::string::npos,
+            "Windows roots: " + text_of(w["messages"][0]));
 }
 
 static void test_matches_stop_at_name_boundaries() {

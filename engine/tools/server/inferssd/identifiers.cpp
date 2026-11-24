@@ -202,22 +202,6 @@ bool is_folder_byte(unsigned char c) {
     return c > ' ' && !is_separator((char) c) && c != '"' && c != '\'' && c != '`' && c != '<' && c != '>' && c != '|';
 }
 
-// a folder that is the same for every project: /tmp, a folder in the temporary directory, the home directory or a
-// folder above it
-bool is_common_folder(const std::string & path, const server_identifier_env & env) {
-    const auto in = [&](const std::string & dir) {
-        return dir.size() >= 4 && path.compare(0, dir.size(), dir) == 0 &&
-               (path.size() == dir.size() || is_separator(path[dir.size()]));
-    };
-    const bool above_home = env.home.compare(0, path.size(), path) == 0 &&
-                            (env.home.size() == path.size() || is_separator(env.home[path.size()]));
-    return path.size() < 4 || path == "/tmp" || path == "/private/tmp" || above_home ||
-           (!env.temp.empty() && (in(env.temp) || in("/private" + env.temp)));
-}
-
-// Codex's writable roots: the project's folder and the folders added to it
-constexpr int writable_root_kind = 6;
-
 struct learned_identifier {
     std::string id;
     std::string stand_in;
@@ -341,31 +325,45 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
         std::string stand_in = text.substr(at, date - at) + "0000-00-00" + text[date + 10] + "task";
         found(4, text.substr(at, end - at), stand_in);
     }
+}
 
-    // Codex's permission instructions: " The writable root is `<root>`." or " The writable roots are `<root>`,
-    // `<root>`.", sorted by name, so the project's folder is any of them. The roots are numbered once all are found
-    // (server_identifiers_apply).
-    const std::string project = env.home_stand_in + (env.windows ? "\\" : "/") + "project";
-    for (const std::string_view lead : {std::string_view(" The writable root is "),
-                                        std::string_view(" The writable roots are ")}) {
-        for (size_t at = text.find(lead); at != std::string::npos; at = text.find(lead, at + 1)) {
-            for (size_t i = at + lead.size(); i < text.size() && text[i] == '`';) {
-                const size_t end = text.find('`', i + 1);
-                if (end == std::string::npos) {
-                    break;
-                }
-                std::string root = text.substr(i + 1, end - i - 1);
-                const bool  seen = std::any_of(out.begin(), out.end(), [&](const auto & l) { return l.id == root; });
-                if (!seen && !is_common_folder(root, env)) {
-                    out.push_back({std::move(root), project, writable_root_kind});
-                }
-                i = end + 1;
-                if (text.compare(i, 2, ", ") != 0) {
-                    break;
-                }
-                i += 2;
-            }
+// Takes the root that is the cwd out of Codex's sentences " The writable root is `<root>`." and " The writable
+// roots are `<root>`, `<root>`.", and writes the sentence again as Codex writes it for the roots left; with none left
+// the sentence goes with the line break before it, as Codex writes its instructions without writable roots.
+void drop_root(std::string & text, const std::string & cwd) {
+    static const std::string stem = " The writable root", one = stem + " is ", many = stem + "s are ";
+    for (size_t at = text.find(stem); at != std::string::npos; at = text.find(stem, at + 1)) {
+        const std::string & lead = text.compare(at, one.size(), one) == 0 ? one : many;
+        if (text.compare(at, lead.size(), lead) != 0) {
+            continue;
         }
+        std::vector<std::string> roots;
+        size_t i = at + lead.size();
+        while (i < text.size() && text[i] == '`') {
+            const size_t end = text.find('`', i + 1);
+            if (end == std::string::npos) {
+                break;
+            }
+            roots.push_back(text.substr(i + 1, end - i - 1));
+            i = end + 1;
+            if (text.compare(i, 2, ", ") != 0) {
+                break;
+            }
+            i += 2;
+        }
+        const auto it = std::find(roots.begin(), roots.end(), cwd);
+        if (i >= text.size() || text[i] != '.' || it == roots.end()) {
+            continue;
+        }
+        roots.erase(it);
+        std::string sentence;
+        for (size_t k = 0; k < roots.size(); ++k) {
+            sentence += (k > 0 ? std::string(", ") : roots.size() == 1 ? one : many) + "`" + roots[k] + "`";
+        }
+        sentence += roots.empty() ? "" : ".";
+        const size_t begin = roots.empty() && at > 0 && text[at - 1] == '\n' ? at - 1 : at;
+        text.replace(begin, i + 1 - begin, sentence);
+        at = begin;
     }
 }
 
@@ -493,22 +491,6 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
             }
         }
     }
-    // A writable root that holds a folder another rule names (a ChatGPT desktop conversation's folder) keeps that
-    // folder's stand-in. The others are the project's folder and the n-th has "-n" after its stand-in.
-    int roots = 0;
-    for (auto & l : learned) {
-        if (l.kind != writable_root_kind) {
-            continue;
-        }
-        const bool holds = std::any_of(learned.begin(), learned.end(), [&](const learned_identifier & o) {
-            return o.kind != writable_root_kind && l.id.find(o.id) != std::string::npos;
-        });
-        if (holds) {
-            l.id.clear(); // add_pair skips it
-        } else if (++roots > 1) {
-            l.stand_in += "-" + std::to_string(roots);
-        }
-    }
     for (const auto & l : learned) {
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
@@ -592,6 +574,39 @@ void server_strip_anthropic_billing_header(json & messages) {
                     server_strip_anthropic_billing_header(part.at("text").get_ref<std::string &>());
                 }
             }
+        }
+    }
+}
+
+void server_drop_codex_cwd_root(json & messages) {
+    if (!messages.is_array()) {
+        return;
+    }
+    const auto role_of = [](const json & msg) {
+        return msg.is_object() && msg.contains("role") && msg.at("role").is_string() ? msg.at("role").get<std::string>()
+                                                                                     : std::string();
+    };
+    std::string cwd;
+    auto        find_cwd = [&](std::string & text) {
+        const size_t begin = cwd.empty() ? text.find("<cwd>") : std::string::npos;
+        const size_t end   = begin == std::string::npos ? std::string::npos : text.find("</cwd>", begin);
+        if (end != std::string::npos) {
+            cwd = text.substr(begin + 5, end - begin - 5);
+        }
+    };
+    for (auto & msg : messages) {
+        if (role_of(msg) == "user" && msg.contains("content")) {
+            for_each_text(msg.at("content"), find_cwd);
+        }
+    }
+    if (cwd.empty()) {
+        return;
+    }
+    auto drop = [&](std::string & text) { drop_root(text, cwd); };
+    for (auto & msg : messages) {
+        const std::string role = role_of(msg);
+        if ((role == "system" || role == "developer") && msg.contains("content")) {
+            for_each_text(msg.at("content"), drop);
         }
     }
 }

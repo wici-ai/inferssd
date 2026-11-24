@@ -1269,10 +1269,12 @@ json oaicompat_chat_params_parse(
 {
     json llama_params;
 
-    // The line Claude Code bills by goes, and stand-ins take the place of the identifiers of the user and the session,
-    // so that the context an app starts every conversation with is the same prompt (see inferssd/identifiers.h).
+    // The line Claude Code bills by goes, so does the writable root of Codex that is its cwd, and stand-ins take the
+    // place of the identifiers of the user and the session, so that the context an app starts every conversation with
+    // is the same prompt (see inferssd/identifiers.h).
     if (body.contains("messages")) {
         server_strip_anthropic_billing_header(body.at("messages"));
+        server_drop_codex_cwd_root(body.at("messages"));
     }
     const server_identifier_map identifiers = server_identifiers_apply(body, server_identifier_env::current());
     if (!identifiers.empty()) {
