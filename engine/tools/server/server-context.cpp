@@ -880,8 +880,13 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model file and the build that computed it.
-    std::string prompt_cache_fingerprint() const {
+    // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
+    // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
+    std::string prompt_cache_fingerprint(const std::string & model_fp) const {
+        if (!model_fp.empty()) {
+            return model_fp + "|" + llama_build_info();
+        }
+        // the model files cannot be read as GGUF files: by the first file's path, size and time
         std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
         std::error_code ec;
         const auto size  = std::filesystem::file_size(params_base.model.path, ec);
@@ -894,7 +899,8 @@ private:
 
     // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
     // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
-    // for the builds that compute it the same, up to rounding (docs/prefix-cache.md).
+    // for the builds that compute it the same, up to rounding (docs/prefix-cache.md). A prefix cache is a file of a
+    // server's prompt cache on disk, whose fingerprint is this and the build.
     std::string prefix_cache_fingerprint() const {
         const std::string files = server_model_files_identity(params_base.model.get_paths());
         if (files.empty()) {
@@ -1147,11 +1153,13 @@ private:
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
+        const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ?
+                prefix_cache_fingerprint() : "";
         if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
-            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint());
+            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp));
         } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1165,12 +1173,11 @@ private:
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
         if (!params_base.prefix_cache.empty()) {
-            const std::string fp = prompt_cache ? prefix_cache_fingerprint() : "";
-            if (fp.empty()) {
+            if (!prompt_cache || model_fp.empty()) {
                 SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
                         prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
             } else {
-                prompt_cache->use_prefix_dir(params_base.prefix_cache, fp);
+                prompt_cache->use_prefix_dir(params_base.prefix_cache, model_fp);
             }
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");

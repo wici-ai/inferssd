@@ -128,8 +128,10 @@ static void server_prompt_file_touch(const std::string & path) {
 }
 
 // read the header of a cached prompt file into `prompt` (tokens, checkpoint and state locations); false if the
-// file is not a prompt of this fingerprint
-static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt) {
+// file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
+// prefix cache: the model's fingerprint, then the build that saved it)
+static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
+                                      bool prefix = false) {
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
         !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
@@ -137,7 +139,12 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         return false;
     }
     std::string fp(n_fp, '\0');
-    if (!server_prompt_fread(f, fp.data(), n_fp) || fp != fingerprint) {
+    if (!server_prompt_fread(f, fp.data(), n_fp)) {
+        return false;
+    }
+    const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
+                             : fp == fingerprint;
+    if (!same) {
         return false;
     }
 
@@ -347,7 +354,7 @@ void server_prompt_cache::scan_prefix_dir() {
         server_prompt prompt;
         bool ok = false;
         if (FILE * f = std::fopen(path.c_str(), "rb")) {
-            ok = server_prompt_read_header(f, prefix_fingerprint, prompt);
+            ok = server_prompt_read_header(f, prefix_fingerprint, prompt, true);
             std::fclose(f);
         }
         if (!ok) {

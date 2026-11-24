@@ -271,8 +271,11 @@ static size_t count_read_only(const server_prompt_cache & cache) {
 
 static void test_prefix_dir_takes_only_this_models_files() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-models");
-    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model", { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model", { 1, 2, 3, 4, 5, 6 }, 64);
+    // a file of another build's prompt cache for this model, one for another model, one whose model's fingerprint
+    // only starts the same
+    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1", { 1, 2, 3, 4, 5, 6 }, 64);
 
     server_prompt_cache cache(1, 0);
     cache.use_prefix_dir(dir.string(), "prefix-cache 1|this model");

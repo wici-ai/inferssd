@@ -14,12 +14,15 @@ restored; it is just not used.
 
 The state in it is what the model computed for those tokens. Another backend, another machine or another build
 computes the same values up to rounding, as a GPU and a CPU do, and the server takes those differences as it takes
-them between its own prompt passes. The file therefore names the model, not the build: its fingerprint is
+them between its own prompt passes. A prefix cache is a file of a server's prompt cache on disk, whose fingerprint
+is
 
-    prefix-cache 1|<size>:<header hash>,...|<model description>
+    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>
 
 with the size and an FNV-1a hash of the header (the metadata and the tensor list) of each file the model is loaded
-from, the other files of a split model included. Where the files are and when they were written are not in it. A
+from, the other files of a split model included, and the build that saved it. A server takes a file of its own prompt
+cache only from its own build, and a prefix cache from any build: it compares the fingerprint up to the build. Where
+the files are and when they were written are not in it. A
 state saved with another layout (another KV type, or flash attention on where it was off) fails to restore; the
 server then leaves that file and processes the prefix itself.
 

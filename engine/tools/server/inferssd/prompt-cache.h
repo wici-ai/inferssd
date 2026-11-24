@@ -150,8 +150,9 @@ struct server_prompt_cache {
     }
 
     // Also restore from the prefix caches in `dir`: cached prompts that another server made for this model and that
-    // came with it (a download), each the state after the shared prefix of an app's requests. Their files carry
-    // `fingerprint`, which names the model but not the build or where the model is. The cache only reads them: it
+    // came with it (a download), each the state after the shared prefix of an app's requests: files of that server's
+    // prompt cache on disk, whose fingerprint is `fingerprint` (the model, not where it is) and the build that saved
+    // them, any build. The cache only reads them: it
     // neither removes them nor counts them against its limits, and it reads the directory again when the directory
     // changes, so a file put there while the server runs serves the next request.
     void use_prefix_dir(const std::string & dir, const std::string & fingerprint);
