@@ -20,7 +20,7 @@
 #include "declared-layout.h"
 
 namespace {
-constexpr int latent = 320, hidden = 64, experts = 6, tokens = 96, nslots = 3;
+constexpr int latent = 320, hidden = 64, experts = 8, tokens = 96, nslots = 3;
 constexpr size_t aligned = size_t(1) << 16;
 
 [[noreturn]] void fail(const char * what) {
@@ -300,6 +300,16 @@ int main() {
     options.activation = { SSD_VRAM_ACTIVATION_SITU, beta, linear_beta, 0.0f };
     if (run(nullptr, output, stats)) { fail(error); }
     compare_with(output, by_hand(SSD_VRAM_ACTIVATION_SITU), by_hand(SSD_VRAM_ACTIVATION_SITU, false, true), "situ");
+    {
+        // Fill one batch with eight copied experts and all token rows. Spare weight slots in a smaller batch
+        // would hide an activation that uses more scratch space than the lane reserves per row.
+        const auto original_routes = routes;
+        std::fill(routes.begin(), routes.end(), -1);
+        for (int token = 0; token < tokens; ++token) { routes[size_t(token) * nslots] = token % experts; }
+        if (run(nullptr, output, stats)) { fail(error); }
+        compare_with(output, by_hand(SSD_VRAM_ACTIVATION_SITU), by_hand(SSD_VRAM_ACTIVATION_SITU, false, true), "full SiTU batch");
+        routes = original_routes;
+    }
     options.activation = { SSD_VRAM_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f };
     options.post_norm = norm_weights.data();
     options.post_norm_eps = norm_eps;

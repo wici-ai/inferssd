@@ -244,10 +244,17 @@ struct lane {
             }
             case SSD_VRAM_ACTIVATION_SITU: {
                 const float beta = activation.situ_beta, linear = activation.situ_linear_beta;
-                ggml_tensor * a = ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, gate, 1.0f / beta)), beta);
-                ggml_tensor * bounded = linear > 0.0f ?
-                    ggml_scale(ctx, ggml_tanh(ctx, ggml_scale(ctx, up, 1.0f / linear)), linear) : up;
-                return ggml_mul(ctx, ggml_mul(ctx, a, ggml_sigmoid(ctx, gate)), bounded);
+                // row_bytes() allows four hidden rows: up, gate, its bounded copy and its sigmoid.
+                ggml_tensor * bounded = ggml_scale(ctx, gate, 1.0f / beta);
+                bounded = ggml_tanh_inplace(ctx, bounded);
+                bounded = ggml_scale_inplace(ctx, bounded, beta);
+                bounded = ggml_mul_inplace(ctx, bounded, ggml_sigmoid(ctx, gate));
+                if (linear > 0.0f) {
+                    up = ggml_scale_inplace(ctx, up, 1.0f / linear);
+                    up = ggml_tanh_inplace(ctx, up);
+                    up = ggml_scale_inplace(ctx, up, linear);
+                }
+                return ggml_mul_inplace(ctx, bounded, up);
             }
             default:
                 throw std::runtime_error("the GPU lane has no such activation");
@@ -317,7 +324,7 @@ struct lane {
         }
         for (int n = 0; n < ggml_graph_n_nodes(graph); ++n) {
             ggml_tensor * node = ggml_graph_node(graph, n);
-            // A clamp works in place: its node is a view of the row it bounds.
+            // In-place activation nodes share the storage of their input.
             const ggml_status placed = node->view_src ? ggml_backend_view_init(node) : ggml_tallocr_alloc(&scratch, node);
             if (placed != GGML_STATUS_SUCCESS) { throw std::runtime_error("the GPU lane's working memory is too small"); }
         }
