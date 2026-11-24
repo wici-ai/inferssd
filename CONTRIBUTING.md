@@ -29,6 +29,9 @@ a review.
 - Do not add automated trailers. Use `Co-authored-by` only for human co-authors.
 - Keep internal code names, task numbers, machine names, run IDs, credentials, personal paths, private
   addresses and links to private repositories out of code, branch names, commits, pull requests and issues.
+- Pull requests from collaborators with write access are reviewed, verified on devices and merged by an
+  automated reviewer that follows [pull request review](docs/development/review.md); a maintainer reviews the
+  others.
 
 ### Pull request titles
 
@@ -115,10 +118,7 @@ transcript checks are bound to those versions and skip on others. CI runs both. 
 failures. Native test targets are described in [testing](docs/testing.md). CI builds the documented CMake presets,
 runs the native tests labelled `ci` on Linux, macOS and Windows hosted runners, and compiles the CUDA server
 whenever the engine or build configuration changes. These checks run for pull requests and again on every merge
-to `main`. A pull request need not be up to date with `main` to merge: the run on `main` checks the merged code,
-and a failure there is fixed or reverted. The macOS and Windows packages are built only by a release,
-and by hand (**Actions > Package macOS** or **Package Windows**, on any branch) for a change to how they are
-built.
+to `main`; a failure on `main` is fixed or reverted.
 
 ## Review checklist
 
