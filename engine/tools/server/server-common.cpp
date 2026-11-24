@@ -1492,23 +1492,43 @@ json oaicompat_chat_params_parse(
 
     // The leading system messages with the tools: what every conversation with this setup starts with. Rendered on
     // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
+    // The user messages that follow them, up to the first reply, open the conversation: every later state of it
+    // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
+        // the length of the first n messages rendered on their own, if that is a prefix of the prompt; 0 otherwise
+        const auto prefix_chars = [&](size_t n) -> size_t {
+            common_chat_templates_inputs prefix_inputs = inputs;
+            prefix_inputs.messages.resize(n);
+            prefix_inputs.add_generation_prompt = false;
+            try {
+                const auto prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+                if (!prefix.empty() && chat_params.prompt.compare(0, prefix.size(), prefix) == 0) {
+                    return prefix.size();
+                }
+            } catch (const std::exception &) {
+                // a template that cannot render these messages alone: no such prefix
+            }
+            return 0;
+        };
+
         size_t n_system = 0;
         while (n_system < inputs.messages.size() &&
                 (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
             ++n_system;
         }
         if (n_system > 0 && n_system < inputs.messages.size()) {
-            common_chat_templates_inputs prefix_inputs = inputs;
-            prefix_inputs.messages.resize(n_system);
-            prefix_inputs.add_generation_prompt = false;
-            try {
-                const auto prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
-                if (!prefix.empty() && chat_params.prompt.compare(0, prefix.size(), prefix) == 0) {
-                    llama_params["shared_prefix_chars"] = prefix.size();
+            const size_t n_chars = prefix_chars(n_system);
+            if (n_chars > 0) {
+                llama_params["shared_prefix_chars"] = n_chars;
+
+                size_t n_opening = n_system;
+                while (n_opening < inputs.messages.size() && inputs.messages[n_opening].role == "user") {
+                    ++n_opening;
                 }
-            } catch (const std::exception &) {
-                // a template that cannot render the system messages alone: no shared prefix
+                const size_t n_opening_chars = n_opening > n_system ? prefix_chars(n_opening) : 0;
+                if (n_opening_chars > n_chars) {
+                    llama_params["conversation_prefix_chars"] = n_opening_chars;
+                }
             }
         }
     }

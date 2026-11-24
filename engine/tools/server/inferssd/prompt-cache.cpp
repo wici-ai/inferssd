@@ -335,6 +335,21 @@ void server_prompt_cache::remove_obsolete(const server_prompt & prompt, common_c
 
 }
 
+void server_prompt_cache::remove_superseded(const server_prompt & prompt, const server_prompt * saved) {
+    for (auto it = states.begin(); it != states.end();) {
+        if (&*it == saved || (saved != nullptr && it->file == saved->file) || !server_prompt_supersedes(prompt, *it)) {
+            ++it;
+            continue;
+        }
+        SRV_WRN(" - removing cached prompt with length %d (%.3f MiB): an earlier state of the conversation saved with "
+                "length %d, same first %" PRId64 " tokens\n",
+                it->n_tokens(), it->size() / (1024.0 * 1024.0), prompt.n_tokens(), prompt.n_conversation);
+
+        auto cur = it++;
+        remove(cur);
+    }
+}
+
 void server_prompt_cache::save(
         const server_prompt        & prompt,
         bool                         current,
@@ -359,6 +374,7 @@ void server_prompt_cache::save(
 
     if (!on_disk()) {
         remove_obsolete(prompt, seq_rm_type);
+        remove_superseded(prompt, nullptr);
 
         server_ssd_memory_change changes(ctx);
         size_t allocation_bytes = state_size;
@@ -396,6 +412,7 @@ void server_prompt_cache::save(
         entry.tokens      = prompt.tokens.clone();
         entry.data        = std::move(state_data);
         entry.checkpoints = prompt.checkpoints;
+        entry.n_conversation = prompt.n_conversation;
         reservation.commit();
         states.push_back(std::move(entry));
 
@@ -422,6 +439,7 @@ void server_prompt_cache::save(
     server_prompt entry;
     entry.tokens = prompt.tokens.clone();
     entry.file   = path;
+    entry.n_conversation = prompt.n_conversation;
 
     bool ok = false;
     if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
@@ -490,6 +508,9 @@ void server_prompt_cache::save(
     }
 
     states.push_back(std::move(entry));
+
+    // only now that the new state is on disk
+    remove_superseded(prompt, &states.back());
 }
 
 bool server_prompt_cache::load(

@@ -61,7 +61,10 @@ replace.
 The prompt cache lives on disk, one directory per model under
 `inferssd/prompts` in your user cache directory, and survives restarts
 (`--cache-disk`, 4 GiB per model unless `--prompt-cache-mib` names another
-limit). With the `dsv` profile the DeepSeek-V4.1
+limit). A chat that starts with a system message keeps one state there: a
+newer state replaces the earlier ones of the same conversation, the ones
+with the same system messages, tools and user messages up to the first
+reply. With the `dsv` profile the DeepSeek-V4.1
 template keeps earlier turns' thinking (`drop_thinking` false), so a
 conversation's history renders as the server cached it.
 
