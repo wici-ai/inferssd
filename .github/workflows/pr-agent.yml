@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: Apache-2.0
+# The automated reviewer of docs/development/review.md. It runs on a self-hosted runner that holds the
+# reviewer and its device tools (PR_AGENT names its entry point); nothing from the pull request runs here.
+name: pr-agent
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      number:
+        description: Pull request number
+        required: true
+
+permissions:
+  contents: read
+
+# One run per pull request at a time; a newer event waits for the current run instead of killing its device jobs.
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || inputs.number }}
+  cancel-in-progress: false
+
+jobs:
+  pr-agent:
+    if: github.event_name == 'workflow_dispatch' || !github.event.pull_request.draft
+    runs-on: [self-hosted, pr-agent]
+    timeout-minutes: 330
+    steps:
+      - name: Review, verify and merge
+        env:
+          NUMBER: ${{ github.event.pull_request.number || inputs.number }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ -n "$HEAD" ]; then exec "$PR_AGENT" "$NUMBER" --head "$HEAD"; fi
+          exec "$PR_AGENT" "$NUMBER"
