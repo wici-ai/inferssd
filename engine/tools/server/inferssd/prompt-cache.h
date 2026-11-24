@@ -58,6 +58,10 @@ struct server_prompt {
     // (not a chat prompt, no system message, or a prompt as the cache found it on disk)
     int64_t n_conversation = 0;
 
+    // a prefix cache (server_prompt_cache::use_prefix_dir): made by another server for this model, read from its
+    // file and never written, removed or counted against the cache's limits
+    bool read_only = false;
+
     size_t size() const {
         size_t res = file.empty() ? data.size() : file_data_size;
 
@@ -81,6 +85,7 @@ struct server_prompt {
             file_data_offset,
             file_data_size,
             n_conversation,
+            read_only,
         };
     }
 };
@@ -144,6 +149,13 @@ struct server_prompt_cache {
         return !dir.empty();
     }
 
+    // Also restore from the prefix caches in `dir`: cached prompts that another server made for this model and that
+    // came with it (a download), each the state after the shared prefix of an app's requests. Their files carry
+    // `fingerprint`, which names the model but not the build or where the model is. The cache only reads them: it
+    // neither removes them nor counts them against its limits, and it reads the directory again when the directory
+    // changes, so a file put there while the server runs serves the next request.
+    void use_prefix_dir(const std::string & dir, const std::string & fingerprint);
+
     std::list<server_prompt> states; // least recently used first
 
     // in bytes, 0 = no limit
@@ -155,6 +167,10 @@ struct server_prompt_cache {
     std::string dir;
     std::string fingerprint;
 
+    std::string prefix_dir;
+    std::string prefix_fingerprint;
+
+    // of the cache's own states, not the prefix caches
     size_t size() const;
 
     size_t n_tokens() const;
@@ -190,4 +206,13 @@ private:
     void remove_superseded(const server_prompt & prompt, const server_prompt * saved);
     bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     void remove(std::list<server_prompt>::iterator it);
+    // reads the prefix cache directory again if it changed since the last read
+    void scan_prefix_dir();
+    int64_t prefix_dir_time = -1;
+    // prefix caches that failed to restore here (another state layout): not taken again from the directory
+    std::vector<std::string> prefix_unusable;
 };
+
+// The model's identity in a prefix cache's fingerprint: the size and the header (metadata and tensor list) of each
+// file it loads from, the files of a split model included. Neither the path nor the time of a file is in it.
+std::string server_model_files_identity(const std::vector<std::string> & paths);

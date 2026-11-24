@@ -51,4 +51,9 @@ struct server_prompt_cache_testing {
         cache.remove_superseded(prompt, &cache.states.back());
         return &cache.states.back();
     }
+
+    // reads the prefix cache directory again if it changed, as load() does before it looks for a state
+    static void scan_prefix_dir(server_prompt_cache & cache) {
+        cache.scan_prefix_dir();
+    }
 };

@@ -1407,6 +1407,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_DISK_MIB").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--prefix-cache"}, "PATH",
+        "also restore from the prefix caches in this directory: cached prompts of an app's shared prefix that "
+        "another server made for this model, used whatever the build or the model's location, only read and never "
+        "removed; files added while the server runs serve the next request (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.prefix_cache = value;
+        }
+    ).set_env("LLAMA_ARG_PREFIX_CACHE").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"-kvu", "--kv-unified"},
         {"-no-kvu", "--no-kv-unified"},
         "use single unified KV buffer shared across all sequences (default: enabled if number of slots is auto)",

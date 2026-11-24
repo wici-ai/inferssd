@@ -618,6 +618,7 @@ struct common_params {
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
     std::string cache_disk      = "";    // keep the prompt cache in this directory instead of in memory // NOLINT
     int32_t cache_disk_mib      = 16384; // size limit of the prompt cache on disk, 0 = no limit
+    std::string prefix_cache    = "";    // also restore from the prefix caches made for this model in this directory // NOLINT
 
     std::string hostname      = "127.0.0.1";
     std::string public_path   = "";                                                                         // NOLINT

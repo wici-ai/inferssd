@@ -11,10 +11,12 @@
 #include "speculative.h"
 #include "../server-common.h"
 #include "../server-ssd-reservation.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <filesystem>
+#include <fstream>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -79,7 +81,7 @@ size_t server_prompt_cache::size() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.size();
+        res += state.read_only ? 0 : state.size();
     }
 
     return res;
@@ -89,7 +91,7 @@ size_t server_prompt_cache::n_tokens() const {
     size_t res = 0;
 
     for (const auto & state : states) {
-        res += state.n_tokens();
+        res += state.read_only ? 0 : state.n_tokens();
     }
 
     return res;
@@ -296,12 +298,76 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
     update();
 }
 
+void server_prompt_cache::use_prefix_dir(const std::string & dir, const std::string & fingerprint) {
+    prefix_dir         = dir;
+    prefix_fingerprint = fingerprint;
+    prefix_dir_time    = -1;
+    scan_prefix_dir();
+}
+
+void server_prompt_cache::scan_prefix_dir() {
+    if (prefix_dir.empty()) {
+        return;
+    }
+    std::error_code ec;
+    const auto    time = std::filesystem::last_write_time(prefix_dir, ec);
+    const int64_t t    = ec ? 0 : (int64_t) time.time_since_epoch().count();
+    if (t == prefix_dir_time) {
+        return;
+    }
+    prefix_dir_time = t;
+
+    // the files there now; a prefix cache whose file went is dropped, a new one is read
+    std::vector<std::string> present;
+    if (!ec) {
+        for (const auto & entry : std::filesystem::directory_iterator(prefix_dir, ec)) {
+            if (entry.path().extension() == ".prompt") {
+                present.push_back(entry.path().string());
+            }
+        }
+    }
+    const auto has = [](const std::vector<std::string> & v, const std::string & x) {
+        return std::find(v.begin(), v.end(), x) != v.end();
+    };
+    for (auto it = states.begin(); it != states.end();) {
+        it = it->read_only && !has(present, it->file) ? states.erase(it) : std::next(it);
+    }
+    size_t n_found = 0;
+    for (const auto & path : present) {
+        const bool known = std::any_of(states.begin(), states.end(), [&](const server_prompt & s) {
+            return s.read_only && s.file == path;
+        });
+        if (known) {
+            ++n_found;
+            continue;
+        }
+        if (has(prefix_unusable, path)) {
+            continue;
+        }
+        server_prompt prompt;
+        bool ok = false;
+        if (FILE * f = std::fopen(path.c_str(), "rb")) {
+            ok = server_prompt_read_header(f, prefix_fingerprint, prompt);
+            std::fclose(f);
+        }
+        if (!ok) {
+            SRV_WRN(" - skipping prefix cache %s: made for another model or format\n", path.c_str());
+            continue;
+        }
+        prompt.file      = path;
+        prompt.read_only = true;
+        states.push_front(std::move(prompt));
+        ++n_found;
+    }
+    SRV_WRN("prefix caches in %s: %zu found\n", prefix_dir.c_str(), n_found);
+}
+
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
         if (lcp == (int) prompt.tokens.size() && server_prompt_can_restore_prefix(*it, prompt.n_tokens(), seq_rm_type)) {
             states.splice(states.end(), states, it);
-            if (!states.back().file.empty()) {
+            if (!states.back().file.empty() && !states.back().read_only) {
                 server_prompt_file_touch(states.back().file);
             }
             return true;
@@ -311,6 +377,12 @@ bool server_prompt_cache::contains(const server_prompt & prompt, common_context_
 }
 
 void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
+    if (it->read_only) {
+        // the file is not the cache's to remove; it is not read from the directory again either
+        prefix_unusable.push_back(it->file);
+        states.erase(it);
+        return;
+    }
     if (!it->file.empty()) {
         std::error_code ec;
         std::filesystem::remove(it->file, ec);
@@ -323,7 +395,7 @@ void server_prompt_cache::remove_obsolete(const server_prompt & prompt, common_c
         for (auto it = states.begin(); it != states.end();) {
             const int len = it->tokens.get_common_prefix(prompt.tokens);
 
-            if (len == (int) it->tokens.size() &&
+            if (!it->read_only && len == (int) it->tokens.size() &&
                     server_prompt_can_restore_prefix(prompt, it->n_tokens(), seq_rm_type)) {
                 SRV_WRN(" - removing obsolete cached prompt with length %d\n", len);
 
@@ -337,7 +409,8 @@ void server_prompt_cache::remove_obsolete(const server_prompt & prompt, common_c
 
 void server_prompt_cache::remove_superseded(const server_prompt & prompt, const server_prompt * saved) {
     for (auto it = states.begin(); it != states.end();) {
-        if (&*it == saved || (saved != nullptr && it->file == saved->file) || !server_prompt_supersedes(prompt, *it)) {
+        if (it->read_only || &*it == saved || (saved != nullptr && it->file == saved->file) ||
+                !server_prompt_supersedes(prompt, *it)) {
             ++it;
             continue;
         }
@@ -521,6 +594,7 @@ bool server_prompt_cache::load(
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
     server_ssd_memory_change budget_changes(ctx);
+    scan_prefix_dir();
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
     int64_t n_tokens_best = -1;
@@ -574,7 +648,8 @@ bool server_prompt_cache::load(
         return true;
     }
 
-    SRV_WRN(" - found a better prompt%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "", n_tokens_best);
+    SRV_WRN(" - found a better prompt%s%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "",
+            it_best->read_only ? " (prefix cache)" : "", n_tokens_best);
 
     if (!server_prompt_restore(*it_best, checkpoint_best, ctx, id_slot)) {
         SRV_WRN("%s", "failed to restore the cached prompt\n");
@@ -605,7 +680,9 @@ bool server_prompt_cache::load(
     }
     prompt = std::move(loaded);
 
-    if (on_disk()) {
+    if (it_best->read_only) {
+        states.splice(states.end(), states, it_best);
+    } else if (on_disk()) {
         // the file stays: other conversations may start from it too
         states.splice(states.end(), states, it_best);
         server_prompt_file_touch(states.back().file);
@@ -617,12 +694,20 @@ bool server_prompt_cache::load(
 }
 
 void server_prompt_cache::update() {
+    // the cache's own states, least recently used first; the prefix caches are not the cache's to drop
+    const auto oldest_own = [this]() {
+        return std::find_if(states.begin(), states.end(), [](const server_prompt & s) { return !s.read_only; });
+    };
+    const auto n_own = [this]() {
+        return (size_t) std::count_if(states.begin(), states.end(), [](const server_prompt & s) { return !s.read_only; });
+    };
+
     if (limit_size > 0) {
         // always keep at least one state, regardless of the limits
-        while (states.size() > 1 && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+        while (n_own() > 1 && size() > limit_size) {
+            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", oldest_own()->size() / (1024.0 * 1024.0));
 
-            remove(states.begin());
+            remove(oldest_own());
         }
     }
 
@@ -633,11 +718,11 @@ void server_prompt_cache::update() {
     const size_t limit_tokens_cur = limit_size > 0 ? std::max<size_t>(limit_tokens, limit_size/size_per_token) : limit_tokens;
 
     if (limit_tokens > 0) {
-        while (states.size() > 1 && n_tokens() > limit_tokens_cur) {
+        while (n_own() > 1 && n_tokens() > limit_tokens_cur) {
             SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, oldest_own()->size() / (1024.0 * 1024.0));
 
-            remove(states.begin());
+            remove(oldest_own());
         }
     }
 
@@ -646,7 +731,82 @@ void server_prompt_cache::update() {
             on_disk() ? " on disk" : "");
 
     for (const auto & state : states) {
-        SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
-                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0));
+        SRV_WRN("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB%s\n",
+                (const void *)&state, state.n_tokens(), state.checkpoints.size(), state.size() / (1024.0 * 1024.0),
+                state.read_only ? " (prefix cache)" : "");
     }
+}
+
+//
+// a model's identity for prefix caches
+//
+
+static void server_fnv1a(uint64_t & hash, const char * data, size_t size) {
+    for (size_t i = 0; i < size; ++i) {
+        hash = (hash ^ (uint8_t) data[i])*1099511628211ull;
+    }
+}
+
+// "<size>:<hash of the header>" of one GGUF file, empty if it cannot be read
+static std::string server_gguf_file_identity(const std::string & path, int64_t * split_count) {
+    gguf_init_params params = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context * gguf = gguf_init_from_file(path.c_str(), params);
+    if (gguf == nullptr) {
+        return "";
+    }
+    const size_t header = gguf_get_data_offset(gguf);
+    if (split_count != nullptr) {
+        const int64_t key = gguf_find_key(gguf, "split.count");
+        *split_count = key >= 0 ? (int64_t) gguf_get_val_u16(gguf, key) : 0;
+    }
+    gguf_free(gguf);
+
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(path, ec);
+    std::ifstream in(path, std::ios::binary);
+    if (ec || !in) {
+        return "";
+    }
+    uint64_t hash = 1469598103934665603ull;
+    std::vector<char> buf(1 << 20);
+    for (size_t left = header; left > 0;) {
+        const size_t n = std::min(left, buf.size());
+        if (!in.read(buf.data(), (std::streamsize) n)) {
+            return "";
+        }
+        server_fnv1a(hash, buf.data(), n);
+        left -= n;
+    }
+    char out[64];
+    std::snprintf(out, sizeof(out), "%" PRIu64 ":%016" PRIx64, (uint64_t) size, hash);
+    return out;
+}
+
+std::string server_model_files_identity(const std::vector<std::string> & paths) {
+    std::string id;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        int64_t n_split = 0;
+        const std::string first = server_gguf_file_identity(paths[i], &n_split);
+        if (first.empty()) {
+            return "";
+        }
+        id += (id.empty() ? "" : ",") + first;
+        if (n_split > 1) {
+            // the other files of a split model, named after the first
+            char prefix[4096];
+            if (llama_split_prefix(prefix, sizeof(prefix), paths[i].c_str(), 0, (int) n_split) <= 0) {
+                return "";
+            }
+            for (int k = 1; k < n_split; ++k) {
+                char split[4096];
+                llama_split_path(split, sizeof(split), prefix, k, (int) n_split);
+                const std::string other = server_gguf_file_identity(split, nullptr);
+                if (other.empty()) {
+                    return "";
+                }
+                id += "," + other;
+            }
+        }
+    }
+    return id;
 }

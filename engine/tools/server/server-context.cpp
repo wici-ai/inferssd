@@ -892,6 +892,19 @@ private:
         return fp + "|" + desc;
     }
 
+    // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
+    // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
+    // for the builds that compute it the same, up to rounding (docs/prefix-cache.md).
+    std::string prefix_cache_fingerprint() const {
+        const std::string files = server_model_files_identity(params_base.model.get_paths());
+        if (files.empty()) {
+            return "";
+        }
+        char desc[256];
+        llama_model_desc(model, desc, sizeof(desc));
+        return "prefix-cache 1|" + files + "|" + desc;
+    }
+
     void slot_save_and_clear(server_slot & slot) {
 
         if (slot.prompt.n_tokens() == 0) {
@@ -1150,6 +1163,15 @@ private:
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
         } else {
             SRV_WRN("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
+        }
+        if (!params_base.prefix_cache.empty()) {
+            const std::string fp = prompt_cache ? prefix_cache_fingerprint() : "";
+            if (fp.empty()) {
+                SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
+                        prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
+            } else {
+                prompt_cache->use_prefix_dir(params_base.prefix_cache, fp);
+            }
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 

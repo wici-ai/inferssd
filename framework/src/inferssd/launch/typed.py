@@ -93,6 +93,9 @@ class LaunchSpec:
     # (docs/architecture/native-observations.md). Without them the events file holds the
     # settings alone, and a long run does not grow it.
     layer_events: bool = True
+    # The directory of the prefix caches that came with each model (the WiCi AI desktop app downloads them), in a
+    # subdirectory named as the prompt cache's; the engine only reads them. None passes none.
+    prefix_cache: Optional[str] = None
 
 
 def listen_host(text: str) -> str:
@@ -311,6 +314,7 @@ def _resolve(
         "--cache-ram",
         "--cache-disk",
         "--cache-disk-mib",
+        "--prefix-cache",
         "--ssd-no-layer-events",
         "-ot",
         "--override-tensor",
@@ -620,6 +624,8 @@ def _resolve(
             "--cache-disk-mib",
             str(spec.prompt_cache_mib or PROMPT_CACHE_MIB),
         ]
+        if spec.prefix_cache is not None:
+            command += ["--prefix-cache", os_path.join(spec.prefix_cache, name)]
     command += [
         "--host",
         spec.host,
