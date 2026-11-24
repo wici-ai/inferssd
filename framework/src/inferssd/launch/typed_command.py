@@ -160,7 +160,7 @@ def prompt_cache_directory() -> Path:
 
 
 def prefix_cache_directory() -> Path:
-    """This user's directory of the prefix caches that came with the models, beside the prompt caches."""
+    """This user's directory of the prefix caches that came with the models, beside the prompts."""
     return cache_directory() / "prefix-cache"
 
 

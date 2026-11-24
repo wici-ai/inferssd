@@ -93,8 +93,9 @@ class LaunchSpec:
     # (docs/architecture/native-observations.md). Without them the events file holds the
     # settings alone, and a long run does not grow it.
     layer_events: bool = True
-    # The directory of the prefix caches that came with each model (the WiCi AI desktop app downloads them), in a
-    # subdirectory named as the prompt cache's; the engine only reads them. None passes none.
+    # The directory of the prefix caches that came with each model (the WiCi AI desktop app
+    # downloads them), in a subdirectory named as the prompt cache's; the engine only reads
+    # them. None passes none.
     prefix_cache: Optional[str] = None
 
 
