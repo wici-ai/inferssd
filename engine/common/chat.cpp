@@ -1640,10 +1640,6 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
         const std::string & generation_start = inputs.enable_thinking ? THINK_START : RESPONSE_START;
         auto generation_prompt = p.prefix(inputs.generation_prompt, generation_start);
 
-        if (!extract_reasoning) {
-            return generation_prompt + p.content(p.rest()) + p.end();
-        }
-
         auto response =
             RESPONSE_START +
             p.content(p.until(RESPONSE_END)) +
@@ -1653,9 +1649,15 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
         // the completed parse stable while streaming each partial/extra closer.
         auto message_end = p.zero_or_more(p.literal(MESSAGE_END));
 
-        // Declared tools may follow the response. The section is parsed even for
-        // tool_choice=none, so generated call markup never becomes content.
-        auto tool_section = has_tools ? p.optional(common_chat_kimi_k3_tool_section(p, inputs.tools)) : p.eps();
+        auto tool_section = p.eps();
+        if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            // Ignore any tool section after the response when calls are disabled.
+            const std::string tools_end = "<|close|>tools<|sep|>";
+            tool_section = p.optional(p.literal("<|open|>tools<|sep|>") +
+                                      p.until(tools_end) + p.optional(p.literal(tools_end)));
+        } else if (has_tools) {
+            tool_section = p.optional(common_chat_kimi_k3_tool_section(p, inputs.tools));
+        }
 
         if (!inputs.enable_thinking) {
             return generation_prompt +
@@ -1666,10 +1668,10 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
                    p.end();
         }
 
-        auto reasoning =
-            THINK_START +
-            p.reasoning(p.until(THINK_END)) +
-            p.optional(p.literal(THINK_END));
+        auto thought = p.until(THINK_END);
+        auto thought_end = p.optional(p.literal(THINK_END));
+        auto reasoning = extract_reasoning ? THINK_START + p.reasoning(thought) + thought_end
+                                           : p.content(THINK_START + thought + thought_end);
 
         return generation_prompt +
                reasoning +

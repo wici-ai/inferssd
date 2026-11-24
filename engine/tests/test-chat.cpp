@@ -1901,6 +1901,23 @@ static void test_muse_spark_peg_parsers(bool detailed_debug) {
                 tc.input += "5<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>";
                 tc.expect = simple_assist_msg("5", thinking ? "Calculate." : "");
             }, detailed_debug);
+            for (auto choice : {COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_NONE}) {
+                test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                    tc.params.enable_thinking = thinking;
+                    tc.params.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+                    tc.params.tools = { special_function_tool };
+                    tc.params.tool_choice = choice;
+                    tc.input = thinking ? "Calculate.<|close|>think<|sep|><|open|>response<|sep|>" : "";
+                    tc.input += "5<|close|>response<|sep|><|open|>tools<|sep|>"
+                                "<|open|>call tool=\"special_function\" index=\"1\"<|sep|>"
+                                "<|open|>json type=\"object\"<|sep|>{\"arg1\":1}<|close|>json<|sep|>"
+                                "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
+                    const std::string content = thinking ? "<|open|>think<|sep|>Calculate.<|close|>think<|sep|>5" : "5";
+                    tc.expect = choice == COMMON_CHAT_TOOL_CHOICE_NONE
+                        ? simple_assist_msg(content)
+                        : simple_assist_msg(content, "", "special_function", "{\"arg1\":1}");
+                }, detailed_debug);
+            }
         }
     }
 
