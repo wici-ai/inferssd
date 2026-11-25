@@ -420,42 +420,49 @@ server_identifier_map server_identifier_map::from_json(const json & value) {
     return map;
 }
 
+server_identifier_env server_identifier_env::of_system(const std::string & os, std::string home, std::string temp) {
+    server_identifier_env e;
+    e.windows = os == "windows";
+    // the paths are split in two literals: written out, a home directory is a personal path to the repository's
+    // public scan (scripts/public-scan.py)
+    e.home_stand_in = e.windows ? "C:\\Users\\infer" : os == "macos" ? "/Users" "/infer" : "/home" "/infer";
+    while (home.size() > 1 && is_separator(home.back())) {
+        home.pop_back();
+    }
+    e.home = std::move(home);
+    // macOS: the per-user folder under /var/folders that $TMPDIR names
+    if (os == "macos" && temp.size() > 1) {
+        while (temp.size() > 1 && temp.back() == '/') {
+            temp.pop_back();
+        }
+        e.temp          = std::move(temp);
+        e.temp_stand_in = "/var/folders/00/infer/T";
+    }
+    return e;
+}
+
 const server_identifier_env & server_identifier_env::current() {
     static const server_identifier_env env = [] {
-        server_identifier_env e;
+        const char * target = std::getenv("INFERSSD_IDENTIFIERS_OS");
+        const std::string os = target ? target : "";
+        if (os == "macos" || os == "windows" || os == "linux") {
+            const char * home = std::getenv(os == "windows" ? "USERPROFILE" : "HOME");
+            const char * temp = std::getenv("TMPDIR");
+            return of_system(os, home ? home : "", os == "macos" && temp ? temp : "");
+        }
 #if defined(_WIN32)
         // as UTF-8, the encoding of the requests, also for a user name outside the ANSI code page
-        e.windows            = true;
         const wchar_t * home = _wgetenv(L"USERPROFILE");
-        e.home               = home ? std::filesystem::path(home).u8string() : std::string();
-        e.home_stand_in      = "C:\\Users\\infer";
-#else
+        return of_system("windows", home ? std::filesystem::path(home).u8string() : std::string(), "");
+#elif defined(__APPLE__)
         const char * home = std::getenv("HOME");
-        e.home            = home ? home : "";
-        // the paths are split in two literals: written out, a home directory is a personal path to the
-        // repository's public scan (scripts/public-scan.py)
-#    if defined(__APPLE__)
-        e.home_stand_in = "/Users" "/infer";
-#    else
-        e.home_stand_in = "/home" "/infer";
-#    endif
-#endif
-        while (e.home.size() > 1 && is_separator(e.home.back())) {
-            e.home.pop_back();
-        }
-#if defined(__APPLE__)
-        // the per-user folder under /var/folders that $TMPDIR names
         char         buf[1024];
         const size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf));
-        if (n > 1 && n <= sizeof(buf)) {
-            e.temp = buf;
-            while (e.temp.size() > 1 && e.temp.back() == '/') {
-                e.temp.pop_back();
-            }
-            e.temp_stand_in = "/var/folders/00/infer/T";
-        }
+        return of_system("macos", home ? home : "", n > 1 && n <= sizeof(buf) ? std::string(buf) : std::string());
+#else
+        const char * home = std::getenv("HOME");
+        return of_system("linux", home ? home : "", "");
 #endif
-        return e;
     }();
     return env;
 }

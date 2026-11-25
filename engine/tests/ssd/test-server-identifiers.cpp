@@ -313,6 +313,29 @@ static void test_codex_projects_share_their_context() {
             "Windows roots: " + text_of(w["messages"][0]));
 }
 
+// A server on one system can render another system's requests as their users' servers do (INFERSSD_IDENTIFIERS_OS).
+static void test_identifiers_of_a_system() {
+    const server_identifier_env mac =
+        server_identifier_env::of_system("macos", users("alice") + "/", "/var/folders/ab/abc123/T/");
+    const server_identifier_env ref = mac_env(users("alice"), "/var/folders/ab/abc123/T");
+    require(mac.home == ref.home && mac.temp == ref.temp && mac.home_stand_in == ref.home_stand_in &&
+                mac.temp_stand_in == ref.temp_stand_in && !mac.windows,
+            "macOS: " + mac.home + " " + mac.temp + " " + mac.home_stand_in);
+
+    const server_identifier_env win = server_identifier_env::of_system("windows", "C:\\Users\\bob\\", "/tmp");
+    require(win.windows && win.home == "C:\\Users\\bob" && win.home_stand_in == "C:\\Users\\infer" && win.temp.empty(),
+            "Windows: " + win.home + " " + win.home_stand_in + " " + win.temp);
+    json body = {{"messages", json::array({{{"role", "system"}, {"content", "C:\\Users\\bob\\app and C:" + users("bob") + "/x"}}})}};
+    server_identifiers_apply(body, win);
+    require(text_of(body["messages"][0]) == "C:\\Users\\infer\\app and C:" + STAND_IN + "/x",
+            "Windows spellings on any system: " + text_of(body["messages"][0]));
+
+    const std::string carol = std::string("/home") + "/carol";
+    const server_identifier_env gnu = server_identifier_env::of_system("linux", carol, "/tmp/x");
+    require(!gnu.windows && gnu.home == carol && gnu.home_stand_in == std::string("/home") + "/infer" && gnu.temp.empty(),
+            "Linux: " + gnu.home_stand_in);
+}
+
 static void test_matches_stop_at_name_boundaries() {
     const std::string al  = users("al");
     const server_identifier_env env = mac_env(al, "");
@@ -422,6 +445,7 @@ int main() {
     test_claude_desktop_sessions_share_their_context();
     test_chatgpt_conversations_share_their_context();
     test_codex_projects_share_their_context();
+    test_identifiers_of_a_system();
     test_matches_stop_at_name_boundaries();
     test_a_request_that_cannot_be_mapped_exactly_stays();
     test_streamed_text_only_grows();

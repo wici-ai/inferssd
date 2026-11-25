@@ -49,6 +49,13 @@ struct server_identifier_env {
     std::string temp_stand_in;    // /var/folders/00/infer/T
     bool        windows = false;  // paths are spelled with '\' as well as '/'
 
+    // Those of a user of a system ("macos", "windows" or "linux") with this home directory and, on macOS, this
+    // temporary directory, with the stand-ins of that system's servers.
+    static server_identifier_env of_system(const std::string & os, std::string home, std::string temp);
+
+    // This machine's. With INFERSSD_IDENTIFIERS_OS set to macos, windows or linux, those of that system instead, for
+    // the home directory in HOME (USERPROFILE for windows) and the temporary directory in TMPDIR (macos): a server on
+    // one system then renders another system's requests as their users' servers do, to make prefix caches for them.
     static const server_identifier_env & current();
 };
 
