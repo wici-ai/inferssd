@@ -279,7 +279,7 @@ static std::unordered_map<char, std::string> GRAMMAR_LITERAL_ESCAPES = {
 };
 
 static std::unordered_set<char> NON_LITERAL_SET = {'|', '.', '(', ')', '[', ']', '{', '}', '*', '+', '?'};
-static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?'};
+static std::unordered_set<char> ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS = {'^', '$', '.', '[', ']', '(', ')', '|', '{', '}', '*', '+', '?', '/', '-', ':'};
 
 static std::string replacePattern(const std::string & input, const std::regex & regex, const std::function<std::string(const std::smatch  &)> & replacement) {
     std::smatch match;
@@ -346,11 +346,27 @@ private:
     }
 
     std::string _visit_pattern(const std::string & pattern, const std::string & name) {
-        if (!(pattern.front() == '^' && pattern.back() == '$')) {
-            _errors.push_back("Pattern must start with '^' and end with '$'");
-            return "";
+        if (pattern.empty()) {
+            return _add_primitive(name == "root" ? "root" : "string", PRIMITIVE_RULES.at("string"));
         }
-        std::string sub_pattern = pattern.substr(1, pattern.length() - 2);
+        const bool anchored_start = pattern.front() == '^';
+        bool anchored_end = false;
+        if (pattern.back() == '$') {
+            size_t bs = 0;
+            for (size_t k = pattern.length() - 1; k > 0 && pattern[k - 1] == '\\'; --k) {
+                bs++;
+            }
+            anchored_end = (bs % 2 == 0);
+        }
+        const size_t sub_start = anchored_start ? 1 : 0;
+        const size_t sub_end   = anchored_end ? pattern.length() - 1 : pattern.length();
+        if (sub_start >= sub_end) {
+            if (anchored_start && anchored_end) {
+                return _add_rule(name, "\"\\\"\\\"\" space");
+            }
+            return _add_primitive(name == "root" ? "root" : "string", PRIMITIVE_RULES.at("string"));
+        }
+        std::string sub_pattern = pattern.substr(sub_start, sub_end - sub_start);
         std::unordered_map<std::string, std::string> sub_rule_ids;
 
         size_t i = 0;
@@ -447,8 +463,13 @@ private:
                     std::string square_brackets = std::string(1, c);
                     i++;
                     while (i < length && sub_pattern[i] != ']') {
-                        if (sub_pattern[i] == '\\') {
-                            square_brackets += sub_pattern.substr(i, 2);
+                        if (sub_pattern[i] == '\\' && i + 1 < length) {
+                            const char next = sub_pattern[i + 1];
+                            if      (next == 'd') { square_brackets += "0-9"; }
+                            else if (next == 'w') { square_brackets += "a-zA-Z0-9_"; }
+                            else if (next == 's') { square_brackets += " \\t\\n\\r"; }
+                            else if (next == '/') { square_brackets += "/"; }
+                            else                  { square_brackets += sub_pattern.substr(i, 2); }
                             i += 2;
                         } else {
                             square_brackets += sub_pattern[i];
@@ -461,6 +482,18 @@ private:
                     square_brackets += ']';
                     i++;
                     seq.emplace_back(square_brackets, false);
+                } else if (c == '\\' && i + 1 < length &&
+                           (sub_pattern[i + 1] == 'd' || sub_pattern[i + 1] == 'D' ||
+                            sub_pattern[i + 1] == 'w' || sub_pattern[i + 1] == 'W' ||
+                            sub_pattern[i + 1] == 's' || sub_pattern[i + 1] == 'S')) {
+                    const char next = sub_pattern[i + 1];
+                    i += 2;
+                    if      (next == 'd') { seq.emplace_back("[0-9]", false); }
+                    else if (next == 'D') { seq.emplace_back("[^0-9\"\\\\]", false); }
+                    else if (next == 'w') { seq.emplace_back("[a-zA-Z0-9_]", false); }
+                    else if (next == 'W') { seq.emplace_back("[^a-zA-Z0-9_\"\\\\]", false); }
+                    else if (next == 's') { seq.emplace_back("[ \\t\\n\\r]", false); }
+                    else                  { seq.emplace_back("[^ \\t\\n\\r\"\\\\]", false); }
                 } else if (c == '|') {
                     seq.emplace_back("|", false);
                     i++;
@@ -525,6 +558,9 @@ private:
                     while (i < length) {
                         if (sub_pattern[i] == '\\' && i < length - 1) {
                             char next = sub_pattern[i + 1];
+                            if (next == 'd' || next == 'D' || next == 'w' || next == 'W' || next == 's' || next == 'S') {
+                                break;
+                            }
                             if (ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.find(next) != ESCAPED_IN_REGEXPS_BUT_NOT_IN_LITERALS.end()) {
                                 i++;
                                 literal += sub_pattern[i];
@@ -551,7 +587,21 @@ private:
             }
             return join_seq();
         };
-        return _add_rule(name, "\"\\\"\" (" + to_rule(transform()) + ") \"\\\"\" space");
+        const std::string body = "(" + to_rule(transform()) + ")";
+        if (anchored_start && anchored_end) {
+            return _add_rule(name, "\"\\\"\" " + body + " \"\\\"\" space");
+        }
+        const std::string char_rule = _add_primitive("char", PRIMITIVE_RULES.at("char"));
+        std::string rule = "\"\\\"\" ";
+        if (!anchored_start) {
+            rule += char_rule + "* ";
+        }
+        rule += body;
+        if (!anchored_end) {
+            rule += " " + char_rule + "*";
+        }
+        rule += " \"\\\"\" space";
+        return _add_rule(name, rule);
     }
 
     /*

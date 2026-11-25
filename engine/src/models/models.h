@@ -883,3 +883,54 @@ struct llm_build_qwen4exp : public llm_build_delta_net_base {
         const llama_model & model;
 
 };
+
+// Inkling 2 (inkling2) and its looped variant (inkling2_loop): the cache slots after the physical layers
+// repeat the core [loop_start, loop_end) for each later pass and share its weights
+struct llm_build_inkling2 : public llm_graph_context {
+    llm_build_inkling2(const llama_model & model, const llm_graph_params & params);
+
+    enum { LOOP_CTRL_Q, LOOP_CTRL_K, LOOP_CTRL_V, LOOP_CTRL_FFN, LOOP_CTRL_COUNT };
+
+    const llama_model & model;
+
+    llm_graph_input_mem_hybrid_iswa_rel * inp      = nullptr;
+    llm_graph_input_rs                  * recr     = nullptr;
+    llm_graph_input_inkling_tree        * tree_inp = nullptr;
+
+    ggml_tensor * inp_pos = nullptr;
+    ggml_tensor * tau = nullptr; // log-scaled positions of the full-attention layers
+    ggml_tensor * tau_rel = nullptr; // tau times the relative clip, the factor of r in the full-attention layers
+    ggml_tensor * zero_sinks = nullptr; // the zero sink logit of every head, shared by the layers
+    uint64_t      tree_parents_packed = 0; // 4-bit per-token parent indices (parent[t]+1) for tree verify
+
+    // the normalized, concatenated blocks of each list of blocks that a mix has seen
+    std::map<std::vector<ggml_tensor *>, ggml_tensor *> mix_banks;
+
+    // the RMS norm with eps 1e-6 of each tensor that a mix or a controller has normalized
+    std::map<ggml_tensor *, ggml_tensor *> rms_cache;
+
+    // the F32 relative bias table of each physical layer, padded with the zero bias of the distances past the extent
+    std::map<const ggml_tensor *, ggml_tensor *> rel_tables;
+
+    ggml_tensor * unit_rms(ggml_tensor * x);
+
+    ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+    ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
+    ggml_tensor * convolve(ggml_tensor * cur, ggml_tensor * weight, ggml_tensor * dynamic,
+            ggml_tensor * history, int64_t offset, float scale = 1.0f);
+    float conv_scale(bool dynamic) const;
+    ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, ggml_tensor * message_norm,
+            const llama_layer & layer, int ctrl);
+    ggml_tensor * attention(ggml_tensor * q, ggml_tensor * k, ggml_tensor * v, ggml_tensor * rel_bias,
+            ggml_tensor * sinks, float kq_scale, int il);
+
+    // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs,
+    // messages_norm is their RMS norm
+    ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
+            ggml_tensor * messages, ggml_tensor * messages_norm);
+};
+
+// Inkling 2 DSpark paired draft model (`mtp.safetensors`)
+struct llm_build_inkling2_dspark : public llm_graph_context {
+    llm_build_inkling2_dspark(const llama_model & model, const llm_graph_params & params);
+};

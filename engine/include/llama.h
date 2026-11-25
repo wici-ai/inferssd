@@ -324,6 +324,7 @@ extern "C" {
                               // load into host memory, and the context moves into a discrete GPU those its memory
                               // holds (the rest streamed)
         bool no_alloc;        // only load metadata and simulate memory allocations
+        int32_t inkling_ssd_layers; // read the first N physical layers' routed experts directly from GGUF
     };
 
     struct llama_sampler_seq_config {
@@ -770,6 +771,31 @@ extern "C" {
 
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
+
+    // Check if seq_rm(seq_id, pos_next, -1) can roll back cleanly in-place while preserving
+    // all required attention (SWA window n_swa) and recurrent state to continue at pos_next.
+    LLAMA_API bool llama_memory_seq_can_rollback(
+            llama_memory_t mem,
+              llama_seq_id seq_id,
+                 llama_pos pos_next,
+                  uint32_t n_swa);
+
+    // Set per-token parent indices for a tree-structured decode batch (n <= 16, parents[0] == -1,
+    // parents[i] < i). Cleared automatically after the next llama_decode call.
+    LLAMA_API void llama_set_tree_parents(
+            struct llama_context * ctx,
+                    const int8_t * parents,
+                         int32_t   n);
+
+    // Retain only the winning root-to-leaf path from the most recent tree-structured decode batch
+    // on `seq_id` starting at `pos0`. `keep_idxs` must be strictly increasing indices in [0, B)
+    // starting with keep_idxs[0] == 0.
+    LLAMA_API bool llama_tree_accept_path(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                       llama_pos   pos0,
+                   const int32_t * keep_idxs,
+                         int32_t   n_keep);
 
     //
     // State / sessions

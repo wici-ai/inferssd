@@ -149,6 +149,10 @@ static ggml_backend_buffer_type_t ggml_backend_meta_device_get_buffer_type(ggml_
 static ggml_backend_buffer_type_t ggml_backend_meta_device_get_host_buffer_type(ggml_backend_dev_t dev);
 
 static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    if (op->op == GGML_OP_FLASH_ATTN_EXT && ggml_flash_attn_ext_has_indexed_bias(op)) {
+        return false;
+    }
+
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
     return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
@@ -982,6 +986,13 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
             } break;
             case GGML_OP_DSV4_HC_COMB:
             case GGML_OP_DSV4_HC_POST:
+            case GGML_OP_INKLING_SCONV:
+            case GGML_OP_INKLING_SCONV_STATE:
+            case GGML_OP_INKLING_MIX:
+            case GGML_OP_INKLING_CTRL_BLEND:
+            case GGML_OP_INKLING_MOE_IDS:
+            case GGML_OP_INKLING_MOE_WEIGHTS:
+            case GGML_OP_INKLING_MOE_REDUCE:
             case GGML_OP_TOP_K_MASK: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;

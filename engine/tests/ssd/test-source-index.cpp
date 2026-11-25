@@ -57,6 +57,7 @@ static void gguf_sources(const std::filesystem::path & directory) {
     const std::string second = write_gguf(directory / "model-00002-of-00002.gguf", {
         { "blk.0.ffn_down_exps.weight", GGML_TYPE_Q8_0, { 32, 64, 4 } },
         { "blk.0.ffn_gate_up_exps.weight", GGML_TYPE_Q8_0, { 64, 6, 4 } },
+        { "blk.0.ffn_gate_up_exps.scale", GGML_TYPE_F32, { 4, 1, 1 } },
     });
     auto opened = ssd::store::source_index::open({first, second});
     require(bool(opened), "GGUF source creation failed");
@@ -67,6 +68,7 @@ static void gguf_sources(const std::filesystem::path & directory) {
     const struct { const char * name; size_t bytes; int fill; } roles[] = {
         { "blk.0.ffn_up_exps.weight", 3 * 68, 1 }, { "blk.0.ffn_gate_exps.weight", 3 * 144, 17 },
         { "blk.0.ffn_down_exps.weight", 64 * 34, 1 },
+        { "blk.0.ffn_gate_up_exps.weight", 6 * 68, 17 },
     };
     for (const auto & role : roles) {
         for (int expert = 0; expert < 4; ++expert) {
@@ -85,7 +87,7 @@ static void gguf_sources(const std::filesystem::path & directory) {
             view.resolve(view.userdata, "blk.0.ffn_down_exps.weight", 0, 64 * 34, 4, &fd, &offset, &bytes) && fd != up,
             "the shards shared a descriptor");
     require(!view.resolve(view.userdata, "blk.0.attn_q.weight", 0, 64 * 64 * 4, 1, &fd, &offset, &bytes) &&
-            !view.resolve(view.userdata, "blk.0.ffn_gate_up_exps.weight", 0, 6 * 68, 4, &fd, &offset, &bytes),
+            !view.resolve(view.userdata, "blk.0.ffn_gate_up_exps.scale", 0, 16, 1, &fd, &offset, &bytes),
             "a tensor that is not a routed expert role was indexed");
     // a routed expert name on a tensor that is not experts after experts refuses the file
     const std::string flat = write_gguf(directory / "flat.gguf", { { "blk.1.ffn_up_exps.weight", GGML_TYPE_Q8_0, { 64, 3, 1 } } });

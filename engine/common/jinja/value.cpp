@@ -214,14 +214,12 @@ static value tojson(const func_args & args) {
     if (is_val<value_int>(val_indent)) {
         indent = static_cast<int>(val_indent->as_int());
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
+    const bool sort_keys    = val_sort->as_bool();  // undefined == false
     const bool ensure_ascii = val_ascii->as_bool(); // undefined == false
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     const string item_sep = separators.size() > 0 ? separators[0]->as_string() : string(std::string(indent < 0 ? ", " : ","));
     const string key_sep = separators.size() > 1 ? separators[1]->as_string() : string(std::string(": "));
-    auto json_str = value_to_json_origin(args.get_pos(0), indent, item_sep, key_sep);
+    auto json_str = value_to_json_origin(args.get_pos(0), indent, item_sep, key_sep, sort_keys);
     if (ensure_ascii) json_str = json_ensure_ascii_preserving_format(json_str);
     return mk_val<value_string>(json_str);
 }
@@ -1409,7 +1407,7 @@ struct origin_stream {
 
 // recursively convert value to JSON string
 // TODO: avoid circular references
-static void value_to_json_internal(origin_stream & oss, const value & val, int curr_lvl, int indent, const string & item_sep, const string & key_sep) {
+static void value_to_json_internal(origin_stream & oss, const value & val, int curr_lvl, int indent, const string & item_sep, const string & key_sep, bool sort_keys = false) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };
@@ -1459,7 +1457,7 @@ static void value_to_json_internal(origin_stream & oss, const value & val, int c
             oss << newline();
             for (size_t i = 0; i < arr.size(); ++i) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < arr.size() - 1) {
                     oss << item_sep;
                 }
@@ -1469,16 +1467,23 @@ static void value_to_json_internal(origin_stream & oss, const value & val, int c
         }
         oss << "]";
     } else if (is_val<value_object>(val)) {
-        const auto & obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        const auto & orig_obj = val->as_ordered_object();
+        auto sorted_obj = orig_obj;
+        if (sort_keys) {
+            std::sort(sorted_obj.begin(), sorted_obj.end(), [](const auto & a, const auto & b) {
+                return a.first->as_string().str() < b.first->as_string().str();
+            });
+        }
+        const auto & obj = sort_keys ? sorted_obj : orig_obj;
         oss << "{";
         if (!obj.empty()) {
             oss << newline();
             size_t i = 0;
             for (const auto & pair : obj) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string()), curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string()), curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 oss << key_sep;
-                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < obj.size() - 1) {
                     oss << item_sep;
                 }
@@ -1493,14 +1498,14 @@ static void value_to_json_internal(origin_stream & oss, const value & val, int c
     }
 }
 
-string value_to_json_origin(const value & val, int indent, const string & item_sep, const string & key_sep) {
+string value_to_json_origin(const value & val, int indent, const string & item_sep, const string & key_sep, bool sort_keys) {
     origin_stream oss;
-    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
+    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep, sort_keys);
     return oss.output;
 }
 
-std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
-    return value_to_json_origin(val, indent, string(std::string(item_sep)), string(std::string(key_sep))).str();
+std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
+    return value_to_json_origin(val, indent, string(std::string(item_sep)), string(std::string(key_sep)), sort_keys).str();
 }
 
 string value_to_string_repr_origin(const value & val) {

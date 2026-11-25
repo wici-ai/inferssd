@@ -1154,6 +1154,11 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             {
                 op_tensor = ggml_scale(ctx, w, 1.0f);
             } break;
+        case GGML_OP_REPEAT:
+            {
+                ggml_tensor * b = ggml_new_tensor_4d(ctx, w->type, w->ne[0], w->ne[1] * 8, w->ne[2], w->ne[3]);
+                op_tensor = ggml_repeat(ctx, w, b);
+            } break;
         default:
             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
     }
@@ -1507,6 +1512,12 @@ std::pair<size_t, size_t> llama_model_loader::drop_blocks(uint32_t first, uint32
     }
     n_tensors = (int) weights_map.size();
     return { tensors, bytes };
+}
+
+void llama_model_loader::account_external_tensor(const ggml_tensor & tensor) {
+    n_created++;
+    created_tensor_names.insert(ggml_get_name(&tensor));
+    size_data -= ggml_nbytes(&tensor); // init_mappings adds all file tensors
 }
 
 void llama_model_loader::done_getting_tensors() const {

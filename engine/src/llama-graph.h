@@ -22,6 +22,8 @@ struct ggml_tensor;
 struct llama_cparams;
 struct llama_layer;
 struct llama_ssd_cpu_sink_node;
+struct inkling_expert_read;
+struct inkling_expert_layer;
 struct llama_ssd_cpu_sink_runtime;
 
 struct llama_memory_context_i;
@@ -70,6 +72,9 @@ enum llm_norm_type {
 inline ggml_tensor * llm_moe_weights_denominator(
         ggml_context * ctx, ggml_tensor * weights_sum, llm_arch arch) {
     if (arch == LLM_ARCH_DEEPSEEK41) {
+        return ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f);
+    }
+    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         return ggml_scale_bias(ctx, weights_sum, 1.0f, 1e-20f);
     }
     return ggml_clamp(ctx, weights_sum, 6.103515625e-5f, std::numeric_limits<float>::infinity());
@@ -271,6 +276,7 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    int32_t s_copy0 = -1;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {
@@ -606,6 +612,33 @@ public:
     const llama_memory_hybrid_iswa_context * mctx;
 };
 
+// hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling2)
+class llm_graph_input_mem_hybrid_iswa_rel : public llm_graph_input_mem_hybrid_iswa {
+public:
+    llm_graph_input_mem_hybrid_iswa_rel(
+            const llama_cparams & cparams,
+            std::unique_ptr<llm_graph_input_attn_kv_iswa> inp_attn,
+            std::unique_ptr<llm_graph_input_rs>          inp_rs,
+            const llama_memory_hybrid_iswa_context *     mctx,
+            uint32_t extent,
+            uint32_t extent_swa) :
+        llm_graph_input_mem_hybrid_iswa(cparams, std::move(inp_attn), std::move(inp_rs), mctx),
+        extent(extent),
+        extent_swa(extent_swa) { }
+    virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    // distance from the token to the cell, extent for the empty, future and more distant cells
+    ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
+    ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    const uint32_t extent;
+    const uint32_t extent_swa;
+};
+
 class llm_graph_input_sampling : public llm_graph_input_i {
 public:
     llm_graph_input_sampling(std::map<llama_seq_id, llama_sampler *> samplers) :
@@ -616,6 +649,34 @@ public:
     bool can_reuse(const llm_graph_params & params) override;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+};
+
+// Updates Inkling2 shortconv tree-parent op_params in-place so the compute graph is reused across tree shapes
+class llm_graph_input_inkling_tree : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_inkling_tree(uint64_t tree_parents_packed) :
+        tree_parents_packed(tree_parents_packed) { }
+    virtual ~llm_graph_input_inkling_tree() = default;
+
+    void set_input(const llama_ubatch * ubatch) override {
+        GGML_UNUSED(ubatch);
+        const int32_t lo      = (int32_t) (tree_parents_packed & 0xffffffffu);
+        const int32_t hi      = (int32_t) (tree_parents_packed >> 32);
+        const int32_t is_tree = (tree_parents_packed != 0) ? 1 : 0;
+        for (ggml_tensor * node : sconv_nodes) {
+            node->op_params[1] = lo;
+            node->op_params[2] = hi;
+        }
+        for (ggml_tensor * node : sconv_state_nodes) {
+            node->op_params[0] = is_tree;
+        }
+    }
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    uint64_t tree_parents_packed = 0;
+    std::vector<ggml_tensor *> sconv_nodes;
+    std::vector<ggml_tensor *> sconv_state_nodes;
 };
 
 //
@@ -681,6 +742,15 @@ struct llm_graph_params {
 
     // Maximum context position covered by the current scheduler reserve.
     uint32_t n_ctx_reserve = 0;
+
+    // Packed 4-bit per-token parent indices (parent[t] + 1) for tree-structured decode (0 = linear).
+    uint64_t tree_parents_packed = 0;
+
+    // Number of pending target tap rows fused into the start of a DSpark draft graph (0 = standalone).
+    int32_t dspark_pending_n = 0;
+
+    // Active DSpark draft vocabulary row count (0 = full vocabulary).
+    int32_t dspark_n_cand = 0;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -750,6 +820,8 @@ struct llm_graph_params {
             arch  == other.arch  &&
             gtype == other.gtype &&
             n_ctx_reserve == other.n_ctx_reserve &&
+            dspark_pending_n == other.dspark_pending_n &&
+            dspark_n_cand == other.dspark_n_cand &&
             cvec  == other.cvec  &&
             loras == other.loras &&
             cross == other.cross;
@@ -808,6 +880,7 @@ public:
     std::vector<llm_graph_input_ptr> inputs;
 
     std::vector<std::unique_ptr<llama_ssd_cpu_sink_node>> cpu_sink_nodes;
+    std::vector<std::unique_ptr<inkling_expert_read>> inkling_reads;
 
     ggml_context_ptr ctx_compute;
 
@@ -844,6 +917,7 @@ struct llm_graph_qkv {
 };
 
 struct llm_graph_context {
+    const inkling_expert_layer * inkling_ssd_layer = nullptr;
     const llm_arch arch;
 
     const llama_hparams & hparams;
@@ -1076,7 +1150,9 @@ struct llm_graph_context {
             ggml_tensor * v_mla,   // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                 int64_t   n_kv_max,
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * bias_table = nullptr,
+            ggml_tensor * bias_indices = nullptr) const;
 
     llm_graph_input_attn_no_cache * build_attn_inp_no_cache() const;
 
@@ -1209,6 +1285,9 @@ struct llm_graph_context {
     llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
+
+    // extent, extent_swa: the distance that the bias tables of the full and the SWA layers stop at
+    llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(uint32_t extent, uint32_t extent_swa) const;
 
     //
     // pooling

@@ -50,6 +50,13 @@ void ggml_compute_forward_l2_norm(const struct ggml_compute_params * params, str
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_sconv(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_sconv_state(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_mix(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_ctrl_blend(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_moe_ids(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_moe_weights(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_inkling_moe_reduce(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_out_prod(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_scale(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_set(const struct ggml_compute_params * params, struct ggml_tensor * dst);

@@ -32,6 +32,10 @@ source tree.
    under the same MIT license, using log1pf(expf(x)) to retain the negative
    tail while preserving the existing positive-input fast path.
 
+   The Inkling 2 GGUF converter, architecture keys and tensor mappings follow
+   the MIT-licensed Inkling 2 support in ggml-org/llama.cpp, including its
+   Inkling 2 Mini loop variant (pull request 32694).
+
    A model's extra GGUF shards (--shard, --ple) are ported from that same
    upstream revision: the option in engine/common/arg.cpp, the model's paths in
    engine/common/common.h, common.cpp and fit.cpp, and the loading of shards
@@ -100,6 +104,9 @@ source tree.
    engine/models/templates/unsloth-Qwen3.6-35B-A3B.jinja is the chat template in
    https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF (revision a483e9e6cbd5),
    under Apache-2.0.
+   engine/models/templates/thinkingmachines-Inkling-2-Mini.jinja is the chat
+   template from https://huggingface.co/thinkingmachines/Inkling-2-Mini
+   (revision b85c3cfa615f), released by Thinking Machines Lab under Apache-2.0.
 
 MIT permission notice for entries 1-5 and the DeepSeek template in entry 6
 --------------------------------------------------------------------------

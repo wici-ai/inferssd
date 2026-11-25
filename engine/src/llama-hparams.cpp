@@ -71,6 +71,10 @@ uint32_t llama_hparams::n_rot(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_inp() const {
+    if (n_embd_inp_enc_impl > 0) {
+        return n_embd_inp_enc_impl;
+    }
+
     uint32_t n_embd_inp = n_embd;
 
     if (n_deepstack_layers > 0) {
@@ -160,6 +164,11 @@ uint32_t llama_hparams::n_embd_r() const {
     if (wkv_head_size != 0) {
         // for RWKV models
         return token_shift_count * n_embd;
+    }
+
+    if (n_sconv_channels != 0) {
+        // for Inkling2 models, checked before LFM2 as they set n_shortconv_l_cache too
+        return n_sconv_channels * (n_shortconv_l_cache - 1);
     }
 
     if (n_shortconv_l_cache != 0) {

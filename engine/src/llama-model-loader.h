@@ -219,6 +219,8 @@ struct llama_model_loader {
 
     struct ggml_tensor * create_tensor_as_view(struct ggml_context * ctx, struct ggml_tensor * base, const std::string & name, const std::initializer_list<int64_t> & ne, size_t offset, bool required = true);
 
+    // Account for a validated weight whose payload is read at execution time.
+    void account_external_tensor(const ggml_tensor & tensor);
     void done_getting_tensors() const;
 
     // Forget the tensors of blocks [first, first + count), as if the file had none: the counts, the

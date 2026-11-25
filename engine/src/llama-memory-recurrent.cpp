@@ -47,12 +47,19 @@ llama_memory_recurrent::llama_memory_recurrent(
     };
     std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
 
+    has_sconv_hist = hparams.n_sconv_channels > 0 &&
+                     hparams.n_shortconv_l_cache > 1 &&
+                     hparams.n_embd_s() == 0 &&
+                     hparams.ple_conv_state() == 0 &&
+                     type_r == GGML_TYPE_F32;
+
     // create a context for each buffer type
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
+            const uint32_t n_per_layer = 2u + (hparams.ple_conv_state() > 0 ? 1u : 0u) + (has_sconv_hist ? 1u : 0u);
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(n_per_layer*n_layer*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -73,6 +80,7 @@ llama_memory_recurrent::llama_memory_recurrent(
     p_l.resize(n_layer);
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    r_hist_l.resize(n_layer);
 
     for (int i = 0; i < n_layer; i++) {
         if (filter && !filter(i)) {
@@ -110,6 +118,11 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;
         }
+        if (has_sconv_hist) {
+            ggml_tensor * rh = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hparams.n_sconv_channels, SCONV_HIST_W, mem_size);
+            ggml_format_name(rh, "cache_r_hist_l%d", i);
+            r_hist_l[i] = rh;
+        }
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -136,14 +149,18 @@ llama_memory_recurrent::llama_memory_recurrent(
 
 void llama_memory_recurrent::clear(bool data) {
     for (int32_t i = 0; i < (int32_t) size; ++i) {
-        cells[i].pos = -1;
+        cells[i].pos      = -1;
+        cells[i].hist_min = 0;
+        cells[i].hist_max = -1;
         cells[i].seq_id.clear();
-        cells[i].src = -1;
-        cells[i].tail = -1;
+        cells[i].src      = -1;
+        cells[i].tail     = -1;
     }
 
     head = 0;
     used = 0;
+    tree_active = false;
+    last_tree_n = 0;
 
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
@@ -173,11 +190,56 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
+            auto & cell = cells[tail_id];
+            // partial intersection at the end of the sequence: supported in O(1) for pure finite-window shortconv
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: partial intersection is invalid, so returning false, p0 = %d, cell.pos = %d, p1 = %d\n", p0, cell.pos, p1);
-                return false;
+                if (!has_sconv_hist || cell.seq_id.size() != 1) {
+                    return false;
+                }
+                const int32_t l_cache    = (int32_t) hparams.n_shortconv_l_cache - 1;
+                const int32_t n_channels = (int32_t) hparams.n_sconv_channels;
+                for (int32_t l = 0; l < l_cache; ++l) {
+                    const llama_pos tp = p0 - l_cache + l;
+                    if (tp < 0) {
+                        if (cell.hist_min != 0) {
+                            return false;
+                        }
+                    } else {
+                        if (tp < cell.hist_min || tp > cell.hist_max || (cell.hist_max - tp) >= (llama_pos) SCONV_HIST_W) {
+                            return false;
+                        }
+                    }
+                }
+
+                std::vector<float> tap_buf((size_t) l_cache * n_channels, 0.0f);
+                std::vector<float> cell_buf((size_t) l_cache * n_channels);
+
+                for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+                    if (r_l[il] == nullptr || r_hist_l[il] == nullptr) {
+                        continue;
+                    }
+                    for (int32_t l = 0; l < l_cache; ++l) {
+                        const llama_pos tp = p0 - l_cache + l;
+                        float * dst_tap = tap_buf.data() + (size_t) l * n_channels;
+                        if (tp < 0) {
+                            std::memset(dst_tap, 0, (size_t) n_channels * sizeof(float));
+                        } else {
+                            const uint32_t slot = (uint32_t) (tp % (llama_pos) SCONV_HIST_W);
+                            const size_t hist_offs = (size_t) slot * r_hist_l[il]->nb[1] + (size_t) tail_id * r_hist_l[il]->nb[2];
+                            ggml_backend_tensor_get(r_hist_l[il], dst_tap, hist_offs, (size_t) n_channels * sizeof(float));
+                        }
+                    }
+                    for (int32_t c = 0; c < n_channels; ++c) {
+                        for (int32_t l = 0; l < l_cache; ++l) {
+                            cell_buf[(size_t) c * l_cache + l] = tap_buf[(size_t) l * n_channels + c];
+                        }
+                    }
+                    ggml_backend_tensor_set(r_l[il], cell_buf.data(), (size_t) tail_id * r_l[il]->nb[1], cell_buf.size() * sizeof(float));
+                }
+
+                cell.pos      = p0 - 1;
+                cell.hist_max = p0 - 1;
+                return true;
             }
             // invalidate tails which will be cleared
             if (p0 <= cell.pos && cell.pos < p1) {
@@ -206,8 +268,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
                 if (cells[i].pos >= 0) {
                     used--;
                 }
-                cells[i].pos = -1;
-                cells[i].src = -1;
+                cells[i].pos      = -1;
+                cells[i].hist_min = 0;
+                cells[i].hist_max = -1;
+                cells[i].src      = -1;
                 if (new_head == size) {
                     new_head = i;
                 }
@@ -220,6 +284,97 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
         head = new_head;
     }
 
+    return true;
+}
+
+void llama_memory_recurrent::set_tree_parents(const int8_t * parents, int32_t n) {
+    tree_active = (parents != nullptr && n > 0);
+}
+
+bool llama_memory_recurrent::tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) {
+    if (seq_id < 0 || seq_id >= (int64_t) size || !keep_idxs || n_keep <= 0 || keep_idxs[0] != 0) {
+        return false;
+    }
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+    auto & cell = cells[tail_id];
+    if (!has_sconv_hist || cell.seq_id.size() != 1 || !cell.has_seq_id(seq_id)) {
+        return false;
+    }
+
+    for (int32_t k = 1; k < n_keep; ++k) {
+        if (keep_idxs[k] <= keep_idxs[k - 1] || (uint32_t) keep_idxs[k] >= last_tree_n) {
+            return false;
+        }
+    }
+
+    const llama_pos p_next     = pos0 + n_keep;
+    const int32_t   l_cache    = (int32_t) hparams.n_shortconv_l_cache - 1;
+    const int32_t   n_channels = (int32_t) hparams.n_sconv_channels;
+
+    // Fast path: full linear tree accepted with no compaction or state rollback needed
+    const bool all_linear_full = ((uint32_t) n_keep == last_tree_n && keep_idxs[n_keep - 1] == n_keep - 1);
+    if (!all_linear_full) {
+        for (int32_t l = 0; l < l_cache; ++l) {
+            const llama_pos tp = p_next - l_cache + l;
+            if (tp < 0) {
+                if (cell.hist_min != 0) {
+                    return false;
+                }
+            } else if (tp < pos0) {
+                if (tp < cell.hist_min || tp > cell.hist_max) {
+                    return false;
+                }
+            }
+        }
+
+        std::vector<float> row_buf((size_t) n_channels);
+        std::vector<float> tap_buf((size_t) l_cache * n_channels, 0.0f);
+        std::vector<float> cell_buf((size_t) l_cache * n_channels);
+
+        for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+            if (r_l[il] == nullptr || r_hist_l[il] == nullptr) {
+                continue;
+            }
+            // Compact winning tree nodes in ascending order: since keep_idxs[k] >= k and
+            // last_tree_n < SCONV_HIST_W, writing dst_slot never clobbers a future src_slot.
+            for (int32_t k = 1; k < n_keep; ++k) {
+                if (keep_idxs[k] == k) {
+                    continue;
+                }
+                const uint32_t src_slot = (uint32_t) ((pos0 + keep_idxs[k]) % (llama_pos) SCONV_HIST_W);
+                const uint32_t dst_slot = (uint32_t) ((pos0 + k)            % (llama_pos) SCONV_HIST_W);
+                const size_t src_offs = (size_t) src_slot * r_hist_l[il]->nb[1] + (size_t) tail_id * r_hist_l[il]->nb[2];
+                const size_t dst_offs = (size_t) dst_slot * r_hist_l[il]->nb[1] + (size_t) tail_id * r_hist_l[il]->nb[2];
+                ggml_backend_tensor_get(r_hist_l[il], row_buf.data(), src_offs, (size_t) n_channels * sizeof(float));
+                ggml_backend_tensor_set(r_hist_l[il], row_buf.data(), dst_offs, (size_t) n_channels * sizeof(float));
+            }
+            // Restore r_l[il] from the compacted winning path's last l_cache taps
+            for (int32_t l = 0; l < l_cache; ++l) {
+                const llama_pos tp = p_next - l_cache + l;
+                float * dst_tap = tap_buf.data() + (size_t) l * n_channels;
+                if (tp < 0) {
+                    std::memset(dst_tap, 0, (size_t) n_channels * sizeof(float));
+                } else {
+                    const uint32_t slot = (uint32_t) (tp % (llama_pos) SCONV_HIST_W);
+                    const size_t hist_offs = (size_t) slot * r_hist_l[il]->nb[1] + (size_t) tail_id * r_hist_l[il]->nb[2];
+                    ggml_backend_tensor_get(r_hist_l[il], dst_tap, hist_offs, (size_t) n_channels * sizeof(float));
+                }
+            }
+            for (int32_t c = 0; c < n_channels; ++c) {
+                for (int32_t l = 0; l < l_cache; ++l) {
+                    cell_buf[(size_t) c * l_cache + l] = tap_buf[(size_t) l * n_channels + c];
+                }
+            }
+            ggml_backend_tensor_set(r_l[il], cell_buf.data(), (size_t) tail_id * r_l[il]->nb[1], cell_buf.size() * sizeof(float));
+        }
+    }
+
+    cell.pos      = p_next - 1;
+    cell.hist_max = p_next - 1;
+    last_tree_n   = 0;
     return true;
 }
 
@@ -246,8 +401,10 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_dst.seq_id.erase(seq_id_dst);
             tail_dst.tail = -1;
             if (cell_dst.seq_id.empty()) {
-                cell_dst.pos = -1;
-                cell_dst.src = -1;
+                cell_dst.pos      = -1;
+                cell_dst.hist_min = 0;
+                cell_dst.hist_max = -1;
+                cell_dst.src      = -1;
                 used -= 1;
             }
         }
@@ -273,8 +430,10 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
                 used--;
             }
 
-            cells[i].pos = -1;
-            cells[i].src = -1;
+            cells[i].pos      = -1;
+            cells[i].hist_min = 0;
+            cells[i].hist_max = -1;
+            cells[i].src      = -1;
             cells[i].seq_id.clear();
 
             if (new_head == size){
@@ -317,6 +476,8 @@ void llama_memory_recurrent::seq_add(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos += shift;
+                cell.hist_min = cell.pos + 1;
+                cell.hist_max = cell.pos;
             }
         }
     }
@@ -347,6 +508,8 @@ void llama_memory_recurrent::seq_div(llama_seq_id seq_id, llama_pos p0, llama_po
             auto & cell = cells[tail_id];
             if (cell.has_seq_id(seq_id) && p0 <= cell.pos && cell.pos < p1) {
                 cell.pos /= d;
+                cell.hist_min = cell.pos + 1;
+                cell.hist_max = cell.pos;
             }
         }
     }
@@ -378,6 +541,48 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
     }
 
     return result;
+}
+
+bool llama_memory_recurrent::seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const {
+    GGML_UNUSED(n_swa);
+
+    if (seq_id < 0 || seq_id >= (llama_seq_id) size) {
+        return false;
+    }
+
+    const int32_t tail_id = cells[seq_id].tail;
+    if (tail_id < 0) {
+        return false;
+    }
+
+    const auto & cell = cells[tail_id];
+    if (!cell.has_seq_id(seq_id)) {
+        return false;
+    }
+
+    if (pos_next > cell.pos) {
+        return true;
+    }
+
+    if (pos_next <= 0 || !has_sconv_hist || cell.seq_id.size() != 1) {
+        return false;
+    }
+
+    const int32_t l_cache = (int32_t) hparams.n_shortconv_l_cache - 1;
+    for (int32_t l = 0; l < l_cache; ++l) {
+        const llama_pos tp = pos_next - l_cache + l;
+        if (tp < 0) {
+            if (cell.hist_min != 0) {
+                return false;
+            }
+        } else {
+            if (tp < cell.hist_min || tp > cell.hist_max || (cell.hist_max - tp) >= (llama_pos) SCONV_HIST_W) {
+                return false;
+            }
+        }
+    }
+
+    return true;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_recurrent::memory_breakdown() const {
@@ -505,8 +710,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                     cell.seq_id.erase(seq_id);
                     seq.tail = -1;
                     if (cell.seq_id.empty()) {
-                        cell.pos = -1;
-                        cell.src = -1;
+                        cell.pos      = -1;
+                        cell.hist_min = 0;
+                        cell.hist_max = -1;
+                        cell.src      = -1;
                         used -= 1;
                     }
                 }
@@ -563,8 +770,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             // copy old tail into the empty cell
             if (seq_meta.tail >= 0) {
                 auto & orig_cell = cells[seq_meta.tail];
-                empty_cell.pos = orig_cell.pos;
-                empty_cell.src = orig_cell.src;
+                empty_cell.pos      = orig_cell.pos;
+                empty_cell.hist_min = orig_cell.pos + 1;
+                empty_cell.hist_max = orig_cell.pos;
+                empty_cell.src      = orig_cell.src;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -596,6 +805,10 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
+            dst_cell.hist_min = dst_cell.pos + 1;
+            dst_cell.hist_max = dst_cell.pos;
+            src_cell.hist_min = src_cell.pos + 1;
+            src_cell.hist_max = src_cell.pos;
 
             // swap tails
             for (uint32_t j = 0; j < size; ++j) {
@@ -612,17 +825,29 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // update the pos of the used seqs
     for (uint32_t s = 0; s < n_seqs; ++s) {
         const uint32_t i = s*n_seq_tokens;
-        const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
+        const llama_pos first_pos = ubatch.pos[i];
+        const llama_pos last_pos  = ubatch.pos[i + n_seq_tokens - 1];
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (!tree_active && cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
+        if (cell.pos < 0) {
+            cell.hist_min = first_pos == 0 ? 0 : first_pos;
+        } else if (first_pos != cell.pos + 1) {
+            cell.hist_min = first_pos;
+        }
+        const llama_pos hist_end = tree_active ? (first_pos + (llama_pos) n_seq_tokens - 1) : last_pos;
+        if (hist_end - cell.hist_min >= (llama_pos) SCONV_HIST_W) {
+            cell.hist_min = hist_end - (llama_pos) SCONV_HIST_W + 1;
+        }
+        cell.hist_max = hist_end;
         cell.pos = last_pos;
+        last_tree_n = tree_active ? n_seq_tokens : 0;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -716,6 +941,7 @@ size_t llama_memory_recurrent::size_r_bytes() const {
     }
 
     for (const auto & p : p_l) { if (p) size_r_bytes += ggml_nbytes(p); }
+    for (const auto & rh : r_hist_l) { if (rh) size_r_bytes += ggml_nbytes(rh); }
     return size_r_bytes;
 }
 
@@ -995,7 +1221,9 @@ bool llama_memory_recurrent::state_read_meta(llama_io_read_i & io, uint32_t cell
     for (uint32_t i = 0; i < cell_count; ++i) {
         uint32_t cell_id = head + i;
         // make sure the recurrent states will keep their restored state
-        cells[cell_id].src = cell_id;
+        cells[cell_id].src      = cell_id;
+        cells[cell_id].hist_min = cells[cell_id].pos + 1;
+        cells[cell_id].hist_max = cells[cell_id].pos;
     }
 
     return true;
@@ -1235,3 +1463,5 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const { return mem->p_l[il]; }
+
+ggml_tensor * llama_memory_recurrent_context::get_r_hist_l(int32_t il) const { return mem->r_hist_l[il]; }

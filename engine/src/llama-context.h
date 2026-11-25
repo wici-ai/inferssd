@@ -152,6 +152,9 @@ struct llama_context {
     void set_causal_attn(bool value);
     void set_warmup(bool value);
 
+    void set_tree_parents(const int8_t * parents, int32_t n);
+    bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -468,6 +471,41 @@ private:
     llm_graph_result_ptr gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;
 
+    // Multi-slot cache of pre-built & pre-split small decode graphs sharing sched's reserved compute buffers
+    struct gf_cache_entry {
+        llm_graph_result_ptr      res;
+        ggml_backend_sched_plan_t plan       = nullptr;
+        uint64_t                  lru        = 0;
+        uint32_t                  memory_gen = 0;
+
+        gf_cache_entry() = default;
+        ~gf_cache_entry() {
+            if (plan) { ggml_backend_sched_plan_free(plan); }
+        }
+        gf_cache_entry(const gf_cache_entry &) = delete;
+        gf_cache_entry & operator=(const gf_cache_entry &) = delete;
+        gf_cache_entry(gf_cache_entry && o) noexcept :
+            res(std::move(o.res)), plan(o.plan), lru(o.lru), memory_gen(o.memory_gen) {
+            o.plan = nullptr;
+        }
+        gf_cache_entry & operator=(gf_cache_entry && o) noexcept {
+            if (this != &o) {
+                if (plan) { ggml_backend_sched_plan_free(plan); }
+                res        = std::move(o.res);
+                plan       = o.plan;
+                lru        = o.lru;
+                memory_gen = o.memory_gen;
+                o.plan     = nullptr;
+            }
+            return *this;
+        }
+    };
+    static constexpr size_t MAX_GF_CACHE = 48;
+    std::vector<gf_cache_entry> gf_cache;
+    ggml_backend_sched_plan_t   gf_active_plan = nullptr;
+    uint64_t                    gf_cache_clock = 0;
+    void clear_graph_cache() noexcept;
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 
@@ -475,6 +513,9 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+
+    // Packed 4-bit per-token parent indices (parent[t] + 1) for tree-structured decode (0 = linear)
+    uint64_t tree_parents_packed = 0;
 
     // perf
     mutable int64_t t_start_us  = 0;

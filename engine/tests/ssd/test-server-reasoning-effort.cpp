@@ -229,6 +229,15 @@ static void test_model_templates() {
         require(f.prompt("max") == f.prompt("xhigh"), "Muse Spark: max must run as xhigh");
         require(f.prompt("on") == f.prompt(nullptr) && f.prompt("xhigh") == f.prompt(nullptr), "Muse Spark: xhigh is its default");
     }
+    {
+        const fixture f(read_file("models/templates/thinkingmachines-Inkling-2-Mini.jinja"));
+        require(offers(f, true, {"minimal", "low", "medium", "high", "xhigh"}, "high"), "Inkling-2-Mini" + offer(f));
+        require(f.prompt("none") != f.prompt(nullptr), "Inkling-2-Mini: \"none\" must turn thinking off");
+        require(f.prompt("none").find("Thinking effort level: 0<|end_message|>") != std::string::npos, "Inkling-2-Mini: \"none\" must emit effort 0");
+        require(f.prompt("low").find("Thinking effort level: 0.2<|end_message|>") != std::string::npos, "Inkling-2-Mini: \"low\" must emit effort 0.2");
+        require(f.prompt("max") == f.prompt("xhigh"), "Inkling-2-Mini: max must run as xhigh");
+        require(f.prompt("on") == f.prompt(nullptr) && f.prompt("high") == f.prompt(nullptr), "Inkling-2-Mini: high is its default");
+    }
 }
 
 int main(int argc, char **) {

@@ -87,7 +87,7 @@ llama_context::llama_context(
 
     cparams.embeddings_layer_inp.resize(hparams.n_layer + 1, false);
     embd_layer_inp.resize(hparams.n_layer + 1);
-    cparams.ctx_other = nullptr;
+    cparams.ctx_other = params.ctx_other;
 
     cparams.n_ctx            = params.n_ctx           == 0    ? hparams.n_ctx_train           : params.n_ctx;
     // A sequence's context past the trained one holds positions the model has not seen, and its cache memory is
@@ -603,6 +603,7 @@ llama_context::~llama_context() {
     }
     // Graph nodes borrow this context's runtime. Complete their work before
     // releasing cache pages, worker threads, and the backend API pointers.
+    clear_graph_cache();
     if (cpu_sink_runtime) {
         if (sched) { synchronize(); }
         cpu_sink_runtime.reset();
@@ -911,7 +912,7 @@ void llama_context::hold_dense_layers() {
             homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
             homes->pinned_bytes() / 1073741824.0, free / 1073741824.0, keep / 1073741824.0);
     // the graph reserved before read the matrices in host memory and placed their copies in the ring just freed
-    if (gf_res_prev) { gf_res_prev->reset(); }
+    clear_graph_cache();
     sched_need_reserve = true;
     sched_reserve();
 }
@@ -935,7 +936,7 @@ bool llama_context::give_dense_layers(size_t bytes) {
             bytes / 1048576.0, homes->held_bytes() / 1073741824.0, homes->streamed_bytes() / 1073741824.0,
             homes->pinned_bytes() / 1073741824.0);
     // the graphs split before read the given-back matrices in the device
-    if (gf_res_prev) { gf_res_prev->reset(); }
+    clear_graph_cache();
     sched_need_reserve = true;
     return true;
 }
@@ -961,8 +962,8 @@ void llama_context::pin_dense_layers() {
         pinned += bytes;
     }
     // the graphs split before stream the matrices from where they were
-    if (pinned && gf_res_prev) {
-        gf_res_prev->reset();
+    if (pinned) {
+        clear_graph_cache();
     }
 }
 
@@ -1468,7 +1469,16 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
     return reserved && vram_complete;
 }
 
+void llama_context::clear_graph_cache() noexcept {
+    gf_active_plan = nullptr;
+    gf_cache.clear();
+    if (gf_res_prev) {
+        gf_res_prev->reset();
+    }
+}
+
 void llama_context::make_scheduler(size_t max_nodes) {
+    clear_graph_cache();
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
@@ -1482,6 +1492,7 @@ void llama_context::drop_scheduler() {
         synchronize();
         dense_graph_cache_end_phase();
     }
+    clear_graph_cache();
     gf_res_prev.reset();
     gf_res_reserve.reset();
     sched.reset();
@@ -1603,7 +1614,7 @@ bool llama_context::memory_update(bool optimize) {
         // reset the previous graph result to make sure that it won't be reused
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
-        gf_res_prev->reset();
+        clear_graph_cache();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1950,6 +1961,7 @@ void llama_context::set_embeddings(bool value) {
             synchronize();
             dense_graph_cache_end_phase();
         }
+        clear_graph_cache();
         gf_res_prev.reset();
         gf_res_reserve.reset();
         sched.reset();
@@ -2003,6 +2015,31 @@ void llama_context::set_warmup(bool value) {
 
     // warmups are usually with small batches, so no need to reserve
     //sched_need_reserve = true;
+}
+
+void llama_context::set_tree_parents(const int8_t * parents, int32_t n) {
+    tree_parents_packed = 0;
+    if (parents && n > 0 && n <= 16) {
+        for (int32_t i = 0; i < n; ++i) {
+            const int32_t p = parents[i];
+            GGML_ASSERT(p >= -1 && p < i && p < 15);
+            tree_parents_packed |= (uint64_t) (uint32_t) (p + 1) << (4 * i);
+        }
+        if (memory) {
+            memory->set_tree_parents(parents, n);
+        }
+    } else {
+        if (memory) {
+            memory->set_tree_parents(nullptr, 0);
+        }
+    }
+}
+
+bool llama_context::tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) {
+    if (!memory) {
+        return false;
+    }
+    return memory->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
 }
 
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
@@ -2152,60 +2189,171 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (dense_stream.phase != nullptr) {
         dense_stream.add(ubatch.n_tokens);
     }
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
-        //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
-        res->prefetch_inputs(&ubatch);
 
-        // with pipeline parallelism, the previous graph_compute_async may still be running
-        // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
-        // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+    const bool can_plan_cache = !graph_reuse_disable && !cpu_sink_runtime &&
+                                !cparams.pipeline_parallel && !cparams.cb_eval &&
+                                ubatch.n_tokens <= 32 &&
+                                ggml_backend_sched_get_n_copies(sched.get()) == 1;
+
+    if (can_plan_cache) {
+        const uint32_t cur_mem_gen = memory ? memory->get_generation() : 0;
+        int hit_idx = -1;
+        for (size_t i = 0; i < gf_cache.size(); ++i) {
+            auto & e = gf_cache[i];
+            if (e.plan && e.memory_gen == cur_mem_gen &&
+                ggml_backend_sched_plan_is_valid(sched.get(), e.plan) &&
+                e.res && e.res->can_reuse(gparams)) {
+                hit_idx = (int) i;
+                break;
+            }
         }
-
-        n_reused++;
-    } else {
-        res->reset();
-
-        ggml_backend_sched_reset(sched.get());
-        ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
-
-        //const auto t_start_us = ggml_time_us();
-
-        gf = model.build_graph(gparams);
-
-        //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
-
-        if (!gf) {
-            LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
-            ret = GGML_STATUS_FAILED;
-            return nullptr;
-        }
-
-        // The managed scheduler cannot grow implicitly. Reserve the real graph
-        // under the same admission path used for worst-case load-time graphs.
-        // The input rows' reads go out once the graph has its room and before its buffers are allocated: the rows
-        // land in room the caches gave back, and the reads overlap the allocation.
-        const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
-        bool allocated = false;
-        if (cpu_sink_runtime) {
-            allocated = reserve_compute_graph(gf, prompt_pass, prefetch,
-                    prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0) &&
-                ggml_backend_sched_alloc_prepared(sched.get(), gf);
+        if (hit_idx >= 0) {
+            auto & e = gf_cache[hit_idx];
+            res = e.res.get();
+            gf  = res->get_gf();
+            e.lru = ++gf_cache_clock;
+            if (gf_active_plan != e.plan) {
+                ggml_backend_sched_synchronize(sched.get());
+                if (gf_active_plan == nullptr) {
+                    if (gf_res_prev) { gf_res_prev->reset(); }
+                    ggml_backend_sched_reset(sched.get());
+                }
+                gf_active_plan = e.plan;
+            }
+            res->prefetch_inputs(&ubatch);
+            n_reused++;
         } else {
-            prefetch();
-            allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
-        }
-        if (!allocated) {
-            LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
-            // A refused graph is still parameterized but has no valid storage.
-            // Drain before dropping metadata and prevent same-shape reuse on a
-            // later request after resource pressure has been relieved.
             ggml_backend_sched_synchronize(sched.get());
+            if (gf_active_plan == nullptr && gf_res_prev) {
+                gf_res_prev->reset();
+            }
+            gf_active_plan = nullptr;
+
+            // Choose an invalid slot, append a new slot, or evict LRU
+            size_t slot_idx = gf_cache.size();
+            for (size_t i = 0; i < gf_cache.size(); ++i) {
+                auto & e = gf_cache[i];
+                if (!e.plan || e.memory_gen != cur_mem_gen || !ggml_backend_sched_plan_is_valid(sched.get(), e.plan)) {
+                    slot_idx = i;
+                    break;
+                }
+            }
+            if (slot_idx == gf_cache.size()) {
+                if (gf_cache.size() < MAX_GF_CACHE) {
+                    gf_cache.emplace_back();
+                    gf_cache.back().res.reset(new llm_graph_result(sched_max_nodes));
+                } else {
+                    slot_idx = 0;
+                    for (size_t i = 1; i < gf_cache.size(); ++i) {
+                        if (gf_cache[i].lru < gf_cache[slot_idx].lru) {
+                            slot_idx = i;
+                        }
+                    }
+                }
+            }
+            auto & slot = gf_cache[slot_idx];
+            if (slot.plan) {
+                ggml_backend_sched_plan_free(slot.plan);
+                slot.plan = nullptr;
+            }
+            if (!slot.res) {
+                slot.res.reset(new llm_graph_result(sched_max_nodes));
+            }
+            slot.res->reset();
             ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            const auto gparams_slot = graph_params(slot.res.get(), ubatch, mctx, gtype);
+            gf = model.build_graph(gparams_slot);
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            slot.res->prefetch_inputs(&ubatch);
+            const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+            if (!allocated) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_reset(sched.get());
+                slot.res->reset();
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
+
+            slot.plan = ggml_backend_sched_capture_plan(sched.get());
+            if (slot.plan) {
+                slot.lru        = ++gf_cache_clock;
+                slot.memory_gen = cur_mem_gen;
+                gf_active_plan  = slot.plan;
+                res             = slot.res.get();
+            } else {
+                // Scheduler not eligible for plan capture (e.g. SSD hooks / host MoE offload): fall back to gf_res_prev
+                gf_res_prev.swap(slot.res);
+                gf_cache.erase(gf_cache.begin() + (ptrdiff_t) slot_idx);
+                gf_active_plan = nullptr;
+                res = gf_res_prev.get();
+            }
+        }
+    } else {
+        if (gf_active_plan != nullptr) {
+            ggml_backend_sched_synchronize(sched.get());
+            gf_active_plan = nullptr;
+            if (gf_res_prev) { gf_res_prev->reset(); }
+            ggml_backend_sched_reset(sched.get());
+        }
+        if (!graph_reuse_disable && res->can_reuse(gparams)) {
+            //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
+            res->prefetch_inputs(&ubatch);
+
+            // with pipeline parallelism, the previous graph_compute_async may still be running
+            // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
+            // that the previous compute is still reading.
+            if (cparams.pipeline_parallel) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
+
+            n_reused++;
+        } else {
             res->reset();
-            ret = GGML_STATUS_ALLOC_FAILED;
-            return nullptr;
+
+            ggml_backend_sched_reset(sched.get());
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+
+            gf = model.build_graph(gparams);
+
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                ret = GGML_STATUS_FAILED;
+                return nullptr;
+            }
+
+            // The managed scheduler cannot grow implicitly. Reserve the real graph
+            // under the same admission path used for worst-case load-time graphs.
+            // The input rows' reads go out once the graph has its room and before its buffers are allocated: the rows
+            // land in room the caches gave back, and the reads overlap the allocation.
+            const auto prefetch = [&]() { res->prefetch_inputs(&ubatch); };
+            bool allocated = false;
+            if (cpu_sink_runtime) {
+                allocated = reserve_compute_graph(gf, prompt_pass, prefetch,
+                        prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0) &&
+                    ggml_backend_sched_alloc_prepared(sched.get(), gf);
+            } else {
+                prefetch();
+                allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+            }
+            if (!allocated) {
+                LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
+                // A refused graph is still parameterized but has no valid storage.
+                // Drain before dropping metadata and prevent same-shape reuse on a
+                // later request after resource pressure has been relieved.
+                ggml_backend_sched_synchronize(sched.get());
+                ggml_backend_sched_reset(sched.get());
+                res->reset();
+                ret = GGML_STATUS_ALLOC_FAILED;
+                return nullptr;
+            }
         }
     }
     if (prompt_pass && cpu_prefill_reserve_pending) {
@@ -2221,12 +2369,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // set the input data for the input tensors
     {
-        //const auto t_start_us = ggml_time_us();
-
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
-
-        //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
     // Phase/token tracking is also required by a VRAM-only tier and by
@@ -2243,7 +2387,20 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    if (status == GGML_STATUS_SUCCESS && !res->inkling_reads.empty()) {
+        ggml_backend_sched_synchronize(sched.get());
+        uint64_t bytes = 0;
+        for (const auto & read : res->inkling_reads) {
+            if (read->failed) {
+                LLAMA_LOG_ERROR("%s: failed to read routed Inkling experts from GGUF\n", __func__);
+                status = GGML_STATUS_FAILED;
+                break;
+            }
+            bytes += read->bytes;
+        }
+        LLAMA_LOG_INFO("inkling_ssd: batch_tokens=%u direct_read_bytes=%" PRIu64 "\n", ubatch.n_tokens, bytes);
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2570,6 +2727,15 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 
 int llama_context::decode(const llama_batch & batch_inp) {
     GGML_ASSERT((!batch_inp.token && batch_inp.embd) || (batch_inp.token && !batch_inp.embd)); // NOLINT
+
+    struct tree_parents_guard {
+        llama_context * ctx;
+        ~tree_parents_guard() {
+            if (ctx->tree_parents_packed != 0) {
+                ctx->set_tree_parents(nullptr, 0);
+            }
+        }
+    } tree_guard { this };
 
     if (!memory) {
         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
@@ -3327,6 +3493,13 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_QWEN35 || model.arch == LLM_ARCH_QWEN35MOE || model.arch == LLM_ARCH_QWEN4EXP) {
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
     }
+    if (model.arch == LLM_ARCH_INKLING2 || model.arch == LLM_ARCH_INKLING2_LOOP) {
+        // each of the cache slots builds a few hundred nodes, the looped ones share their weights
+        return std::max<uint32_t>(65536u, 64u * model.n_tensors());
+    }
+    if (model.arch == LLM_ARCH_INKLING2_DSPARK) {
+        return std::max<uint32_t>(4096u, 32u * model.n_tensors());
+    }
     if (model.arch == LLM_ARCH_DEEPSEEK41) {
         // same bound upstream uses for DeepSeek-V4.1
         return std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
@@ -3489,7 +3662,7 @@ ggml_cgraph * llama_context::graph_reserve(
     ggml_backend_sched_reset(sched.get());
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
-    gf_res_prev->reset();
+    clear_graph_cache();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -3633,6 +3806,12 @@ llm_graph_params llama_context::graph_params(
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
         /*.n_ctx_reserve =*/ sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx,
+        /*.tree_parents_packed =*/ (gtype == LLM_GRAPH_TYPE_DECODER && ubatch.n_seqs == 1 && ubatch.n_tokens <= 16) ? tree_parents_packed : 0,
+        /*.dspark_pending_n =*/ (model.arch == LLM_ARCH_INKLING2_DSPARK && !ubatch.embd) ? model.dspark_pending_n : 0,
+        /*.dspark_n_cand =*/ (model.arch == LLM_ARCH_INKLING2_DSPARK && !ubatch.embd && n_outputs == 0 && model.dspark_vocab_lm != nullptr)
+            ? (int32_t) std::min<int64_t>(model.dspark_vocab_lm->ne[1],
+                                          std::max<int64_t>(4096, GGML_PAD((int64_t) model.dspark_vocab_ids.size(), 1024)))
+            : 0,
     };
 }
 
@@ -3678,7 +3857,9 @@ ggml_status llama_context::graph_compute(
     const int64_t t_submit_start_us = graph_profile ? ggml_time_us() : 0;
     ggml_backend_sched_ssd_set_profile_phase(sched.get(), batched ? 1 : 2);
     if (mctx) { mctx->submit_precompute(); }
-    auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
+    auto status = gf_active_plan
+        ? ggml_backend_sched_compute_plan(sched.get(), gf_active_plan)
+        : ggml_backend_sched_graph_compute_async(sched.get(), gf);
     ggml_backend_sched_ssd_set_profile_phase(sched.get(), 0);
     if (graph_profile) {
         const auto published = ssd_runtime->diagnostics.graph(true,
@@ -4994,6 +5175,40 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_seq_can_rollback(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos pos_next,
+              uint32_t n_swa) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_can_rollback(seq_id, pos_next, n_swa);
+}
+
+void llama_set_tree_parents(
+        struct llama_context * ctx,
+                const int8_t * parents,
+                     int32_t   n) {
+    if (!ctx) {
+        return;
+    }
+    ctx->set_tree_parents(parents, n);
+}
+
+bool llama_tree_accept_path(
+        struct llama_context * ctx,
+                llama_seq_id   seq_id,
+                   llama_pos   pos0,
+               const int32_t * keep_idxs,
+                     int32_t   n_keep) {
+    if (!ctx) {
+        return false;
+    }
+    return ctx->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
+}
+
 // llama state API
 
 // deprecated
@@ -5189,7 +5404,7 @@ void llama_context::discard_failed_graph() noexcept {
         ggml_backend_sched_synchronize(sched.get());
         ggml_backend_sched_reset(sched.get());
     }
-    if (gf_res_prev) { gf_res_prev->reset(); }
+    clear_graph_cache();
     if (gf_res_reserve) { gf_res_reserve->reset(); }
     sched_need_reserve = true;
 }

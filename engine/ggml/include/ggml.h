@@ -593,6 +593,13 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
         GGML_OP_ROW_MASK,
+        GGML_OP_INKLING_SCONV,
+        GGML_OP_INKLING_SCONV_STATE,
+        GGML_OP_INKLING_MIX,
+        GGML_OP_INKLING_CTRL_BLEND,
+        GGML_OP_INKLING_MOE_IDS,
+        GGML_OP_INKLING_MOE_WEIGHTS,
+        GGML_OP_INKLING_MOE_REDUCE,
 
         GGML_OP_COUNT,
     };
@@ -635,6 +642,7 @@ extern "C" {
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
         GGML_GLU_OP_SWIGLU_CLAMP,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1391,6 +1399,29 @@ extern "C" {
             struct ggml_tensor  * b,
             float                 limit);
 
+    // SiTU gated activation: beta*tanh(gate/beta)*sigmoid(gate) * (linear_beta > 0 ? linear_beta*tanh(up/linear_beta) : up)
+    GGML_API struct ggml_tensor * ggml_situ(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            float                 beta,
+            float                 linear_beta);
+
+    GGML_API struct ggml_tensor * ggml_situ_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            float                 beta,
+            float                 linear_beta);
+
+    GGML_API struct ggml_tensor * ggml_situ_ex(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * scales,
+            struct ggml_tensor  * ids,
+            float                 beta,
+            float                 linear_beta);
+
     // normalize along rows
     GGML_API struct ggml_tensor * ggml_norm(
             struct ggml_context * ctx,
@@ -1482,6 +1513,83 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             float                 scale);
+
+    // Fused Inkling causal short convolution with residual, optional dynamic per-head taps, and output scale:
+    //   cur [C, T*S], past [K-1, C, S], weight [K, C], dynamic [K*H, T*S] (or NULL) -> [C, T*S]
+    GGML_API struct ggml_tensor * ggml_inkling_sconv(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * weight,
+            struct ggml_tensor  * dynamic,
+            float                 scale);
+
+    // Update the last K-1 shortconv history taps in `cell` [(K-1)*C, S] from `past` [K-1, C, S] and `cur` [C, T*S]:
+    GGML_API struct ggml_tensor * ggml_inkling_sconv_state(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cell,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur);
+
+    // Update all 4 shortconv channel groups (k, v, attn_post, ffn_post) of a layer in a single op:
+    GGML_API struct ggml_tensor * ggml_inkling_sconv_state_4(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cell,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur0,
+            struct ggml_tensor  * cur1,
+            struct ggml_tensor  * cur2,
+            struct ggml_tensor  * cur3);
+
+    // Same as ggml_inkling_sconv_state_4, additionally recording channel inputs into `hist` [C, W, S] at `pos` [T*S] % W:
+    GGML_API struct ggml_tensor * ggml_inkling_sconv_state_4_hist(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cell,
+            struct ggml_tensor  * past,
+            struct ggml_tensor  * cur0,
+            struct ggml_tensor  * cur1,
+            struct ggml_tensor  * cur2,
+            struct ggml_tensor  * cur3,
+            struct ggml_tensor  * hist,
+            struct ggml_tensor  * pos);
+
+    // Fused Inkling depth-attention residual mix:
+    //   cur_norm [D, T], query [D, Q], bank [D, K_bank, T] (or NULL) -> [D, T, Q]
+    GGML_API struct ggml_tensor * ggml_inkling_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur_norm,
+            struct ggml_tensor  * query,
+            struct ggml_tensor  * bank);
+
+    // Fused Inkling loop-controller gate blend:
+    //   cur [D, T, C_cur] (C_cur in {1, C}), msg [D, T, C], gf_raw [2*D, T, C] -> [D, T, C]
+    //   dst = (cur - tanh(forget)*cur) + tanh(gain)*msg
+    GGML_API struct ggml_tensor * ggml_inkling_ctrl_blend(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * cur,
+            struct ggml_tensor  * msg,
+            struct ggml_tensor  * gf_raw);
+
+    // Fused Inkling sigmoid+bias top-K MoE router IDs & normalized/scaled expert weights:
+    GGML_API struct ggml_tensor * ggml_inkling_moe_ids(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * exp_probs_b,
+            int64_t               n_expert_used);
+
+    GGML_API struct ggml_tensor * ggml_inkling_moe_weights(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * logits,
+            struct ggml_tensor  * selected_experts,
+            struct ggml_tensor  * down_exps_s,
+            float                 w_scale);
+
+    // Fused weighted reduction over routed expert outputs:
+    //   experts [D, K, T], weights [1, K, T] -> [D, T]
+    GGML_API struct ggml_tensor * ggml_inkling_moe_reduce(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * experts,
+            struct ggml_tensor  * weights);
 
     // DeepSeek-V4 hyper-connection expansion:
     //   x [n_embd, n_tokens], residual [n_embd, hc, n_tokens], post [hc, n_tokens],
@@ -2524,6 +2632,15 @@ extern "C" {
     GGML_API void ggml_flash_attn_ext_add_sinks(
             struct ggml_tensor * a,
             struct ggml_tensor * sinks);
+
+    GGML_API bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a);
+
+    // Add table[indices[key, query], head, query] to the mask before its F16 rounding.
+    // Queries from all streams are flattened in stream order. Indices must be in [0, table->ne[0]).
+    GGML_API void ggml_flash_attn_ext_add_indexed_bias(
+            struct ggml_tensor * a,
+            struct ggml_tensor * table,
+            struct ggml_tensor * indices);
 
     // TODO: needs to be adapted to ggml_flash_attn_ext
     GGML_API struct ggml_tensor * ggml_flash_attn_back(

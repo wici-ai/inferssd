@@ -177,12 +177,12 @@ protected:
 
 const func_builtins & global_builtins();
 
-std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ");
+std::string value_to_json(const value & val, int indent = -1, const std::string_view item_sep = ", ", const std::string_view key_sep = ": ", bool sort_keys = false);
 
 // Note: only used for debugging purposes
 std::string value_to_string_repr(const value & val);
 string value_to_string_repr_origin(const value & val);
-string value_to_json_origin(const value & val, int indent = -1, const string & item_sep = string(std::string(", ")), const string & key_sep = string(std::string(": ")));
+string value_to_json_origin(const value & val, int indent = -1, const string & item_sep = string(std::string(", ")), const string & key_sep = string(std::string(": ")), bool sort_keys = false);
 
 struct not_implemented_exception : public std::runtime_error {
     not_implemented_exception(const std::string & msg) : std::runtime_error("NotImplemented: " + msg) {}

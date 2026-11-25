@@ -377,6 +377,10 @@ llama_kv_cache::llama_kv_cache(
 }
 
 void llama_kv_cache::clear(bool data) {
+    tree_parents.clear();
+    last_tree_cells.clear();
+    last_tree_stream = 0;
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         v_cells[s].reset();
         v_heads[s] = 0;
@@ -1512,6 +1516,65 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
         head = sinfo.idxs[s].back() + 1;
     }
+
+    if (!tree_parents.empty() && sinfo.n_stream() == 1 && sinfo.size() == tree_parents.size()) {
+        last_tree_stream = sinfo.strm[0];
+        last_tree_cells  = sinfo.idxs[0];
+    } else {
+        last_tree_cells.clear();
+    }
+}
+
+void llama_kv_cache::set_tree_parents(const int8_t * parents, int32_t n) {
+    if (parents && n > 0) {
+        tree_parents.assign(parents, parents + n);
+    } else {
+        tree_parents.clear();
+    }
+}
+
+bool llama_kv_cache::tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) {
+    GGML_UNUSED(pos0);
+    if (seq_id < 0 || (size_t) seq_id >= seq_to_stream.size() || !keep_idxs || n_keep <= 0) {
+        return false;
+    }
+    if (last_tree_cells.empty()) {
+        return false;
+    }
+
+    const uint32_t n_tree = (uint32_t) last_tree_cells.size();
+    uint32_t keep_mask = 0;
+    for (int32_t i = 0; i < n_keep; ++i) {
+        if (keep_idxs[i] < 0 || (uint32_t) keep_idxs[i] >= n_tree) {
+            return false;
+        }
+        keep_mask |= (1u << (uint32_t) keep_idxs[i]);
+    }
+
+    auto & cells = v_cells[last_tree_stream];
+    auto & head  = v_heads[last_tree_stream];
+    uint32_t new_head = cells.size();
+
+    for (uint32_t k = 0; k < n_tree; ++k) {
+        if ((keep_mask & (1u << k)) != 0) {
+            continue;
+        }
+        const uint32_t c = last_tree_cells[k];
+        if (!cells.is_empty(c) && cells.seq_has(c, seq_id)) {
+            if (cells.seq_rm(c, seq_id)) {
+                if (c < new_head) {
+                    new_head = c;
+                }
+            }
+        }
+    }
+
+    if (new_head != cells.size() && new_head < head) {
+        head = new_head;
+    }
+
+    last_tree_cells.clear();
+    return true;
 }
 
 bool llama_kv_cache::get_can_shift() const {
@@ -2113,6 +2176,38 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
         set_input_kq_mask_impl<float>(args, (float *) dst->data, causal_attn);
     }
 
+    if (!tree_parents.empty() && n_stream == 1 && causal_attn &&
+        n_tokens == tree_parents.size() && last_tree_cells.size() == n_tokens && n_tokens <= 32) {
+        uint32_t anc[32] = {};
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            uint32_t mask = 1u << i;
+            int8_t p = tree_parents[i];
+            while (p >= 0 && (uint32_t) p < n_tokens) {
+                mask |= (1u << (uint32_t) p);
+                p = tree_parents[p];
+            }
+            anc[i] = mask;
+        }
+        auto patch = [&](auto * data, auto mask_drop) {
+            for (uint32_t i = 0; i < n_tokens; ++i) {
+                const uint64_t idst = (uint64_t) n_kv * i;
+                for (uint32_t k = 0; k < n_tokens; ++k) {
+                    if ((anc[i] & (1u << k)) == 0) {
+                        const uint32_t j = last_tree_cells[k];
+                        if (j < (uint32_t) n_kv) {
+                            data[idst + j] = mask_drop;
+                        }
+                    }
+                }
+            }
+        };
+        if (dst->type == GGML_TYPE_F16) {
+            patch((ggml_fp16_t *) dst->data, llama_cast<ggml_fp16_t>(-INFINITY));
+        } else {
+            patch((float *) dst->data, -INFINITY);
+        }
+    }
+
     //const int64_t t_end = ggml_time_us();
 
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
@@ -2141,6 +2236,81 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
             }
         }
     }
+}
+
+// the distance from each token to each cell of the K/V view, extent for the empty, future and more distant cells
+void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+
+    const int64_t  n_kv  = dst->ne[0];
+    const uint32_t n_tok = ubatch->n_tokens;
+    const int32_t  ext   = (int32_t) extent;
+
+    static thread_local std::vector<int32_t> data;
+    static thread_local std::vector<int32_t> near_idxs;
+    data.resize((size_t) n_kv * n_tok);
+
+    // Check if all tokens share a single stream (standard decode/verify/prefill case)
+    bool same_stream = n_tok > 0;
+    const uint32_t s0 = n_tok > 0 ? seq_to_stream.at(ubatch->seq_id[0][0]) : 0;
+    llama_pos pos_min = n_tok > 0 ? ubatch->pos[0] : 0;
+    llama_pos pos_max = pos_min;
+    for (uint32_t i = 1; i < n_tok; ++i) {
+        if (seq_to_stream.at(ubatch->seq_id[i][0]) != s0) {
+            same_stream = false;
+            break;
+        }
+        pos_min = std::min(pos_min, ubatch->pos[i]);
+        pos_max = std::max(pos_max, ubatch->pos[i]);
+    }
+
+    if (same_stream && n_tok > 1) {
+        const auto & cells = v_cells.at(s0);
+        const int64_t near_lo = (int64_t) pos_min - (int64_t) ext;
+        const int64_t near_hi = (int64_t) pos_max;
+
+        near_idxs.clear();
+        int32_t * row0 = data.data();
+        const int64_t p_i0 = (int64_t) ubatch->pos[0];
+        for (int64_t j = 0; j < n_kv; ++j) {
+            if (cells.is_empty(j)) {
+                row0[j] = ext;
+                continue;
+            }
+            const int64_t pj = (int64_t) cells.pos_get(j);
+            if (pj > near_lo && pj <= near_hi) {
+                near_idxs.push_back((int32_t) j);
+                const int64_t d = p_i0 - pj;
+                row0[j] = (d >= 0 && d < ext) ? (int32_t) d : ext;
+            } else {
+                row0[j] = ext;
+            }
+        }
+
+        for (uint32_t i = 1; i < n_tok; ++i) {
+            int32_t * row = data.data() + (size_t) i * n_kv;
+            std::fill(row, row + n_kv, ext);
+            const int64_t pi = (int64_t) ubatch->pos[i];
+            for (int32_t j : near_idxs) {
+                const int64_t d = pi - (int64_t) cells.pos_get(j);
+                if (d >= 0 && d < ext) {
+                    row[j] = (int32_t) d;
+                }
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < n_tok; ++i) {
+            const auto & cells = v_cells.at(seq_to_stream.at(ubatch->seq_id[i][0]));
+            int32_t * row = data.data() + (size_t) i * n_kv;
+            const int64_t pi = (int64_t) ubatch->pos[i];
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const int64_t distance = cells.is_empty(j) ? -1 : pi - (int64_t) cells.pos_get(j);
+                row[j] = distance >= 0 && distance < ext ? (int32_t) distance : ext;
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }
 
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
@@ -3083,6 +3253,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_relative_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t extent) const {
+    kv->set_input_relative_pos(dst, ubatch, extent);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -651,7 +651,12 @@ def derive(
     # The cost priors price where each routed expert computes; a model without them has none.
     experts = model.experts
     if experts is None:
-        notes.append("place.costs: omitted, the model has no routed experts to place")
+        if model.architecture in ("inkling2", "inkling2_loop"):
+            notes.append(
+                "place.costs: Inkling fused experts use the launch's explicit Metal placement"
+            )
+        else:
+            notes.append("place.costs: omitted, the model has no routed experts to place")
     else:
         terms: dict[str, float] = {}
         reasons: list[str] = []
@@ -738,6 +743,11 @@ def derive(
         notes.append(
             "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
             "expert it routes to once"
+        )
+    elif model.architecture in ("inkling2", "inkling2_loop"):
+        notes.append(
+            "prefill: the launch's batch sizes; selected experts of SSD layers are read for each "
+            "microbatch"
         )
     else:
         notes.append(

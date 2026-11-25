@@ -142,6 +142,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         n_ff   = 192;
     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
         n_layer = 3;
+    } else if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+        n_layer = 4;
     } else if (arch == LLM_ARCH_CHAMELEON) {
         n_vocab = 10240;
     }
@@ -225,7 +227,8 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ROPE_FREQ_BASE_SWA,              10000.0f);
         // SWA pattern: every 5th layer is full attention (matches E2B layer_types)
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(5));
-    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_SPARK) {
+    } else if (arch == LLM_ARCH_MIMO2 || arch == LLM_ARCH_STEP35 || arch == LLM_ARCH_MUSE_SPARK ||
+            arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
         std::vector<uint32_t> pattern;
         pattern.reserve(n_block);
         for (uint32_t il = 0; il < n_block; il++) {
@@ -234,6 +237,26 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
+    }
+
+    if (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) {
+        ms.add_kv(LLM_KV_ATTENTION_QK_CLIP,         10.0f);
+        ms.add_kv(LLM_KV_ATTN_RES_BLOCK_SIZE,       uint32_t(1));
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_LENGTH, uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_EXTENT, uint32_t(32));
+        ms.add_kv(LLM_KV_ATTENTION_RELATIVE_CLIP,   10.0f);
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_FLOOR, uint32_t(16));
+        ms.add_kv(LLM_KV_ATTENTION_LOG_SCALE_ALPHA, 0.1f);
+        ms.add_kv(LLM_KV_VOCAB_SIZE_UNPADDED,       n_vocab);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_BETA,        10.0f);
+        ms.add_kv(LLM_KV_ACTIVATION_SITU_LINEAR_BETA, 10.0f);
+        ms.add_kv(LLM_KV_FINAL_LOGIT_SOFTCAPPING,   30.0f);
+        if (arch == LLM_ARCH_INKLING2_LOOP) {
+            ms.add_kv(LLM_KV_LOOP_START,     uint32_t(1));
+            ms.add_kv(LLM_KV_LOOP_END,       uint32_t(3));
+            ms.add_kv(LLM_KV_LOOP_COUNT,     uint32_t(2));
+            ms.add_kv(LLM_KV_LOOP_GATE_RANK, uint32_t(16));
+        }
     }
 
     if (arch == LLM_ARCH_MUSE_SPARK) {
@@ -323,7 +346,7 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe, const 
     ms.add_kv(LLM_KV_SSM_GROUP_COUNT,           arch == LLM_ARCH_PLAMO2 ? 0 : uint32_t(2));
     ms.add_kv(LLM_KV_KDA_HEAD_DIM,              uint32_t(128));
     ms.add_kv(LLM_KV_WKV_HEAD_SIZE,             n_embd/n_head);
-    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,         uint32_t(3));
+    ms.add_kv(LLM_KV_SHORTCONV_L_CACHE,         (arch == LLM_ARCH_INKLING2 || arch == LLM_ARCH_INKLING2_LOOP) ? uint32_t(4) : uint32_t(3));
 
     for (uint32_t il = 0; il < n_layer; il++) {
         ggml_tensor t;
@@ -457,6 +480,8 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
         case LLM_ARCH_MISTRAL4:
+        case LLM_ARCH_INKLING2:
+        case LLM_ARCH_INKLING2_LOOP:
             return true;
         default:
             return false;
@@ -509,6 +534,9 @@ static bool arch_supported(const llm_arch arch) {
     }
     if (arch == LLM_ARCH_DEEPSEEK2OCR) {
         return false;
+    }
+    if (arch == LLM_ARCH_INKLING2_DSPARK) {
+        return false; // Drafter architecture requires target hidden taps; tested by test-inkling-dspark.
     }
 
     // FIXME some models are segfaulting with WebGPU:
@@ -821,6 +849,9 @@ static int test_nextn(const llm_arch target_arch, const size_t seed, const ggml_
         }
         if (arch == LLM_ARCH_GEMMA4) {
             continue; // FIXME: ISWA KV cache initialization needs more fixture params
+        }
+        if (arch == LLM_ARCH_INKLING2_LOOP) {
+            continue; // inkling2_loop explicitly rejects nextn_predict_layers
         }
 #if defined(GGML_USE_WEBGPU)
         continue; // FIXME

@@ -8692,6 +8692,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // the batched BF16 mat-vec kernel of the Metal backend: 5 to 8 inputs, with rows that do not fill the last threadgroup
+    for (int n = 5; n <= 8; ++n) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 83, n, 256, {1, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_BF16, GGML_TYPE_F32, 64, n, 128, {3, 1}, {2, 1}));
+    }
+
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,   64, { 8,  1}, {4, 1}));
@@ -8768,6 +8774,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+
+    // NVFP4 MoE with the expert widths of a native-precision model: 128 experts, 8 used, decode, verify and prefill batches
+    for (int n : {1, 8, 9, 512}) {
+        for (int k : {1152, 2304}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_NVFP4, GGML_TYPE_F32, 128, 8, false, 256, n, k));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_NVFP4, GGML_TYPE_F32, 256, 512, 2304, {1, 1}, {1, 1}));
 
     for (ggml_type type_a : base_types) {
         for (ggml_type type_b : {GGML_TYPE_F32 /*, GGML_TYPE_F16 */}) {
@@ -9343,6 +9357,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // a few queries over a long cache, which the Metal backend runs with one threadgroup per KV head
+    for (int hs : { 64, 128 }) {
+        for (int kv : { 2048, 2113, 16448 }) {
+            for (int nb : { 1, 2, 5, 8 }) {
+                for (int nr2 : { 1, 3 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {nr2, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {3, 1}, 2113, 5, true, false, 8.0f, 10.0f, GGML_PREC_F32, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {3, 1}, 2113, 5, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, {0, 2, 1, 3}));
+        test_cases.emplace_back(new test_flash_attn_ext(hs, hs, 4, {3, 3}, 2113, 4, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16));
+    }
+
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {   10, 5, 4, 3}));
     test_cases.emplace_back(new test_cross_entropy_loss     (GGML_TYPE_F32, {30000, 1, 1, 1}));
     test_cases.emplace_back(new test_cross_entropy_loss_back(GGML_TYPE_F32, {   10, 5, 4, 3}));
@@ -9575,6 +9603,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 32, 4, false, 2880, bs, 2880));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 32, 4, false, 2880, bs, 2880, 1));
             }
+        }
+    }
+
+    // NVFP4 MoE experts (gate_up and down), with MXFP4 and Q4_0 at the same shapes as references
+    for (int bs : {1, 8, 512}) {
+        for (ggml_type type_a : {GGML_TYPE_NVFP4, GGML_TYPE_MXFP4, GGML_TYPE_Q4_0}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 2304));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 128, 8, false, 2304, bs, 1152));
         }
     }
 

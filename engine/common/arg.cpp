@@ -2343,6 +2343,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_DIO"));
     add_opt(common_arg(
+        {"--inkling-ssd-layers"}, "N",
+        "stream selected experts of the first N physical Inkling layers from GGUF on Metal (default: 0)",
+        [](common_params & params, int value) {
+            if (value < 0) { throw std::invalid_argument("--inkling-ssd-layers requires a nonnegative count"); }
+            params.inkling_ssd_layers = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--defer-experts"},
         "defer expert mmap residency to reduce load-time host RSS",
         [](common_params & params) {

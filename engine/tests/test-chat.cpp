@@ -4780,12 +4780,44 @@ static void test_template_output_peg_parsers(bool detailed_debug) {
             .expect_reconstruction()
             .run();
 
+        // GigaChat V3.1
         tst.test(
             "Hello, world!\nWhat's up?"
             "<|function_call|>{\"name\": \"special_function\", \"arguments\": {\"arg1\": 1}}"
         )
             .tools({ special_function_tool })
             .expect(message_assist_call_content)
+            .expect_reconstruction()
+            .run();
+    }
+
+    // Inkling 2 Mini
+    {
+        auto tst = peg_tester("models/templates/thinkingmachines-Inkling-2-Mini.jinja", detailed_debug);
+        tst.test("<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist)
+            .expect_reconstruction()
+            .run();
+        tst.test("<|message_model|><|content_thinking|>I'm\nthinking<|end_message|><|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .expect(message_assist_thoughts)
+            .expect_reconstruction()
+            .run();
+        tst.test("<|message_model|>special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>")
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("", "", "special_function", "{\"arg1\":1}"))
+            .expect_reconstruction()
+            .run();
+        tst.test(
+            "<|message_model|><|content_thinking|>Let me call the tool<|end_message|>"
+            "<|message_model|><|content_text|>Hello, world!\nWhat's up?<|end_message|>"
+            "<|message_model|>special_function<|content_invoke_tool_json|>{\"name\":\"special_function\",\"args\":{\"arg1\":1}}<|end_message|>"
+        )
+            .reasoning_format(COMMON_REASONING_FORMAT_AUTO)
+            .tools({ special_function_tool })
+            .expect(simple_assist_msg("Hello, world!\nWhat's up?", "Let me call the tool", "special_function", "{\"arg1\":1}"))
             .expect_reconstruction()
             .run();
     }
@@ -4802,9 +4834,10 @@ static void test_template_reasoning() {
         std::string              default_effort;
     };
     const std::vector<expected> cases = {
-        { "models/templates/deepseek-ai-DeepSeek-V4.1.jinja", true,  { "low", "medium", "high", "max" },  "high"  },
-        { "models/templates/muse-spark.jinja",                false, { "low", "medium", "high", "xhigh" }, "xhigh" },
-        { "models/templates/unsloth-Qwen3.6-35B-A3B.jinja",   true,  {},                                  ""      },
+        { "models/templates/deepseek-ai-DeepSeek-V4.1.jinja",         true,  { "low", "medium", "high", "max" },            "high"  },
+        { "models/templates/muse-spark.jinja",                        false, { "low", "medium", "high", "xhigh" },          "xhigh" },
+        { "models/templates/thinkingmachines-Inkling-2-Mini.jinja",   true,  { "minimal", "low", "medium", "high", "xhigh" }, "high" },
+        { "models/templates/unsloth-Qwen3.6-35B-A3B.jinja",           true,  {},                                            ""      },
     };
     for (const auto & c : cases) {
         auto tmpls     = read_templates(c.path);

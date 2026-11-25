@@ -407,6 +407,14 @@ extern "C" {
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
+    // Capture a lightweight executable split plan from an allocated single-copy scheduler so multiple
+    // pre-built graphs can share the scheduler's reserved compute buffers without rebuilding or re-splitting.
+    typedef struct ggml_backend_sched_plan * ggml_backend_sched_plan_t;
+    GGML_API ggml_backend_sched_plan_t ggml_backend_sched_capture_plan(ggml_backend_sched_t sched);
+    GGML_API bool                      ggml_backend_sched_plan_is_valid(ggml_backend_sched_t sched, ggml_backend_sched_plan_t plan);
+    GGML_API enum ggml_status          ggml_backend_sched_compute_plan(ggml_backend_sched_t sched, ggml_backend_sched_plan_t plan);
+    GGML_API void                      ggml_backend_sched_plan_free(ggml_backend_sched_plan_t plan);
+
     //
     // Meta backend
     //

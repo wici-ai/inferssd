@@ -1123,9 +1123,16 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "TOP_K_MASK",
     "ROW_MASK",
+    "INKLING_SCONV",
+    "INKLING_SCONV_STATE",
+    "INKLING_MIX",
+    "INKLING_CTRL_BLEND",
+    "INKLING_MOE_IDS",
+    "INKLING_MOE_WEIGHTS",
+    "INKLING_MOE_REDUCE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1239,9 +1246,16 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
     "row_mask(n_visible)",
+    "inkling_sconv(x, past, w, dyn)",
+    "inkling_sconv_state(cell, past, x)",
+    "inkling_mix(cur, q, bank)",
+    "inkling_ctrl_blend(cur, msg, gf)",
+    "inkling_moe_ids(logits, bias)",
+    "inkling_moe_weights(logits, ids, s)",
+    "inkling_moe_reduce(experts, w)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT != 109");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1283,9 +1297,10 @@ static const char * GGML_GLU_OP_NAME[GGML_GLU_OP_COUNT] = {
     "GEGLU_ERF",
     "GEGLU_QUICK",
     "SWIGLU_CLAMP",
+    "SITU",
 };
 
-static_assert(GGML_GLU_OP_COUNT == 7, "GGML_GLU_OP_COUNT != 7");
+static_assert(GGML_GLU_OP_COUNT == 8, "GGML_GLU_OP_COUNT != 8");
 
 
 static_assert(sizeof(struct ggml_object)%GGML_MEM_ALIGN == 0, "ggml_object size must be a multiple of GGML_MEM_ALIGN");
@@ -3170,6 +3185,48 @@ struct ggml_tensor * ggml_swiglu_clamp(
     return result;
 }
 
+struct ggml_tensor * ggml_situ_ex(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * scales,
+        struct ggml_tensor  * ids,
+        float                 beta,
+        float                 linear_beta) {
+    GGML_ASSERT(beta > 0.0f);
+    struct ggml_tensor * result = ggml_glu_impl(ctx, a, b, GGML_GLU_OP_SITU, false);
+    ggml_set_op_params_f32(result, 2, beta);
+    ggml_set_op_params_f32(result, 3, linear_beta);
+
+    if (scales || ids) {
+        GGML_ASSERT(scales && ids);
+        GGML_ASSERT(scales->type == GGML_TYPE_F32 && ggml_is_contiguous(scales));
+        GGML_ASSERT(ids->type == GGML_TYPE_I32);
+        GGML_ASSERT(ids->ne[0] == result->ne[1] && ids->ne[1] == result->ne[2]);
+        result->src[2] = scales;
+        result->src[3] = ids;
+    }
+
+    return result;
+}
+
+struct ggml_tensor * ggml_situ(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        float                 beta,
+        float                 linear_beta) {
+    return ggml_situ_ex(ctx, a, NULL, NULL, NULL, beta, linear_beta);
+}
+
+struct ggml_tensor * ggml_situ_split(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        float                 beta,
+        float                 linear_beta) {
+    return ggml_situ_ex(ctx, a, b, NULL, NULL, beta, linear_beta);
+}
+
 // ggml_norm
 
 static struct ggml_tensor * ggml_norm_impl(
@@ -3434,6 +3491,240 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+struct ggml_tensor * ggml_inkling_sconv(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * weight,
+        struct ggml_tensor  * dynamic,
+        float                 scale) {
+    GGML_ASSERT(cur->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(cur));
+    GGML_ASSERT(past->type == GGML_TYPE_F32 && past->nb[0] == sizeof(float));
+    GGML_ASSERT(weight->type == GGML_TYPE_F32 && weight->nb[0] == sizeof(float));
+
+    const int64_t n_channels = cur->ne[0];
+    const int64_t n_tokens   = cur->ne[1];
+    const int64_t n_conv     = weight->ne[0];
+    const int64_t n_seqs     = past->ne[2];
+
+    GGML_ASSERT(cur->ne[2] == 1 && cur->ne[3] == 1);
+    GGML_ASSERT(n_conv >= 2);
+    GGML_ASSERT(past->ne[0] == n_conv - 1 && past->ne[1] == n_channels && past->ne[3] == 1);
+    GGML_ASSERT(weight->ne[1] == n_channels && weight->ne[2] == 1 && weight->ne[3] == 1);
+    GGML_ASSERT(n_seqs > 0 && n_tokens % n_seqs == 0);
+
+    if (dynamic) {
+        GGML_ASSERT(dynamic->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(dynamic));
+        GGML_ASSERT(dynamic->ne[1] == n_tokens && dynamic->ne[2] == 1 && dynamic->ne[3] == 1);
+        GGML_ASSERT(dynamic->ne[0] % n_conv == 0);
+        const int64_t n_heads = dynamic->ne[0] / n_conv;
+        GGML_ASSERT(n_heads > 0 && n_channels % n_heads == 0);
+    }
+
+    struct ggml_tensor * result = ggml_dup_tensor(ctx, cur);
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_INKLING_SCONV;
+    result->src[0] = cur;
+    result->src[1] = past;
+    result->src[2] = weight;
+    result->src[3] = dynamic;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_sconv_state_4_hist(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cell,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * cur0,
+        struct ggml_tensor  * cur1,
+        struct ggml_tensor  * cur2,
+        struct ggml_tensor  * cur3,
+        struct ggml_tensor  * hist,
+        struct ggml_tensor  * pos) {
+    GGML_ASSERT(cell->type == GGML_TYPE_F32 && cell->nb[0] == sizeof(float));
+    GGML_ASSERT(past->type == GGML_TYPE_F32 && past->nb[0] == sizeof(float));
+    GGML_ASSERT(cur0 && cur0->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(cur0));
+
+    const int64_t l_cache    = past->ne[0];
+    const int64_t n_channels = past->ne[1];
+    const int64_t n_seqs     = past->ne[2];
+    const int64_t n_tokens   = cur0->ne[1];
+
+    int64_t c_sum = cur0->ne[0];
+    const struct ggml_tensor * curs[3] = { cur1, cur2, cur3 };
+    for (int i = 0; i < 3; ++i) {
+        if (curs[i]) {
+            GGML_ASSERT(curs[i]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(curs[i]));
+            GGML_ASSERT(curs[i]->ne[1] == n_tokens && curs[i]->ne[2] == 1 && curs[i]->ne[3] == 1);
+            c_sum += curs[i]->ne[0];
+        }
+    }
+
+    if (hist) {
+        GGML_ASSERT(pos != NULL);
+        GGML_ASSERT(hist->type == GGML_TYPE_F32 && hist->nb[0] == sizeof(float));
+        GGML_ASSERT(hist->ne[0] == n_channels && hist->ne[1] >= l_cache && hist->ne[2] == n_seqs && hist->ne[3] == 1);
+        GGML_ASSERT(pos->type == GGML_TYPE_I32 && ggml_is_contiguous(pos) && pos->ne[0] == n_tokens);
+    }
+
+    GGML_ASSERT(l_cache >= 1);
+    GGML_ASSERT(cur0->ne[2] == 1 && cur0->ne[3] == 1 && c_sum == n_channels);
+    GGML_ASSERT(cell->ne[0] == l_cache * n_channels && cell->ne[1] == n_seqs && cell->ne[2] == 1 && cell->ne[3] == 1);
+    GGML_ASSERT(n_seqs > 0 && n_tokens % n_seqs == 0);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, cell);
+    ggml_format_name(result, "%s (sconv_state)", cell->name);
+
+    result->op     = GGML_OP_INKLING_SCONV_STATE;
+    result->src[0] = past;
+    result->src[1] = cur0;
+    result->src[2] = cell;
+    result->src[3] = cur1;
+    result->src[4] = cur2;
+    result->src[5] = cur3;
+    result->src[6] = hist;
+    result->src[7] = pos;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur_norm,
+        struct ggml_tensor  * query,
+        struct ggml_tensor  * bank) {
+    GGML_ASSERT(cur_norm && cur_norm->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(cur_norm));
+    GGML_ASSERT(query    && query->type    == GGML_TYPE_F32 && ggml_is_contiguous_rows(query));
+
+    const int64_t n_embd   = cur_norm->ne[0];
+    const int64_t n_tokens = cur_norm->ne[1];
+    const int64_t n_query  = query->ne[1];
+
+    GGML_ASSERT(cur_norm->ne[2] == 1 && cur_norm->ne[3] == 1);
+    GGML_ASSERT(query->ne[0] == n_embd && query->ne[2] == 1 && query->ne[3] == 1);
+    if (bank) {
+        GGML_ASSERT(bank->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(bank));
+        GGML_ASSERT(bank->ne[0] == n_embd && bank->ne[1] >= 1 && bank->ne[1] <= 31 && bank->ne[2] == n_tokens && bank->ne[3] == 1);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_query);
+    result->op     = GGML_OP_INKLING_MIX;
+    result->src[0] = cur_norm;
+    result->src[1] = query;
+    result->src[2] = bank;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_ctrl_blend(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cur,
+        struct ggml_tensor  * msg,
+        struct ggml_tensor  * gf_raw) {
+    GGML_ASSERT(cur    && cur->type    == GGML_TYPE_F32 && ggml_is_contiguous_rows(cur));
+    GGML_ASSERT(msg    && msg->type    == GGML_TYPE_F32 && ggml_is_contiguous_rows(msg));
+    GGML_ASSERT(gf_raw && gf_raw->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(gf_raw));
+
+    const int64_t n_embd   = msg->ne[0];
+    const int64_t n_tokens = msg->ne[1];
+    const int64_t n_ctrl   = msg->ne[2];
+
+    GGML_ASSERT(msg->ne[3] == 1 && cur->ne[3] == 1 && gf_raw->ne[3] == 1);
+    GGML_ASSERT(cur->ne[0] == n_embd && cur->ne[1] == n_tokens && (cur->ne[2] == n_ctrl || cur->ne[2] == 1));
+    GGML_ASSERT(gf_raw->ne[0] == 2 * n_embd && gf_raw->ne[1] == n_tokens && gf_raw->ne[2] == n_ctrl);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_ctrl);
+    result->op     = GGML_OP_INKLING_CTRL_BLEND;
+    result->src[0] = cur;
+    result->src[1] = msg;
+    result->src[2] = gf_raw;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_moe_ids(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * exp_probs_b,
+        int64_t               n_expert_used) {
+    GGML_ASSERT(logits && logits->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(logits));
+    GGML_ASSERT(logits->ne[2] == 1 && logits->ne[3] == 1);
+    GGML_ASSERT(n_expert_used >= 1 && n_expert_used <= logits->ne[0] && n_expert_used <= 32);
+    if (exp_probs_b) {
+        GGML_ASSERT(exp_probs_b->type == GGML_TYPE_F32 && ggml_is_contiguous(exp_probs_b));
+        GGML_ASSERT(exp_probs_b->ne[0] == logits->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_expert_used, logits->ne[1]);
+    result->op     = GGML_OP_INKLING_MOE_IDS;
+    result->src[0] = logits;
+    result->src[1] = exp_probs_b;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_moe_weights(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * logits,
+        struct ggml_tensor  * selected_experts,
+        struct ggml_tensor  * down_exps_s,
+        float                 w_scale) {
+    GGML_ASSERT(logits && logits->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(logits));
+    GGML_ASSERT(selected_experts && selected_experts->type == GGML_TYPE_I32 && ggml_is_contiguous(selected_experts));
+    GGML_ASSERT(selected_experts->ne[1] == logits->ne[1]);
+    if (down_exps_s) {
+        GGML_ASSERT(down_exps_s->type == GGML_TYPE_F32 && ggml_is_contiguous(down_exps_s));
+        GGML_ASSERT(down_exps_s->ne[0] == logits->ne[0]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, selected_experts->ne[0], logits->ne[1]);
+    ggml_set_op_params_f32(result, 0, (w_scale != 0.0f) ? w_scale : 1.0f);
+    result->op     = GGML_OP_INKLING_MOE_WEIGHTS;
+    result->src[0] = logits;
+    result->src[1] = selected_experts;
+    result->src[2] = down_exps_s;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_moe_reduce(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * experts,
+        struct ggml_tensor  * weights) {
+    GGML_ASSERT(experts && experts->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(experts));
+    GGML_ASSERT(weights && weights->type == GGML_TYPE_F32 && ggml_is_contiguous(weights));
+    GGML_ASSERT(experts->ne[1] == weights->ne[1] && experts->ne[2] == weights->ne[2]);
+    GGML_ASSERT(weights->ne[0] == 1 && experts->ne[3] == 1 && weights->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, experts->ne[0], experts->ne[2]);
+    result->op     = GGML_OP_INKLING_MOE_REDUCE;
+    result->src[0] = experts;
+    result->src[1] = weights;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_inkling_sconv_state_4(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cell,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * cur0,
+        struct ggml_tensor  * cur1,
+        struct ggml_tensor  * cur2,
+        struct ggml_tensor  * cur3) {
+    return ggml_inkling_sconv_state_4_hist(ctx, cell, past, cur0, cur1, cur2, cur3, NULL, NULL);
+}
+
+struct ggml_tensor * ggml_inkling_sconv_state(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * cell,
+        struct ggml_tensor  * past,
+        struct ggml_tensor  * cur) {
+    return ggml_inkling_sconv_state_4(ctx, cell, past, cur, NULL, NULL, NULL);
 }
 
 // ggml_dsv4_hc_post
@@ -5691,6 +5982,34 @@ void ggml_flash_attn_ext_add_sinks(
     GGML_ASSERT(sinks->type == GGML_TYPE_F32);
 
     a->src[4] = sinks;
+}
+
+bool ggml_flash_attn_ext_has_indexed_bias(const struct ggml_tensor * a) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    return ggml_get_op_params_i32(a, 5) != 0;
+}
+
+void ggml_flash_attn_ext_add_indexed_bias(
+        struct ggml_tensor * a,
+        struct ggml_tensor * table,
+        struct ggml_tensor * indices) {
+    GGML_ASSERT(a->op == GGML_OP_FLASH_ATTN_EXT);
+    GGML_ASSERT((table == NULL) == (indices == NULL));
+    a->src[6] = table;
+    a->src[7] = indices;
+    ggml_set_op_params_i32(a, 5, table != NULL);
+    if (!table) {
+        return;
+    }
+
+    const struct ggml_tensor * q = a->src[0];
+    const struct ggml_tensor * mask = a->src[3];
+    GGML_ASSERT(mask && mask->ne[0] == a->src[1]->ne[1] && mask->ne[1] >= q->ne[1]);
+    GGML_ASSERT(mask->ne[2] == 1 && mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(table->type == GGML_TYPE_F32 && ggml_is_contiguous(table));
+    GGML_ASSERT(table->ne[1] == q->ne[2] && table->ne[0] > 0 && table->ne[2] == q->ne[1]*q->ne[3] && table->ne[3] == 1);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32 && ggml_is_contiguous(indices) && ggml_is_matrix(indices));
+    GGML_ASSERT(indices->ne[0] == mask->ne[0] && indices->ne[1] == table->ne[2]);
 }
 
 // ggml_flash_attn_back

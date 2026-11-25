@@ -311,6 +311,11 @@ std::optional<common_chat_reasoning> common_chat_templates_reasoning(const commo
     std::vector<std::string> prompts;
     for (const auto & effort : probe->compared) {
         if (effort == "none") {
+            if (!reasoning.can_turn_off) {
+                vars["reasoning_effort"] = effort;
+                const auto none_prompt = render(vars);
+                reasoning.can_turn_off = none_prompt && *none_prompt != *on;
+            }
             continue; // the request's word for thinking off
         }
         vars["reasoning_effort"] = effort;
@@ -2015,6 +2020,11 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return inferssd::chat::muse(tmpl, params, {common_chat_template_direct_apply_impl, foreach_function, foreach_parameter});
     }
 
+    if (inferssd::chat::is_inkling_template(src)) {
+        LOG_DBG("Using specialized template: Inkling\n");
+        return inferssd::chat::inkling(tmpl, params, {common_chat_template_direct_apply_impl, foreach_function, foreach_parameter});
+    }
+
     // GPT-OSS - has unique channel-based structure that needs dedicated handler
     if (src.find("<|channel|>") != std::string::npos) {
         LOG_DBG("Using specialized template: GPT-OSS\n");
@@ -2129,6 +2139,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     inferssd::chat::keep_history_stable(src, params.extra_context);
     for (auto el : inputs.chat_template_kwargs) {
         params.extra_context[el.first] = json::parse(el.second);
+    }
+    if (inferssd::chat::is_inkling_template(src) && !params.enable_thinking &&
+            !params.extra_context.contains("reasoning_effort")) {
+        params.extra_context["reasoning_effort"] = "none";
     }
 
     // The comparison owns this flag. A same-named template kwarg must not

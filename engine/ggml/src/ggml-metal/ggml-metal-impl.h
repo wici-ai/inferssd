@@ -42,6 +42,19 @@
 #define N_R0_MXFP4 2
 #define N_SG_MXFP4 2
 
+// 16 rows per simdgroup are 8 rows per thread, which share every load of the input. With fewer rows the input loads
+// bound the kernel when it runs for several tokens of a batch at once.
+#define N_R0_NVFP4 16
+#define N_SG_NVFP4 1
+
+#define N_R0_MXFP8 4
+#define N_SG_MXFP8 2
+
+// rows per simdgroup, inputs and simdgroups per threadgroup of the batched BF16 mat-vec kernel
+#define N_R0_MV_ROWS 4
+#define N_R1_MV_ROWS 8
+#define N_SG_MV_ROWS 2
+
 #define N_R0_Q2_K 4
 #define N_SG_Q2_K 2
 
@@ -108,6 +121,12 @@
 
 #define OP_FLASH_ATTN_EXT_VEC_NQPSG 1
 #define OP_FLASH_ATTN_EXT_VEC_NCPSG 32
+
+// the vec kernel's variant that takes all the query rows of a KV head (kernel_flash_attn_ext_mq)
+#define OP_FLASH_ATTN_EXT_MQ_NCPSG 64 // cache items per chunk
+#define OP_FLASH_ATTN_EXT_MQ_NSG   4  // simdgroups per threadgroup
+#define OP_FLASH_ATTN_EXT_MQ_NWG   32 // slices of the cache, as many as a simdgroup reduces
+#define OP_FLASH_ATTN_EXT_MQ_ROWS  48 // most query rows per threadgroup (dk=dv=128 supports up to 48; dk=64 up to 24)
 
 #define OP_UNARY_NUM_SCALE      10
 #define OP_UNARY_NUM_FILL       11
@@ -359,6 +378,8 @@ typedef struct {
     uint64_t nb31;
     uint64_t nb32;
     uint64_t nb33;
+    int32_t  bias_n_bins;
+    int32_t  bias_n_keys;
 } ggml_metal_kargs_flash_attn_ext_blk;
 
 typedef struct {
@@ -394,6 +415,9 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  bias_n_bins;
+    int32_t  bias_n_keys;
+    int32_t  bias_query_stride;
 } ggml_metal_kargs_flash_attn_ext;
 
 typedef struct {
@@ -429,6 +453,10 @@ typedef struct {
     float    m1;
     int32_t  n_head_log2;
     float    logit_softcap;
+    int32_t  bias_n_bins;
+    int32_t  bias_n_keys;
+    int32_t  bias_query_stride;
+    int32_t  ne30; // mask columns, for the mask blocks of kernel_flash_attn_ext_mq
 } ggml_metal_kargs_flash_attn_ext_vec;
 
 typedef struct {
@@ -547,6 +575,71 @@ typedef struct {
     uint64_t nb1;
     int32_t  nr0;
 } ggml_metal_kargs_mul_mv_id;
+
+typedef struct {
+    int32_t  nei0;
+    int32_t  nei1;
+    uint64_t nbi1;
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne02;
+    uint64_t nb00;
+    uint64_t nb01;
+    uint64_t nb02;
+    int32_t  ne10;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  ne13;
+    uint64_t nb10;
+    uint64_t nb11;
+    uint64_t nb12;
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb1;
+    int32_t  nr0;
+    float    beta;
+    float    inv_beta;
+    float    lb;
+    float    inv_lb;
+    int32_t  has_scales;
+    int32_t  use_sorted;
+} ggml_metal_kargs_mul_mv_id_situ;
+
+typedef struct {
+    int32_t  nei0;
+    int32_t  nei1;
+    int32_t  ne02;
+    uint64_t nbi1;
+} ggml_metal_kargs_mul_mv_id_group_compact;
+
+typedef struct {
+    int32_t  ne01;
+    int32_t  gmax_idx;
+    int32_t  gate_idx;
+    int32_t  has_ctrl;
+    int32_t  norm_stride;
+    uint64_t nb01;
+} ggml_metal_kargs_dspark_vocab_argmax;
+
+typedef struct {
+    int32_t  slots;
+    int32_t  dst_slot;
+    int32_t  top2_slot;
+    int32_t  top3_slot;
+    int32_t  gate_idx;
+    int32_t  alt2_ctrl;
+    int32_t  alt3_ctrl;
+    int32_t  has_ctrl;
+} ggml_metal_kargs_dspark_vocab_reduce;
+
+typedef struct {
+    int32_t  rank;
+    int32_t  write_state;
+    int32_t  gate_idx;
+    int32_t  has_ctrl;
+    uint64_t nb_w1;
+    uint64_t nb_wstep;
+} ggml_metal_kargs_dspark_markov_step;
 
 // NORM
 // RMS_NORM
@@ -708,11 +801,15 @@ typedef struct{
     int32_t  ne10;
     uint64_t nb11;
     int32_t  ne0;
+    int32_t  ne1;
     uint64_t nb1;
     int32_t  i00;
     int32_t  i10;
     float    alpha;
     float    limit;
+    uint64_t nb30;
+    uint64_t nb31;
+    int32_t  has_scales;
 } ggml_metal_kargs_glu;
 
 typedef struct {
@@ -1212,6 +1309,225 @@ typedef struct {
     uint64_t nbd1;
     uint64_t nbd2;
 } ggml_metal_kargs_dsv4_hc_post;
+
+typedef struct {
+    int32_t  n_channels;
+    int32_t  n_seq_tokens;
+    int32_t  n_seqs;
+    int32_t  n_conv;
+    int32_t  head_dim;
+    int32_t  has_dynamic;
+    int32_t  has_res;
+    float    scale;
+    uint64_t nbc1;
+    uint64_t nbp1;
+    uint64_t nbp2;
+    uint64_t nbw1;
+    uint64_t nbd1;
+    uint64_t tree_parents;
+} ggml_metal_kargs_inkling_sconv;
+
+typedef struct {
+    int32_t  n_channels;
+    int32_t  n_seq_tokens;
+    int32_t  n_conv;
+    int32_t  head_dim;
+    int32_t  has_dynamic;
+    int32_t  norm_mode;
+    float    scale;
+    float    norm_eps;
+    uint64_t nbc1;
+    uint64_t nbp1;
+    uint64_t nbw1;
+    uint64_t nbd1;
+    uint64_t nb_dst1;
+    uint64_t tree_parents;
+} ggml_metal_kargs_inkling_sconv_norm_sr;
+
+typedef struct {
+    int32_t  ne01;
+    int32_t  ne11;
+    int32_t  ne12;
+    int32_t  has_sink;
+    int32_t  has_clip;
+    int32_t  has_tau;
+    float    clip_eps;
+    float    post_scale;
+    uint64_t nb01;
+    uint64_t nb11;
+    uint64_t nb12;
+    uint64_t nb21;
+    uint64_t nb22;
+    uint64_t nb1;
+    uint64_t nb2;
+    uint64_t nb_cw1;
+    uint64_t nb_tau2;
+} ggml_metal_kargs_inkling_rel_bias;
+
+typedef struct {
+    int32_t  ne0;
+    int32_t  ne1;
+    uint64_t nb_x1;
+    uint64_t nb_g1;
+    uint64_t nb_d1;
+} ggml_metal_kargs_mul_sigmoid;
+
+typedef struct {
+    int32_t  ne04;
+    int32_t  ne01;
+    int32_t  ne02;
+    int32_t  ne_w1;
+    int32_t  ne_w2;
+    int32_t  has_tau;
+    float    eps;
+    float    post_scale;
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nbw1;
+    uint64_t nbw2;
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_clip_l2_norm;
+
+typedef struct {
+    int32_t  l_cache;
+    int32_t  n_channels;
+    int32_t  n_seq_tokens;
+    int32_t  n_seqs;
+    int32_t  c0;
+    int32_t  c1;
+    int32_t  c2;
+    int32_t  c3;
+    int32_t  hist_w;
+    int32_t  has_hist;
+    int32_t  is_tree;
+    uint64_t nbc01;
+    uint64_t nbc11;
+    uint64_t nbc21;
+    uint64_t nbc31;
+    uint64_t nbp1;
+    uint64_t nbp2;
+    uint64_t nbd1;
+    uint64_t nbh1;
+    uint64_t nbh2;
+} ggml_metal_kargs_inkling_sconv_state;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_query;
+    int32_t  k_bank;
+    float    scale;
+    int32_t  has_rms;
+    int32_t  has_mul;
+    float    eps;
+    int32_t  pre_rms;
+    float    pre_eps;
+    uint64_t nbc1;
+    uint64_t nbq1;
+    uint64_t nbb1;
+    uint64_t nbb2;
+    uint64_t nbw2;
+} ggml_metal_kargs_inkling_mix;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_out;
+    int32_t  n_tokens;
+    int32_t  n_ctrl;
+    int32_t  bcast_a;
+    uint64_t nbw1;
+    uint64_t nbw2;
+    uint64_t nba1;
+    uint64_t nba2;
+    uint64_t nbb1;
+    uint64_t nbb2;
+    uint64_t nbd1;
+    uint64_t nbd2;
+} ggml_metal_kargs_inkling_ctrl_down;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_ctrl;
+    int32_t  bcast_cur;
+    int32_t  has_rms;
+    int32_t  has_mul;
+    float    eps;
+    uint64_t nbc1;
+    uint64_t nbc2;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbw2;
+} ggml_metal_kargs_inkling_ctrl_blend;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  n_tokens;
+    int32_t  n_ctrl;
+    int32_t  bcast_cur;
+    float    eps;
+    uint64_t nbw1;
+    uint64_t nbw2;
+    uint64_t nbg1;
+    uint64_t nbg2;
+    uint64_t nbc1;
+    uint64_t nbc2;
+    uint64_t nbm1;
+    uint64_t nbm2;
+    uint64_t nbnw2;
+} ggml_metal_kargs_inkling_ctrl_up_blend;
+
+typedef struct {
+    int32_t  ne00;
+    int32_t  ne01;
+    int32_t  ne11;
+    int32_t  ne0;
+    uint64_t nb01;
+    uint64_t nb11;
+    uint64_t nbg1;
+} ggml_metal_kargs_mul_mm_bf16_siggate;
+
+typedef struct {
+    int32_t  n;
+    int32_t  sk;
+} ggml_metal_kargs_mul_mm_splitk_reduce;
+
+typedef struct {
+    int32_t  n_expert;
+    int32_t  n_tokens;
+    int32_t  k_used;
+    int32_t  has_bias;
+    int32_t  has_down_s;
+    int32_t  write_ids;
+    int32_t  write_weights;
+    float    w_scale;
+    uint64_t nbl1;
+} ggml_metal_kargs_inkling_moe_route;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  k_used;
+    int32_t  n_tokens;
+    uint64_t nbe1;
+    uint64_t nbe2;
+} ggml_metal_kargs_inkling_moe_reduce;
+
+typedef struct {
+    int32_t  n_embd;
+    int32_t  k_used;
+    int32_t  n_tokens;
+    int32_t  has_res;
+    float    scale;
+    int32_t  _pad;
+    uint64_t nbe1;
+    uint64_t nbe2;
+    uint64_t nbp1;
+    uint64_t nbw1;
+    uint64_t tree_parents;
+} ggml_metal_kargs_inkling_moe_reduce_sconv;
 
 typedef struct {
     int64_t  np;

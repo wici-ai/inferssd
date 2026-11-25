@@ -1900,6 +1900,34 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_row_mask(params, tensor);
             } break;
+        case GGML_OP_INKLING_SCONV:
+            {
+                ggml_compute_forward_inkling_sconv(params, tensor);
+            } break;
+        case GGML_OP_INKLING_SCONV_STATE:
+            {
+                ggml_compute_forward_inkling_sconv_state(params, tensor);
+            } break;
+        case GGML_OP_INKLING_MIX:
+            {
+                ggml_compute_forward_inkling_mix(params, tensor);
+            } break;
+        case GGML_OP_INKLING_CTRL_BLEND:
+            {
+                ggml_compute_forward_inkling_ctrl_blend(params, tensor);
+            } break;
+        case GGML_OP_INKLING_MOE_IDS:
+            {
+                ggml_compute_forward_inkling_moe_ids(params, tensor);
+            } break;
+        case GGML_OP_INKLING_MOE_WEIGHTS:
+            {
+                ggml_compute_forward_inkling_moe_weights(params, tensor);
+            } break;
+        case GGML_OP_INKLING_MOE_REDUCE:
+            {
+                ggml_compute_forward_inkling_moe_reduce(params, tensor);
+            } break;
         case GGML_OP_SOFT_MAX:
             {
                 ggml_compute_forward_soft_max(params, tensor);
@@ -2315,6 +2343,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
                 case GGML_GLU_OP_SWIGLU_CLAMP:
+                case GGML_GLU_OP_SITU:
                     {
                         n_tasks = n_threads;
                     } break;
@@ -2363,6 +2392,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_DIAG_MASK_ZERO:
         case GGML_OP_DIAG_MASK_INF:
         case GGML_OP_ROW_MASK:
+        case GGML_OP_INKLING_SCONV:
+        case GGML_OP_INKLING_SCONV_STATE:
+        case GGML_OP_INKLING_MIX:
+        case GGML_OP_INKLING_CTRL_BLEND:
+        case GGML_OP_INKLING_MOE_IDS:
+        case GGML_OP_INKLING_MOE_WEIGHTS:
+        case GGML_OP_INKLING_MOE_REDUCE:
         case GGML_OP_SOFT_MAX_BACK:
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:

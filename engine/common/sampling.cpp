@@ -17,6 +17,10 @@
 #include <unordered_map>
 #include <vector>
 
+#if defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
+
 // the ring buffer works similarly to std::deque, but with a fixed capacity
 // TODO: deduplicate with llama-impl.h
 template<typename T>
@@ -123,10 +127,53 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    bool    is_greedy  = false;
+    int32_t fast_top_k = 0;
+
     void reset() {
         prev.clear();
 
         llama_sampler_reset(chain);
+    }
+
+    void set_logits_top_k(struct llama_context * ctx, int idx, int32_t k) {
+        const float *       sampled_probs  = llama_get_sampled_probs_ith     (ctx, idx);
+        const float *       sampled_logits = llama_get_sampled_logits_ith    (ctx, idx);
+        const llama_model * model = llama_get_model(ctx);
+        const llama_vocab * vocab = llama_model_get_vocab(model);
+        const int n_vocab = llama_vocab_n_tokens(vocab);
+
+        if (sampled_probs || sampled_logits || k <= 0 || n_vocab <= 256 || k >= n_vocab) {
+            set_logits(ctx, idx);
+            return;
+        }
+
+        const float * logits = llama_get_logits_ith(ctx, idx);
+        GGML_ASSERT(logits != nullptr);
+
+        static const auto comp = [](const llama_token_data & a, const llama_token_data & b) {
+            return a.logit > b.logit;
+        };
+
+        cur.resize(k);
+        for (int32_t i = 0; i < k; ++i) {
+            cur[i] = llama_token_data{ i, logits[i], 0.0f };
+        }
+        std::make_heap(cur.begin(), cur.end(), comp);
+
+        float min_top_logit = cur[0].logit;
+        for (llama_token token_id = k; token_id < n_vocab; ++token_id) {
+            const float v = logits[token_id];
+            if (v > min_top_logit) {
+                std::pop_heap(cur.begin(), cur.end(), comp);
+                cur[k - 1] = llama_token_data{ token_id, v, 0.0f };
+                std::push_heap(cur.begin(), cur.end(), comp);
+                min_top_logit = cur[0].logit;
+            }
+        }
+        std::sort_heap(cur.begin(), cur.end(), comp);
+
+        cur_p = { cur.data(), cur.size(), -1, true };
     }
 
     void set_logits(struct llama_context * ctx, int idx) {
@@ -397,14 +444,92 @@ struct common_sampler * common_sampler_init(const struct llama_model * model, st
         params.backend_sampling = false;
     }
 
+    bool    is_greedy  = false;
+    int32_t fast_top_k = 0;
+
+    if (params.n_probs == 0 && params.mirostat == 0 && !params.has_logit_bias()) {
+        const bool penalties_noop = (params.penalty_last_n == 0) ||
+            (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+        const bool dry_noop = (params.dry_multiplier == 0.0f) || (params.dry_base < 1.0f) || (params.dry_penalty_last_n == 0);
+        const bool top_n_sigma_noop = (params.top_n_sigma <= 0.0f);
+        const bool xtc_noop = (params.xtc_probability <= 0.0f) || (params.xtc_threshold > 0.5f);
+        const bool typ_p_noop = (params.typ_p >= 1.0f);
+        const bool has_infill = std::find(
+            params.samplers.begin(), params.samplers.end(), COMMON_SAMPLER_TYPE_INFILL) != params.samplers.end();
+
+        if (params.temp <= 0.0f && params.dynatemp_range <= 0.0f && !has_infill) {
+            bool has_temp = false;
+            bool preserves_argmax = true;
+            for (const auto & cnstr : params.samplers) {
+                switch (cnstr) {
+                    case COMMON_SAMPLER_TYPE_PENALTIES:
+                        if (!penalties_noop) { preserves_argmax = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_DRY:
+                        if (!dry_noop) { preserves_argmax = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    case COMMON_SAMPLER_TYPE_TOP_K:
+                    case COMMON_SAMPLER_TYPE_TOP_P:
+                    case COMMON_SAMPLER_TYPE_MIN_P:
+                        break;
+                    case COMMON_SAMPLER_TYPE_TYPICAL_P:
+                        if (!typ_p_noop) { preserves_argmax = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_XTC:
+                        if (!xtc_noop) { preserves_argmax = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TEMPERATURE:
+                        has_temp = true;
+                        break;
+                    case COMMON_SAMPLER_TYPE_INFILL:
+                    case COMMON_SAMPLER_TYPE_ADAPTIVE_P:
+                    default:
+                        preserves_argmax = false;
+                        break;
+                }
+            }
+            is_greedy = has_temp && preserves_argmax;
+        }
+
+        if (!is_greedy && !has_infill && params.top_k >= 1 && params.top_k <= 256) {
+            bool pre_topk_noop = true;
+            for (const auto & cnstr : params.samplers) {
+                if (cnstr == COMMON_SAMPLER_TYPE_TOP_K) {
+                    fast_top_k = pre_topk_noop ? params.top_k : 0;
+                    break;
+                }
+                switch (cnstr) {
+                    case COMMON_SAMPLER_TYPE_PENALTIES:
+                        if (!penalties_noop) { pre_topk_noop = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_DRY:
+                        if (!dry_noop) { pre_topk_noop = false; }
+                        break;
+                    case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                        if (!top_n_sigma_noop) { pre_topk_noop = false; }
+                        break;
+                    default:
+                        pre_topk_noop = false;
+                        break;
+                }
+                if (!pre_topk_noop) {
+                    break;
+                }
+            }
+        }
+    }
+
     auto * result = new common_sampler {
-        /* .params  = */ params,
-        /* .grmr      = */ grmr,
-        /* .rbudget   = */ rbudget,
-        /* .chain     = */ chain,
-        /* .prev    = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
-        /* .cur     = */ {},
-        /* .cur_p   = */ {},
+        /* .params     = */ params,
+        /* .grmr       = */ grmr,
+        /* .rbudget    = */ rbudget,
+        /* .chain      = */ chain,
+        /* .prev       = */ ring_buffer<llama_token>(std::max(32, params.n_prev)),
+        /* .cur        = */ {},
+        /* .cur_p      = */ {},
+        /* .is_greedy  = */ is_greedy,
+        /* .fast_top_k = */ fast_top_k,
     };
 
     return result;
@@ -479,13 +604,15 @@ void common_sampler_reset(struct common_sampler * gsmpl) {
 struct common_sampler * common_sampler_clone(common_sampler * gsmpl) {
     llama_sampler * chain = llama_sampler_clone(gsmpl->chain);
     return new common_sampler {
-        /* .params    = */ gsmpl->params,
-        /* .grmr      = */ llama_sampler_clone(gsmpl->grmr),
-        /* .rbudget   = */ llama_sampler_clone(gsmpl->rbudget),
-        /* .chain     = */ chain,
-        /* .prev      = */ gsmpl->prev,
-        /* .cur       = */ gsmpl->cur,
-        /* .cur_p     = */ gsmpl->cur_p,
+        /* .params     = */ gsmpl->params,
+        /* .grmr       = */ llama_sampler_clone(gsmpl->grmr),
+        /* .rbudget    = */ llama_sampler_clone(gsmpl->rbudget),
+        /* .chain      = */ chain,
+        /* .prev       = */ gsmpl->prev,
+        /* .cur        = */ gsmpl->cur,
+        /* .cur_p      = */ gsmpl->cur_p,
+        /* .is_greedy  = */ gsmpl->is_greedy,
+        /* .fast_top_k = */ gsmpl->fast_top_k,
     };
 }
 
@@ -614,7 +741,63 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         }
     }
 
-    gsmpl->set_logits(ctx, idx);
+    if (!rbudget && !grammar_should_apply(gsmpl) && !pre_chain) {
+        if (gsmpl->is_greedy &&
+            llama_get_sampled_probs_ith(ctx, idx) == nullptr &&
+            llama_get_sampled_logits_ith(ctx, idx) == nullptr) {
+            const float * logits = llama_get_logits_ith(ctx, idx);
+            GGML_ASSERT(logits != nullptr);
+            const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(llama_get_model(ctx)));
+            GGML_ASSERT(n_vocab > 0);
+
+            llama_token best_id = 0;
+            float best_logit = logits[0];
+            llama_token token_id = 1;
+#if defined(__ARM_NEON)
+            if (n_vocab >= 16) {
+                // Single-pass 16-wide NEON max scan with exact tie-break (strict `>` matches scalar loop)
+                for (; token_id + 16 <= n_vocab; token_id += 16) {
+                    const float32x4_t v0 = vld1q_f32(logits + token_id +  0);
+                    const float32x4_t v1 = vld1q_f32(logits + token_id +  4);
+                    const float32x4_t v2 = vld1q_f32(logits + token_id +  8);
+                    const float32x4_t v3 = vld1q_f32(logits + token_id + 12);
+                    const float blk_max  = vmaxvq_f32(vmaxq_f32(vmaxq_f32(v0, v1), vmaxq_f32(v2, v3)));
+                    if (blk_max > best_logit) {
+                        for (int j = 0; j < 16; ++j) {
+                            const float v = logits[token_id + j];
+                            if (v > best_logit) {
+                                best_logit = v;
+                                best_id = token_id + j;
+                            }
+                        }
+                    }
+                }
+            }
+#endif
+            for (; token_id < n_vocab; ++token_id) {
+                const float v = logits[token_id];
+                if (v > best_logit) {
+                    best_logit = v;
+                    best_id = token_id;
+                }
+            }
+
+            gsmpl->cur.resize(1);
+            gsmpl->cur[0] = { best_id, best_logit, 1.0f };
+            cur_p = { gsmpl->cur.data(), 1, 0, true };
+
+            common_debug_sample_token(ctx, best_id);
+            return best_id;
+        }
+
+        if (gsmpl->fast_top_k > 0) {
+            gsmpl->set_logits_top_k(ctx, idx, gsmpl->fast_top_k);
+        } else {
+            gsmpl->set_logits(ctx, idx);
+        }
+    } else {
+        gsmpl->set_logits(ctx, idx);
+    }
 
     // apply reasoning budget first
     llama_sampler_apply(rbudget, &cur_p);
@@ -676,6 +859,9 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const llama_tokens & draft, bool grammar_first) {
     GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
 
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const bool stop_eog = !gsmpl->params.ignore_eos;
+
     std::vector<llama_token> result;
     result.reserve(idxs.size());
 
@@ -687,12 +873,12 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
         result.push_back(id);
 
-        if (draft[i] != id) {
+        if ((stop_eog && llama_vocab_is_eog(vocab, id)) || draft[i] != id) {
             break;
         }
     }
 
-    if (i == draft.size()) {
+    if (i == draft.size() && (result.empty() || !stop_eog || !llama_vocab_is_eog(vocab, result.back()))) {
         const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[i], grammar_first);
 
         common_sampler_accept(gsmpl, id, true);
@@ -710,6 +896,52 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+common_sampler_tree_result common_sampler_sample_and_accept_tree(
+        struct common_sampler     * gsmpl,
+        struct llama_context      * ctx,
+        const std::vector<int>    & idxs,
+        const llama_tokens        & draft,
+        const std::vector<int8_t> & parents,
+        bool                        grammar_first) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1 && "idxs.size() must be draft.size() + 1");
+    GGML_ASSERT(parents.size() == draft.size()  && "parents.size() must be draft.size()");
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+    const bool stop_eog = !gsmpl->params.ignore_eos;
+
+    common_sampler_tree_result res;
+    res.tokens.reserve(idxs.size());
+    res.keep_idxs.reserve(idxs.size());
+
+    int32_t cur = 0;
+    res.keep_idxs.push_back(0);
+
+    while (true) {
+        const llama_token id = common_sampler_sample(gsmpl, ctx, idxs[cur], grammar_first);
+        common_sampler_accept(gsmpl, id, true);
+        res.tokens.push_back(id);
+
+        if (stop_eog && llama_vocab_is_eog(vocab, id)) {
+            break;
+        }
+
+        int32_t next_node = -1;
+        for (size_t i = 0; i < draft.size(); ++i) {
+            if (parents[i] == cur && draft[i] == id) {
+                next_node = (int32_t) (i + 1);
+                break;
+            }
+        }
+        if (next_node < 0) {
+            break;
+        }
+        res.keep_idxs.push_back(next_node);
+        cur = next_node;
+    }
+
+    return res;
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {

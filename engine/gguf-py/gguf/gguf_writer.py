@@ -708,6 +708,9 @@ class GGUFWriter:
     def add_vocab_size(self, size: int) -> None:
         self.add_uint32(Keys.LLM.VOCAB_SIZE.format(arch=self.arch), size)
 
+    def add_vocab_size_unpadded(self, size: int) -> None:
+        self.add_uint32(Keys.LLM.VOCAB_SIZE_UNPADDED.format(arch=self.arch), size)
+
     def add_context_length(self, length: int) -> None:
         self.add_uint32(Keys.LLM.CONTEXT_LENGTH.format(arch=self.arch), length)
 
@@ -848,6 +851,57 @@ class GGUFWriter:
 
     def add_router_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.ROUTER_LOGIT_SOFTCAPPING.format(arch=self.arch), value)
+
+    def add_relative_length(self, length: int) -> None:
+        self.add_uint32(Keys.Attention.RELATIVE_LENGTH.format(arch=self.arch), length)
+
+    def add_relative_extent(self, extent: int) -> None:
+        self.add_uint32(Keys.Attention.RELATIVE_EXTENT.format(arch=self.arch), extent)
+
+    def add_qk_clip(self, value: float) -> None:
+        self.add_float32(Keys.Attention.QK_CLIP.format(arch=self.arch), value)
+
+    def add_relative_clip(self, value: float) -> None:
+        self.add_float32(Keys.Attention.RELATIVE_CLIP.format(arch=self.arch), value)
+
+    def add_log_scale_floor(self, value: int) -> None:
+        self.add_uint32(Keys.Attention.LOG_SCALE_FLOOR.format(arch=self.arch), value)
+
+    def add_log_scale_alpha(self, value: float) -> None:
+        self.add_float32(Keys.Attention.LOG_SCALE_ALPHA.format(arch=self.arch), value)
+
+    def add_activation_situ_beta(self, value: float) -> None:
+        self.add_float32(Keys.Activation.SITU_BETA.format(arch=self.arch), value)
+
+    def add_activation_situ_linear_beta(self, value: float) -> None:
+        self.add_float32(Keys.Activation.SITU_LINEAR_BETA.format(arch=self.arch), value)
+
+    def add_attn_res_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.AttnRes.BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_loop_start(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.START.format(arch=self.arch), value)
+
+    def add_loop_end(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.END.format(arch=self.arch), value)
+
+    def add_loop_count(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.COUNT.format(arch=self.arch), value)
+
+    def add_loop_gate_rank(self, value: int) -> None:
+        self.add_uint32(Keys.Loop.GATE_RANK.format(arch=self.arch), value)
+
+    def add_loop_varying(self, value: bool) -> None:
+        self.add_bool(Keys.Loop.VARYING.format(arch=self.arch), value)
+
+    def add_target_layers(self, layers: Sequence[int]) -> None:
+        self.add_array(Keys.DSpark.TARGET_LAYERS.format(arch=self.arch), layers)
+
+    def add_dspark_block_size(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.BLOCK_SIZE.format(arch=self.arch), value)
+
+    def add_dspark_markov_rank(self, value: int) -> None:
+        self.add_uint32(Keys.DSpark.MARKOV_RANK.format(arch=self.arch), value)
 
     def add_final_logit_softcapping(self, value: float) -> None:
         self.add_float32(Keys.LLM.FINAL_LOGIT_SOFTCAPPING.format(arch=self.arch), value)

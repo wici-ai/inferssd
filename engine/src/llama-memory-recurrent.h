@@ -52,6 +52,11 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const override;
+
+    void set_tree_parents(const int8_t * parents, int32_t n) override;
+    bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     bool prepare(const std::vector<llama_ubatch> & ubatches);
@@ -76,12 +81,16 @@ public:
     // first zero-ed state
     int32_t rs_z = -1;
 
+    static constexpr uint32_t SCONV_HIST_W = 32;
+
     // TODO: optimize for recurrent state needs
     struct mem_cell {
-        llama_pos pos  = -1;
-        int32_t   src  = -1; // used to know where states should be copied from
-        int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
-        int32_t   tail = -1;
+        llama_pos pos      = -1;
+        llama_pos hist_min = 0;  // earliest position (>= 0) valid in r_hist_l
+        llama_pos hist_max = -1; // latest position valid in r_hist_l
+        int32_t   src      = -1; // used to know where states should be copied from
+        int32_t   src0     = -1; // like src, but only used when setting the inputs (allowing to copy once)
+        int32_t   tail     = -1;
 
         std::set<llama_seq_id> seq_id;
 
@@ -115,9 +124,13 @@ public:
     void restore_metadata(metadata_undo & saved) noexcept;
 
     // per layer
+    bool has_sconv_hist = false;
+    bool tree_active    = false;
+    uint32_t last_tree_n = 0;
     std::vector<ggml_tensor *> p_l;
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
+    std::vector<ggml_tensor *> r_hist_l;
 
 private:
     //const llama_model & model;
@@ -182,6 +195,7 @@ public:
     ggml_tensor * get_p_l(int32_t il) const;
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
+    ggml_tensor * get_r_hist_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
 

@@ -3,6 +3,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 // represents a memory range (i.e. an interval from a starting address p0 to an ending address p1 in a given buffer pb)
@@ -117,6 +119,9 @@ bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
             ggml_mem_ranges_add_src(mrs, tensor->src[i]);
         }
     }
+    if (tensor->op == GGML_OP_INKLING_SCONV_STATE && tensor->src[6]) {
+        ggml_mem_ranges_add_dst(mrs, tensor->src[6]);
+    }
 
     return ggml_mem_ranges_add_dst(mrs, tensor);
 }
@@ -180,6 +185,11 @@ bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
             }
         }
     }
+    if (tensor->op == GGML_OP_INKLING_SCONV_STATE && tensor->src[6]) {
+        if (!ggml_mem_ranges_check_dst(mrs, tensor->src[6])) {
+            return false;
+        }
+    }
 
     return ggml_mem_ranges_check_dst(mrs, tensor);
 }
@@ -217,13 +227,28 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
-        // keep track of the sources of the fused nodes as well
+        // keep track of the sources and destinations of node and all fused nodes
+        if (!node.fused.empty() && !ggml_op_is_empty(node.node->op)) {
+            if (!ggml_mem_ranges_add_dst(mrs, node.node)) {
+                return false;
+            }
+        }
+        if (node.node->op == GGML_OP_INKLING_SCONV_STATE && node.node->src[6]) {
+            if (!ggml_mem_ranges_add_dst(mrs, node.node->src[6])) {
+                return false;
+            }
+        }
         for (const auto * fused : node.fused) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 if (fused->src[i]) {
                     if (!ggml_mem_ranges_add_src(mrs, fused->src[i])) {
                         return false;
                     }
+                }
+            }
+            if (fused != node.dst() && !ggml_op_is_empty(fused->op)) {
+                if (!ggml_mem_ranges_add_dst(mrs, fused)) {
+                    return false;
                 }
             }
         }
@@ -241,12 +266,27 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             }
         }
 
+        if (!node.fused.empty() && !ggml_op_is_empty(node.node->op)) {
+            if (!ggml_mem_ranges_check_dst(mrs, node.node)) {
+                return false;
+            }
+        }
+        if (node.node->op == GGML_OP_INKLING_SCONV_STATE && node.node->src[6]) {
+            if (!ggml_mem_ranges_check_dst(mrs, node.node->src[6])) {
+                return false;
+            }
+        }
         for (const auto * fused : node.fused) {
             for (int i = 0; i < GGML_MAX_SRC; i++) {
                 if (fused->src[i]) {
                     if (!ggml_mem_ranges_check_src(mrs, fused->src[i])) {
                         return false;
                     }
+                }
+            }
+            if (fused != node.dst() && !ggml_op_is_empty(fused->op)) {
+                if (!ggml_mem_ranges_check_dst(mrs, fused)) {
+                    return false;
                 }
             }
         }
@@ -268,6 +308,13 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
             case GGML_OP_SUM_ROWS:
             case GGML_OP_SSM_CONV:
             case GGML_OP_SSM_SCAN:
+            case GGML_OP_INKLING_SCONV:
+            case GGML_OP_INKLING_SCONV_STATE:
+            case GGML_OP_INKLING_MIX:
+            case GGML_OP_INKLING_CTRL_BLEND:
+            case GGML_OP_INKLING_MOE_IDS:
+            case GGML_OP_INKLING_MOE_WEIGHTS:
+            case GGML_OP_INKLING_MOE_REDUCE:
             case GGML_OP_CLAMP:
             case GGML_OP_TRI:
             case GGML_OP_DIAG:
@@ -372,7 +419,92 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     return res;
 }
 
+static void ggml_graph_optimize_impl(ggml_cgraph * gf);
+
+// the order depends only on which tensors the nodes read and write: on the tensors themselves, and on the addresses of
+// the tensors that already have memory (weights, caches). A graph rebuilt with the same tensors gets the same order, so
+// the order is kept for each such graph and reused. A decode step whose batch size differs from the previous one
+// rebuilds its graph, and the reorder pass would otherwise cost about as much CPU time as the rest of the rebuild.
+static void ggml_graph_optimize_key(const ggml_cgraph * gf, std::vector<uint64_t> & key) {
+    key.clear();
+    key.reserve((size_t) gf->n_nodes * (2 + 3*(GGML_MAX_SRC + 1)));
+
+    const auto add_tensor = [&](const ggml_tensor * t) {
+        const ggml_tensor * base = t->view_src ? t->view_src : t;
+        key.push_back((uint64_t) t);
+        key.push_back((uint64_t) base);
+        key.push_back(base->buffer ? (uint64_t) base->data ^ ((uint64_t) ggml_nbytes(base) << 1) : 0);
+    };
+
+    for (int i = 0; i < gf->n_nodes; i++) {
+        const ggml_tensor * node = gf->nodes[i];
+        key.push_back((uint64_t) node->op | ((uint64_t) node->flags << 32));
+        add_tensor(node);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                add_tensor(node->src[j]);
+            } else {
+                key.push_back(0);
+            }
+        }
+    }
+}
+
 void ggml_graph_optimize(ggml_cgraph * gf) {
+    struct entry {
+        std::vector<uint64_t> key;
+        std::vector<int>      order;
+    };
+    static std::mutex                                mutex;
+    static std::unordered_map<uint64_t, entry>       cache;
+    static thread_local std::vector<uint64_t>        key;
+
+    ggml_graph_optimize_key(gf, key);
+
+    uint64_t hash = 1469598103934665603ull;
+    for (uint64_t v : key) {
+        hash = (hash ^ v) * 1099511628211ull;
+    }
+
+    const int n = gf->n_nodes;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        auto it = cache.find(hash);
+        if (it != cache.end() && it->second.key == key && (int) it->second.order.size() == n) {
+            std::vector<ggml_tensor *> orig(gf->nodes, gf->nodes + n);
+            for (int j = 0; j < n; j++) {
+                gf->nodes[j] = orig[it->second.order[j]];
+            }
+            return;
+        }
+    }
+
+    std::vector<ggml_tensor *> orig(gf->nodes, gf->nodes + n);
+
+    ggml_graph_optimize_impl(gf);
+
+    std::unordered_map<const ggml_tensor *, int> index;
+    index.reserve(n);
+    for (int i = 0; i < n; i++) {
+        index[orig[i]] = i;
+    }
+
+    entry e;
+    e.key = key;
+    e.order.resize(n);
+    for (int j = 0; j < n; j++) {
+        e.order[j] = index.at(gf->nodes[j]);
+    }
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (cache.size() >= 256) {
+        cache.clear();
+    }
+    cache[hash] = std::move(e);
+}
+
+static void ggml_graph_optimize_impl(ggml_cgraph * gf) {
     constexpr int MAX_FUSE = 16;
 
     const int n = gf->n_nodes;
@@ -424,6 +556,149 @@ void ggml_graph_optimize(ggml_cgraph * gf) {
                 ++i;
 
                 // the .dst() becomes the last fused tensor
+                node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_MUL_MAT && i + 3 < n &&
+                   gf->nodes[i]->src[0]->type == GGML_TYPE_BF16 &&
+                   gf->nodes[i]->src[0]->ne[0] == 64 &&
+                   gf->nodes[i + 1]->op == GGML_OP_INKLING_CTRL_BLEND &&
+                   gf->nodes[i + 1]->src[2] == gf->nodes[i] &&
+                   gf->nodes[i + 2]->op == GGML_OP_RMS_NORM &&
+                   gf->nodes[i + 2]->src[0] == gf->nodes[i + 1] &&
+                   gf->nodes[i + 3]->op == GGML_OP_MUL &&
+                   (gf->nodes[i + 3]->src[0] == gf->nodes[i + 2] || gf->nodes[i + 3]->src[1] == gf->nodes[i + 2]) &&
+                   ggml_node_has_n_uses(gf, i, 1) &&
+                   ggml_node_has_n_uses(gf, i + 1, 1) &&
+                   ggml_node_has_n_uses(gf, i + 2, 1)) {
+            for (int k = 1; k <= 3; ++k) {
+                ++i;
+                node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_MUL_MAT && i + 1 < n &&
+                   gf->nodes[i]->src[0]->ne[0] == 16 &&
+                   gf->nodes[i]->src[0]->type == GGML_TYPE_F32 &&
+                   gf->nodes[i + 1]->op == GGML_OP_SUB) {
+            ops[0] = GGML_OP_MUL_MAT;
+            ops[1] = GGML_OP_SUB;
+            if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i;
+                node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_UNARY && i + 1 < n &&
+                   ggml_get_unary_op(gf->nodes[i]) == GGML_UNARY_OP_SIGMOID &&
+                   gf->nodes[i]->src[0]->ne[2] == 1 && gf->nodes[i]->src[0]->ne[3] == 1 &&
+                   gf->nodes[i + 1]->op == GGML_OP_MUL) {
+            ops[0] = GGML_OP_UNARY;
+            ops[1] = GGML_OP_MUL;
+            if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i;
+                node.add_fused(gf->nodes[i]);
+                if (i + 1 < n &&
+                    gf->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                    gf->nodes[i + 1]->src[1] == gf->nodes[i] &&
+                    gf->nodes[i + 1]->src[0]->type == GGML_TYPE_BF16 &&
+                    gf->nodes[i + 1]->src[0]->ne[0] % 64 == 0 &&
+                    ggml_node_has_n_uses(gf, i, 1)) {
+                    ++i;
+                    node.add_fused(gf->nodes[i]);
+                }
+            }
+        } else if (node.op() == GGML_OP_INKLING_SCONV && i + 4 < n &&
+                   gf->nodes[i + 1]->op == GGML_OP_RESHAPE &&
+                   (gf->nodes[i + 2]->op == GGML_OP_L2_NORM || gf->nodes[i + 2]->op == GGML_OP_RMS_NORM) &&
+                   gf->nodes[i + 3]->op == GGML_OP_VIEW &&
+                   gf->nodes[i + 4]->op == GGML_OP_SET_ROWS &&
+                   gf->nodes[i + 1]->view_src == gf->nodes[i] &&
+                   gf->nodes[i + 2]->src[0]   == gf->nodes[i + 1] &&
+                   gf->nodes[i + 3]->view_src == gf->nodes[i + 2] &&
+                   gf->nodes[i + 4]->src[0]   == gf->nodes[i + 3] &&
+                   ggml_node_has_n_uses(gf, i, 1) &&
+                   ggml_node_has_n_uses(gf, i + 2, 1)) {
+            for (int k = 1; k <= 4; ++k) {
+                ++i;
+                node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_INKLING_SCONV && i + 1 < n &&
+                   gf->nodes[i + 1]->op == GGML_OP_ADD) {
+            ops[0] = GGML_OP_INKLING_SCONV;
+            ops[1] = GGML_OP_ADD;
+            if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i;
+                node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_INKLING_MIX && i + 1 < n &&
+                   gf->nodes[i + 1]->op == GGML_OP_RMS_NORM) {
+            ops[0] = GGML_OP_INKLING_MIX;
+            ops[1] = GGML_OP_RMS_NORM;
+            ops[2] = GGML_OP_MUL;
+            if (i + 2 < n && gf->nodes[i + 2]->op == GGML_OP_MUL && ggml_can_fuse(gf, i, ops, 3)) {
+                ++i; node.add_fused(gf->nodes[i]);
+                ++i; node.add_fused(gf->nodes[i]);
+            } else if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i; node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_INKLING_CTRL_BLEND && i + 1 < n &&
+                   gf->nodes[i + 1]->op == GGML_OP_RMS_NORM) {
+            ops[0] = GGML_OP_INKLING_CTRL_BLEND;
+            ops[1] = GGML_OP_RMS_NORM;
+            ops[2] = GGML_OP_MUL;
+            if (i + 2 < n && gf->nodes[i + 2]->op == GGML_OP_MUL && ggml_can_fuse(gf, i, ops, 3)) {
+                ++i; node.add_fused(gf->nodes[i]);
+                ++i; node.add_fused(gf->nodes[i]);
+            } else if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i; node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_MUL && i + 1 < n &&
+                   gf->nodes[i + 1]->op == GGML_OP_L2_NORM &&
+                   gf->nodes[i]->src[0]->ne[0] % 4 == 0 && gf->nodes[i]->src[0]->ne[0] <= 128) {
+            ops[0] = GGML_OP_MUL;
+            ops[1] = GGML_OP_L2_NORM;
+            ops[2] = (i + 2 < n) ? gf->nodes[i + 2]->op : GGML_OP_NONE;
+            if (i + 2 < n && (ops[2] == GGML_OP_SCALE || ops[2] == GGML_OP_MUL) && ggml_can_fuse(gf, i, ops, 3)) {
+                ++i; node.add_fused(gf->nodes[i]);
+                ++i; node.add_fused(gf->nodes[i]);
+                // Keep trailing Inkling2 rel_bias MUL_MAT(rel_table [16, ne01], Rcur) [+ SUB(sinks)] adjacent
+                if (gf->nodes[i]->ne[0] == 16 && i + 1 < n &&
+                    gf->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                    gf->nodes[i + 1]->src[1] == gf->nodes[i] &&
+                    gf->nodes[i + 1]->src[0]->ne[0] == 16 &&
+                    gf->nodes[i + 1]->src[0]->type == GGML_TYPE_F32 &&
+                    ggml_node_has_n_uses(gf, i, 1)) {
+                    ++i; node.add_fused(gf->nodes[i]);
+                    if (i + 1 < n &&
+                        gf->nodes[i + 1]->op == GGML_OP_SUB &&
+                        gf->nodes[i + 1]->src[0] == gf->nodes[i] &&
+                        ggml_node_has_n_uses(gf, i, 1)) {
+                        ++i; node.add_fused(gf->nodes[i]);
+                    }
+                }
+            } else if (ggml_can_fuse(gf, i, ops, 2)) {
+                ++i; node.add_fused(gf->nodes[i]);
+            }
+        } else if (node.op() == GGML_OP_GET_ROWS && i + 5 < n &&
+                   gf->nodes[i]->src[0]->type == GGML_TYPE_BF16 &&
+                   gf->nodes[i]->src[0]->ne[0] == 256 &&
+                   gf->nodes[i + 1]->op == GGML_OP_CONCAT &&
+                   gf->nodes[i + 2]->op == GGML_OP_MUL_MAT &&
+                   gf->nodes[i + 2]->src[0]->ne[0] == 512 &&
+                   gf->nodes[i + 2]->src[0]->ne[1] == 768 &&
+                   gf->nodes[i + 3]->op == GGML_OP_ADD &&
+                   gf->nodes[i + 4]->op == GGML_OP_VIEW &&
+                   gf->nodes[i + 5]->op == GGML_OP_UNARY &&
+                   ggml_get_unary_op(gf->nodes[i + 5]) == GGML_UNARY_OP_TANH) {
+            int f = 6;
+            if (i + 12 < n &&
+                gf->nodes[i + 6]->op == GGML_OP_VIEW &&
+                gf->nodes[i + 7]->op == GGML_OP_UNARY && ggml_get_unary_op(gf->nodes[i + 7]) == GGML_UNARY_OP_TANH &&
+                gf->nodes[i + 8]->op == GGML_OP_VIEW &&
+                gf->nodes[i + 9]->op == GGML_OP_UNARY && ggml_get_unary_op(gf->nodes[i + 9]) == GGML_UNARY_OP_SIGMOID &&
+                gf->nodes[i + 10]->op == GGML_OP_SUB &&
+                gf->nodes[i + 11]->op == GGML_OP_MUL &&
+                gf->nodes[i + 12]->op == GGML_OP_ADD) {
+                f = 13;
+            }
+            for (int k = 1; k < f; k++) {
+                ++i;
                 node.add_fused(gf->nodes[i]);
             }
         }

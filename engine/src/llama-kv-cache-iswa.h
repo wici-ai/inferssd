@@ -73,6 +73,17 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    void set_tree_parents(const int8_t * parents, int32_t n) override {
+        kv_base->set_tree_parents(parents, n);
+        kv_swa ->set_tree_parents(parents, n);
+    }
+
+    bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) override {
+        const bool ok_base = kv_base->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
+        const bool ok_swa  = kv_swa ->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
+        return ok_base && ok_swa;
+    }
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void set_commit(const commit_cb & commit) override {

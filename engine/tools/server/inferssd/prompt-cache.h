@@ -171,6 +171,11 @@ struct server_prompt_cache {
     std::string prefix_dir;
     std::string prefix_fingerprint;
 
+    // Last disk prompt file written by save() or restored by load() (empty for RAM cache or no-op).
+    std::string last_saved_file;
+    std::string last_loaded_file;
+    int64_t     last_loaded_tokens = 0;
+
     // of the cache's own states, not the prefix caches
     size_t size() const;
 
@@ -196,7 +201,8 @@ struct server_prompt_cache {
             int64_t                      n_reuse_slot,
             llama_context              * ctx,
             int32_t                      id_slot,
-            common_context_seq_rm_type   seq_rm_type);
+            common_context_seq_rm_type   seq_rm_type,
+            bool                       * did_load = nullptr);
 
     void update();
 

@@ -70,6 +70,8 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void set_commit(const commit_cb & commit) override { mem_attn->set_commit(commit); }

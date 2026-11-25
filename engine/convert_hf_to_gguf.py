@@ -12,6 +12,7 @@ import os
 import re
 import sys
 from enum import IntEnum
+from functools import partial
 from pathlib import Path
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
@@ -71,6 +72,7 @@ class SentencePieceTokenTypes(IntEnum):
 class ModelType(IntEnum):
     TEXT = 1
     MMPROJ = 2
+    MTP = 3
 
 
 AnyModel = TypeVar("AnyModel", bound="type[ModelBase]")
@@ -80,6 +82,7 @@ class ModelBase:
     _model_classes: dict[ModelType, dict[str, type[ModelBase]]] = {
         ModelType.TEXT: {},
         ModelType.MMPROJ: {},
+        ModelType.MTP: {},
     }
 
     dir_model: Path
@@ -879,12 +882,13 @@ class ModelBase:
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
+                quantize = data.quantize if isinstance(data, gguf.LazyChunkedTensor) else partial(gguf.quants.quantize, data)
                 try:
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
                 except gguf.QuantError as e:
                     logger.warning("%s, %s", e, "falling back to F16")
                     data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                    data = quantize(data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -963,6 +967,13 @@ class ModelBase:
                 config = json.load(f)
             return config
 
+        # AutoConfig injects MXFP8 defaults into Inkling 2 and can replace the original layer schedule
+        if (dir_model / "config.json").is_file():
+            with open(dir_model / "config.json", "r", encoding="utf-8") as f:
+                raw_config = json.load(f)
+            if raw_config.get("model_type") in _INKLING2_MODEL_TYPES:
+                return raw_config
+
         try:
             # for security reason, we don't allow loading remote code by default
             # if a model need remote code, we will fallback to config.json
@@ -994,7 +1005,12 @@ class ModelBase:
         assert names
 
         def func(modelcls: AnyModel) -> AnyModel:
-            model_type = ModelType.MMPROJ if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ else ModelType.TEXT
+            if modelcls.model_arch == gguf.MODEL_ARCH.MMPROJ:
+                model_type = ModelType.MMPROJ
+            elif getattr(modelcls, "model_type", None) == ModelType.MTP:
+                model_type = ModelType.MTP
+            else:
+                model_type = ModelType.TEXT
             for name in names:
                 cls._model_classes[model_type][name] = modelcls
             return modelcls
@@ -1546,6 +1562,9 @@ class TextModel(ModelBase):
         if chkhsh == "862f827721df956049dff5ca81a57f29e575280bc622e290d3bf4e35eca29015":
             # ref: https://huggingface.co/codefuse-ai/F2LLM-v2-4B
             res = "f2llmv2"
+        if chkhsh == "5635e1c8d621dff7b4825f41f2f97b6ceb39bcf2d5c541db28577080d6efd5e5":
+            # ref: https://huggingface.co/thinkingmachines/Inkling-2-Small
+            res = "inkling2"
 
         if res is None:
             logger.warning("\n")
@@ -13211,6 +13230,511 @@ class DotsOCRVisionModel(MmprojModel):
             yield from super().modify_tensors(data_torch, name, bid)
 
 
+def _e4m3_table() -> np.ndarray:
+    codes = np.arange(256, dtype=np.uint8)
+    exponent = ((codes & 0x7F) >> 3).astype(np.int32)
+    mantissa = (codes & 7).astype(np.float32)
+    values = np.where(exponent == 0, np.ldexp(mantissa, -9), np.ldexp(1 + mantissa / 8, exponent - 7))
+    values = np.where(codes & 0x80, -values, values)
+    values[(codes & 0x7F) == 0x7F] = np.nan
+    return values.astype(np.float32)
+
+
+_E4M3 = _e4m3_table()
+_E2M1 = np.array([0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6], dtype=np.float32)
+_EXPERT_CHUNK_ROWS = 128
+
+
+def _dequant_expert_chunk(weight: Callable[[], Tensor], scale: Callable[[], Tensor], amax: Callable[[], Tensor] | None, denominator: Callable[[], Tensor] | None, name: str, expert: int, rows: slice) -> np.ndarray:
+    # Fresh lazy tensors release their mappings after each chunk instead of caching the layer.
+    packed = LazyTorchTensor.to_eager(weight().view(torch.uint8)[expert, rows]).numpy()
+    scales = LazyTorchTensor.to_eager(scale().view(torch.uint8)[expert, rows]).numpy()
+    if amax is not None:
+        block_scale = _E4M3[scales]
+        if np.isnan(block_scale).any():
+            raise ValueError(f"Inkling2: {name}_scale expert {expert}: E4M3FN NaN")
+        values = np.empty((packed.shape[0], packed.shape[1] * 2), dtype=np.float32)
+        values[:, 0::2] = _E2M1[packed & 15]
+        values[:, 1::2] = _E2M1[packed >> 4]
+        values.reshape(values.shape[0], -1, 16)[:] *= block_scale[:, :, None]
+        assert denominator is not None
+        a = LazyTorchTensor.to_eager(amax()[expert]).item()
+        d = LazyTorchTensor.to_eager(denominator()).item()
+        if not np.isfinite(a) or a < 0:
+            raise ValueError(f"Inkling2: {name}_amax expert {expert}: expected finite nonnegative value")
+        if not np.isfinite(d) or d <= 0:
+            raise ValueError(f"Inkling2: {name}_outer_scale_denominator expert {expert}: expected finite positive value")
+        with np.errstate(over="ignore", invalid="ignore"):
+            values *= np.float32(a) / np.float32(d)
+    else:
+        if np.any(scales == 255):
+            raise ValueError(f"Inkling2: {name}_scale expert {expert}: UE8M0 byte 255 is NaN")
+        values = _E4M3[packed]
+        if np.isnan(values).any():
+            raise ValueError(f"Inkling2: {name} expert {expert}: E4M3FN NaN")
+        block_scale = np.ldexp(np.ones(scales.shape, dtype=np.float32), scales.astype(np.int32) - 127)
+        with np.errstate(over="ignore", invalid="ignore"):
+            values.reshape(values.shape[0], -1, 32)[:] *= block_scale[:, :, None]
+    if not np.isfinite(values).all():
+        raise ValueError(f"Inkling2: {name} expert {expert}: non-finite dequantized weight")
+    return values
+
+
+def _dequant_expert_chunk_bf16(*args) -> np.ndarray:
+    # MXFP8 values are E4M3 codes times a power of two, so BF16 holds them exactly; refuse anything else
+    values = _dequant_expert_chunk(*args)
+    if np.any(values.view(np.uint32) & 0xFFFF):
+        raise ValueError(f"Inkling2: {args[4]} expert {args[5]}: dequantized MXFP8 value is not exact in BF16")
+    return values
+
+
+def _nvfp4_expert_rows(packed: np.ndarray, scales: np.ndarray, name: str, expert: int) -> np.ndarray:
+    # Original checkpoint: consecutive FP4 nibbles, with one E4M3 scale per 16 values.
+    # GGML block_nvfp4: four scales followed by 32 bytes pairing values j and j+8.
+    n, half = packed.shape
+    nb = scales.shape[1]
+    if half * 2 != nb * 16 or nb % 4:
+        raise ValueError(f"Inkling2: {name} expert {expert}: {half * 2} columns do not form NVFP4 blocks of 64")
+    if np.any(scales & 0x80) or np.any(scales == 0x7F):
+        raise ValueError(f"Inkling2: {name}_scale expert {expert}: block scales must be non-negative and finite to keep NVFP4")
+    nibbles = np.stack([packed & 15, packed >> 4], axis=-1).reshape(n, nb, 16)
+    qs = (nibbles[:, :, :8] | (nibbles[:, :, 8:] << 4)).astype(np.uint8)
+    blocks = np.concatenate([scales.reshape(n, nb // 4, 4), qs.reshape(n, nb // 4, 32)], axis=-1)
+    return blocks.reshape(n, nb // 4 * 36)
+
+
+def _mxfp8_expert_rows(codes: np.ndarray, scales: np.ndarray, name: str, expert: int) -> np.ndarray:
+    # Original checkpoint: E4M3 codes, with one UE8M0 scale per 32 values.
+    # GGML block_mxfp8: the E8M0 scale byte followed by the 32 codes.
+    n, cols = codes.shape
+    nb = scales.shape[1]
+    if cols != nb * 32:
+        raise ValueError(f"Inkling2: {name} expert {expert}: {cols} columns do not form MXFP8 blocks of 32")
+    if np.any(scales == 0xFF):
+        raise ValueError(f"Inkling2: {name}_scale expert {expert}: UE8M0 byte 255 is NaN")
+    if np.any((codes & 0x7F) == 0x7F):
+        raise ValueError(f"Inkling2: {name} expert {expert}: E4M3FN NaN")
+    blocks = np.concatenate([scales.reshape(n, nb, 1), codes.reshape(n, nb, 32)], axis=-1)
+    return blocks.reshape(n, nb * 33)
+
+
+def _native_expert(weight: Callable[[], Tensor], scale: Callable[[], Tensor], name: str, expert: int, w13: bool, nvfp4: bool) -> np.ndarray:
+    packed = LazyTorchTensor.to_eager(weight().view(torch.uint8)[expert]).numpy()
+    scales = LazyTorchTensor.to_eager(scale().view(torch.uint8)[expert]).numpy()
+    repack = _nvfp4_expert_rows if nvfp4 else _mxfp8_expert_rows
+    if not w13:
+        return repack(packed, scales, name, expert)
+    # Original checkpoint interleaves gate and up rows; GGUF stores them grouped.
+    return np.concatenate([repack(packed[half::2], scales[half::2], name, expert) for half in (0, 1)])
+
+
+_INKLING2_MODEL_TYPES = ("inkling2", "inkling2_text", "inkling2_loop", "inkling2_loop_text")
+
+
+@ModelBase.register("Inkling2ForConditionalGeneration", "Inkling2ForCausalLM")
+class Inkling2Model(TextModel):
+    model_arch = gguf.MODEL_ARCH.INKLING2
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        self._expert_quant: dict[str, dict] = {}
+        self._packed_experts: dict[str, gguf.LazyChunkedTensor] = {}
+        # Packed NVFP4 and MXFP8 experts are kept as GGML NVFP4 and MXFP8 blocks;
+        # INKLING2_NVFP4_NATIVE=0 dequantizes NVFP4, INKLING2_MXFP8_BF16=1 writes MXFP8 as exact BF16.
+        self._native_nvfp4 = os.environ.get("INKLING2_NVFP4_NATIVE", "1") == "1"
+        self._mxfp8_bf16 = os.environ.get("INKLING2_MXFP8_BF16", "0") == "1"
+        self._native_experts: dict[str, tuple[gguf.LazyChunkedTensor, gguf.GGMLQuantizationType, np.ndarray | None]] = {}
+        quant_path = dir_model / "hf_quant_config.json"
+        if quant_path.is_file():
+            with open(quant_path, encoding="utf-8") as f:
+                groups = json.load(f).get("model", {}).get("parameter_groups", [])
+            for group in groups:
+                for name in group.get("tensors", []):
+                    item = self.filter_tensors((name, lambda: torch.empty(0)))
+                    if item is not None and item[0].endswith((".w13_weight", ".w2_weight")):
+                        name = item[0]
+                        if name in self._expert_quant:
+                            raise ValueError(f"Inkling2: duplicate hf_quant_config.json scheme for {name}")
+                        self._expert_quant[name] = group
+        super().__init__(dir_model, *args, **kwargs)
+        logger.warning("Inkling2: converting the text backbone only; vision and MTP tensors are skipped")
+        hp = self.hparams
+        for name, default in (("q_bias", False), ("o_bias", False), ("n_shared_experts", 0), ("use_value_norm_no_gamma", True), ("attn_res_normalize_values", True), ("scoring_func", "sigmoid")):
+            if hp.get(name, default) != default:
+                raise ValueError(f"Inkling2: unsupported {name}={hp[name]!r}")
+        types = hp.get("layer_types")
+        if types is None:
+            local = hp["local_layer_ids"]
+            types = ["hybrid_sliding" if i in local else "hybrid" for i in range(self.block_count)]
+        if len(types) != self.block_count or set(types) - {"hybrid", "hybrid_sliding"}:
+            raise ValueError("Inkling2: invalid layer_types")
+        self.is_swa = [t == "hybrid_sliding" for t in types]
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        tensors: dict[str, Callable[[], Tensor]] = {}
+        for item in super().index_tensors(remote_hf_model_id=remote_hf_model_id).items():
+            if (kept := self.filter_tensors(item)) is not None:
+                tensors[kept[0]] = kept[1]
+        return tensors
+
+    def _generate_nvfp4_tensors(self):
+        # the generic ModelOpt repack does not know the fused expert layout; dequant_model handles it
+        return
+
+    def dequant_model(self):
+        for name in list(self.model_tensors):
+            if not name.endswith((".w13_weight", ".w2_weight")):
+                continue
+            weight = self.model_tensors[name]
+            tensor = weight()
+            companions = [name + suffix for suffix in ("_scale", "_amax", "_outer_scale_denominator")]
+            if tensor.dtype.is_floating_point and tensor.element_size() > 1:
+                if any(n in self.model_tensors for n in companions):
+                    raise ValueError(f"Inkling2: floating-point {name} has packed quantization companions")
+                continue
+            config = self._expert_quant.get(name, {})
+            scheme = config.get("weight_transform")
+            if scheme not in ("nvfp4_nearest", "mxfp8_nearest"):
+                raise ValueError(f"Inkling2: {name}: missing or unsupported hf_quant_config.json scheme {scheme!r}")
+            nvfp4 = scheme == "nvfp4_nearest"
+            if nvfp4 and config.get("weight_scale_format") != "amax_denominator":
+                raise ValueError(f"Inkling2: {name}: expected NVFP4 amax_denominator scale format")
+            required = companions if nvfp4 else companions[:1]
+            for companion in required:
+                if companion not in self.model_tensors:
+                    raise ValueError(f"Inkling2: {name}: missing companion {companion}")
+            if not nvfp4 and any(n in self.model_tensors for n in companions[1:]):
+                raise ValueError(f"Inkling2: {name}: MXFP8 must not have amax or outer_scale_denominator")
+            scale = self.model_tensors[companions[0]]
+            scale_tensor = scale()
+            weight_dtype, scale_dtype = (torch.uint8, torch.float8_e4m3fn) if nvfp4 else (torch.float8_e4m3fn, torch.uint8)
+            if tensor.dtype != weight_dtype or scale_tensor.dtype != scale_dtype:
+                raise ValueError(f"Inkling2: {name}: expected {weight_dtype} weights and {scale_dtype} scales, got {tensor.dtype} and {scale_tensor.dtype}")
+            experts = self.hparams["n_routed_experts"]
+            hidden = self.hparams["hidden_size"]
+            inter = self.find_hparam(["moe_intermediate_size", "intermediate_size"])
+            w13 = name.endswith(".w13_weight")
+            rows, cols = (2 * inter, hidden) if w13 else (hidden, inter)
+            shape = (experts, rows, cols)
+            if min(shape) <= 0 or cols % (16 if nvfp4 else 32) or tuple(tensor.shape) != (experts, rows, cols // (2 if nvfp4 else 1)):
+                raise ValueError(f"Inkling2: {name}: invalid packed shape {tuple(tensor.shape)} for logical shape {shape}")
+            ss = tuple(scale_tensor.shape)
+            if len(ss) != 3 or ss[0] != experts or min(ss) <= 0 or rows % ss[1] or cols % ss[2]:
+                raise ValueError(f"Inkling2: {name}_scale: shape {ss} does not divide logical shape {shape}")
+            block = (rows // ss[1], cols // ss[2])
+            if block != (1, 16 if nvfp4 else 32):
+                raise ValueError(f"Inkling2: {name}_scale: unsupported stored block shape {block}")
+            if list(block) != config.get("weight_block_shape"):
+                logger.warning("Inkling2: %s: hf_quant_config.json weight_block_shape %s conflicts with stored weight/scale shapes %s/%s; using %s", name, config.get("weight_block_shape"), tuple(tensor.shape), ss, list(block))
+            amax = denominator = None
+            if nvfp4:
+                amax, denominator = (self.model_tensors[n] for n in companions[1:])
+                for companion, gen, expected in ((companions[1], amax, (experts,)), (companions[2], denominator, (1,))):
+                    t = gen()
+                    if t.dtype != torch.float32 or tuple(t.shape) != expected:
+                        raise ValueError(f"Inkling2: {companion}: expected F32 {expected}, got {t.dtype} {tuple(t.shape)}")
+            if (nvfp4 and self._native_nvfp4) or (not nvfp4 and not self._mxfp8_bf16):
+                expert_scale = None
+                if nvfp4:
+                    assert amax is not None and denominator is not None
+                    a = LazyTorchTensor.to_eager(amax()).numpy().astype(np.float32)
+                    d = LazyTorchTensor.to_eager(denominator()).numpy().astype(np.float32)
+                    if not np.isfinite(a).all() or (a < 0).any() or not np.isfinite(d).all() or (d <= 0).any():
+                        raise ValueError(f"Inkling2: {name}: amax must be finite and nonnegative, denominator finite and positive")
+                    if cols % 64:
+                        raise ValueError(f"Inkling2: {name}: {cols} columns do not form NVFP4 blocks of 64")
+                    expert_scale = a / d
+                qtype = gguf.GGMLQuantizationType.NVFP4 if nvfp4 else gguf.GGMLQuantizationType.MXFP8
+                byte_shape = gguf.quant_shape_to_byte_shape(shape, qtype)
+                chunks_native: list[Callable[[], np.ndarray]] = [
+                    partial(_native_expert, weight, scale, name, expert, w13, nvfp4) for expert in range(experts)
+                ]
+                self._native_experts[name] = (gguf.LazyChunkedTensor(chunks_native, byte_shape, np.uint8), qtype, expert_scale)
+                self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
+                for companion in required:
+                    del self.model_tensors[companion]
+                continue
+            dequant = _dequant_expert_chunk if nvfp4 else _dequant_expert_chunk_bf16
+            chunks: list[Callable[[], np.ndarray]] = []
+            for expert in range(experts):
+                for half in range(2 if w13 else 1):
+                    for start in range(0, rows // 2 if w13 else rows, _EXPERT_CHUNK_ROWS):
+                        stop = min(start + _EXPERT_CHUNK_ROWS, rows // 2 if w13 else rows)
+                        # The same packed row slice selects the weight and its scale groups.
+                        row_slice = slice(2 * start + half, 2 * stop + half, 2) if w13 else slice(start, stop)
+                        chunks.append(partial(dequant, weight, scale, amax, denominator, name, expert, row_slice))
+            self._packed_experts[name] = gguf.LazyChunkedTensor(chunks, shape, np.float32)
+            self.model_tensors[name] = lambda shape=shape: torch.empty(shape, dtype=torch.float32, device="meta")
+            for companion in required:
+                del self.model_tensors[companion]
+        for name, gen in self.model_tensors.items():
+            t = gen()
+            if not t.dtype.is_floating_point or t.element_size() == 1 or name.endswith(("_weight_scale", "_weight_amax", "_weight_outer_scale_denominator")):
+                raise ValueError(f"Inkling2: unexpected packed tensor or orphan companion {name}")
+
+    @classmethod
+    def filter_tensors(cls, item: tuple[str, Callable[[], Tensor]]) -> tuple[str, Callable[[], Tensor]] | None:
+        name, gen = item
+        if any(p in name for p in ("visual.", "vision_tower.", "mtp.", "markov_head", "nextn_predict")):
+            return None
+        name = name.replace("model.language_model.", "model.").replace("model.llm.", "model.")
+        # the mapping table cannot shift a block index: attn_queries.{i} feeds block i + 1
+        name = re.sub(r"attn_res\.attn_queries\.(\d+)", lambda m: f"layers.{int(m[1]) + 1}.attention_input.query", name)
+        # the table maps a module, not its bias: gate.weight is the router, gate.bias the score correction
+        name = name.replace("mlp.gate.bias", "mlp.gate.e_score_correction_bias")
+        return name, gen
+
+    def get_vocab_base(self):
+        tokens, types, pre = super().get_vocab_base()
+        n = self.hparams["unpadded_vocab_size"]
+        return tokens[:n], types[:n], pre
+
+    def set_vocab(self):
+        tokens, types, pre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(pre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(types)
+        special = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        eos = self.hparams["eos_token_id"]
+        special.special_token_ids["eos"] = eos
+        special.special_token_ids["eot"] = eos
+        special.add_special_token["bos"] = False
+        special.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        hp["num_attention_heads"] = [hp.get("swa_num_attention_heads", hp["num_attention_heads"]) if s else hp["num_attention_heads"] for s in self.is_swa]
+        hp["num_key_value_heads"] = [hp.get("swa_num_key_value_heads", hp["num_key_value_heads"]) if s else hp["num_key_value_heads"] for s in self.is_swa]
+        for name in ("n_routed_experts", "num_experts_per_tok"):
+            if name not in hp:
+                raise KeyError(f"Inkling2: missing {name}")
+        super().set_gguf_parameters()
+        w = self.gguf_writer
+        # upstream's TextModel reads the expert count from n_routed_experts, this one does not
+        w.add_expert_count(hp["n_routed_experts"])
+        w.add_vocab_size(hp["vocab_size"])
+        w.add_vocab_size_unpadded(hp["unpadded_vocab_size"])
+        w.add_expert_feed_forward_length(self.find_hparam(["moe_intermediate_size", "intermediate_size"]))
+        w.add_key_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
+        w.add_value_length_swa(hp.get("swa_head_dim", hp["head_dim"]))
+        w.add_rope_dimension_count(0)
+        w.add_sliding_window(hp["sliding_window_size"])
+        w.add_sliding_window_pattern(self.is_swa)
+        w.add_shortconv_l_cache(self.find_hparam(["conv_kernel_size", "sconv_kernel_size"]))
+        w.add_expert_weights_scale(hp["route_scale"])
+        w.add_activation_situ_beta(hp["mlp_gate_softcap"])
+        w.add_activation_situ_linear_beta(hp["mlp_up_softcap"])
+        w.add_attn_res_block_size(hp["n_layers_per_attn_res_block"])
+        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
+        w.add_relative_length(hp["d_rel"])
+        w.add_relative_extent(hp["rel_extent"])
+        w.add_qk_clip(hp["qk_l2_clip_threshold"])
+        w.add_relative_clip(hp["rel_l2_clip_threshold"])
+        w.add_log_scale_floor(hp["log_scaling_n_floor"])
+        w.add_log_scale_alpha(hp["log_scaling_alpha"])
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if new_name.endswith(("_conv.weight", "_clip.weight", "_res_query.weight", "attn_rel_bias.weight")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in self._native_experts:
+            target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
+            new_name = self.map_tensor_name(target, try_suffixes=()) + ".weight"
+            packed, qtype, scale = self._native_experts[name]
+            logger.info(f"{new_name}: native {qtype.name}, shape = {{{', '.join(str(n) for n in reversed(gguf.quant_shape_from_byte_shape(packed.shape, qtype)))}}}")
+            self.gguf_writer.add_tensor(new_name, cast("np.ndarray", packed), raw_dtype=qtype)
+            if scale is not None:
+                yield new_name.removesuffix(".weight") + ".scale", torch.from_numpy(scale)
+            return
+        if name in self._packed_experts:
+            target = name.replace(".w13_weight", ".gate_up_proj").replace(".w2_weight", ".down_proj")
+            yield self.map_tensor_name(target, try_suffixes=()) + ".weight", cast("Tensor", self._packed_experts[name])
+            return
+        if name.endswith(".w13_weight"):
+            shape = data_torch.shape
+            data_torch = data_torch.reshape(shape[0], shape[1] // 2, 2, shape[2]).transpose(1, 2).reshape(shape)
+            name = name.replace(".w13_weight", ".gate_up_proj")
+        name = name.replace(".w2_weight", ".down_proj")
+        for static, conv in ((".static_weight", ".conv1d.weight"), (".static_w", ".weight")):
+            if name.endswith(static):
+                data_torch = data_torch.flip(0).T.contiguous()
+                name = name.removesuffix(static) + conv
+        if name.endswith((".conv1d.weight", "sconv.weight")):
+            data_torch = data_torch.squeeze(1) if data_torch.ndim == 3 else data_torch
+        elif name.endswith(".rel_logits_proj.proj"):
+            data_torch = data_torch.T.contiguous()
+        # a name the table maps without a suffix is a bare parameter
+        new_name = self.tensor_map.get_name(name)
+        if new_name is not None:
+            suffix = ".bias" if name.endswith(".e_score_correction_bias") else ".weight"
+            yield new_name + suffix, data_torch
+        else:
+            yield from super().modify_tensors(data_torch, name, bid)
+
+
+@ModelBase.register("Inkling2LoopForConditionalGeneration", "Inkling2LoopForCausalLM")
+class Inkling2LoopModel(Inkling2Model):
+    model_arch = gguf.MODEL_ARCH.INKLING2_LOOP
+
+    # raw checkpoint and transformers names of the cross-pass message queries
+    _query_kinds = {
+        "model.middle_cycle_cross_pass_queries": "q",
+        "model.middle_cycle_cross_pass_kv_queries": "kv",
+        "model.cross_pass_messages.queries": "q",
+        "model.cross_pass_messages.kv_queries": "kv",
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._queries: dict[str, Tensor] = {}
+        self.loop = self.hparams["loop_config"]
+        if set(self.loop) != {"core_start", "core_end", "num_passes", "gate_rank", "is_varloop"}:
+            raise ValueError(f"Inkling2Loop: unsupported loop_config keys {sorted(self.loop)}")
+        start, end, block = self.loop["core_start"], self.loop["core_end"], self.hparams["n_layers_per_attn_res_block"]
+        # a fixed loop needs at least 2 passes, a variable loop at least 1
+        min_passes = 1 if self.loop["is_varloop"] else 2
+        if not 0 < start < end <= self.block_count or start % block or end % block or self.loop["num_passes"] < min_passes or self.loop["gate_rank"] < 1:
+            raise ValueError(f"Inkling2Loop: invalid loop_config {self.loop}")
+
+    def set_gguf_parameters(self):
+        super().set_gguf_parameters()
+        self.gguf_writer.add_loop_start(self.loop["core_start"])
+        self.gguf_writer.add_loop_end(self.loop["core_end"])
+        self.gguf_writer.add_loop_count(self.loop["num_passes"])
+        self.gguf_writer.add_loop_gate_rank(self.loop["gate_rank"])
+        self.gguf_writer.add_loop_varying(self.loop["is_varloop"])
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        # the reference does not quantize the loop tensors
+        if new_name.endswith(("loop_msg_query.weight", "_ctrl_down.weight", "_ctrl_gain.weight", "_ctrl_forget.weight")):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name not in self._query_kinds:
+            yield from super().modify_tensors(data_torch, name, bid)
+            return
+        self._queries[self._query_kinds[name]] = data_torch
+        if len(self._queries) < 2:
+            return
+        q, kv = self._queries["q"], self._queries["kv"]
+        start = self.loop["core_start"]
+        if q.shape[0] != 2 * (self.loop["core_end"] - start) or kv.shape != q.shape:
+            raise ValueError(f"Inkling2Loop: cross-pass queries {tuple(q.shape)} and {tuple(kv.shape)} do not match the loop core")
+        # core layer start + i mixes its q, k, v and mlp messages with these four queries
+        for i in range(q.shape[0] // 2):
+            query = torch.stack([q[2 * i], kv[2 * i], kv[2 * i + 1], q[2 * i + 1]])
+            yield self.format_tensor_name(gguf.MODEL_TENSOR.LOOP_MSG_QUERY, start + i, ".weight"), query
+
+
+@ModelBase.register(
+    "Inkling2ForConditionalGeneration",
+    "Inkling2ForCausalLM",
+    "Inkling2LoopForConditionalGeneration",
+    "Inkling2LoopForCausalLM",
+)
+class Inkling2DSparkModel(TextModel):
+    model_type = ModelType.MTP
+    model_arch = gguf.MODEL_ARCH.INKLING2_DSPARK
+
+    def __init__(self, dir_model: Path, *args, **kwargs):
+        raw = ModelBase.load_hparams(dir_model, False)
+        mtp = raw.get("mtp_config")
+        if not mtp:
+            raise ValueError(f"Inkling2DSpark: {dir_model} config.json has no mtp_config")
+        text = raw.get("text_config", raw)
+        merged = {
+            "architectures": raw.get("architectures"),
+            "eos_token_id": text.get("eos_token_id", raw.get("eos_token_id")),
+            "vocab_size": text["vocab_size"],
+            "unpadded_vocab_size": text.get("unpadded_vocab_size", text["vocab_size"]),
+            "final_logit_softcapping": text.get("final_logit_softcapping", 0.0),
+            **mtp,
+        }
+        kwargs["hparams"] = merged
+        super().__init__(dir_model, *args, **kwargs)
+        hp = self.hparams
+        if hp.get("markov_head_type") != "rnn_hidden":
+            raise ValueError(f"Inkling2DSpark: unsupported markov_head_type={hp.get('markov_head_type')!r}")
+        for name, default in (("q_bias", False), ("o_bias", False)):
+            if hp.get(name, default) != default:
+                raise ValueError(f"Inkling2DSpark: unsupported {name}={hp[name]!r}")
+        local = set(hp.get("local_layer_ids", []))
+        self.is_swa = [i in local for i in range(self.block_count)]
+        targets = hp.get("target_layer_ids", [])
+        if len(targets) < 2 or targets != sorted(set(targets)):
+            raise ValueError(f"Inkling2DSpark: invalid target_layer_ids={targets!r}")
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        if remote_hf_model_id is not None:
+            raise NotImplementedError("Inkling2DSpark remote conversion is not supported")
+        mtp_path = self.dir_model / "mtp.safetensors"
+        if not mtp_path.is_file():
+            raise FileNotFoundError(f"Inkling2DSpark: missing {mtp_path}")
+        logger.info(f"gguf: indexing MTP model '{mtp_path.name}'")
+        tensors: dict[str, Callable[[], Tensor]] = {}
+        with cast(ContextManager[Any], gguf.utility.SafetensorsLocal(mtp_path)) as model_part:
+            for name in model_part.keys():
+                data: gguf.utility.LocalTensor = model_part[name]
+                if self.lazy:
+                    data_gen = lambda data=data: LazyTorchTensor.from_local_tensor(data)  # noqa: E731
+                else:
+                    dtype = LazyTorchTensor._dtype_str_map[data.dtype]
+                    data_gen = lambda data=data, dtype=dtype: torch.from_numpy(data.mmap_bytes()).view(dtype).reshape(data.shape)  # noqa: E731
+                tensors[name] = data_gen
+        return tensors
+
+    def dequant_model(self):
+        return
+
+    def get_vocab_base(self):
+        tokens, types, pre = super().get_vocab_base()
+        n = self.hparams["unpadded_vocab_size"]
+        return tokens[:n], types[:n], pre
+
+    def set_vocab(self):
+        tokens, types, pre = self.get_vocab_base()
+        self.gguf_writer.add_tokenizer_model("gpt2")
+        self.gguf_writer.add_tokenizer_pre(pre)
+        self.gguf_writer.add_token_list(tokens)
+        self.gguf_writer.add_token_types(types)
+        special = gguf.SpecialVocab(self.dir_model, load_merges=True)
+        eos = self.hparams["eos_token_id"]
+        special.special_token_ids["eos"] = eos
+        special.special_token_ids["eot"] = eos
+        special.add_special_token["bos"] = False
+        special.add_to_gguf(self.gguf_writer)
+
+    def set_gguf_parameters(self):
+        hp = self.hparams
+        super().set_gguf_parameters()
+        w = self.gguf_writer
+        w.add_vocab_size(hp["vocab_size"])
+        w.add_vocab_size_unpadded(hp["unpadded_vocab_size"])
+        w.add_causal_attention(False)
+        w.add_rope_dimension_count(hp["head_dim"])
+        w.add_sliding_window(hp["sliding_window_size"])
+        w.add_sliding_window_pattern(self.is_swa)
+        w.add_final_logit_softcapping(hp["final_logit_softcapping"])
+        w.add_target_layers(hp["target_layer_ids"])
+        w.add_dspark_block_size(hp["block_size"])
+        w.add_dspark_markov_rank(hp["markov_rank"])
+
+    def tensor_force_quant(self, name: str, new_name: str, bid: int | None, n_dims: int) -> gguf.GGMLQuantizationType | bool:
+        if new_name in ("dspark_fuse.weight", "dspark_mask_embd.weight"):
+            return gguf.GGMLQuantizationType.F32
+        return super().tensor_force_quant(name, new_name, bid, n_dims)
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if name in ("fuse_weight", "mask_embed"):
+            name = f"model.{name}.weight"
+        elif not name.startswith("model."):
+            name = f"model.{name}"
+        yield from super().modify_tensors(data_torch, name, bid)
+
+
 ###### CONVERSION LOGIC ######
 
 
@@ -13414,6 +13938,10 @@ def parse_args() -> argparse.Namespace:
         help="(Experimental) Export multimodal projector (mmproj) for vision models. This will only work on some vision models. A prefix 'mmproj-' will be added to the output file name.",
     )
     parser.add_argument(
+        "--mtp", action="store_true",
+        help="Export bundled MTP / DSpark draft model (e.g. mtp.safetensors) to GGUF.",
+    )
+    parser.add_argument(
         "--mistral-format", action="store_true",
         help="Whether the model is stored following the Mistral format.",
     )
@@ -13564,7 +14092,10 @@ def main() -> None:
 
     with torch.inference_mode():
         output_type = ftype_map[args.outtype]
-        model_type = ModelType.MMPROJ if args.mmproj else ModelType.TEXT
+        if args.mmproj and args.mtp:
+            logger.error("Error: --mmproj and --mtp are mutually exclusive")
+            sys.exit(1)
+        model_type = ModelType.MMPROJ if args.mmproj else (ModelType.MTP if args.mtp else ModelType.TEXT)
         hparams = ModelBase.load_hparams(dir_model, is_mistral_format)
         if not is_mistral_format:
             model_architecture = get_model_architecture(hparams, model_type)

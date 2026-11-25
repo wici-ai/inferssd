@@ -21,6 +21,7 @@
 
 struct ggml_metal_command_buffer {
     id<MTLCommandBuffer> obj;
+    id<MTLBuffer>        aux_buf;
 };
 
 struct ggml_metal {
@@ -173,8 +174,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 
     res->gf = nil;
     res->encode_async = nil;
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
-        res->cmd_bufs[i].obj = nil;
+    {
+        id<MTLDevice> mtl_dev = ggml_metal_device_get_obj(dev);
+        for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+            res->cmd_bufs[i].obj     = nil;
+            res->cmd_bufs[i].aux_buf = [mtl_dev newBufferWithLength:1179648 options:MTLResourceStorageModePrivate];
+        }
     }
 
     res->cmd_bufs_ext = [[NSMutableArray alloc] init];
@@ -189,9 +194,12 @@ ggml_metal_t ggml_metal_init(ggml_metal_device_t dev) {
 void ggml_metal_free(ggml_metal_t ctx) {
     GGML_LOG_INFO("%s: deallocating\n", __func__);
 
-    for (int i = 0; i < GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
+    for (int i = 0; i <= GGML_METAL_MAX_COMMAND_BUFFERS; ++i) {
         if (ctx->cmd_bufs[i].obj) {
             [ctx->cmd_bufs[i].obj release];
+        }
+        if (ctx->cmd_bufs[i].aux_buf) {
+            [ctx->cmd_bufs[i].aux_buf release];
         }
     }
 
@@ -359,9 +367,10 @@ void ggml_metal_get_tensor_async(ggml_metal_t ctx, const struct ggml_tensor * te
 
         // A buffer in shared storage is memory the CPU reads: copy from it once the queued work is done. A blit costs a
         // command buffer and a wrap of the destination for every read, which needs a page-aligned destination.
-        if ([bid_src.metal storageMode] == MTLStorageModeShared) {
+        id<MTLBuffer> buf_src = (id<MTLBuffer>) bid_src.metal;
+        if ([buf_src storageMode] == MTLStorageModeShared) {
             ggml_metal_synchronize(ctx);
-            memcpy(data, (const char *) [bid_src.metal contents] + bid_src.offs, size);
+            memcpy(data, (const char *) [buf_src contents] + bid_src.offs, size);
             return;
         }
 
@@ -711,6 +720,7 @@ void ggml_metal_set_n_cb(ggml_metal_t ctx, int n_cb) {
             ctx->capture_compute,
             ctx->debug_graph,
             ctx->debug_fusion);
+        ggml_metal_op_set_aux_buf(ctx_op, (void *) ctx->cmd_bufs[cb_idx].aux_buf, 1179648);
 
         for (int idx = 0; idx < ggml_metal_op_n_nodes(ctx_op); ++idx) {
             const int res = ggml_metal_op_encode(ctx_op, idx);

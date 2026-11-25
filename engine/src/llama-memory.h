@@ -158,6 +158,30 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // Whether seq_rm(seq_id, pos_next, -1) can roll back cleanly in-place while preserving
+    // all required attention (SWA window n_swa) and recurrent state to continue at pos_next.
+    virtual bool seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const {
+        const llama_pos pos_min = seq_pos_min(seq_id);
+        if (pos_min == -1) {
+            return false;
+        }
+        const llama_pos pos_min_thold = pos_next > (llama_pos) n_swa ? pos_next - (llama_pos) n_swa : 0;
+        return pos_min < pos_min_thold || (pos_min == 0 && pos_min_thold == 0);
+    }
+
+    virtual void set_tree_parents(const int8_t * parents, int32_t n) {
+        GGML_UNUSED(parents);
+        GGML_UNUSED(n);
+    }
+
+    virtual bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(pos0);
+        GGML_UNUSED(keep_idxs);
+        GGML_UNUSED(n_keep);
+        return false;
+    }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

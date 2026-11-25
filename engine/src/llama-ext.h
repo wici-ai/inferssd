@@ -104,3 +104,25 @@ LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 LLAMA_API const int32_t * llama_model_target_layer_ids(const struct llama_model * model);
 LLAMA_API uint32_t llama_model_target_layer_ids_n(const struct llama_model * model);
+
+LLAMA_API uint32_t llama_model_dspark_block_size(const struct llama_model * model);
+LLAMA_API bool llama_model_inkling2_dspark_attach_target(struct llama_model * model_dft, const struct llama_model * model_tgt);
+LLAMA_API void llama_model_inkling2_dspark_set_f_rnn(struct llama_model * model_dft, const float * f_rnn);
+LLAMA_API void llama_model_inkling2_dspark_set_pending_taps(struct llama_model * model_dft, const float * taps, int32_t n);
+LLAMA_API void llama_model_inkling2_dspark_set_cum_min(struct llama_model * model_dft, float cum_min);
+LLAMA_API void llama_model_inkling2_dspark_set_tree_params(
+        struct llama_model * model_dft, float trunk_min, float alt_min);
+LLAMA_API void llama_model_inkling2_dspark_get_draft_ids(const struct llama_model * model_dft, int32_t * dst, uint32_t n);
+LLAMA_API void llama_model_inkling2_dspark_get_draft_ids_and_probs(
+        const struct llama_model * model_dft, int32_t * dst_ids, float * dst_probs, uint32_t n);
+LLAMA_API void llama_model_inkling2_dspark_get_tree(
+        const struct llama_model * model_dft, int32_t * dst_ids, float * dst_probs, uint32_t n);
+
+// Restrict drafting to n_slots tokens: the n_ascii ASCII and n_other other tokens with the largest folded Markov bias,
+// the control tokens, and room for tokens added later. Verification is unchanged, so a token outside the set only
+// cannot be drafted. Call after llama_model_inkling2_dspark_attach_target.
+LLAMA_API bool llama_model_inkling2_dspark_init_draft_vocab(
+        struct llama_model * model_dft, uint32_t n_ascii, uint32_t n_other, uint32_t n_slots);
+// Add tokens to the draft vocabulary while slots are free; returns the number added. Call while no draft is computing.
+LLAMA_API uint32_t llama_model_inkling2_dspark_add_draft_vocab(
+        struct llama_model * model_dft, const int32_t * ids, uint32_t n);

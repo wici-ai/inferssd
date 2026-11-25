@@ -1,6 +1,7 @@
 #pragma once
 
 #include "llama.h"
+#include "ssd/inkling-experts.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-hparams.h"
@@ -551,6 +552,53 @@ struct llama_layer {
     // gemma4 layer output scale
     struct ggml_tensor * out_scale = nullptr;
 
+    // inkling2
+    struct ggml_tensor * attn_rel         = nullptr;
+    struct ggml_tensor * attn_rel_bias    = nullptr;
+    struct ggml_tensor * attn_q_clip      = nullptr;
+    struct ggml_tensor * attn_rel_clip    = nullptr;
+    struct ggml_tensor * attn_sink_proj   = nullptr;
+    struct ggml_tensor * attn_q_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_inp_norm  = nullptr;
+    struct ggml_tensor * attn_v_inp_norm  = nullptr;
+    struct ggml_tensor * attn_k_conv      = nullptr;
+    struct ggml_tensor * attn_v_conv      = nullptr;
+    struct ggml_tensor * attn_k_conv_proj = nullptr;
+    struct ggml_tensor * attn_v_conv_proj = nullptr;
+    struct ggml_tensor * attn_post_conv   = nullptr;
+    struct ggml_tensor * attn_res_query   = nullptr;
+    struct ggml_tensor * ffn_post_conv    = nullptr;
+    struct ggml_tensor * ffn_res_query    = nullptr;
+
+    // inkling2_loop: the message query and the q, k, v and ffn controllers of a looped layer
+    struct ggml_tensor * loop_msg_query       = nullptr;
+    struct ggml_tensor * loop_ctrl_down[4]    = {};
+    struct ggml_tensor * loop_ctrl_gain[4]    = {};
+    struct ggml_tensor * loop_ctrl_forget[4]  = {};
+
+    // inkling2 derived packed weights (single-device fast path)
+    struct ggml_tensor * attn_qkv_inp_norm    = nullptr;
+    struct ggml_tensor * loop_ctrl_down_qkv   = nullptr;
+    struct ggml_tensor * loop_ctrl_up_qkv     = nullptr;
+    struct ggml_tensor * loop_ctrl_up_ffn     = nullptr;
+    struct ggml_tensor * loop_ctrl_down_ffn   = nullptr; // BF16 copy of loop_ctrl_down[3]
+    struct ggml_tensor * ffn_gate_inp_bf16    = nullptr; // BF16 copy of ffn_gate_inp
+    struct ggml_tensor * attn_gate_rel_sink   = nullptr; // BF16 packed [wq; wqkv_gate; attn_rel; attn_sink_proj]
+    struct ggml_tensor * attn_qkv_grs         = nullptr; // BF16 packed [wq; wqkv_gate; attn_rel; attn_sink_proj; wk; wv] (SWA)
+    struct ggml_tensor * attn_kv_kvdyn        = nullptr; // BF16 packed [wk; attn_k_conv_proj; wv; attn_v_conv_proj] [n_embd, nk+ndyn, 2] (full-attn)
+    struct ggml_tensor * attn_k_kdyn          = nullptr; // BF16 packed [wk; attn_k_conv_proj] (fallback)
+    struct ggml_tensor * attn_v_vdyn          = nullptr; // BF16 packed [wv; attn_v_conv_proj] (fallback)
+    struct ggml_tensor * attn_kv              = nullptr; // BF16 packed [wk; wv] (fallback)
+    struct ggml_tensor * attn_rel_bias_pad    = nullptr; // F32 pre-cast + zero-padded [n_rel, n_extent + 1]
+
+    // inkling2_dspark
+    struct ggml_tensor * wk_ctx             = nullptr;
+    struct ggml_tensor * wv_ctx             = nullptr;
+    struct ggml_tensor * wkv_ctx            = nullptr; // BF16 packed [wk_ctx; wv_ctx]
+    struct ggml_tensor * ffn_gate_up        = nullptr; // BF16 packed [ffn_gate; ffn_up]
+    struct ggml_tensor * attn_k_ctx_norm    = nullptr;
+    struct ggml_tensor * dspark_dflare_norm = nullptr;
+
     struct llama_layer_posnet posnet;
 
     struct llama_layer_convnext convnext;
@@ -574,6 +622,7 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
+    std::vector<inkling_expert_layer> inkling_ssd_experts;
     ggml_tensor * hc_head_norm = nullptr;
     ggml_tensor * hc_head_down = nullptr;
     ggml_tensor * hc_head_up = nullptr;
@@ -597,6 +646,7 @@ struct llama_model {
     struct ggml_tensor * tok_norm_b = nullptr;
 
     struct ggml_tensor * output_norm     = nullptr;
+    struct ggml_tensor * output_res_query = nullptr; // inkling2: query of the final attention-residual mix
     struct ggml_tensor * output_norm_b   = nullptr;
     struct ggml_tensor * output          = nullptr;
     struct ggml_tensor * output_b        = nullptr;
@@ -608,6 +658,46 @@ struct llama_model {
     struct ggml_tensor * dspark_markov_w2   = nullptr;
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
+
+    // Inkling2 DSpark draft weights and derived GPU buffers.
+    struct ggml_tensor * dspark_fuse               = nullptr;
+    struct ggml_tensor * dspark_mask_embd          = nullptr;
+    struct ggml_tensor * dspark_markov_dflare_norm = nullptr;
+    struct ggml_tensor * dspark_rnn_proj           = nullptr;
+    struct ggml_tensor * dspark_rnn_proj_b         = nullptr;
+    struct ggml_tensor * dspark_hidden_out         = nullptr;
+    struct ggml_tensor * dspark_hidden_out_b       = nullptr;
+
+    float dspark_fuse_alpha[8][8] = {};
+    struct ggml_tensor * dspark_fold_w        = nullptr; // [markov_rank, n_vocab_unpadded] BF16
+    struct ggml_tensor * dspark_fold_b        = nullptr; // [n_vocab_unpadded] F32
+    struct ggml_tensor * dspark_rnn_w_step    = nullptr; // [2*markov_rank, 3*markov_rank] BF16
+    struct ggml_tensor * dspark_rnn_w_ctx     = nullptr; // [2*n_embd, 3*markov_rank] BF16
+    struct ggml_tensor * dspark_f_rnn_buf     = nullptr; // [n_embd] F32
+    struct ggml_tensor * dspark_draft_ids_buf = nullptr; // [88] I32
+    struct ggml_tensor * dspark_pending_taps  = nullptr; // [n_taps * n_embd, 16] F32 for fused inj+draft
+    mutable int32_t      dspark_pending_n     = 0;
+    ggml_context_ptr        dspark_fold_ctx;
+    ggml_backend_buffer_ptr dspark_fold_buf;
+
+    // the draft vocabulary: the rows of the LM head, the folded Markov head and the Markov embedding of a subset of the
+    // tokens, so that a draft reads these rows only. Slot s holds token dspark_vocab_ids[s]; unused slots have a fold
+    // bias of -inf and never win the argmax
+    struct ggml_tensor * dspark_vocab_lm     = nullptr; // [n_embd, n_slots] BF16
+    struct ggml_tensor * dspark_vocab_fold_w = nullptr; // [markov_rank, n_slots] BF16
+    struct ggml_tensor * dspark_vocab_fold_b = nullptr; // [n_slots] F32
+    struct ggml_tensor * dspark_vocab_w1     = nullptr; // [markov_rank, n_slots] BF16
+    const llama_model *     dspark_target = nullptr;    // the model whose LM head the draft uses
+    mutable bool            dspark_vocab_drafted = false; // the last draft graph built drafts slots, not tokens
+    std::vector<int32_t>    dspark_vocab_ids;           // slot -> token
+    std::vector<int32_t>    dspark_vocab_slot;          // token -> slot, or -1
+    ggml_context_ptr        dspark_vocab_ctx;
+    ggml_backend_buffer_ptr dspark_vocab_buf;
+
+    // inkling2 packed inference weights
+    struct ggml_tensor * loop_msg_query_all = nullptr;
+    std::vector<ggml_context_ptr>        inkling2_pack_ctxs;
+    std::vector<ggml_backend_buffer_ptr> inkling2_pack_bufs;
 
     // Target-model hidden-state indices consumed by a paired draft model.
     std::vector<int32_t> target_layer_ids;

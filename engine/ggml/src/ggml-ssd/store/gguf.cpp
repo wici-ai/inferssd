@@ -12,15 +12,14 @@ namespace {
 struct free_gguf { void operator()(gguf_context * gguf) const noexcept { gguf_free(gguf); } };
 struct free_ggml { void operator()(ggml_context * ggml) const noexcept { ggml_free(ggml); } };
 
-// blk.<layer>.ffn_up_exps.weight, ffn_gate_exps or ffn_down_exps: a routed expert tensor
+// Scales and router tensors stay resident. Only complete 3-D weight banks are indexed.
 bool routed_expert_tensor(const char * name) noexcept {
-    unsigned layer = 0;
-    char role[8] = {};
-    int end = 0;
-    if (std::sscanf(name, "blk.%u.ffn_%7[a-z]_exps.weight%n", &layer, role, &end) != 2 || end <= 0 || name[end] != '\0') {
-        return false;
-    }
-    return !std::strcmp(role, "up") || !std::strcmp(role, "gate") || !std::strcmp(role, "down");
+    unsigned layer;
+    int prefix = 0;
+    if (std::sscanf(name, "blk.%u.%n", &layer, &prefix) != 1 || !prefix) { return false; }
+    const char * tensor = name + prefix;
+    return !std::strcmp(tensor, "ffn_up_exps.weight") || !std::strcmp(tensor, "ffn_gate_exps.weight") ||
+           !std::strcmp(tensor, "ffn_gate_up_exps.weight") || !std::strcmp(tensor, "ffn_down_exps.weight");
 }
 }
 

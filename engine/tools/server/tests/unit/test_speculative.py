@@ -71,8 +71,11 @@ def test_different_draft_min_draft_max():
             "temperature": 0.0,
             "top_k": 1,
             "n_predict": 16,
+            "ignore_eos": True,
+            "return_tokens": True,
         })
         assert res.status_code == 200
+        assert len(res.body["tokens"]) == res.body["timings"]["predicted_n"] == 16
         if last_content is not None:
             assert last_content == res.body["content"]
         last_content = res.body["content"]

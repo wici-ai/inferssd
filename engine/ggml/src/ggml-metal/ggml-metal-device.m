@@ -1061,7 +1061,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 case GGML_GLU_OP_SWIGLU_OAI:
                 case GGML_GLU_OP_GEGLU_ERF:
                 case GGML_GLU_OP_GEGLU_QUICK:
-                    return ggml_is_contiguous_1(op->src[0]) && op->src[0]->type == GGML_TYPE_F32;
+                case GGML_GLU_OP_SITU:
+                    return ggml_is_contiguous_1(op->src[0]) && op->src[0]->type == GGML_TYPE_F32 &&
+                        (op->src[2] == NULL || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]))) &&
+                        (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_I32);
                default:
                     return false;
             }
@@ -1116,6 +1119,40 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 (op->src[2] == NULL || op->src[2]->type == GGML_TYPE_F32) &&
                 (op->src[3] == NULL || op->src[3]->type == GGML_TYPE_F32);
+        case GGML_OP_INKLING_SCONV:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_F32 && op->src[1]->nb[0] == sizeof(float) &&
+                op->src[2]->type == GGML_TYPE_F32 && op->src[2]->nb[0] == sizeof(float) &&
+                (op->src[3] == NULL || (op->src[3]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[3])));
+        case GGML_OP_INKLING_SCONV_STATE:
+            return op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[1]);
+        case GGML_OP_INKLING_MIX:
+            return has_simdgroup_reduction && op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[1]) &&
+                (op->src[2] == NULL || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[2])));
+        case GGML_OP_INKLING_CTRL_BLEND:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[1]) &&
+                op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[2]);
+        case GGML_OP_INKLING_MOE_IDS:
+            return has_simdgroup_reduction && op->type == GGML_TYPE_I32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[0]->ne[0] <= 256 && op->ne[0] <= 32 &&
+                (op->src[1] == NULL || (op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1])));
+        case GGML_OP_INKLING_MOE_WEIGHTS:
+            return has_simdgroup_reduction && op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(op->src[1]) && op->src[1]->ne[0] <= 32 &&
+                (op->src[2] == NULL || (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2])));
+        case GGML_OP_INKLING_MOE_REDUCE:
+            return op->type == GGML_TYPE_F32 &&
+                op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(op->src[0]) &&
+                op->src[1]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[1]) && op->src[0]->ne[1] <= 32;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             return has_simdgroup_reduction && (ggml_is_contiguous_rows(op->src[0]));
@@ -1153,6 +1190,16 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
         case GGML_OP_ROLL:
             return true;
         case GGML_OP_FLASH_ATTN_EXT:
+            if (ggml_flash_attn_ext_has_indexed_bias(op)) {
+                const struct ggml_tensor * bias_table   = op->src[6];
+                const struct ggml_tensor * bias_indices = op->src[7];
+
+                if (!op->src[3] || !bias_table || !bias_indices ||
+                    bias_table->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias_table) ||
+                    bias_indices->type != GGML_TYPE_I32 || !ggml_is_contiguous(bias_indices)) {
+                    return false;
+                }
+            }
             // for new head sizes, add checks here
             if (op->src[0]->ne[0] != 32 &&
                 op->src[0]->ne[0] != 40 &&
@@ -1201,8 +1248,12 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return has_simdgroup_reduction && op->src[2]->ne[0] % 32 == 0;
         case GGML_OP_SOLVE_TRI:
         case GGML_OP_MUL_MAT:
+            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_MXFP8;
         case GGML_OP_MUL_MAT_ID:
-            return has_simdgroup_reduction && op->src[0]->type != GGML_TYPE_NVFP4;
+            // MXFP8 has F32-activation kernels only, and its mat-vec kernel reads rows as words, so they must be whole
+            // groups of 4 blocks
+            return has_simdgroup_reduction && (op->src[0]->type != GGML_TYPE_MXFP8 ||
+                (op->src[1]->type == GGML_TYPE_F32 && op->src[0]->ne[0] % (4*ggml_blck_size(GGML_TYPE_MXFP8)) == 0));
         case GGML_OP_SET:
         case GGML_OP_CPY:
         case GGML_OP_DUP:
@@ -1262,7 +1313,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 };
             }
         case GGML_OP_GET_ROWS:
-            return op->src[0]->type != GGML_TYPE_NVFP4 && op->src[0]->type != GGML_TYPE_MXFP8;
+            return op->src[0]->type != GGML_TYPE_MXFP8;
         case GGML_OP_SET_ROWS:
             {
                 if (op->src[0]->type != GGML_TYPE_F32) {

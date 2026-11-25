@@ -184,6 +184,9 @@ static struct llama_model * llama_model_load_from_file_impl(
         FILE * file,
         struct llama_model_params params) {
     {
+        // Load the resident tensors into compact buffers. None of the potentially
+        // interleaved file ranges containing streamed experts are mapped or prefetched.
+        if (params.inkling_ssd_layers > 0) { params.use_mmap = false; }
         int n_sources_defined = 0;
         if (metadata != nullptr) {
             n_sources_defined++;
@@ -441,6 +444,10 @@ struct llama_model * llama_model_load_from_file_ptr(FILE * file, struct llama_mo
 }
 
 void llama_model_save_to_file(const struct llama_model * model, const char * path_model) {
+    if (!model->inkling_ssd_experts.empty()) {
+        LLAMA_LOG_ERROR("%s: reload the target with resident expert weights before saving it\n", __func__);
+        return;
+    }
     llama_model_saver ms(model);
     ms.add_kv_from_model();
     ms.add_tensors_from_model();

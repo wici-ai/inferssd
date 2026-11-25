@@ -9,12 +9,21 @@
 #include <vector>
 
 namespace inferssd { namespace chat {
+bool is_inkling_template(const std::string & src) {
+    return src.find("<|message_user|>") != std::string::npos &&
+           src.find("<|content_thinking|>") != std::string::npos;
+}
+
 void configure_muse_caps(common_chat_template * default_template, common_chat_template * tool_use_template) {
     for (auto * tmpl : { default_template, tool_use_template }) {
-        if (tmpl && tmpl->source().find("to=commentary") != std::string::npos &&
-                tmpl->source().find("<|eom|>") != std::string::npos) {
-            // Macro-heavy Muse templates defeat this fork's dynamic capability
-            // probe. These capabilities are exercised in the Muse chat tests.
+        if (!tmpl) {
+            continue;
+        }
+        if ((tmpl->source().find("to=commentary") != std::string::npos &&
+                tmpl->source().find("<|eom|>") != std::string::npos) ||
+            is_inkling_template(tmpl->source())) {
+            // Macro-heavy Muse and Inkling templates defeat this fork's dynamic capability
+            // probe. Both require parsed object tool-call arguments and preserve reasoning.
             auto & caps = tmpl->caps;
             caps.supports_string_content = caps.supports_typed_content = true;
             caps.supports_tools = caps.supports_tool_calls = caps.supports_parallel_tool_calls = true;
@@ -344,6 +353,115 @@ common_chat_params muse(const common_chat_template &          tmpl,
             { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN,
               "<\\|start\\|>assistant( to=(?!self<\\|message\\|>)(?!commentary<\\|message\\|>)(?!user<\\|message\\|>)[^<]*?<\\|message\\|>)" },
         };
+    }
+
+    return data;
+}
+
+// Inkling 1 and 2 - the assistant turn is a list of blocks, all closed by <|end_message|>:
+//   <|message_model|><|content_thinking|>...<|end_message|>
+//   <|message_model|><|content_text|>...<|end_message|>
+//   <|message_model|>NAME<|content_invoke_tool_json|>{"name":"NAME","args":{...}}<|end_message|>
+common_chat_params inkling(const common_chat_template &          tmpl,
+                           const autoparser::generation_params & inputs,
+                           services                              shared) {
+    const auto common_chat_template_direct_apply_impl = shared.apply;
+    const auto foreach_function = shared.functions;
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, std::nullopt, &data.prompt_input_spans);
+    data.generation_prompt = inputs.generation_prompt;
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+
+    const std::string HEADER    = "<|message_model|>";
+    const std::string THINK     = "<|content_thinking|>";
+    const std::string TEXT      = "<|content_text|>";
+    const std::string TOOL_JSON = "<|content_invoke_tool_json|>";
+    const std::string END       = "<|end_message|>";
+    const std::string END_SAMP  = "<|content_model_end_sampling|>";
+
+    data.preserved_tokens = { HEADER, THINK, TEXT, TOOL_JSON, END, END_SAMP };
+
+    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    auto has_response_format = !inputs.json_schema.is_null() && inputs.json_schema.is_object();
+    auto use_tools           = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto header   = p.literal(HEADER);
+        auto end      = p.literal(END);
+        auto end_samp = p.optional(p.literal(END_SAMP));
+
+        auto think    = p.literal(THINK);
+        auto thinking = p.rule("thinking", extract_reasoning ? think + p.reasoning(p.until(END)) + end :
+                                                               p.atomic(p.content(think)) + p.content(p.until(END) + end));
+        auto text     = p.rule("text", p.literal(TEXT) + p.content(p.until(END)) + end);
+
+        if (has_response_format) {
+            auto response_format = p.rule("response-format", p.content(p.schema(p.json(), "response-format-schema", inputs.json_schema)));
+            return p.zero_or_more(header + thinking) + header + p.literal(TEXT) + response_format + end + end_samp;
+        }
+
+        auto blocks = p.zero_or_more(header + (thinking | text));
+
+        if (!use_tools) {
+            return blocks + end_samp;
+        }
+
+        auto tool_choice = p.choice();
+        size_t tool_index = 0;
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            std::string  name     = function.at("name");
+            auto         schema   = function.value("parameters", json::object());
+
+            auto open = p.tool_name(p.literal(name)) + p.literal(TOOL_JSON) + p.literal("{\"name\":" + json(name).dump() + ",\"args\":");
+            auto args = p.tool_args(schema.empty() ? p.json() : p.schema(p.json(), "tool-" + std::to_string(tool_index) + "-schema", schema));
+
+            tool_choice |= p.rule("tool-" + std::to_string(tool_index), p.tool(p.tool_open(open) + args + p.tool_close(p.literal("}")) + end));
+            ++tool_index;
+        });
+
+        // tool calls are the last blocks of the turn
+        auto calls      = inputs.parallel_tool_calls ? tool_choice + p.zero_or_more(header + tool_choice) : tool_choice;
+        auto tool_calls = header + p.trigger_rule("tool-calls", calls);
+
+        if (inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED) {
+            return blocks + tool_calls + end_samp;
+        }
+
+        return blocks + p.optional(tool_calls) + end_samp;
+    });
+
+    data.parser = parser.save();
+
+    if (has_response_format || use_tools) {
+        data.grammar_lazy = !has_response_format && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                auto schema = tool.at("function").value("parameters", json::object());
+                if (!schema.empty()) {
+                    builder.resolve_refs(schema);
+                }
+            });
+            if (has_response_format) {
+                auto schema = inputs.json_schema;
+                builder.resolve_refs(schema);
+            }
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        if (data.grammar_lazy) {
+            // a header followed by text and not by a content token is a tool call, the grammar starts at the name
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN, "<\\|message_model\\|>([^<])" },
+            };
+            // Inkling 1: the first header is in the generation prompt, and a lazy grammar does not get the prompt.
+            if (!inputs.generation_prompt.empty()) {
+                data.grammar_triggers.push_back({ COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL, "[^<]+" });
+            }
+        }
     }
 
     return data;

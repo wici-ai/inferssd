@@ -68,6 +68,19 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    bool seq_can_rollback(llama_seq_id seq_id, llama_pos pos_next, uint32_t n_swa) const override;
+
+    void set_tree_parents(const int8_t * parents, int32_t n) override {
+        mem_attn->set_tree_parents(parents, n);
+        mem_recr->set_tree_parents(parents, n);
+    }
+
+    bool tree_accept_path(llama_seq_id seq_id, llama_pos pos0, const int32_t * keep_idxs, int32_t n_keep) override {
+        const bool ok_attn = mem_attn->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
+        const bool ok_recr = mem_recr->tree_accept_path(seq_id, pos0, keep_idxs, n_keep);
+        return ok_attn && ok_recr;
+    }
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void set_commit(const commit_cb & commit) override { mem_attn->set_commit(commit); }

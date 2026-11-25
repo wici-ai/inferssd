@@ -24,6 +24,9 @@ void ggml_metal_op_free(ggml_metal_op_t ctx);
 
 int ggml_metal_op_n_nodes(ggml_metal_op_t ctx);
 
+struct ggml_tensor * ggml_metal_op_node(ggml_metal_op_t ctx, int idx);
+void ggml_metal_op_set_aux_buf(ggml_metal_op_t ctx, void * metal_buf, size_t size);
+
 int ggml_metal_op_encode(ggml_metal_op_t ctx, int idx);
 
 //
@@ -88,6 +91,13 @@ int ggml_metal_op_argmax            (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_comb      (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_pre       (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_dsv4_hc_post      (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_sconv     (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_sconv_state(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_mix       (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_ctrl_blend(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_moe_ids   (ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_moe_weights(ggml_metal_op_t ctx, int idx);
+int ggml_metal_op_inkling_moe_reduce(ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_argsort           (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_top_k             (ggml_metal_op_t ctx, int idx);
 int ggml_metal_op_tri               (ggml_metal_op_t ctx, int idx);

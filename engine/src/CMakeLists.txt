@@ -13,6 +13,7 @@ add_library(llama
             ../include/llama-ssd.h
             ssd/options.cpp
             ssd/model-adapter.cpp
+            ssd/inkling-experts.cpp
             ssd/model-source.cpp
             ssd/model-facts.cpp
             ssd/model-pages.cpp

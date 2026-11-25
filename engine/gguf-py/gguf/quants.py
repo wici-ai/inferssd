@@ -796,6 +796,25 @@ class NVFP4(__Quant, qtype=GGMLQuantizationType.NVFP4):
         return (d * vals.astype(np.float32)).reshape(n_super, 64)
 
 
+class MXFP8(__Quant, qtype=GGMLQuantizationType.MXFP8):
+    # block_mxfp8: one E8M0 scale byte, then 32 E4M3 codes; dequantize only (written natively by converters)
+
+    @staticmethod
+    def e4m3_to_fp32(x: np.ndarray) -> np.ndarray:
+        exp = ((x >> 3) & 0xF).astype(np.int32)
+        man = (x & 0x7).astype(np.float32)
+        v = np.where(exp == 0, np.ldexp(man, -9), np.ldexp(8.0 + man, exp - 10)).astype(np.float32)
+        v = np.where((x & 0x7F) == 0x7F, np.float32(np.nan), v)
+        return np.where(x & 0x80, -v, v).astype(np.float32)
+
+    @classmethod
+    def dequantize_blocks(cls, blocks: np.ndarray) -> np.ndarray:
+        e, qs = np.hsplit(blocks, [1])
+        d = np.ldexp(np.ones(e.shape, dtype=np.float32), e.astype(np.int32) - 127)
+        d = np.where(e == 0xFF, np.float32(np.nan), d)
+        return (cls.e4m3_to_fp32(qs) * d).astype(np.float32)
+
+
 class IQ2_XXS(__Quant, qtype=GGMLQuantizationType.IQ2_XXS):
     ksigns: bytes = (
         b"\x00\x81\x82\x03\x84\x05\x06\x87\x88\x09\x0a\x8b\x0c\x8d\x8e\x0f"
