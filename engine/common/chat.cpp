@@ -1650,7 +1650,14 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
 
     const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
     auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
-        const std::string & generation_start = inputs.enable_thinking ? THINK_START : RESPONSE_START;
+        // A request's template kwargs can select a different channel than the server default.
+        bool thinking = inputs.enable_thinking;
+        if (string_ends_with(inputs.generation_prompt, THINK_START)) {
+            thinking = true;
+        } else if (string_ends_with(inputs.generation_prompt, RESPONSE_START)) {
+            thinking = false;
+        }
+        const std::string & generation_start = thinking ? THINK_START : RESPONSE_START;
         auto generation_prompt = p.prefix(inputs.generation_prompt, generation_start);
 
         auto response =
@@ -1675,7 +1682,7 @@ static common_chat_params common_chat_params_init_kimi_k3(const common_chat_temp
             ending = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? calls : (calls | tail);
         }
 
-        if (!inputs.enable_thinking) {
+        if (!thinking) {
             return generation_prompt +
                    response +
                    ending +

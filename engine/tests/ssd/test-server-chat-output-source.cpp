@@ -1,3 +1,4 @@
+#include "server-common.h"
 #include "server-task.h"
 #include "llama-cpp.h"
 #include <algorithm>
@@ -26,7 +27,12 @@ int main(int argc, char ** argv) {
     llama_model_ptr model(llama_model_load_from_file(argv[1], params));
     require(bool(model), "vocabulary load failed");
     const auto * vocab = llama_model_get_vocab(model.get());
-    auto templates = common_chat_templates_init(model.get(), "");
+    server_chat_params options{};
+    options.use_jinja = true;
+    options.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+    options.chat_template_kwargs["thinking_effort"] = "\"low\"";
+    options.tmpls = common_chat_templates_init(model.get(), "");
+    const auto & templates = options.tmpls;
     common_chat_templates_inputs in;
     common_chat_msg user; user.role = "user"; user.content = "Synthetic parser check.";
     in.messages.push_back(user); in.use_jinja = true; in.enable_thinking = true;
@@ -40,7 +46,10 @@ int main(int argc, char ** argv) {
     require(!pp.parser.empty(), "Kimi parser not constructed");
     const std::string boundary = "<|close|>think<|sep|><|open|>response<|sep|>";
     const std::string ending = "<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>";
-    struct testcase { std::string name, reasoning, content; };
+    struct testcase {
+        std::string name, reasoning, content;
+        std::optional<bool> request_thinking = std::nullopt;
+    };
     const std::vector<testcase> cases = {
         {"ordinary", "Synthetic reasoning.", "Synthetic response."},
         {"close-spelling", "Synthetic reasoning.", "Literal A <|close|> B."},
@@ -51,9 +60,28 @@ int main(int argc, char ** argv) {
         {"all-marker-spellings", "A <|open|>response<|sep|> B <|close|>think<|sep|> C.", "A <|open|>think<|sep|> B <|close|>message<|sep|><|end_of_msg|> C."},
         {"literal-tail", "Synthetic reasoning.", "Literal A <|close|>response<|sep|>"},
         {"partial-literal-tail", "Synthetic reasoning.", "Literal A <|cl"},
+        {"request-disables-thinking", "", "Synthetic response.", false},
+        {"request-enables-thinking", "Synthetic reasoning.", "Synthetic response.", true},
     };
     json rows = json::array();
     for (const auto & item : cases) {
+        const bool thinking = item.request_thinking.value_or(true);
+        auto parser_for = [&](bool stream) {
+            if (!item.request_thinking.has_value()) return pp;
+            options.enable_thinking = !thinking;
+            json body = {{"messages", json::array({{{"role", "user"}, {"content", user.content}}})},
+                         {"stream", stream}, {"chat_template_kwargs", {{"thinking", thinking}}}};
+            std::vector<raw_buffer> files;
+            const auto request = oaicompat_chat_params_parse(body, options, files);
+            common_params base;
+            base.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            auto task = server_task::params_from_json_cmpl(vocab, base, 2048, {}, request);
+            require(task.stream == stream, "stream flag changed");
+            require(string_ends_with(task.chat_parser_params.generation_prompt,
+                                     thinking ? "<|open|>think<|sep|>" : "<|open|>response<|sep|>"),
+                    "template ignored request thinking mode");
+            return task.chat_parser_params;
+        };
         llama_tokens ids;
         std::string text;
         common_chat_output_source source; source.valid = true;
@@ -72,15 +100,17 @@ int main(int argc, char ** argv) {
             }
             require(rebuilt == value, "synthetic token roundtrip changed bytes");
         };
-        append(item.reasoning, false, "reasoning"); append(boundary, true, "boundary");
+        if (thinking) {
+            append(item.reasoning, false, "reasoning"); append(boundary, true, "boundary");
+        }
         append(item.content, false, "content"); append(ending, true, "ending");
         require(std::count_if(token_rows.begin(), token_rows.end(), [](const json & r) {
             return r.at("control").get<bool>();
-        }) >= 8, "missing structural control token IDs");
+        }) >= (thinking ? 8 : 5), "missing structural control token IDs");
         json row = {{"name", item.name}, {"expected", {{"content", item.content}, {"reasoning", item.reasoning}}},
                     {"text", text}, {"tokens", token_rows}};
         try {
-            task_result_state state(pp);
+            task_result_state state(parser_for(false));
             server_task_result_cmpl_final final{};
             final.content = text; final.tokens = {}; final.stream = false;
             final.output_source = source; // return_tokens=false must still parse correctly
@@ -91,7 +121,7 @@ int main(int argc, char ** argv) {
         } catch (const std::exception & e) { row["nonstream"] = {{"correct", false}, {"error", e.what()}}; }
         size_t token_index = 0;
         try {
-            task_result_state state(pp);
+            task_result_state state(parser_for(true));
             std::string pending, all, wire_content, wire_reasoning;
             auto add_diffs = [&](const std::vector<common_chat_msg_diff> & diffs) {
                 for (const auto & diff : diffs) { wire_content += diff.content_delta; wire_reasoning += diff.reasoning_content_delta; }
@@ -114,6 +144,9 @@ int main(int argc, char ** argv) {
             row["stream"]["correct"] = final.oaicompat_msg.content == item.content && final.oaicompat_msg.reasoning_content == item.reasoning &&
                                        wire_content == item.content && wire_reasoning == item.reasoning;
         } catch (const std::exception & e) { row["stream"] = {{"correct", false}, {"error", e.what()}, {"token_index", token_index}}; }
+        if (!row["nonstream"]["correct"].get<bool>() || !row["stream"]["correct"].get<bool>()) {
+            std::cerr << item.name << " nonstream=" << row["nonstream"].dump() << " stream=" << row["stream"].dump() << '\n';
+        }
         rows.push_back(row);
     }
     require(rows[0]["nonstream"]["correct"] == true && rows[0]["stream"]["correct"] == true, "ordinary baseline failed");
