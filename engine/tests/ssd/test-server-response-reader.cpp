@@ -12,6 +12,14 @@ using namespace std::chrono_literals;
 
 int main() {
     ggml_time_init();
+    // These tasks collect one final result per input with wait_for_all().
+    for (auto type : {SERVER_TASK_TYPE_EMBEDDING, SERVER_TASK_TYPE_RERANK}) {
+        if (server_task(type).params.stream) {
+            std::fprintf(stderr, "Embedding and reranking tasks must default to non-streaming\n");
+            return 1;
+        }
+    }
+
     server_response responses;
     responses.add_waiting_task_id(1);
     responses.add_waiting_task_id(2);
