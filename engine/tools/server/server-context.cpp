@@ -1872,11 +1872,12 @@ private:
         return true;
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
+    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
         res->index = slot.task->index;
+        res->is_begin = is_begin;
 
         if (is_progress) {
             res->is_progress        = true;
@@ -1884,7 +1885,7 @@ private:
             res->progress.cache     = slot.n_prompt_tokens_cache;
             res->progress.processed = slot.prompt.tokens.size();
             res->progress.time_ms   = (ggml_time_us() - slot.t_start_process_prompt) / 1000;
-        } else {
+        } else if (!is_begin) {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
             res->output_source = slot.output_source;
@@ -3070,10 +3071,13 @@ private:
                         // from here on the slot holds a state of the task's conversation
                         slot.prompt.n_conversation = slot.task->n_conversation_prefix;
 
-                        // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream && slot.task->params.return_progress) {
-                            send_partial_response(slot, {}, true);
+                        if (slot.task->params.stream) {
+                            if (slot.task->params.return_progress) {
+                                send_partial_response(slot, {}, true);
+                            } else {
+                                send_partial_response(slot, {}, false, true);
+                            }
                         }
                     }
 
@@ -3956,42 +3960,37 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // Give the first result time to report an HTTP error before starting the stream.
-        // Anthropic clients also need a heartbeat during a long wait for the first result.
+        // A slot-start result opens the stream. Errors before it still use an HTTP status.
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        const int heartbeat_seconds = res_type == TASK_RESPONSE_TYPE_ANTHROPIC ? 15 : 0;
-        static constexpr char anthropic_ping[] = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
-        auto first_result = rd.next(req.should_stop, heartbeat_seconds);
-        if (first_result == nullptr && req.should_stop()) {
+        auto first_result = rd.next(req.should_stop);
+        if (first_result == nullptr) {
+            GGML_ASSERT(req.should_stop());
             return res; // connection is closed
         }
 
-        if (first_result != nullptr && first_result->is_error()) {
+        if (first_result->is_error()) {
             set_outcome(SERVER_USAGE_FAILED);
             res->error(first_result->to_json());
             return res;
         }
 
-        if (first_result == nullptr) {
-            GGML_ASSERT(heartbeat_seconds > 0);
-            res->data = anthropic_ping;
+        GGML_ASSERT(
+            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+        );
+        json first_result_json = first_result->to_json();
+        if (first_result_json == nullptr) {
+            res->data.clear(); // send only the HTTP headers and status code
+        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+            res->data = format_anthropic_sse(first_result_json);
+        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+            res->data = format_oai_resp_sse(first_result_json);
         } else {
-            GGML_ASSERT(
-                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-            );
-            json first_result_json = first_result->to_json();
-            if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-                res->data = format_anthropic_sse(first_result_json);
-            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-                res->data = format_oai_resp_sse(first_result_json);
-            } else {
-                res->data = format_oai_sse(first_result_json);
-            }
+            res->data = format_oai_sse(first_result_json);
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, heartbeat_seconds, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, sse_ping_interval = params.sse_ping_interval, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -4038,13 +4037,26 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return false; // no more data, terminate
                 }
 
-                // receive subsequent results
-                auto result = rd.next(req.should_stop, heartbeat_seconds);
-                if (result == nullptr) {
-                    if (heartbeat_seconds > 0 && !req.should_stop()) {
-                        output = anthropic_ping;
+                // Receive subsequent results, yielding to an SSE ping on an idle stream.
+                bool timeout = false;
+                const int64_t start_time = ggml_time_ms();
+                auto result = rd.next([&]() {
+                    if (req.should_stop()) {
                         return true;
                     }
+                    timeout = sse_ping_interval > 0 &&
+                        ggml_time_ms() - start_time >= int64_t(sse_ping_interval) * 1000;
+                    return timeout;
+                });
+
+                if (timeout) {
+                    output = res_type == TASK_RESPONSE_TYPE_ANTHROPIC
+                        ? "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+                        : ":\n\n";
+                    return true;
+                }
+
+                if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
@@ -4066,7 +4078,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    if (res_json == nullptr) {
+                        output.clear(); // another slot began within this request
+                    } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
                         output = format_oai_resp_sse(res_json);

@@ -13,8 +13,9 @@
 // A prompt is cached as a prefix: the state of an app's leading context (its system prompt and tools, 10k-50k tokens)
 // is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the
 // home directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop
-// app the skill folders under the home directory, and the ChatGPT desktop app the conversation's folder. A new
-// project, session or user would process all of the context after them again. The server gives the model stand-ins
+// app the skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the
+// folder of its visualizations, both dated. A new project, session or user would process all of the context after
+// them again. The server gives the model stand-ins
 // for these identifiers wherever they occur in a request, and puts the request's identifiers back in place of the
 // stand-ins in what the model writes. The model only copies such strings into paths, so it does the same work, and
 // the client sees its own paths. The user name in the stand-ins is infer: with inferssd, three tokens to Qwen3.6,
@@ -49,6 +50,13 @@ struct server_identifier_env {
     std::string temp_stand_in;    // /var/folders/00/infer/T
     bool        windows = false;  // paths are spelled with '\' as well as '/'
 
+    // Those of a user of a system ("macos", "windows" or "linux") with this home directory and, on macOS, this
+    // temporary directory, with the stand-ins of that system's servers.
+    static server_identifier_env of_system(const std::string & os, std::string home, std::string temp);
+
+    // This machine's. With INFERSSD_IDENTIFIERS_OS set to macos, windows or linux, those of that system instead, for
+    // the home directory in HOME (USERPROFILE for windows) and the temporary directory in TMPDIR (macos): a server on
+    // one system then renders another system's requests as their users' servers do, to make prefix caches for them.
     static const server_identifier_env & current();
 };
 
@@ -73,3 +81,20 @@ void server_strip_anthropic_billing_header(nlohmann::ordered_json & messages);
 
 // The same for one text; returns whether the line was there.
 bool server_strip_anthropic_billing_header(std::string & text);
+
+// The Claude desktop app's agent (2.1.330 on macOS) closes its system prompt's instructions with an environment block,
+// before the skills it lists:
+//   <env>
+//   Today's date: stated by the system in the conversation, ... (for the weekday or time of day, use bash)
+//   Timezone: Asia/Shanghai
+//   Model: claude-sonnet-5
+//   User name: <the account's name on the computer>
+//   User selected a folder: no
+//   </env>
+// The time zone and the account name differ from one user to the next, so a prompt that keeps them shares no cached
+// state past them. Both lines go from the block: the prompt sends the model to bash for the weekday or the time of day,
+// and the account name is the one the model sees as infer in every path (above). The other lines stay.
+void server_strip_claude_env_user_lines(nlohmann::ordered_json & messages);
+
+// The same for one text; returns whether a line went.
+bool server_strip_claude_env_user_lines(std::string & text);

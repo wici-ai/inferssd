@@ -6,8 +6,8 @@ take responsibility for maintaining it. Support is best effort.
 
 Participation in this project is governed by the [Code of Conduct](.github/CODE_OF_CONDUCT.md).
 
-The first release focuses on the supported DeepSeek and Muse configurations. Please open an issue to discuss
-additional models, new runtime policies or broad interface changes before implementing them.
+Please open an issue to discuss additional models, new runtime policies or broad interface changes before
+implementing them.
 
 ## Issues
 
@@ -26,16 +26,18 @@ a review.
   [Checks](#checks), `git diff upstream:src/llama-vocab.cpp HEAD:engine/src/llama-vocab.cpp` shows what InferSSD
   changed in a file.
 - Pull requests are squash-merged, so the pull request title becomes the commit title on `main`.
-- Do not add automated trailers. Use `Co-authored-by` only for human co-authors.
 - Keep internal code names, task numbers, machine names, run IDs, credentials, personal paths, private
   addresses and links to private repositories out of code, branch names, commits, pull requests and issues.
+- Pull requests are reviewed, verified on devices and merged by an automated reviewer that follows
+  [pull request review](docs/development/review.md). It takes pull requests from collaborators with write
+  access on its own; for other authors, a maintainer reads the change first and then starts it.
 
 ### Pull request titles
 
 Use `area: summary`, for example:
 
 ```text
-ci: add isolated Mac base and PR performance comparisons
+ci: remove the paused device CI
 cuda, metal: fix expert staging
 ```
 
@@ -74,7 +76,11 @@ on every pull request.
 
 - Start new files with `SPDX-License-Identifier: Apache-2.0`.
 - Code ported or transcribed from a third-party project keeps its original license and copyright notice.
-  Add its origin to [NOTICE](NOTICE).
+  [NOTICE](NOTICE) lists each such project once: add a project that is not listed. Code from llama.cpp falls
+  under its entry at any revision. Name the source commit in the pull request description, so that the
+  squash commit on `main` keeps it.
+- A chat template copied from a model's repository is listed with its source, revision and license in
+  [engine/models/templates/README.md](engine/models/templates/README.md).
 - Bundled llama.cpp and ggml files keep their MIT notices.
 
 ## Checks
@@ -115,10 +121,7 @@ transcript checks are bound to those versions and skip on others. CI runs both. 
 failures. Native test targets are described in [testing](docs/testing.md). CI builds the documented CMake presets,
 runs the native tests labelled `ci` on Linux, macOS and Windows hosted runners, and compiles the CUDA server
 whenever the engine or build configuration changes. These checks run for pull requests and again on every merge
-to `main`. A pull request need not be up to date with `main` to merge: the run on `main` checks the merged code,
-and a failure there is fixed or reverted. The macOS and Windows packages are built only by a release,
-and by hand (**Actions > Package macOS** or **Package Windows**, on any branch) for a change to how they are
-built.
+to `main`; a failure on `main` is fixed or reverted.
 
 ## Review checklist
 
@@ -126,7 +129,8 @@ built.
 - Include a regression test for a behavior fix; use synthetic inputs where possible. Add a test that needs no
   GPU or model to hosted CI with `inferssd_ci_test` (see [testing](docs/testing.md)).
 - Keep placement decisions general and derived from measured costs, without machine-specific shortcuts.
-- Check CPU-only and applicable CUDA or macOS builds when shared code changes.
+- Shared code is built for every backend (CPU, CUDA, ROCm, Vulkan and Metal; the CUDA sources also build
+  ROCm) and every operating system (Linux, macOS and Windows). Keep it building on each and say in the pull
+  request which you built and ran.
 - Document memory ownership, thread lifetime and resource limits affected by the change.
-- Report performance only with the exact source, model, configuration and workload recorded. See the
-  [measurement checklist](docs/benchmark.md#reproducing-a-result).
+- Report performance only with the exact source, model, configuration and workload recorded.

@@ -2,38 +2,45 @@
 
 #include "server-queue.h"
 
+#include <atomic>
+#include <chrono>
 #include <cstdio>
-#include <cstdlib>
-#include <memory>
-#include <utility>
+#include <future>
+#include <thread>
 
-static void require(bool condition, const char * message) {
-    if (!condition) {
-        std::fprintf(stderr, "FAIL: %s\n", message);
-        std::exit(1);
-    }
-}
+using namespace std::chrono_literals;
 
 int main() {
     ggml_time_init();
-    server_queue tasks;
     server_response responses;
-    server_response_reader reader(tasks, responses, 1);
+    responses.add_waiting_task_id(1);
+    responses.add_waiting_task_id(2);
 
-    server_task task(SERVER_TASK_TYPE_METRICS);
-    const int id = reader.get_new_id();
-    task.id = id;
-    reader.post_task(std::move(task));
+    std::atomic<bool> done{false};
+    std::promise<void> primed;
+    auto ready = primed.get_future();
+    std::thread other_task([&] {
+        for (size_t i = 0; i < 65 && !done.load(); ++i) {
+            auto result = std::make_unique<server_task_result_metrics>();
+            result->id = 2;
+            responses.send(std::move(result));
+            if (i == 0) {
+                primed.set_value();
+            }
+            std::this_thread::sleep_for(40ms);
+        }
+    });
+    ready.get();
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = responses.recv_with_timeout({1}, 1);
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    done.store(true);
+    other_task.join();
 
-    // A heartbeat gets a turn when the reader has been idle, with the request still pending.
-    const auto connected = [] { return false; };
-    require(!reader.next(connected, 1), "idle read did not yield to the heartbeat");
-    require(reader.has_next(), "heartbeat ended the request");
-
-    auto result = std::make_unique<server_task_result_metrics>();
-    result->id = id;
-    responses.send(std::move(result));
-    const auto received = reader.next(connected, 1);
-    require(received && received->id == id, "completion was not delivered after the heartbeat");
-    require(!reader.has_next(), "completed request is still pending");
+    if (result || elapsed < 900ms || elapsed >= 2s) {
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+        std::fprintf(stderr, "Unrelated results changed the one-second deadline: %lld ms\n", static_cast<long long>(ms));
+        return 1;
+    }
+    return 0;
 }

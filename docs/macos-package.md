@@ -16,7 +16,7 @@ an installer from a release builds that release from source, as before. So does 
 
 One archive, `inferssd-<version>-macos-arm64.tar.gz`, about 30 MB, 80 MB unpacked, named by the
 build's [version](engine-resources.md), `<yymmdd>.<build>` (`inferssd-261119.301-macos-arm64`). A
-package built outside a release, by a pull request or a merge to `main`, is never published:
+package built outside a release, by hand, is never published:
 
 ```text
 inferssd-<version>-macos-arm64/
@@ -79,6 +79,10 @@ release and no tag, so no notes or pinned installers are published. The CDN then
 version, and a release built again at the same commit would be refused there: the next GitHub
 release needs a newer commit on `main`. The same holds for a run whose later package fails: the
 packages already published stay, and the failed one's list keeps its earlier version.
+
+**Package macOS** also runs by hand on any branch, building and checking without publishing; run it for
+a change to how the package is built. Pull requests and merges to `main` build no package. A run
+produces the `package-macos` Actions artifact.
 
 Each release's installers pin their package lists to that same GitHub release. The installer
 from `main` follows the latest package list; explicit `INFERSSD_REF` or `INFERSSD_FROM_SOURCE`

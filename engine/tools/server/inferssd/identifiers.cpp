@@ -325,6 +325,36 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
         std::string stand_in = text.substr(at, date - at) + "0000-00-00" + text[date + 10] + "task";
         found(4, text.substr(at, end - at), stand_in);
     }
+
+    // the folder of a ChatGPT desktop app conversation's visualizations, one of its writable roots:
+    // ~/.codex/visualizations/<yyyy>/<mm>/<dd>/<uuid>
+    for (size_t at = text.find(".codex"); at != std::string::npos; at = text.find(".codex", at + 1)) {
+        size_t i = literal_end(text, at, ".codex/visualizations");
+        if (i == std::string::npos) {
+            continue;
+        }
+        std::string stand_in = text.substr(at, i - at);
+        bool        ok       = true;
+        for (const size_t digits : {4, 2, 2}) {
+            ok = ok && sep_at(i) && i + 1 + digits <= text.size();
+            for (size_t k = 1; ok && k <= digits; ++k) {
+                ok = std::isdigit((unsigned char) text[i + k]) != 0;
+            }
+            if (ok) {
+                stand_in += text[i] + std::string(digits, '0');
+                i += 1 + digits;
+            }
+        }
+        const size_t end = ok && sep_at(i) ? run_end(text, i + 1, is_hex_or_dash) : i;
+        if (!ok || end != i + 37 || (end < text.size() && is_name_byte(text[end]))) {
+            continue;
+        }
+        stand_in += text[i];
+        for (size_t j = i + 1; j < end; ++j) {
+            stand_in += text[j] == '-' ? '-' : '0';
+        }
+        found(6, text.substr(at, end - at), stand_in);
+    }
 }
 
 // Takes the root that is the cwd out of Codex's sentences " The writable root is `<root>`." and " The writable
@@ -420,42 +450,49 @@ server_identifier_map server_identifier_map::from_json(const json & value) {
     return map;
 }
 
+server_identifier_env server_identifier_env::of_system(const std::string & os, std::string home, std::string temp) {
+    server_identifier_env e;
+    e.windows = os == "windows";
+    // the paths are split in two literals: written out, a home directory is a personal path to the repository's
+    // public scan (scripts/public-scan.py)
+    e.home_stand_in = e.windows ? "C:\\Users\\infer" : os == "macos" ? "/Users" "/infer" : "/home" "/infer";
+    while (home.size() > 1 && is_separator(home.back())) {
+        home.pop_back();
+    }
+    e.home = std::move(home);
+    // macOS: the per-user folder under /var/folders that $TMPDIR names
+    if (os == "macos" && temp.size() > 1) {
+        while (temp.size() > 1 && temp.back() == '/') {
+            temp.pop_back();
+        }
+        e.temp          = std::move(temp);
+        e.temp_stand_in = "/var/folders/00/infer/T";
+    }
+    return e;
+}
+
 const server_identifier_env & server_identifier_env::current() {
     static const server_identifier_env env = [] {
-        server_identifier_env e;
+        const char * target = std::getenv("INFERSSD_IDENTIFIERS_OS");
+        const std::string os = target ? target : "";
+        if (os == "macos" || os == "windows" || os == "linux") {
+            const char * home = std::getenv(os == "windows" ? "USERPROFILE" : "HOME");
+            const char * temp = std::getenv("TMPDIR");
+            return of_system(os, home ? home : "", os == "macos" && temp ? temp : "");
+        }
 #if defined(_WIN32)
         // as UTF-8, the encoding of the requests, also for a user name outside the ANSI code page
-        e.windows            = true;
         const wchar_t * home = _wgetenv(L"USERPROFILE");
-        e.home               = home ? std::filesystem::path(home).u8string() : std::string();
-        e.home_stand_in      = "C:\\Users\\infer";
-#else
+        return of_system("windows", home ? std::filesystem::path(home).u8string() : std::string(), "");
+#elif defined(__APPLE__)
         const char * home = std::getenv("HOME");
-        e.home            = home ? home : "";
-        // the paths are split in two literals: written out, a home directory is a personal path to the
-        // repository's public scan (scripts/public-scan.py)
-#    if defined(__APPLE__)
-        e.home_stand_in = "/Users" "/infer";
-#    else
-        e.home_stand_in = "/home" "/infer";
-#    endif
-#endif
-        while (e.home.size() > 1 && is_separator(e.home.back())) {
-            e.home.pop_back();
-        }
-#if defined(__APPLE__)
-        // the per-user folder under /var/folders that $TMPDIR names
         char         buf[1024];
         const size_t n = confstr(_CS_DARWIN_USER_TEMP_DIR, buf, sizeof(buf));
-        if (n > 1 && n <= sizeof(buf)) {
-            e.temp = buf;
-            while (e.temp.size() > 1 && e.temp.back() == '/') {
-                e.temp.pop_back();
-            }
-            e.temp_stand_in = "/var/folders/00/infer/T";
-        }
+        return of_system("macos", home ? home : "", n > 1 && n <= sizeof(buf) ? std::string(buf) : std::string());
+#else
+        const char * home = std::getenv("HOME");
+        return of_system("linux", home ? home : "", "");
 #endif
-        return e;
     }();
     return env;
 }
@@ -557,7 +594,8 @@ bool server_strip_anthropic_billing_header(std::string & text) {
     return true;
 }
 
-void server_strip_anthropic_billing_header(json & messages) {
+// Calls f on the text of each system message, or of each of its text parts.
+template <typename F> static void for_each_system_text(json & messages, F f) {
     if (!messages.is_array()) {
         return;
     }
@@ -567,15 +605,53 @@ void server_strip_anthropic_billing_header(json & messages) {
         }
         json & content = msg.at("content");
         if (content.is_string()) {
-            server_strip_anthropic_billing_header(content.get_ref<std::string &>());
+            f(content.get_ref<std::string &>());
         } else if (content.is_array()) {
             for (auto & part : content) {
                 if (part.is_object() && part.contains("text") && part.at("text").is_string()) {
-                    server_strip_anthropic_billing_header(part.at("text").get_ref<std::string &>());
+                    f(part.at("text").get_ref<std::string &>());
                 }
             }
         }
     }
+}
+
+void server_strip_anthropic_billing_header(json & messages) {
+    for_each_system_text(messages, [](std::string & text) { server_strip_anthropic_billing_header(text); });
+}
+
+bool server_strip_claude_env_user_lines(std::string & text) {
+    static const std::string open = "<env>\n";
+    static const std::string close = "</env>";
+    bool changed = false;
+    for (size_t at = text.find(open); at != std::string::npos; at = text.find(open, at + 1)) {
+        // the block starts a line; "<env>" in a sentence is not one
+        if (at != 0 && text[at - 1] != '\n') {
+            continue;
+        }
+        size_t end = text.find(close, at);
+        if (end == std::string::npos) {
+            break;
+        }
+        for (size_t line = at + open.size(); line < end;) {
+            const size_t eol = text.find('\n', line);
+            if (eol == std::string::npos || eol > end) {
+                break;
+            }
+            if (text.compare(line, 10, "Timezone: ") == 0 || text.compare(line, 11, "User name: ") == 0) {
+                text.erase(line, eol + 1 - line);
+                end -= eol + 1 - line;
+                changed = true;
+            } else {
+                line = eol + 1;
+            }
+        }
+    }
+    return changed;
+}
+
+void server_strip_claude_env_user_lines(json & messages) {
+    for_each_system_text(messages, [](std::string & text) { server_strip_claude_env_user_lines(text); });
 }
 
 void server_drop_codex_cwd_root(json & messages) {

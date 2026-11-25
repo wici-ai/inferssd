@@ -374,21 +374,15 @@ bool server_response_reader::has_next() const {
     return !cancelled && received_count < id_tasks.size();
 }
 
-// Return nullptr on disconnect or after idle_seconds without a result, if positive.
+// return nullptr if should_stop() is true before receiving a result
 // note: if one error is received, it will stop further processing and return error result
-server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop, int idle_seconds) {
-    const auto deadline = idle_seconds > 0
-        ? std::chrono::steady_clock::now() + std::chrono::seconds(idle_seconds)
-        : std::chrono::steady_clock::time_point::max();
+server_task_result_ptr server_response_reader::next(const std::function<bool()> & should_stop) {
     while (true) {
         server_task_result_ptr result = queue_results.recv_with_timeout(id_tasks, polling_interval_seconds);
         if (result == nullptr) {
             // timeout, check stop condition
             if (should_stop()) {
                 SRV_DBG("%s", "stopping wait for next result due to should_stop condition\n");
-                return nullptr;
-            }
-            if (idle_seconds > 0 && std::chrono::steady_clock::now() >= deadline) {
                 return nullptr;
             }
         } else {

@@ -468,6 +468,7 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     bool post_sampling_probs;
     bool is_progress = false;
+    bool is_begin = false; // signal the HTTP headers before streaming any model output
     completion_token_output prob_output;
     result_timings timings;
     result_prompt_progress progress;
