@@ -3075,7 +3075,8 @@ private:
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
                                 send_partial_response(slot, {}, true);
-                            } else {
+                            } else if (!slot.task->cli) {
+                                // The CLI waits for model output before stopping its prefill spinner.
                                 send_partial_response(slot, {}, false, true);
                             }
                         }

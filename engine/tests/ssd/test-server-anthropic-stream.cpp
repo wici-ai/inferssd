@@ -221,6 +221,32 @@ struct wire_probe {
     }
 };
 
+static void check_cli_first_result(common_params params) {
+    server_context context;
+    require(context.load_model(params), "could not load CLI fixture");
+    auto reader = context.get_response_reader();
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = reader.get_new_id();
+    task.cli = true;
+    task.cli_prompt = "Hello";
+    task.params.stream = true;
+    task.params.n_predict = 1;
+    reader.post_task(std::move(task));
+
+    struct worker {
+        server_context & context;
+        std::thread thread;
+        ~worker() {
+            context.terminate();
+            thread.join();
+        }
+    } run{context, std::thread([&] { context.start_loop(); })};
+    auto first = reader.next([] { return false; });
+    auto * partial = dynamic_cast<server_task_result_cmpl_partial *>(first.get());
+    require((partial && !partial->tokens.empty()) || dynamic_cast<server_task_result_cmpl_final *>(first.get()),
+            "CLI received a header marker before model output");
+}
+
 static void test_wire(const fs::path & model) {
     common_params params;
     params.model.path = model.string();
@@ -234,6 +260,7 @@ static void test_wire(const fs::path & model) {
     params.port = 0;
     params.sse_ping_interval = 1;
 
+    check_cli_first_result(params);
     server_context context;
     require(context.load_model(params), "could not load stream fixture");
     auto channel = context.get_response_reader();
