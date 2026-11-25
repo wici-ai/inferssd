@@ -38,6 +38,10 @@ source tree.
    given by path, including a table kept outside a split model, in
    engine/src/llama-model-loader.cpp.
 
+   The fixed response-queue wait deadline in engine/tools/server/server-queue.cpp
+   is backported from llama.cpp revision 4e201388c319fc9f747fbe6a666793e2dc2a6d8e
+   (pull request 29707). The same MIT license applies.
+
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026

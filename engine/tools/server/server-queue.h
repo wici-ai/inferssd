@@ -189,9 +189,9 @@ struct server_response_reader {
     void post_tasks(std::vector<server_task> && tasks, bool front = false);
     bool has_next() const;
 
-    // return nullptr if should_stop() is true before receiving a result
+    // Return nullptr on disconnect or after idle_seconds without a result, if positive.
     // note: if one error is received, it will stop further processing and return error result
-    server_task_result_ptr next(const std::function<bool()> & should_stop);
+    server_task_result_ptr next(const std::function<bool()> & should_stop, int idle_seconds = 0);
 
     struct batch_response {
         bool is_terminated = false; // if true, indicates that processing was stopped before all results were received

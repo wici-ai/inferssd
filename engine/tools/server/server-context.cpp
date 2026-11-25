@@ -3956,44 +3956,47 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // in streaming mode, the first error must be treated as non-stream response
-        // this is to match the OAI API behavior
+        // Give the first result time to report an HTTP error before starting the stream.
+        // Anthropic clients also need a heartbeat during a long wait for the first result.
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
-        auto first_result = rd.next(req.should_stop);
-        if (first_result == nullptr) {
-            GGML_ASSERT(req.should_stop());
+        const int heartbeat_seconds = res_type == TASK_RESPONSE_TYPE_ANTHROPIC ? 15 : 0;
+        static constexpr char anthropic_ping[] = "event: ping\ndata: {\"type\":\"ping\"}\n\n";
+        auto first_result = rd.next(req.should_stop, heartbeat_seconds);
+        if (first_result == nullptr && req.should_stop()) {
             return res; // connection is closed
         }
 
-        if (first_result->is_error()) {
+        if (first_result != nullptr && first_result->is_error()) {
             set_outcome(SERVER_USAGE_FAILED);
             res->error(first_result->to_json());
             return res;
         }
 
-        GGML_ASSERT(
-            dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
-            dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
-        );
-
-        // next responses are streamed
-        // to be sent immediately
-        json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
-            res->data = format_anthropic_sse(first_result_json);
-        } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
-            res->data = format_oai_resp_sse(first_result_json);
+        if (first_result == nullptr) {
+            GGML_ASSERT(heartbeat_seconds > 0);
+            res->data = anthropic_ping;
         } else {
-            res->data = format_oai_sse(first_result_json);
+            GGML_ASSERT(
+                dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
+                dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
+            );
+            json first_result_json = first_result->to_json();
+            if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                res->data = format_anthropic_sse(first_result_json);
+            } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
+                res->data = format_oai_resp_sse(first_result_json);
+            } else {
+                res->data = format_oai_sse(first_result_json);
+            }
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, heartbeat_seconds, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
                         {"event", "error"},
-                        {"data", res_json},
+                        {"data", {{"type", "error"}, {"error", res_json}}},
                     });
                 } else {
                     return format_oai_sse(json {{ "error", res_json }});
@@ -4036,8 +4039,12 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 }
 
                 // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                auto result = rd.next(req.should_stop, heartbeat_seconds);
                 if (result == nullptr) {
+                    if (heartbeat_seconds > 0 && !req.should_stop()) {
+                        output = anthropic_ping;
+                        return true;
+                    }
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
                     return false; // should_stop condition met
