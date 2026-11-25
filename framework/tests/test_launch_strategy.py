@@ -645,6 +645,16 @@ def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
     assert json.loads((out / "strategy.json").read_text())["inputs"]["model_drive"] == X86_DRIVE
 
 
+def test_launch_warns_once_for_retired_setting(tmp_path, monkeypatch, capsys):
+    words, facts, _ = launch_arguments(tmp_path)
+    settings = Path(words[words.index("--settings") + 1])
+    settings.write_text("inferssd-settings 1\nprefill.cpu_max_tokens=8\n")
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
+    assert main(words + ["--dry-run", "--host-facts", str(facts), "--machine", str(X86_FILE)]) == 0
+    warning = f"prefill.cpu_max_tokens ({settings}:2): ignoring retired setting"
+    assert capsys.readouterr().err.splitlines().count(warning) == 1
+
+
 def test_dry_run_without_characteristics_keeps_todays_resolution(tmp_path, monkeypatch):
     words, facts, out = launch_arguments(tmp_path)
     receipt = tmp_path / "resolution.json"

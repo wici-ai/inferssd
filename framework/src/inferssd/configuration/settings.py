@@ -6,7 +6,7 @@ import json
 import math
 import re
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import Any, Optional, Union, cast
@@ -168,12 +168,17 @@ def uncomment(line: str) -> tuple[str, str]:
     return line.strip(" \t\r\n"), ""
 
 
+def _warn_stderr(message: str) -> None:
+    print(message, file=sys.stderr)
+
+
 def parse(
     text: Optional[str] = None,
     source: str = "settings.ssd",
     *,
     overrides: Sequence[tuple[str, str]] = (),
     platform: str = "linux",
+    warn: Callable[[str], None] = _warn_stderr,
 ) -> Snapshot:
     source.encode("utf-8")
     if text is not None:
@@ -190,7 +195,7 @@ def parse(
         try:
             if origin == "file" and key == "prefill.cpu_max_tokens":
                 integer(literal.strip(" \t\r\n"), 0, 4294967295)
-                print(f"{key} ({location}): ignoring retired setting", file=sys.stderr)
+                warn(f"{key} ({location}): ignoring retired setting")
                 return
             prop = properties.get(key)
             if prop is None:
