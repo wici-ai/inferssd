@@ -21,10 +21,11 @@ a review.
 
 - Work on a short branch name without `/` and without the name of the tool that produced the change.
 - Keep each pull request to one concern. Separate numerical or algorithm changes from source-layout changes.
-- A fix to code that InferSSD takes from llama.cpp, rather than to InferSSD's own code, belongs in llama.cpp:
-  submit it to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp). With the `upstream` alias from
-  [Checks](#checks), `git diff upstream:src/llama-vocab.cpp HEAD:engine/src/llama-vocab.cpp` shows what InferSSD
-  changed in a file.
+- A fix to code that InferSSD takes from llama.cpp is accepted here when the problem affects InferSSD: show it
+  in InferSSD, keep the change to what the fix needs and say whether current llama.cpp has the same problem.
+  Sending the fix to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) as well is welcome; a problem
+  that does not affect InferSSD belongs there only. With the `upstream` alias from [Checks](#checks),
+  `git diff upstream:src/llama-vocab.cpp HEAD:engine/src/llama-vocab.cpp` shows what InferSSD changed in a file.
 - Pull requests are squash-merged, so the pull request title becomes the commit title on `main`.
 - Keep internal code names, task numbers, machine names, run IDs, credentials, personal paths, private
   addresses and links to private repositories out of code, branch names, commits, pull requests and issues.
