@@ -12,6 +12,7 @@ from functools import partial
 from pathlib import Path
 
 import pytest
+from test_decode_profiling import setup as gpu_machine
 from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
@@ -22,9 +23,9 @@ from inferssd.cli import main
 from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
 from inferssd.machine.probes import Completed
-from inferssd.machine.store import exclusive
+from inferssd.machine.store import exclusive, save
 from inferssd.strategy.inputs import RuntimeFacts
-from inferssd.strategy.kernels import VEC_DOT_TYPE
+from inferssd.strategy.kernels import INPUT_BLOCK, VEC_DOT_TYPE, WEIGHT_BLOCK
 
 
 def parse(argv):
@@ -49,7 +50,7 @@ def machine(tmp_path):
 RUNTIME = RuntimeFacts((0, 1, 2, 3), (), 24 * GIB)
 
 
-def execute(argv, host, runner, tmp_path, environ=None):
+def execute(argv, host, runner, tmp_path, environ=None, *, runtime=RUNTIME):
     out, progress = [], []
     code = command.run(
         parse(argv),
@@ -60,7 +61,7 @@ def execute(argv, host, runner, tmp_path, environ=None):
         clock=Clock(),
         progress=progress.append,
         emit=out.append,
-        runtime=lambda: RUNTIME,
+        runtime=lambda: runtime,
     )
     return code, out, progress
 
@@ -482,6 +483,11 @@ def test_explicit_target_requires_a_supported_ssd_path(
     ("architecture", "kv", "tensor", "refusal"),
     [
         ("qwen35", {}, "blk.0.ffn_up.weight", None),
+        ("bert", {}, "blk.0.ffn_up.weight", "encoder"),
+        ("gemma-embedding", {}, "blk.0.ffn_up.weight", "encoder"),
+        ("llama-embed", {}, "blk.0.ffn_up.weight", "encoder"),
+        ("dream", {}, "blk.0.ffn_up.weight", "autoregressive"),
+        ("pangu-embedded", {}, "blk.0.ffn_up.weight", None),
         (
             "bert",
             {"bert.attention.causal": False},
@@ -536,16 +542,47 @@ def test_routed_formats_are_those_the_cpu_expert_executor_computes(up, gate, dow
     assert reason is None if refusal is None else refusal in reason
 
 
+@pytest.mark.parametrize(("weight", "width"), [("q1_0", 64), ("q2_0", 32), ("nvfp4", 32)])
+def test_expert_rows_must_contain_whole_weight_blocks(weight, width):
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    raw["architecture"] = "qwen35moe"
+    raw["experts"]["hidden"] = width
+    for fmt in raw["experts"]["formats"]:
+        fmt["down"]["type"] = weight
+    assert f"cannot compute {weight.upper()} experts" in (command.launch_refusal(raw) or "")
+
+
 def test_expert_input_types_follow_the_cpu_type_traits():
-    source = (ENGINE_FIXTURE.parents[4] / "engine/ggml/src/ggml-cpu/ggml-cpu.c").read_text()
+    ggml = ENGINE_FIXTURE.parents[4] / "engine/ggml/src"
+    source = (ggml / "ggml-cpu/ggml-cpu.c").read_text()
     table = source[source.index("type_traits_cpu[GGML_TYPE_COUNT] = {") :]
     table = table[table.index("{") + 1 : table.index("\n};")]
     found = {}
+    quantizers = set()
     for name, block in re.findall(r"\[GGML_TYPE_(\w+)\]\s*=\s*\{(.*?)\n    \}", table, re.S):
         input_type = re.search(r"\.vec_dot_type\s*=\s*GGML_TYPE_(\w+)", block)
+        if re.search(r"\.from_float\s*=", block):
+            quantizers.add(name)
         if re.search(r"\.vec_dot\s*=", block) and input_type:
             found[name] = input_type.group(1)
     assert found == VEC_DOT_TYPE
+    macros = dict(
+        re.findall(r"^#define (QK\w*)\s+(\d+)\b", (ggml / "ggml-common.h").read_text(), re.M)
+    )
+    blocks = {
+        name: int(macros.get(size, size))
+        for name, size in re.findall(
+            r"\[GGML_TYPE_(\w+)\]\s*=\s*\{[^}]*?\.blck_size\s*=\s*(\w+)",
+            (ggml / "ggml.c").read_text(),
+        )
+    }
+    inputs = (set(found.values()) & quantizers) - {"F32"}
+    assert INPUT_BLOCK == {name: blocks[name] for name in inputs}
+    assert WEIGHT_BLOCK == {
+        weight: blocks[weight]
+        for weight, activation in found.items()
+        if activation in inputs and blocks[activation] % blocks[weight]
+    }
 
 
 def test_estimates_use_the_gpu_backends_of_the_engine_they_are_for(tmp_path, monkeypatch):
@@ -584,6 +621,66 @@ def test_estimates_use_the_gpu_backends_of_the_engine_they_are_for(tmp_path, mon
         == 0
     )
     assert seen == [(), ("CUDA",)]
+
+
+@pytest.mark.parametrize(
+    ("entry", "advertised", "cuda_cache", "gpu"),
+    [
+        ("gguf", None, "OFF", False),
+        ("gguf", [], "ON", False),
+        ("facts", [], "ON", False),
+        ("facts-build", None, "OFF", False),
+        ("installed", [], "ON", False),
+        ("installed", None, "ON", True),
+        ("offline", None, None, True),
+    ],
+)
+def test_show_estimates_use_the_selected_engine_and_work_offline(
+    tmp_path, entry, advertised, cuda_cache, gpu
+):
+    host, paths, build = machine(tmp_path)
+    profile, runtime = gpu_machine()
+    saved = tmp_path / "machine.json"
+    save(profile, saved)
+    original = saved.read_bytes()
+    descriptor = resource_descriptor(tmp_path, build)
+    data = json.loads(descriptor.read_text())
+    if advertised is not None:
+        data["capabilities"]["gpu_backends"] = advertised
+        descriptor.write_text(json.dumps(data))
+    if cuda_cache:
+        (build / "CMakeCache.txt").write_text(f"GGML_CUDA:BOOL={cuda_cache}\n")
+    raw = engine_facts(
+        [("token_embd.weight", (256, 256), Q8_0), ("blk.0.ffn_up.weight", (256, 256), Q4_K)],
+        {"general.architecture": "qwen35"},
+        path=paths[0],
+    )
+    exported = tmp_path / "facts.json"
+    exported.write_text(json.dumps(raw))
+    target = (
+        ["--estimate-gguf", paths[0]] if entry == "gguf" else ["--estimate-facts", str(exported)]
+    )
+    selection = (
+        ["--build", str(build)]
+        if entry == "facts-build"
+        else ["--resources", str(descriptor)]
+        if entry in ("gguf", "facts")
+        else []
+    )
+    environ = {"INFERSSD_RESOURCES": str(descriptor)} if entry == "installed" else {}
+    runner = FakeRunner({"inferssd-server": Completed(0, json.dumps(raw))})
+    code, out, _ = execute(
+        ["--show", "--output", str(saved), "--json", *selection, *target],
+        host,
+        runner,
+        tmp_path,
+        environ,
+        runtime=runtime,
+    )
+    (row,) = json.loads(out[0])["estimates"]
+    assert code == 0 and row["decode_tokens_per_second"] > 0
+    assert row["reference_scenario"] == ("dense_pipeline" if gpu else "dense_host_serial")
+    assert saved.read_bytes() == original and len(runner.calls) == int(entry == "gguf")
 
 
 def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):

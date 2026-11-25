@@ -213,7 +213,30 @@ def launch_refusal(raw: Mapping[str, Any]) -> Optional[str]:
     encoder_only = any(n.startswith("enc.blk.") for n in names) and not any(
         n.startswith("dec.blk.") for n in names
     )
-    if encoder_only or raw.get("metadata", {}).get(architecture + ".attention.causal") is False:
+    # Some GGUFs omit attention.causal. These native graphs never build next-token
+    # logits (e.g. BERT uses ordinary blk.* names); diffusion logits price a denoising step.
+    if architecture in ("dream", "llada", "llada-moe", "rnd1"):
+        return f"the {architecture} diffusion graph does not run autoregressive decode"
+    if architecture in ("clip", "wavtokenizer-dec"):
+        return f"the {architecture} graph does not run autoregressive text decode"
+    if (
+        encoder_only
+        or architecture
+        in (
+            "bert",
+            "modern-bert",
+            "nomic-bert",
+            "nomic-bert-moe",
+            "neo-bert",
+            "jina-bert-v2",
+            "jina-bert-v3",
+            "eurobert",
+            "llama-embed",
+            "gemma-embedding",
+            "t5encoder",
+        )
+        or raw.get("metadata", {}).get(architecture + ".attention.causal") is False
+    ):
         return f"the {architecture} model is an encoder; a launch runs decoder models"
     layout = raw["experts"]
     if layout is None:
@@ -242,7 +265,10 @@ def engine_gpu_backends(
     """The GPU backends of the engine the estimate is for, as a launch reads them: the resource
     descriptor's, else the build's CMake cache; None when neither says."""
     if resources is not None:
-        return read_resources(resources).gpu_backends
+        descriptor = read_resources(resources)
+        if descriptor.gpu_backends is not None:
+            return descriptor.gpu_backends
+        build = Path(descriptor.binary).parent.parent
     if build is not None:
         try:
             return cmake_gpu_backends((build / "CMakeCache.txt").read_text(encoding="utf-8"))
@@ -409,9 +435,12 @@ def run(
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
     resources = args.resources
-    if resources is None and args.build is None and (not args.show or args.estimate_gguf):
-        resources = installed_resources(environ, home)
-        if not resources.is_file():
+    needs_engine = not args.show or args.estimate_gguf is not None
+    if resources is None and args.build is None and (needs_engine or args.estimate_facts):
+        installed = installed_resources(environ, home)
+        if installed.is_file():
+            resources = installed
+        elif needs_engine:
             raise ValueError(
                 "engine not installed; run scripts/install.sh "
                 "or pass --build DIR or --resources FILE"
@@ -483,11 +512,11 @@ def run(
         if (
             args.reprofile
             or args.estimate_compute
-            or ((args.resources or args.build) and args.estimate_gguf is None)
+            or ((args.resources or args.build) and not (args.estimate_gguf or args.estimate_facts))
         ):
             raise ValueError(
-                "--show measures nothing; omit --reprofile, --resources, "
-                "--build and --estimate-compute"
+                "--show measures nothing; omit --reprofile and --estimate-compute, "
+                "and use --resources or --build only with an estimate target"
             )
         saved = load_current(path)
         if saved is None:

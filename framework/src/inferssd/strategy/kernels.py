@@ -44,6 +44,8 @@ VEC_DOT_TYPE = {
 }
 # Values per block of the input types that have a from_float quantizer.
 INPUT_BLOCK = {"F16": 1, "BF16": 1, "Q8_0": 32, "Q8_1": 32, "Q8_K": 256}
+# Weights whose own block is larger than the input block. Each row must fit both.
+WEIGHT_BLOCK = {"Q1_0": 128, "Q2_0": 64, "NVFP4": 64}
 
 
 def expert_format_refusal(layout: Mapping[str, Any]) -> Optional[str]:
@@ -60,7 +62,11 @@ def expert_format_refusal(layout: Mapping[str, Any]) -> Optional[str]:
             weight = str(roles[role]["type"]).upper()
             input_type = VEC_DOT_TYPE.get(weight)
             columns = layout["hidden"] if role == "down" else layout["latent"]
-            if input_type not in INPUT_BLOCK or columns % INPUT_BLOCK[input_type]:
+            if (
+                input_type not in INPUT_BLOCK
+                or columns % INPUT_BLOCK[input_type]
+                or columns % WEIGHT_BLOCK.get(weight, 1)
+            ):
                 return f"the CPU expert executor cannot compute {weight} experts"
             inputs[role] = input_type
         if inputs["up"] != inputs["gate"]:
