@@ -8,11 +8,12 @@ engine/ggml/src/ggml-cpu/ssd/cpu-sink.cpp). A test compares VEC_DOT_TYPE with th
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from itertools import product
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
-from inferssd.strategy.inputs import Experts, needs_layer_formats
+if TYPE_CHECKING:
+    from inferssd.strategy.inputs import Experts
 
 # Each weight type with a CPU vec_dot, and the type its input rows are quantized to.
 VEC_DOT_TYPE = {
@@ -85,41 +86,62 @@ def expert_format_refusal(layout: Mapping[str, Any]) -> Optional[str]:
 GPU_EXPERT_TYPES = frozenset(VEC_DOT_TYPE) - {"F32", "TQ1_0", "TQ2_0"}
 
 
-def gpu_expert_refusal(experts: Experts) -> Optional[str]:
-    """Why the active VRAM tier cannot create a decode executor for these routed layers."""
-    formats: Iterable[tuple[str, str, str]] = experts.layer_formats
-    ambiguous = False
-    known_companions = bool(experts.layer_formats)
-    if not experts.layer_formats:
-        # Older recordings only counted layers per type. All role combinations are safe
-        # if every type has a kernel and up/down cannot form the one retired pairing.
-        roles = [
-            {name: count for name, count, _ in role.formats}
-            for role in (experts.up, experts.gate, experts.down)
-        ]
-        ambiguous = needs_layer_formats(experts.layers, roles[0], roles[2])
-        known_companions = all(len(role) == 1 for role in roles)
-        formats = product(roles[0], roles[1], roles[2])
+_RETIRED_PAIR = "IQ2_XXS/Q2_K expert format is retired"
 
-    latent, hidden = experts.up.cols, experts.down.cols
-    for up, gate, down in formats:
-        if not ambiguous and up == "IQ2_XXS" and down == "Q2_K":
-            return "IQ2_XXS/Q2_K expert format is retired"
-        if not (0 < latent <= 16384 and 0 < hidden <= 16384):
+
+def _gpu_layer_refusal(up: str, gate: str, down: str, latent: int, hidden: int) -> Optional[str]:
+    if up == "IQ2_XXS" and down == "Q2_K":
+        return _RETIRED_PAIR
+    if not (0 < latent <= 16384 and 0 < hidden <= 16384):
+        return "unsupported generic VRAM expert geometry"
+    for weight, width in ((up, latent), (gate, latent), (down, hidden)):
+        block = WEIGHT_BLOCK.get(weight, INPUT_BLOCK.get(VEC_DOT_TYPE.get(weight, ""), 1))
+        if width % block:
             return "unsupported generic VRAM expert geometry"
-        for weight, width in ((up, latent), (gate, latent), (down, hidden)):
-            block = WEIGHT_BLOCK.get(weight, INPUT_BLOCK.get(VEC_DOT_TYPE.get(weight, ""), 1))
-            if width % block:
-                return "unsupported generic VRAM expert geometry"
-        missing = [weight for weight in (up, gate, down) if weight not in GPU_EXPERT_TYPES]
-        if missing:
-            # Marginal counts in older mixed receipts cannot identify the other two weights.
-            names = (up, gate, down) if known_companions else tuple(dict.fromkeys(missing))
-            native = "/".join(weight.lower().replace("_k", "_K") for weight in names)
-            return f"GPU expert layer: no CUDA matrix-vector kernel for {native} experts"
-    if ambiguous:
+    if any(weight not in GPU_EXPERT_TYPES for weight in (up, gate, down)):
+        native = "/".join(weight.lower().replace("_k", "_K") for weight in (up, gate, down))
+        return f"GPU expert layer: no CUDA matrix-vector kernel for {native} experts"
+    return None
+
+
+def gpu_expert_refusal(
+    experts: Experts, *, layer_formats: tuple[tuple[str, str, str], ...] = ()
+) -> Optional[str]:
+    """The first native refusal for ordered formats, or the conclusion old role counts prove."""
+    latent, hidden = experts.up.cols, experts.down.cols
+    ordered = layer_formats or experts.layer_formats
+    if ordered:
+        for up, gate, down in ordered:
+            reason = _gpu_layer_refusal(up, gate, down, latent, hidden)
+            if reason:
+                return reason
+        return None
+
+    # Older recordings contain marginal counts. Return a native reason only when it must
+    # occur and no other refusal is possible, irrespective of layer pairing and ordering.
+    up_counts, gate_counts, down_counts = (
+        {name: count for name, count, _ in role.formats}
+        for role in (experts.up, experts.gate, experts.down)
+    )
+    reasons = {
+        reason
+        for u, g, d in product(up_counts, gate_counts, down_counts)
+        if (reason := _gpu_layer_refusal(u, g, d, latent, hidden))
+    }
+    if not reasons:
+        return None
+    if len(reasons) > 1:
+        return (
+            "the recorded role counts cannot identify the first failing GPU expert format; "
+            "supply the GGUF or exported engine facts"
+        )
+    reason = reasons.pop()
+    if (
+        reason == _RETIRED_PAIR
+        and up_counts.get("IQ2_XXS", 0) + down_counts.get("Q2_K", 0) <= experts.layers
+    ):
         return (
             "the recorded role counts cannot tell whether a layer uses the retired "
             "IQ2_XXS/Q2_K expert format; supply the GGUF or exported engine facts"
         )
-    return None
+    return reason

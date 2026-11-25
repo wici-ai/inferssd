@@ -116,3 +116,43 @@ def test_ordinary_records_keep_their_previous_fields(monkeypatch):
         recorded = model_facts_json(facts)
         assert "layer_formats" not in recorded["experts"]
         assert model_facts_from(recorded) == facts
+
+
+@pytest.mark.parametrize(
+    ("first", "second", "reason"),
+    [
+        (
+            (Q8_0,) * 3,
+            (TQ2_0,) * 3,
+            "GPU expert layer: no CUDA matrix-vector kernel for tq2_0/tq2_0/tq2_0 experts",
+        ),
+        (
+            (TQ2_0,) * 3,
+            (IQ2_XXS, IQ2_XXS, Q2_K),
+            "GPU expert layer: no CUDA matrix-vector kernel for tq2_0/tq2_0/tq2_0 experts",
+        ),
+        ((IQ2_XXS, IQ2_XXS, Q2_K), (TQ2_0,) * 3, "IQ2_XXS/Q2_K expert format is retired"),
+    ],
+)
+def test_report_the_first_native_failure_for_real_layer_combinations(
+    monkeypatch, first, second, reason
+):
+    c, rt = setup()
+    facts = model(monkeypatch, *([a, b] for a, b in zip(first, second)))
+    assert estimate(c, rt, facts).detail == reason
+    recorded = model_facts_json(facts)
+    assert estimate(c, rt, model_facts_from(recorded)).detail == reason
+    del recorded["experts"]["layer_formats"]
+    legacy = estimate(c, rt, model_facts_from(recorded))
+    assert legacy.tokens_per_second is None and "first failing" in legacy.detail
+    assert "q8_0/q8_0/tq2_0" not in legacy.detail
+
+
+def test_one_possible_missing_kernel_signature_needs_no_additional_record_field(monkeypatch):
+    c, rt = setup()
+    facts = model(monkeypatch, Q8_0, Q8_0, [Q4_K, TQ2_0])
+    recorded = model_facts_json(facts)
+    assert "layer_formats" not in recorded["experts"]
+    assert estimate(c, rt, model_facts_from(recorded)).detail == (
+        "GPU expert layer: no CUDA matrix-vector kernel for q8_0/q8_0/tq2_0 experts"
+    )

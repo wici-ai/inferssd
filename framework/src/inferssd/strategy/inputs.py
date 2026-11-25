@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional, Protocol, cast
 
 from inferssd.configuration.settings import cpus as cpu_list
@@ -29,6 +29,7 @@ from inferssd.machine.characteristics import (
     nullable,
     record,
 )
+from inferssd.strategy.kernels import GPU_EXPERT_TYPES, gpu_expert_refusal
 
 ROLES = ("gate", "up", "down")
 
@@ -63,12 +64,6 @@ class Role:
         return 8 * self.slice_bytes(format) / (self.rows * self.cols)
 
 
-def needs_layer_formats(layers: int, up: Mapping[str, int], down: Mapping[str, int]) -> bool:
-    """Whether role counts alone leave the GPU executor's retired IQ2_XXS/Q2_K pairing undecided."""
-    up_count, down_count = up.get("IQ2_XXS", 0), down.get("Q2_K", 0)
-    return bool(up_count and down_count and up_count + down_count <= layers)
-
-
 @dataclass(frozen=True)
 class Experts:
     """A model's routed experts as the engine lays them out."""
@@ -83,7 +78,7 @@ class Experts:
     expert_read_bytes: int  # the most one expert's three role reads (whole 4 KiB pages) take
     format_bytes: tuple[tuple[str, int], ...]  # routed bytes per ggml type, the most first
 
-    # Distinct (up, gate, down) combinations when the counts alone leave GPU support undecided.
+    # Ordered, distinct (up, gate, down) combinations when counts cannot recover the GPU result.
     # Only these models need an additional field in the existing recording format.
     layer_formats: tuple[tuple[str, str, str], ...] = ()
 
@@ -171,18 +166,6 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             for role in ROLES
         }
         routed = {routed_tensor(layer, role) for layer, _ in layers for role in ROLES}
-        layer_formats: tuple[tuple[str, str, str], ...] = ()
-        if needs_layer_formats(len(layers), counts["up"], counts["down"]):
-            layer_formats = tuple(
-                dict.fromkeys(
-                    (
-                        formats[index]["up"]["type"].upper(),
-                        formats[index]["gate"]["type"].upper(),
-                        formats[index]["down"]["type"].upper(),
-                    )
-                    for _, index in layers
-                )
-            )
         found = Experts(
             layers=len(layers),
             count=experts["count"],
@@ -193,8 +176,23 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             expert_bytes=experts["expert_bytes"],
             expert_read_bytes=experts["expert_read_bytes"],
             format_bytes=_ranked(per_format),
-            layer_formats=layer_formats,
         )
+        possible_retired = "IQ2_XXS" in counts["up"] and "Q2_K" in counts["down"]
+        if len(formats) > 1 and (possible_retired or not GPU_EXPERT_TYPES.issuperset(per_format)):
+            actual = tuple(
+                dict.fromkeys(
+                    (
+                        formats[index]["up"]["type"].upper(),
+                        formats[index]["gate"]["type"].upper(),
+                        formats[index]["down"]["type"].upper(),
+                    )
+                    for _, index in layers
+                )
+            )
+            # Preserve the existing recording when its counts prove the same first native
+            # refusal (or successful admission) as the actual ordered layer formats.
+            if gpu_expert_refusal(found, layer_formats=actual) != gpu_expert_refusal(found):
+                found = replace(found, layer_formats=actual)
     dense = [t for t in model["tensors"] if t["name"] not in routed]
     per_type: Counter[str] = Counter()
     has_decoder = any(t["name"].startswith("dec.blk.") for t in dense)
