@@ -549,6 +549,8 @@ def test_explicit_target_requires_a_supported_ssd_path(
             "the bert model is an encoder",
         ),
         ("t5encoder", {}, "enc.blk.0.ffn_up.weight", "the t5encoder model is an encoder"),
+        # No decoder layers to read facts from: the reason still reaches the report.
+        ("clip", {}, "v.blk.0.ffn_up.weight", "does not run autoregressive text decode"),
     ],
 )
 def test_a_dense_decoder_needs_no_profile_and_an_encoder_has_no_estimate(
@@ -604,61 +606,6 @@ def test_expert_rows_must_contain_whole_weight_blocks(weight, width):
     for fmt in raw["experts"]["formats"]:
         fmt["down"]["type"] = weight
     assert f"cannot compute {weight.upper()} experts" in (command.launch_refusal(raw) or "")
-
-
-@pytest.mark.parametrize(("clamps", "refused"), [([7, 7], False), ([0, 7], True)])
-def test_deepseek_clamp_admission_matches_on_gguf_and_saved_facts(tmp_path, clamps, refused):
-    host, paths, build = machine(tmp_path)
-    raw = json.loads(ENGINE_FIXTURE.read_text())
-    raw["architecture"] = "deepseek41"
-    raw["metadata"]["deepseek41.swiglu_clamp_exp"] = clamps
-    target = tmp_path / "facts.json"
-    target.write_text(json.dumps(raw))
-    runner = FakeRunner(replies(**{"inferssd-server": Completed(0, json.dumps(raw))}))
-    args = ["--build", str(build), "--model", paths[0], "--json"]
-    estimates = []
-    for entry in (["--estimate-gguf", paths[0]], ["--show", "--estimate-facts", str(target)]):
-        code, out, _ = execute([*args, *entry], host, runner, tmp_path)
-        assert code == 0
-        estimates.append(json.loads(out[0])["estimates"][0])
-    row, replay = estimates
-    assert row == replay
-    if refused:
-        assert row["decode_tokens_per_second"] is None and not row["scenarios"]
-        assert row["detail"] == "layer 0: the model's SwiGLU clamp must be finite and positive"
-    else:
-        assert row["decode_tokens_per_second"] > 0
-
-
-@pytest.mark.parametrize(
-    ("canonical", "legacy", "encoding", "bad_layer"),
-    [
-        (7, 0, "", None),  # canonical scalar broadcasts to all layers
-        ([7, None], 7, "", 1),  # the native facts writer encodes non-finite floats as null
-        ([7, 7, 0], 0, "", None),  # a dropped NextN block
-        ([0, 0], 7, "e4m3_e8m0_32_row264", None),
-        ([7, 7], 0, "e4m3_e8m0_32_row264", 0),
-        ([7, 9.999999974752427e-7], 7, "", 1),  # 1e-6f
-        ([7, 1.0000001111620804e-6], 7, "", None),  # next representable float32
-    ],
-)
-def test_deepseek_clamp_uses_the_native_layout_and_active_layers(
-    canonical, legacy, encoding, bad_layer
-):
-    raw = json.loads(ENGINE_FIXTURE.read_text())
-    raw["architecture"] = "deepseek41"
-    raw["metadata"].update(
-        {
-            "deepseek41.swiglu_clamp_exp": canonical,
-            "deepseek41.swiglu_limit": legacy,
-            "deepseek41.engram.encoding": encoding,
-        }
-    )
-    reason = command.launch_refusal(raw)
-    if bad_layer is None:
-        assert reason is None
-    else:
-        assert reason == f"layer {bad_layer}: the model's SwiGLU clamp must be finite and positive"
 
 
 def test_expert_input_types_follow_the_cpu_type_traits():

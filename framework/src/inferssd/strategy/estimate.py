@@ -24,10 +24,9 @@ from inferssd.strategy.derive import (
     link_rates,
     placement,
     single_gpu,
-    tier_backends,
     tier_gpus,
 )
-from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import Experts, ModelFacts, RuntimeFacts
 from inferssd.strategy.kernels import gpu_expert_refusal
 from inferssd.strategy.routing import cache_slot_bytes, hit_at_slots, rank_hit_curve
 from inferssd.strategy.weights import DenseWeights
@@ -229,6 +228,14 @@ def cpu_decode_seconds(
     return total, ""
 
 
+def shared_gpu_bytes(c: Characteristics, runtime: RuntimeFacts, gpu_work_bytes: int) -> int:
+    """Host memory the GPU takes on a unified machine: its working memory and the launch reserve
+    for other compute processes, both of which the native ledger counts against host memory."""
+    if not c["memory"]["unified"]:
+        return 0
+    return gpu_work_bytes + (gpu_reserve_mib(tier_gpus(runtime, c)) << 20)
+
+
 def tier_gpu(
     c: Characteristics, runtime: RuntimeFacts, gpu_work_bytes: int
 ) -> tuple[Optional[GPU], int, list[ComputeRow]]:
@@ -243,16 +250,6 @@ def tier_gpu(
     reserve_bytes = gpu_reserve_mib(usable) << 20
     room = max(0, min(free or 0, gpu["vram_total_bytes"]) - reserve_bytes - gpu_work_bytes)
     return gpu, room, gpu.get("decode_compute", [])
-
-
-def device_refusal(
-    devices: Optional[tuple[GPUState, ...]], runtime: RuntimeFacts, characteristics: Characteristics
-) -> Optional[str]:
-    if devices is None and tier_backends(runtime.gpu_backends, characteristics):
-        return "cannot determine which GPU expert executors the selected engine will attach"
-    if devices and len(devices) > 1:
-        return "one GPU expert executor per context is supported"
-    return None
 
 
 def moved_fraction(
@@ -322,9 +319,6 @@ def decode_estimate(
     # A visible CUDA/ROCm tier initializes the executors for the declared layer formats,
     # even when the profiler has no timing for that GPU or cannot price its placement.
     devices = tier_gpus(runtime, characteristics)
-    refusal = device_refusal(devices, runtime, characteristics)
-    if refusal:
-        return Estimate(None, refusal)
     if devices:
         refusal = gpu_expert_refusal(experts)
         if refusal:
@@ -342,7 +336,13 @@ def decode_estimate(
     if runtime.memory_budget_bytes is not None:
         available = min(available, runtime.memory_budget_bytes)
     available = min(available, characteristics["memory"]["total_bytes"])
-    room = max(0, available - headroom_bytes(characteristics, runtime, platform) - host_work_bytes)
+    room = max(
+        0,
+        available
+        - headroom_bytes(characteristics, runtime, platform)
+        - host_work_bytes
+        - shared_gpu_bytes(characteristics, runtime, gpu_work_bytes),
+    )
     gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
     assumptions = [
         "Warmed cache hits come from a shared 1/rank routing assumption, capped at one selection "
@@ -807,10 +807,6 @@ def dense_decode_estimate(
         raise ValueError("memory sizes must be nonnegative")
     if dense_read_bytes <= 0:
         return Estimate(None, "the model's dense weight bytes are not known")
-    devices = tier_gpus(runtime, characteristics)
-    refusal = device_refusal(devices, runtime, characteristics)
-    if refusal:
-        return Estimate(None, refusal)
     assumptions = [
         "One read of active non-lookup weights per token. Attention, active KV reads, lookup "
         "I/O and graph execution overhead are unpriced.",
@@ -823,13 +819,20 @@ def dense_decode_estimate(
         available = min(available, runtime.memory_budget_bytes)
     platform = platform or characteristics["identity"]["hard"]["platform"]
     host_room = max(
-        0, available - headroom_bytes(characteristics, runtime, platform) - host_work_bytes
+        0,
+        available
+        - headroom_bytes(characteristics, runtime, platform)
+        - host_work_bytes
+        - shared_gpu_bytes(characteristics, runtime, gpu_work_bytes),
     )
     gpu, gpu_room, rows = tier_gpu(characteristics, runtime, gpu_work_bytes)
     formats = model.layer_format_bytes if model else ()
+    devices = tier_gpus(runtime, characteristics)
     compute, notes = _dense_compute_times(rows, formats, dense_read_bytes, weights=weights)
     if not gpu or not compute or not devices or devices[0].free_bytes is None:
-        if gpu and devices and devices[0].free_bytes is None:
+        if devices and len(devices) > 1:
+            assumptions.append("Multiple GPUs are visible; the per-device layer split is unknown.")
+        elif gpu and devices and devices[0].free_bytes is None:
             assumptions.append("Free VRAM is unknown for dense layer placement.")
         elif gpu and not compute:
             assumptions.append("GPU matvec timing unavailable; run profile --estimate-compute.")

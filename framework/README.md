@@ -247,11 +247,11 @@ profiling window. No historical tokens/s multiplier is used.
 
 `--estimate-gguf FILE` and `--estimate-facts JSON` estimate a specific checkpoint.
 A dense decoder can run without a named model profile. Routed experts need a profile
-and a layout the SSD executor supports. For example, an invalid expert SwiGLU clamp
-in a DeepSeek-V4.1 checkpoint yields a refusal reason in place of a decode rate.
-Placement uses the selected engine's GPU backends, including when replaying a saved
-machine profile. A default launch that would attach two CUDA or ROCm expert
-executors to one context also yields a refusal reason.
+and a layout the SSD executor supports. An architecture or expert format that the
+engine cannot run yields a refusal reason in place of a decode rate. Placement uses the
+selected engine's GPU backends, including when replaying a saved machine profile.
+Checks the engine makes when it starts are left to the launch. These include the
+devices chosen through launch settings and values inside the model.
 
 For a routed model, the estimator prices dense GPU work at the measured Q8_0 matvec
 rate for both catalog entries and explicit checkpoints. It checks each routed layer's
@@ -259,7 +259,8 @@ up, gate and down formats against the executors used by the launch. An executabl
 expert format with no timing measurement can borrow the rate of the measured format
 nearest it in bits per weight. The estimate identifies these proxies in its assumptions.
 When another compute process is using the GPU, the estimate leaves the launcher's
-VRAM reserve free before counting how many routed experts fit.
+VRAM reserve free before counting how many routed experts fit. On unified memory, the
+GPU's working memory and that reserve come out of host memory.
 
 For a dense model such as Gemma 4 E4B, the catalog records the bytes in each layer
 weight format. The estimator prices that mix using matvec measurements near

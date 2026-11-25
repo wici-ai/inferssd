@@ -7,7 +7,6 @@ import argparse
 import json
 import math
 import os
-import re
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -31,8 +30,8 @@ from inferssd.machine.characteristics import (
     Section,
 )
 from inferssd.machine.decode_probe import measure_decode_compute
-from inferssd.machine.identity import TIER_BACKENDS, Host, NativeHost, UnsupportedPlatform
-from inferssd.machine.probes import ProbeError, Probes, Runner, locate, run_process
+from inferssd.machine.identity import Host, NativeHost, UnsupportedPlatform
+from inferssd.machine.probes import Probes, Runner, locate, run_process
 from inferssd.machine.profile import (
     Clock,
     Progress,
@@ -44,7 +43,7 @@ from inferssd.machine.profile import (
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
-from inferssd.strategy.inputs import GPUState, RuntimeFacts, facts_from_engine, read_runtime
+from inferssd.strategy.inputs import ModelFacts, RuntimeFacts, facts_from_engine, read_runtime
 from inferssd.strategy.kernels import expert_format_refusal
 from inferssd.strategy.weights import DenseWeights, dense_weights
 
@@ -248,21 +247,6 @@ def launch_refusal(raw: Mapping[str, Any]) -> Optional[str]:
         )
     if architecture not in SSD_ARCHITECTURES:
         return f"the engine has no routed SSD executor for architecture {architecture}"
-    if architecture == "deepseek41":
-        # load_hparams selects the legacy scalar or the canonical scalar/per-block array.
-        # The SSD adapter checks only the routed layers that survived NextN removal.
-        metadata = raw["metadata"]
-        legacy = metadata.get("deepseek41.engram.encoding") == "e4m3_e8m0_32_row264"
-        clamps = metadata.get(
-            "deepseek41.swiglu_limit" if legacy else "deepseek41.swiglu_clamp_exp"
-        )
-        for layer, _ in layout["layers"]:
-            clamp = clamps
-            if isinstance(clamps, list):
-                clamp = clamps[layer] if not legacy and layer < len(clamps) else None
-            # Native facts serialize non-finite floats as null.
-            if type(clamp) not in (int, float) or not 1e-6 < clamp < math.inf:
-                return f"layer {layer}: the model's SwiGLU clamp must be finite and positive"
     if architecture in ("qwen35moe", "qwen4exp"):
         # These graph builders prefer fused gate/up and pass per-expert scales
         # to the adapter. The SSD adapter accepts separate, unscaled roles.
@@ -295,75 +279,6 @@ def estimate_engine(
         return binary, None
 
 
-class DeviceSelectionError(ValueError):
-    """The selected launch devices cannot be used for this estimate."""
-
-
-def engine_tier_devices(
-    binary: Path, runner: Runner, environ: Mapping[str, str], runtime: RuntimeFacts
-) -> Optional[tuple[GPUState, ...]]:
-    """The CUDA/ROCm devices enumerated by this build under the launch's visibility masks.
-
-    Both backends register every ordinal as a GPU, including unified devices. The default
-    layer split attaches all of them. Vulkan aliases of the same cards, iGPUs and accelerators
-    in --list-devices are not additional CUDA/ROCm executors.
-    """
-    try:
-        listed = runner([str(binary), "--list-devices"], 30.0, environ)
-    except (OSError, ProbeError):
-        return None
-    lines = listed.stdout.splitlines()
-    if listed.returncode:
-        for line in listed.stderr.splitlines():
-            if line.startswith('error while handling environment variable "LLAMA_ARG_'):
-                raise DeviceSelectionError(line)
-        return None
-    if "Available devices:" not in lines:
-        return None
-    available = [
-        match.group(1).lower()
-        for line in lines[lines.index("Available devices:") + 1 :]
-        if (match := re.match(r"^\s+(\S+?):", line))
-    ]
-    states: dict[str, GPUState] = {}
-    for backend in TIER_BACKENDS:
-        visible = [name for name in available if re.fullmatch(backend.lower() + r"\d+", name)]
-        measured = [gpu for gpu in runtime.gpus or () if gpu.backend == backend]
-        # A live runtime UUID identifies a profiled card. When the host and the driver
-        # disagree, retain the driver's device count without assigning unverified telemetry.
-        if len(visible) != len(measured):
-            measured = [GPUState(name, None, 0, backend) for name in visible]
-        states.update(zip(visible, measured))
-    # --list-devices lists available ordinals even when the server's --device environment
-    # selects a subset (or "none"). Keep that subset's actual free-memory/process records.
-    requested = environ.get("LLAMA_ARG_DEVICE")
-    selected = requested.lower().split(",") if requested else list(states)
-    if requested == "none":
-        selected = []
-    if requested and any(name not in available for name in selected):
-        raise DeviceSelectionError("invalid device: " + requested)
-    if not states and available:
-        # A Metal- or Vulkan-only build attaches no CUDA/ROCm transport, including
-        # when its single GPU is chosen explicitly with split-mode=none.
-        return ()
-    if environ.get("LLAMA_ARG_SPLIT_MODE") == "none":
-        main = int(environ.get("LLAMA_ARG_MAIN_GPU", "0"))
-        if main < 0:
-            return ()
-        if main >= len(selected):
-            if not requested and any(name not in states for name in available):
-                # The flat listing also includes accelerators and Vulkan aliases. It does
-                # not tell us which non-tier devices survived the loader's deduplication.
-                raise DeviceSelectionError(
-                    "cannot resolve the selected main GPU in the device list"
-                )
-            raise DeviceSelectionError(
-                f"invalid value for main_gpu: {main} (available devices: {len(selected)})"
-            )
-        selected = [selected[main]]
-    return tuple(states[name] for name in selected if name in states)
-
-
 def estimates(
     value: Characteristics,
     drive_key: Optional[str],
@@ -384,7 +299,7 @@ def estimates(
     if drive_key is not None or target is not None:
         try:
             facts = runtime()
-        except (UnsupportedPlatform, DeviceSelectionError) as error:
+        except UnsupportedPlatform as error:
             reason = str(error)
         else:
             return [
@@ -551,37 +466,29 @@ def run(
         else:
             raw = engine_model.validate(json.loads(args.estimate_facts.read_text(encoding="utf-8")))
         target_refusal = launch_refusal(raw)
-        facts = facts_from_engine(raw)
-        weights = dense_weights(raw)
-        read_bytes = weights.active_bytes
-        # Report the actual GGUF types. Mixed checkpoints need not have a canonical quant label.
-        formats = facts.experts.format_bytes if facts.experts else facts.layer_format_bytes
-        target = catalog.Model(
-            facts.paths[0],
-            "+".join(name for name, _ in formats),
-            "",
-            facts,
-            facts.dense_bytes - read_bytes,
-        )
+        if target_refusal is not None:
+            # Only the name and the reason are reported. A non-decoder header may hold no
+            # layer tensors to read facts from.
+            facts = ModelFacts(tuple(raw["files"]), raw["architecture"], 0, (), None)
+            target = catalog.Model(facts.paths[0], "", "", facts, 0)
+        else:
+            facts = facts_from_engine(raw)
+            weights = dense_weights(raw)
+            read_bytes = weights.active_bytes
+            # Report the actual GGUF types. Mixed checkpoints need not have a canonical quant label.
+            formats = facts.experts.format_bytes if facts.experts else facts.layer_format_bytes
+            target = catalog.Model(
+                facts.paths[0],
+                "+".join(name for name, _ in formats),
+                "",
+                facts,
+                facts.dense_bytes - read_bytes,
+            )
 
     # Placement uses the GPU backends of the engine the estimate is for, as a launch does, so a
     # CPU-only engine gets a host estimate even where the profile holds GPU measurements.
     def estimate_runtime() -> RuntimeFacts:
         facts = runtime()
-        if (
-            binary is not None
-            and binary.is_file()
-            and (
-                backends is None
-                or any(b in TIER_BACKENDS for b in backends)
-                or "LLAMA_ARG_DEVICE" in environ
-                or "LLAMA_ARG_SPLIT_MODE" in environ
-            )
-        ):
-            devices = engine_tier_devices(binary, runner or run_process, environ, facts)
-            if devices is not None:
-                active = backends if backends is not None else tuple({g.backend for g in devices})
-                return replace(facts, gpus=devices, gpu_backends=active)
         return facts if backends is None else replace(facts, gpu_backends=backends)
 
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
