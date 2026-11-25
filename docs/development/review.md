@@ -1,14 +1,18 @@
 # Pull request review
 
-Pull requests from collaborators with write access are reviewed, verified and merged by an automated
-reviewer. It applies the rules on this page, which are also the rules a human reviewer applies. Lessons it
-learns are recorded in [lessons](lessons.md) and become rules here.
+Pull requests are reviewed, verified and merged by an automated reviewer. It applies the rules on this page,
+which are also the rules a human reviewer applies. Lessons it learns are recorded in [lessons](lessons.md)
+and become rules here.
 
 ## Which pull requests
 
-- The reviewer takes a pull request when it is opened, gets new commits, is reopened or is marked ready for
-  review. Drafts wait until they are marked ready.
-- Pull requests from authors without write access are reviewed by a maintainer.
+- The reviewer takes a pull request from a collaborator with write access when it is opened, gets new
+  commits, is reopened or is marked ready for review. Drafts wait until they are marked ready.
+- A pull request from an author without write access waits for a maintainer, because the reviewer builds and
+  runs its code on the test devices. The maintainer reads the head commit and starts the reviewer for that
+  commit: **Actions → pr-agent → Run workflow** with the pull request number and the head commit, or
+  `gh workflow run pr-agent.yml -f number=N -f head=SHA`. The reviewer does not push fixes to such a pull
+  request but asks for them; each new commit needs a maintainer to read it and start the reviewer again.
 - A pull request that changes this page, [lessons](lessons.md) or the reviewer's workflow is verified like any
   other but merged by a maintainer: it changes the reviewer itself.
 

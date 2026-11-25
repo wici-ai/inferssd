@@ -6,11 +6,16 @@ name: pr-agent
 on:
   pull_request_target:
     types: [opened, synchronize, reopened, ready_for_review]
+  # A maintainer starts the reviewer by hand, for example on a pull request from an author without write
+  # access after reading its head commit.
   workflow_dispatch:
     inputs:
       number:
         description: Pull request number
         required: true
+      head:
+        description: Head commit you have read (needed when the author has no write access)
+        required: false
 
 permissions:
   contents: read
@@ -29,7 +34,10 @@ jobs:
       - name: Review, verify and merge
         env:
           NUMBER: ${{ github.event.pull_request.number || inputs.number }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || inputs.head }}
+          STARTED_BY: ${{ github.event_name == 'workflow_dispatch' && github.actor || '' }}
         run: |
-          if [ -n "$HEAD" ]; then exec "$PR_AGENT" "$NUMBER" --head "$HEAD"; fi
-          exec "$PR_AGENT" "$NUMBER"
+          set -- "$NUMBER"
+          if [ -n "$HEAD" ]; then set -- "$@" --head "$HEAD"; fi
+          if [ -n "$STARTED_BY" ]; then set -- "$@" --started-by "$STARTED_BY"; fi
+          exec "$PR_AGENT" "$@"
