@@ -1581,6 +1581,10 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 //
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
+    if (is_begin) {
+        // The header marker emits no deltas. Leave the generation prompt for the first model output.
+        return;
+    }
     state.update_chat_msg(content, true, oaicompat_msg_diffs, false, &output_source);
 
     // Copy current state for use in to_json_*() (reflects state BEFORE this chunk)

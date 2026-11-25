@@ -221,6 +221,22 @@ struct wire_probe {
     }
 };
 
+static void check_slot_start_preserves_first_delta() {
+    common_chat_parser_params parser;
+    parser.generation_prompt = "The template supplies the beginning of this reply. ";
+    task_result_state state(parser);
+    server_task_result_cmpl_partial begin{};
+    begin.is_begin = true;
+    begin.update(state);
+
+    server_task_result_cmpl_partial first{};
+    first.content = "Hello";
+    first.update(state);
+    require(first.oaicompat_msg_diffs.size() == 1 &&
+            first.oaicompat_msg_diffs.front().content_delta == parser.generation_prompt + first.content,
+            "slot-start consumed part of the first chat delta");
+}
+
 static void check_cli_first_result(common_params params) {
     server_context context;
     require(context.load_model(params), "could not load CLI fixture");
@@ -311,6 +327,7 @@ int main() {
     try {
         ggml_backend_load_all();
         llama_backend_init();
+        check_slot_start_preserves_first_delta();
         write_model(model);
         test_wire(model);
         return 0;
