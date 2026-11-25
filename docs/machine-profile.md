@@ -49,8 +49,9 @@ Without `--resources` or `--build`, the command uses the installed engine, as
 `cli` and `serve` do: `INFERSSD_RESOURCES` when nonempty (set by the one-command
 installer's wrapper), otherwise `current/engine-resources.json` in the data
 directory. Without an installed engine it exits with status 2. `--show` only
-reads the saved profile. Adding `--estimate-gguf` also needs the engine header reader. Adding `--estimate-facts` works offline. For a saved facts estimate, the selected
-or installed engine descriptor supplies its GPU backends. If an older descriptor omits
+reads the saved profile. Adding `--estimate-gguf` also needs the engine header reader.
+Adding `--estimate-facts` works offline. For saved catalog and explicit-target estimates,
+the selected or installed engine descriptor supplies its GPU backends. If an older descriptor omits
 them, the estimator checks the build cache beside its binary. With no engine or build
 information, the saved machine GPU inventory and live availability determine placement.
 The command prints one progress line per step on stderr and one summary line per
@@ -247,8 +248,9 @@ spread, without assigning probabilities. `--memory-gib`, `--host-work-mib` and
 An explicit target is estimated where a launch runs it as its header describes it: a
 decoder needs no model profile; separated routed experts need one, a layout the SSD
 path runs and expert formats its CPU executor computes. GPU placement follows the GPU
-backends of the engine the estimate is for. Otherwise the JSON row gives a null speed
-and the reason.
+backends of the selected engine. When its CUDA or ROCm expert tier is active, each
+routed layer's up, gate and down combination must also be executable there. The JSON
+row gives a null speed and the reason when an executor rejects the format.
 
 **Routed experts.** Routing is not uniform: a few experts take many of the
 routes, so a cache with space for 10% of the expert store serves far more than

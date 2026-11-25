@@ -436,7 +436,8 @@ def run(
     paths = [str(model) for model in args.model]
     resources = args.resources
     needs_engine = not args.show or args.estimate_gguf is not None
-    if resources is None and args.build is None and (needs_engine or args.estimate_facts):
+    has_estimate = bool(paths or args.estimate_gguf or args.estimate_facts)
+    if resources is None and args.build is None and (needs_engine or has_estimate):
         installed = installed_resources(environ, home)
         if installed.is_file():
             resources = installed
@@ -512,7 +513,7 @@ def run(
         if (
             args.reprofile
             or args.estimate_compute
-            or ((args.resources or args.build) and not (args.estimate_gguf or args.estimate_facts))
+            or ((args.resources or args.build) and not has_estimate)
         ):
             raise ValueError(
                 "--show measures nothing; omit --reprofile and --estimate-compute, "

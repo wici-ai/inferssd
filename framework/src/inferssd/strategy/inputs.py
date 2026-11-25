@@ -63,6 +63,12 @@ class Role:
         return 8 * self.slice_bytes(format) / (self.rows * self.cols)
 
 
+def needs_layer_formats(layers: int, up: Mapping[str, int], down: Mapping[str, int]) -> bool:
+    """Whether role counts alone leave the GPU executor's retired IQ2_XXS/Q2_K pairing undecided."""
+    up_count, down_count = up.get("IQ2_XXS", 0), down.get("Q2_K", 0)
+    return bool(up_count and down_count and up_count + down_count <= layers)
+
+
 @dataclass(frozen=True)
 class Experts:
     """A model's routed experts as the engine lays them out."""
@@ -76,6 +82,10 @@ class Experts:
     expert_bytes: int  # the largest expert, all three roles
     expert_read_bytes: int  # the most one expert's three role reads (whole 4 KiB pages) take
     format_bytes: tuple[tuple[str, int], ...]  # routed bytes per ggml type, the most first
+
+    # Distinct (up, gate, down) combinations when the counts alone leave GPU support undecided.
+    # Only these models need an additional field in the existing recording format.
+    layer_formats: tuple[tuple[str, str, str], ...] = ()
 
     @property
     def roles(self) -> tuple[Role, Role, Role]:
@@ -161,6 +171,18 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             for role in ROLES
         }
         routed = {routed_tensor(layer, role) for layer, _ in layers for role in ROLES}
+        layer_formats: tuple[tuple[str, str, str], ...] = ()
+        if needs_layer_formats(len(layers), counts["up"], counts["down"]):
+            layer_formats = tuple(
+                dict.fromkeys(
+                    (
+                        formats[index]["up"]["type"].upper(),
+                        formats[index]["gate"]["type"].upper(),
+                        formats[index]["down"]["type"].upper(),
+                    )
+                    for _, index in layers
+                )
+            )
         found = Experts(
             layers=len(layers),
             count=experts["count"],
@@ -171,6 +193,7 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             expert_bytes=experts["expert_bytes"],
             expert_read_bytes=experts["expert_read_bytes"],
             format_bytes=_ranked(per_format),
+            layer_formats=layer_formats,
         )
     dense = [t for t in model["tensors"] if t["name"] not in routed]
     per_type: Counter[str] = Counter()
@@ -226,7 +249,8 @@ EXPERTS_RECORD = record(
         "expert_bytes": POSITIVE,
         "expert_read_bytes": POSITIVE,
         "format_bytes": _type_bytes,
-    }
+    },
+    optional={"layer_formats": array(record({role: TEXT for role in ROLES}), minimum=1)},
 )
 MODEL_RECORD = record(
     {
@@ -253,6 +277,16 @@ def model_facts_json(facts: ModelFacts) -> dict[str, object]:
             "layers": experts.layers,
             "count": experts.count,
             "used": experts.used,
+            **(
+                {
+                    "layer_formats": [
+                        {"up": up, "gate": gate, "down": down}
+                        for up, gate, down in experts.layer_formats
+                    ]
+                }
+                if experts.layer_formats
+                else {}
+            ),
             "roles": {
                 role.name: {
                     "formats": [list(item) for item in role.formats],
@@ -279,7 +313,10 @@ def model_facts_from(value: object) -> ModelFacts:
         built = {
             name: Role(
                 name,
-                tuple((format, layers, size) for format, layers, size in roles[name]["formats"]),
+                tuple(
+                    (format.upper(), layers, size)
+                    for format, layers, size in roles[name]["formats"]
+                ),
                 roles[name]["rows"],
                 roles[name]["cols"],
             )
@@ -295,6 +332,10 @@ def model_facts_from(value: object) -> ModelFacts:
             expert_bytes=experts["expert_bytes"],
             expert_read_bytes=experts["expert_read_bytes"],
             format_bytes=tuple((name, size) for name, size in experts["format_bytes"]),
+            layer_formats=tuple(
+                (fmt["up"].upper(), fmt["gate"].upper(), fmt["down"].upper())
+                for fmt in experts.get("layer_formats", ())
+            ),
         )
     return ModelFacts(
         paths=tuple(item["paths"]),

@@ -27,6 +27,7 @@ from inferssd.strategy.derive import (
     tier_gpus,
 )
 from inferssd.strategy.inputs import Experts, ModelFacts, RuntimeFacts
+from inferssd.strategy.kernels import gpu_expert_refusal
 from inferssd.strategy.routing import cache_slot_bytes, hit_at_slots, rank_hit_curve
 from inferssd.strategy.weights import DenseWeights
 
@@ -306,6 +307,13 @@ def decode_estimate(
         return Estimate(None, "the model has no routed experts")
     if not experts.used or not experts.routed_bytes:
         return Estimate(None, "the model names no routed experts per token")
+    # A visible CUDA/ROCm tier initializes the executors for the declared layer formats,
+    # even when the profiler has no timing for that GPU or cannot price its placement.
+    devices = tier_gpus(runtime, characteristics)
+    if devices:
+        refusal = gpu_expert_refusal(experts)
+        if refusal:
+            return Estimate(None, refusal)
     memory_Bps = max((r["Bps"] for r in characteristics["memory"]["dram_read_Bps"]), default=0)
     try:
         threads, _, _ = placement(characteristics, model, runtime, [])
@@ -335,7 +343,7 @@ def decode_estimate(
         "Attention, non-matmul graph work, lookup I/O and cache warm-up are unpriced.",
         "KV/graph working memory is unreserved unless work-byte arguments are supplied.",
     ]
-    if any(device.processes for device in tier_gpus(runtime, characteristics) or ()):
+    if any(device.processes for device in devices or ()):
         assumptions.append("GPU contention is present and is not priced by this estimate.")
     # Dense quantization is not retained by ModelFacts. Q8_0 is an explicit proxy;
     # never substitute a GPU's peak bandwidth for measured quantized computation.

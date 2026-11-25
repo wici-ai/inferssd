@@ -8,8 +8,11 @@ engine/ggml/src/ggml-cpu/ssd/cpu-sink.cpp). A test compares VEC_DOT_TYPE with th
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
+from itertools import product
 from typing import Any, Optional
+
+from inferssd.strategy.inputs import Experts, needs_layer_formats
 
 # Each weight type with a CPU vec_dot, and the type its input rows are quantized to.
 VEC_DOT_TYPE = {
@@ -75,4 +78,48 @@ def expert_format_refusal(layout: Mapping[str, Any]) -> Optional[str]:
                 f"up={roles['up']['type'].upper()} and gate={roles['gate']['type'].upper()} need "
                 "different ones"
             )
+    return None
+
+
+# The CUDA and ROCm expert tiers compile the same ggml_cuda_moe_stream_mmvq_supports switch.
+GPU_EXPERT_TYPES = frozenset(VEC_DOT_TYPE) - {"F32", "TQ1_0", "TQ2_0"}
+
+
+def gpu_expert_refusal(experts: Experts) -> Optional[str]:
+    """Why the active VRAM tier cannot create a decode executor for these routed layers."""
+    formats: Iterable[tuple[str, str, str]] = experts.layer_formats
+    ambiguous = False
+    known_companions = bool(experts.layer_formats)
+    if not experts.layer_formats:
+        # Older recordings only counted layers per type. All role combinations are safe
+        # if every type has a kernel and up/down cannot form the one retired pairing.
+        roles = [
+            {name: count for name, count, _ in role.formats}
+            for role in (experts.up, experts.gate, experts.down)
+        ]
+        ambiguous = needs_layer_formats(experts.layers, roles[0], roles[2])
+        known_companions = all(len(role) == 1 for role in roles)
+        formats = product(roles[0], roles[1], roles[2])
+
+    latent, hidden = experts.up.cols, experts.down.cols
+    for up, gate, down in formats:
+        if not ambiguous and up == "IQ2_XXS" and down == "Q2_K":
+            return "IQ2_XXS/Q2_K expert format is retired"
+        if not (0 < latent <= 16384 and 0 < hidden <= 16384):
+            return "unsupported generic VRAM expert geometry"
+        for weight, width in ((up, latent), (gate, latent), (down, hidden)):
+            block = WEIGHT_BLOCK.get(weight, INPUT_BLOCK.get(VEC_DOT_TYPE.get(weight, ""), 1))
+            if width % block:
+                return "unsupported generic VRAM expert geometry"
+        missing = [weight for weight in (up, gate, down) if weight not in GPU_EXPERT_TYPES]
+        if missing:
+            # Marginal counts in older mixed receipts cannot identify the other two weights.
+            names = (up, gate, down) if known_companions else tuple(dict.fromkeys(missing))
+            native = "/".join(weight.lower().replace("_k", "_K") for weight in names)
+            return f"GPU expert layer: no CUDA matrix-vector kernel for {native} experts"
+    if ambiguous:
+        return (
+            "the recorded role counts cannot tell whether a layer uses the retired "
+            "IQ2_XXS/Q2_K expert format; supply the GGUF or exported engine facts"
+        )
     return None

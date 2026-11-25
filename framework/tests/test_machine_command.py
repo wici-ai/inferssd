@@ -320,7 +320,15 @@ def test_json_prints_one_object_with_the_machine_and_the_estimates(tmp_path):
         assert row["estimator_version"] == 2
         assert row["scenarios"][row["reference_scenario"]] == row["decode_tokens_per_second"]
     # Without --model the estimates have no drive, and the machine no models drive.
-    code, out, _ = execute(["--show", "--json"], host, FakeRunner({}), tmp_path)
+    descriptor = tmp_path / "unreadable-engine.json"
+    descriptor.write_text("invalid descriptor")
+    code, out, _ = execute(
+        ["--show", "--json"],
+        host,
+        FakeRunner({}),
+        tmp_path,
+        environ={"INFERSSD_RESOURCES": str(descriptor)},
+    )
     value = json.loads(out[0])
     assert value["machine"]["models_drive"] is None and {
         row["detail"] for row in value["estimates"]
@@ -681,6 +689,35 @@ def test_show_estimates_use_the_selected_engine_and_work_offline(
     assert code == 0 and row["decode_tokens_per_second"] > 0
     assert row["reference_scenario"] == ("dense_pipeline" if gpu else "dense_host_serial")
     assert saved.read_bytes() == original and len(runner.calls) == int(entry == "gguf")
+
+
+@pytest.mark.parametrize("selection", ["installed", "explicit", "offline"])
+def test_show_catalog_uses_the_selected_engine_when_available(tmp_path, selection):
+    host, paths, build = machine(tmp_path)
+    profile, runtime = gpu_machine()
+    saved = tmp_path / "machine.json"
+    save(profile, saved)
+    directory = Path(paths[0]).parent
+    args = ["--show", "--model", str(directory), "--output", str(saved), "--json"]
+    environ = {}
+    if selection != "offline":
+        descriptor = resource_descriptor(tmp_path, build)
+        data = json.loads(descriptor.read_text())
+        data["capabilities"]["gpu_backends"] = []
+        descriptor.write_text(json.dumps(data))
+        if selection == "installed":
+            environ["INFERSSD_RESOURCES"] = str(descriptor)
+        else:
+            args += ["--resources", str(descriptor)]
+    runner = FakeRunner({})
+    code, out, _ = execute(args, host, runner, tmp_path, environ, runtime=runtime)
+    rows = {row["model"]: row for row in json.loads(out[0])["estimates"]}
+    dense = rows["google/gemma-4-E4B-it-qat-q4_0-gguf"]
+    routed = rows["unsloth/Qwen3.6-35B-A3B-GGUF"]
+    gpu = selection == "offline"
+    assert code == 0 and not runner.calls
+    assert dense["reference_scenario"] == ("dense_pipeline" if gpu else "dense_host_serial")
+    assert routed["components"]["gpu_execution_fraction"] == (1.0 if gpu else 0.0)
 
 
 def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):

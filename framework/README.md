@@ -245,19 +245,22 @@ drive quartiles. The range carries **no probabilities**: it is not a confidence
 interval or a guaranteed bound, and microbenchmark quartiles describe only the
 profiling window. No historical tokens/s multiplier is used.
 
-`--estimate-gguf FILE` and `--estimate-facts JSON` estimate another checkpoint from
-its own header, where a launch runs it as the header describes: a decoder needs no
-model profile; routed experts need one, a layout the SSD path executes and formats
-its CPU expert executor computes (`strategy/kernels.py`). Placement uses the GPU
-backends of the engine the estimate is for. Catalog models keep only aggregate facts,
-so their dense matrices take a measured Q8_0 matvec rate; an explicit target uses each
-tensor's shape and type. Attention, non-matmul graph work, lookup I/O and warm-up
-remain unpriced (issue #395).
+`--estimate-gguf FILE` and `--estimate-facts JSON` estimate a specific checkpoint.
+A dense decoder can run without a named model profile. Routed experts need a profile
+and a layout the SSD executor supports. Placement uses the selected engine's GPU
+backends, including when replaying a saved machine profile.
 
-Two defaults stand in for measurements the profile lacks. An expert format the
-probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight
-bytes per second) of the measured format nearest it in bits per weight. A model
-without routed experts, such as Gemma 4 E4B, reads its dense weights once a
-token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
-measured RAM read rate. Each estimate names the default it used in its
-assumptions; neither is calibrated against a run.
+For a routed model, the estimator prices dense GPU work at the measured Q8_0 matvec
+rate for both catalog entries and explicit checkpoints. It checks each routed layer's
+up, gate and down formats against the executors used by the launch. An executable
+expert format with no timing measurement can borrow the rate of the measured format
+nearest it in bits per weight. The estimate identifies these proxies in its assumptions.
+
+For a dense model such as Gemma 4 E4B, the catalog records the bytes in each layer
+weight format. The estimator prices that mix using matvec measurements near
+4096 × 4096. An explicit checkpoint supplies individual matrix shapes and types.
+On a single profiled CUDA or ROCm GPU, non-streamable weights must fit in available
+VRAM. Other layers can stream from pinned host memory or the model drive. The
+`dense_pipeline` scenario overlaps GPU compute, host-to-device transfer and drive
+reads. The host scenario uses the measured CPU or RAM rates. Attention, lookup I/O
+and cache warm-up remain unpriced (issue #395).
