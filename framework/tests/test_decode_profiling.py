@@ -150,6 +150,26 @@ def test_fully_gpu_resident_uses_only_gpu_timings():
         assert "CPU compute measurement" in result.detail
 
 
+@pytest.mark.parametrize("miss", [0, 1])
+def test_host_sourced_experts_can_run_on_gpu_without_a_vram_hit(miss):
+    c, rt = setup()
+    value = estimate(c, rt, observed_hits=(0, miss))
+    terms = value.components
+    assert terms["gpu_hit_fraction"] == 0 < terms["gpu_execution_fraction"] < 1
+    assert terms["gpu_experts_ms"] > 0 and terms["h2d_ms"] > 0
+    assert (terms["storage_ms"] > 0) == bool(miss)
+    assert value.tokens_per_second == pytest.approx(
+        1000
+        / sum(
+            terms[key]
+            for key in ("dense_ms", "cpu_experts_ms", "gpu_experts_ms", "storage_ms", "h2d_ms")
+        )
+    )
+    c["gpus"][0]["h2d"]["pinned"] = []
+    fallback = estimate(c, rt, observed_hits=(0, miss)).components
+    assert fallback["gpu_execution_fraction"] == fallback["h2d_ms"] == 0
+
+
 def test_scenarios_are_conditional_not_a_fitted_scalar():
     c, rt = setup()
     value = estimate(c, rt)

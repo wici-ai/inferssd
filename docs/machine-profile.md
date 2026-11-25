@@ -251,15 +251,19 @@ hold popular experts. The share of accesses at rank `r` is
 select an expert at most once. The estimate converts host and device bytes to
 whole aligned slots. Their distinct coverage lies between the larger cache's
 slot count and their sum capped at the full store. The reference uses the
-midpoint and exposes both endpoints. It charges the GPU for device hits, the CPU
-for the remaining routes, and the drive for misses in both tiers. Prefetch and
+midpoint and exposes both endpoints. Device hits run on the GPU. For RAM and
+drive sources, the estimate balances CPU service against GPU compute and pinned
+host-to-device transfer time using measured rates. The reported
+`gpu_execution_fraction` includes these transfers, priced in `h2d_ms`.
+Without a measured link or space for a device slot, host-sourced work stays
+on the CPU in the estimate. A miss in both caches also incurs a drive read. Prefetch and
 changing working sets can move the actual miss rate substantially.
 
 Small expert products also have fixed dispatch cost. When the target is smaller
 than all measured shapes of its weight format, two different measured sizes
 can supply a fixed time and a per-byte time. The measured shape remains the
 fallback. Nearest-format proxies and the dense Q8_0 matvec proxy for MoE are
-identified in the report. `uniform_serial` retains the previous comparator.
+identified in the report. `uniform_serial` uses uniform routing and the same dispatch model.
 
 **Other expert layouts.** The native SSD store describes separate gate, up and
 down tensors. Fused gate/up and nongated experts can execute in the ordinary
@@ -314,7 +318,8 @@ inferssd profile --show --estimate-gguf /models/other.gguf \
 
 **Measured accuracy.** The target was a predicted/actual ratio between 0.5 and
 2. Under the [benchmark decode window](benchmark.md#measurement-definitions), six
-4K single-GPU comparisons gave the following rates in tok/s. A single short
+4K single-GPU comparisons with the earlier cache-hit-only dispatch estimate
+gave the following rates in tok/s. A single short
 Q2_0 reference supplied 0.204 ms per layer for all five MoE estimates on that
 machine. The separate dense host's fitted residual was zero.
 

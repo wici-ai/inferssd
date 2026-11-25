@@ -442,22 +442,50 @@ def decode_estimate(
     gpu_all_s = routes * gpu_expert_s
     io_all_s = routes * experts.mean_read_bytes / drive_Bps if drive_Bps else 0.0
 
+    pinned = link_rates(characteristics, runtime)[0].get("link_gbps") if use_gpu else None
+    # The copy contains the role payloads, without the drive read's page padding.
+    copy_all_s = experts.used * routed / experts.count / (pinned * GB) if pinned else 0.0
+    if use_gpu:
+        assumptions.append(
+            "Estimated dispatch balances CPU service against GPU matvec and pinned H2D service "
+            "for ready experts. Runtime slot availability, page locking and batch refusals are "
+            "unknown; cache events measure residency only."
+            if pinned
+            else "No pinned H2D measurement; host-sourced experts are priced on the CPU."
+        )
+
     def terms(
         gpu_hit: float, storage_miss: float, legacy: bool = False
-    ) -> tuple[float, float, float]:
+    ) -> tuple[float, float, float, float, float]:
         ct = routes * legacy_cpu_expert_s if legacy else cpu_all_s
         gt = routes * legacy_gpu_expert_s if legacy else gpu_all_s
-        return ct * (1 - gpu_hit), gt * gpu_hit, io_all_s * storage_miss
+        # Balance the two lanes. Resident hits already occupy GPU time; each moved
+        # route releases CPU work and adds both a transfer and a GPU matvec.
+        moved = 0.0
+        if pinned and gpu_cache >= gpu_slot_bytes:
+            moved = max(
+                0.0, min(1 - gpu_hit, (ct * (1 - gpu_hit) - gt * gpu_hit) / (ct + gt + copy_all_s))
+            )
+        executed = gpu_hit + moved
+        return (
+            ct * (1 - executed),
+            gt * executed,
+            io_all_s * storage_miss,
+            copy_all_s * moved,
+            executed,
+        )
 
-    cpu_s, gpu_s, drive_s = terms(gpu_fraction, 1 - hit, legacy=True)
-    seconds = dense_s + cpu_s + gpu_s + drive_s
+    cpu_s, gpu_s, drive_s, copy_s, _ = terms(gpu_fraction, 1 - hit, legacy=True)
+    seconds = dense_s + cpu_s + gpu_s + copy_s + drive_s
     serial = 1 / seconds
     scenarios = {
         "uniform_serial": serial,
-        "uniform_perfect_overlap": 1 / (dense_s + max(cpu_s, gpu_s, drive_s)),
+        "uniform_perfect_overlap": 1 / (dense_s + max(cpu_s, gpu_s + copy_s, drive_s)),
     }
     disjoint_miss = 1 - min(1.0, ram_fraction + gpu_fraction)
-    scenarios["uniform_disjoint_serial"] = 1 / (dense_s + cpu_s + gpu_s + io_all_s * disjoint_miss)
+    scenarios["uniform_disjoint_serial"] = 1 / (
+        dense_s + cpu_s + gpu_s + copy_s + io_all_s * disjoint_miss
+    )
     io_low, io_high, io_samples = (
         drive_iqr(characteristics, experts, drive_key, drive_Bps) if drive_Bps else (0.0, 0.0, 0)
     )
@@ -526,24 +554,26 @@ def decode_estimate(
     details: list[dict[str, object]] = []
     lows, highs = [], []
     for name, gh, miss, legacy, parameters in cases:
-        ct, gt, it = terms(gh, miss, legacy=legacy)
-        no_overlap = 1 / (dense_s + ct + gt + it)
+        ct, gt, it, copy_s, executed = terms(gh, miss, legacy=legacy)
+        no_overlap = 1 / (dense_s + ct + gt + copy_s + it)
         # Only half of the smaller I/O/compute service time is hidden in this
         # intermediate scenario; the optimistic endpoint allows full overlap.
-        partial = 1 / (dense_s + ct + gt + it - 0.5 * min(it, ct + gt))
+        partial = 1 / (dense_s + ct + gt + copy_s + it - 0.5 * min(it, ct + gt + copy_s))
         slow_io = it * drive_Bps / io_low if it else 0.0
         fast_io = it * drive_Bps / io_high if it else 0.0
-        slow_cpu = routes * (cpu_slow or cpu_expert_s) * (1 - gh)
-        fast_cpu = routes * (cpu_fast or cpu_expert_s) * (1 - gh)
-        slow_gpu, fast_gpu = routes * gpu_slow_s * gh, routes * gpu_fast_s * gh
-        low = min(no_overlap, 1 / (dense_slow + slow_cpu + slow_gpu + slow_io))
-        high = max(no_overlap, 1 / (dense_fast + max(fast_cpu, fast_gpu, fast_io)))
+        slow_cpu = routes * (cpu_slow or cpu_expert_s) * (1 - executed)
+        fast_cpu = routes * (cpu_fast or cpu_expert_s) * (1 - executed)
+        slow_gpu, fast_gpu = routes * gpu_slow_s * executed, routes * gpu_fast_s * executed
+        low = min(no_overlap, 1 / (dense_slow + slow_cpu + slow_gpu + copy_s + slow_io))
+        high = max(no_overlap, 1 / (dense_fast + max(fast_cpu, fast_gpu + copy_s, fast_io)))
         scenarios[name + "_serial"] = no_overlap
         details.append(
             {
                 "name": name,
                 **parameters,
                 "gpu_hit_fraction": gh,
+                "gpu_execution_fraction": executed,
+                "h2d_ms": copy_s * 1e3,
                 "disk_miss_fraction": miss,
                 "cpu_experts_ms": ct * 1e3,
                 "gpu_experts_ms": gt * 1e3,
@@ -556,8 +586,8 @@ def decode_estimate(
         )
         lows.append(low)
         highs.append(high)
-    cpu_s, gpu_s, drive_s = terms(gpu_hit, disk_miss)
-    seconds = dense_s + cpu_s + gpu_s + drive_s
+    cpu_s, gpu_s, drive_s, copy_s, executed = terms(gpu_hit, disk_miss)
+    seconds = dense_s + cpu_s + gpu_s + copy_s + drive_s
     drive_detail = (
         f"{disk_miss:.0%} from the drive at {drive_gbps:.2f} GB/s {drive_s * 1e3:.0f} ms"
         if drive_gbps is not None
@@ -567,7 +597,7 @@ def decode_estimate(
         f"{seconds * 1e3:.0f} ms a token: dense {dense_s * 1e3:.0f} ms"
         + (f" ({spill / GB:.1f} GB of it from the drive)" if spill else "")
         + f", CPU experts {cpu_s * 1e3:.0f} ms, GPU experts {gpu_s * 1e3:.0f} ms, "
-        f"{drive_detail} "
+        f"H2D {copy_s * 1e3:.0f} ms, {drive_detail} "
         f"(a {cache / GB:.1f} GB cache of {routed / GB:.0f} GB of experts); "
         f"{route_detail}"
     )
@@ -584,6 +614,8 @@ def decode_estimate(
             "host_cache_capacity_bytes": float(cache),
             "gpu_cache_capacity_bytes": float(gpu_cache),
             "gpu_hit_fraction": gpu_hit,
+            "gpu_execution_fraction": executed,
+            "h2d_ms": copy_s * 1e3,
             "storage_miss_fraction": disk_miss,
             "uniform_gpu_hit_fraction": gpu_fraction,
             "uniform_storage_miss_fraction": 1 - hit,
