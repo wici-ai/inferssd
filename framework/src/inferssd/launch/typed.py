@@ -402,7 +402,13 @@ def _resolve(
         raise ValueError("missing chat template: " + template)
     if configured is None:
         text = s.text("read_text", spec.settings_file) if spec.settings_file else None
-        value = parse(text, spec.settings_file or "", overrides=spec.overrides, platform=platform)
+        value = parse(
+            text,
+            spec.settings_file or "",
+            overrides=spec.overrides,
+            platform=platform,
+            warn=lambda message: s.emit(message + "\n", "stderr"),
+        )
     else:
         value = configured
     if value.platform != platform:

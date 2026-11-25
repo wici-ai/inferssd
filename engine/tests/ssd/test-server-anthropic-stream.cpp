@@ -84,7 +84,7 @@ static void write_model(const fs::path & path) {
     require(gguf_write_to_file(model.get(), path.string().c_str(), false), "could not write stream fixture");
 }
 
-enum class outcome { normal, early_error, late_error };
+enum class outcome { normal, early_error, late_error, message_error };
 
 struct wire_probe {
     std::mutex mutex;
@@ -114,6 +114,23 @@ struct wire_probe {
         begin->res_type = TASK_RESPONSE_TYPE_ANTHROPIC;
         queue.send(std::move(begin));
 
+        const auto send_text = [&] {
+            auto partial = std::make_unique<server_task_result_cmpl_partial>();
+            partial->id = request.id;
+            partial->index = request.index;
+            partial->res_type = TASK_RESPONSE_TYPE_ANTHROPIC;
+            partial->content = "Ready.";
+            partial->n_decoded = 1;
+            partial->oaicompat_model = "test-model";
+            partial->oaicompat_cmpl_id = "wire-test";
+            queue.send(std::move(partial));
+        };
+        if (scenario == outcome::message_error) {
+            send_text();
+            fail();
+            return;
+        }
+
         // Cap the wait even if the stream stopped sending heartbeat events.
         {
             std::unique_lock<std::mutex> lock(mutex);
@@ -125,15 +142,7 @@ struct wire_probe {
             return;
         }
 
-        auto partial = std::make_unique<server_task_result_cmpl_partial>();
-        partial->id = request.id;
-        partial->index = request.index;
-        partial->res_type = TASK_RESPONSE_TYPE_ANTHROPIC;
-        partial->content = "Ready.";
-        partial->n_decoded = 1;
-        partial->oaicompat_model = "test-model";
-        partial->oaicompat_cmpl_id = "wire-test";
-        queue.send(std::move(partial));
+        send_text();
 
         auto final = std::make_unique<server_task_result_cmpl_final>();
         final->id = request.id;
@@ -181,13 +190,24 @@ struct wire_probe {
         require(response->status == 200 &&
                 response->get_header_value("Content-Type").find("text/event-stream") == 0,
                 "slot-start did not open an SSE response");
-        if (scenario == outcome::late_error) {
-            const auto error = received.find("event: error\n");
-            require(pings >= 1 && error != std::string::npos && received.find(ping) < error,
-                    "late error must follow the ping inside the HTTP 200 stream");
-            require(received.find("\"type\":\"error\",\"error\":") != std::string::npos &&
-                    received.find("scripted request error") != std::string::npos,
-                    "late error did not use the Anthropic envelope");
+        if (scenario == outcome::late_error || scenario == outcome::message_error) {
+            constexpr char event[] = "event: error\ndata: ";
+            const auto error = received.find(event);
+            require(error != std::string::npos, "missing SSE error");
+            if (scenario == outcome::late_error) {
+                require(pings >= 1 && received.find(ping) < error,
+                        "late error must follow the ping inside the HTTP 200 stream");
+            } else {
+                require(pings == 0 && received.find("event: message_start\n") < error,
+                        "error must follow the message on the stream with no pings");
+            }
+            const auto start = error + sizeof(event) - 1;
+            const auto end = received.find("\n\n", start);
+            require(end != std::string::npos, "incomplete SSE error");
+            const auto payload = json::parse(received.substr(start, end - start));
+            require(payload.value("type", "") == "invalid_request_error" &&
+                    payload.value("message", "") == "scripted request error" && !payload.contains("error"),
+                    "streamed error changed the inherited Anthropic payload");
             return;
         }
 
@@ -249,6 +269,7 @@ static void test_wire(const fs::path & model) {
     httplib::Client client("127.0.0.1", http.port);
     client.set_read_timeout(9s);
     probe.check(client, outcome::early_error);
+    probe.check(client, outcome::message_error);
     probe.check(client, outcome::normal);
     probe.check(client, outcome::late_error);
 }

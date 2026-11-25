@@ -3995,7 +3995,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
                         {"event", "error"},
-                        {"data", {{"type", "error"}, {"error", res_json}}},
+                        {"data", res_json},
                     });
                 } else {
                     return format_oai_sse(json {{ "error", res_json }});
