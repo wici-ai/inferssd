@@ -1273,6 +1273,8 @@ json oaicompat_chat_params_parse(
     // environment block and the writable root of Codex that is its cwd, and stand-ins take the place of the
     // identifiers of the user and the session, so that the context an app starts every conversation with is the same
     // prompt (see inferssd/identifiers.h).
+    const bool user_context_system = json_value(body, SERVER_USER_CONTEXT_SYSTEM_MESSAGE, false);
+    body.erase(SERVER_USER_CONTEXT_SYSTEM_MESSAGE);
     if (body.contains("messages")) {
         server_strip_anthropic_billing_header(body.at("messages"));
         server_strip_claude_env_user_lines(body.at("messages"));
@@ -1496,6 +1498,9 @@ json oaicompat_chat_params_parse(
 
     // The leading system messages with the tools: what every conversation with this setup starts with. Rendered on
     // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
+    // When the last of them holds the user's context (SERVER_USER_CONTEXT_SYSTEM_MESSAGE), the shared prefix is the
+    // app's own system message with the tools, which every user of the app starts with, and the context prefix is
+    // all of them, which the users with the same context start with: the server keeps a state at both.
     // The user messages that follow them, up to the first reply, open the conversation: every later state of it
     // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
@@ -1515,15 +1520,59 @@ json oaicompat_chat_params_parse(
             return 0;
         };
 
+        // For templates that merge the leading system messages into one turn (Qwen3.6), where the first n messages
+        // rendered on their own end the turn that the prompt goes on with the user's context: if the text they
+        // share with the prompt holds all of the app's text, its length up to the start of its last line; 0
+        // otherwise. A line start is where tokenizers start a token, so that prefix tokenizes as in the prompt.
+        const auto merged_prefix_chars = [&](size_t n) -> size_t {
+            common_chat_templates_inputs prefix_inputs = inputs;
+            prefix_inputs.messages.resize(n);
+            prefix_inputs.add_generation_prompt = false;
+            std::string prefix;
+            try {
+                prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+            } catch (const std::exception &) {
+                return 0;
+            }
+            const std::string & prompt = chat_params.prompt;
+            size_t common = 0;
+            while (common < prefix.size() && common < prompt.size() && prefix[common] == prompt[common]) {
+                ++common;
+            }
+            // templates may trim a message's text, so its end is looked for without trailing white space
+            const std::string & content = inputs.messages[n - 1].content;
+            const std::string text = content.substr(0, content.find_last_not_of(" \t\r\n") + 1);
+            const std::string tail = text.substr(text.size() - std::min<size_t>(text.size(), 64));
+            const size_t at = tail.empty() ? std::string::npos : prefix.rfind(tail);
+            if (at == std::string::npos || at + tail.size() > common) {
+                return 0;
+            }
+            const size_t line = prompt.rfind('\n', common - 1);
+            return line == std::string::npos ? 0 : line + 1;
+        };
+
         size_t n_system = 0;
         while (n_system < inputs.messages.size() &&
                 (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
             ++n_system;
         }
         if (n_system > 0 && n_system < inputs.messages.size()) {
-            const size_t n_chars = prefix_chars(n_system);
+            size_t n_chars = 0;
+            size_t n_context_chars = 0;
+            if (user_context_system && n_system == 2) {
+                n_chars = prefix_chars(1);
+                if (n_chars == 0) {
+                    n_chars = merged_prefix_chars(1);
+                }
+                n_context_chars = prefix_chars(n_system);
+            } else {
+                n_chars = prefix_chars(n_system);
+            }
             if (n_chars > 0) {
                 llama_params["shared_prefix_chars"] = n_chars;
+                if (n_context_chars > n_chars) {
+                    llama_params["context_prefix_chars"] = n_context_chars;
+                }
 
                 size_t n_opening = n_system;
                 while (n_opening < inputs.messages.size() && inputs.messages[n_opening].role == "user") {

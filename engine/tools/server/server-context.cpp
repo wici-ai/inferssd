@@ -50,8 +50,9 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 
-// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
-// "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
+// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars",
+// "context_prefix_chars" or "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes
+// to a prefix of the
 // prompt's tokens; 0 otherwise.
 static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens,
         const char * key) {
@@ -1353,6 +1354,11 @@ private:
         } else if (task.n_shared_prefix > int64_t(n_before)) {
             task.n_shared_prefix = int64_t(n_before);
         }
+        if (task.n_context_prefix >= replaced_end) {
+            task.n_context_prefix += delta;
+        } else if (task.n_context_prefix > int64_t(n_before)) {
+            task.n_context_prefix = 0; // ends inside the replaced text: unknown
+        }
         if (task.n_conversation_prefix >= replaced_end) {
             task.n_conversation_prefix += delta;
         } else if (task.n_conversation_prefix > int64_t(n_before)) {
@@ -2151,15 +2157,17 @@ private:
     // end of the prompt part other conversations share (the leading system messages and tools,
     // task->n_shared_prefix), a few tokens before the end of the prompt (the generation prompt may be rendered
     // differently in the next turn) and every checkpoint_every_nt tokens, each rounded down to a position the memory
-    // can save. The shared prefix also goes to the prompt cache, where a conversation started later, or after a
-    // restart, finds it.
+    // can save, and the end of the leading system messages with the user's context (task->n_context_prefix) when
+    // the shared prefix ends before it. The shared and the context prefix also go to the prompt cache, where a
+    // conversation started later, or after a restart, finds them.
     void checkpoint_decoded_prompt(server_slot & slot) {
         const int64_t n0 = slot.prompt_batch.n0;
         const int64_t n1 = slot.prompt_batch.n1;
         slot.prompt_batch.row_end = -1;
 
-        const int64_t align    = checkpoint_at_align;
-        const int64_t n_shared = slot.task->n_shared_prefix - slot.task->n_shared_prefix % align;
+        const int64_t align     = checkpoint_at_align;
+        const int64_t n_shared  = slot.task->n_shared_prefix - slot.task->n_shared_prefix % align;
+        const int64_t n_context = slot.task->n_context_prefix - slot.task->n_context_prefix % align;
 
         std::vector<int64_t> at;
         const auto want = [&](int64_t n) {
@@ -2170,6 +2178,9 @@ private:
         };
         if (n_shared > 0) {
             want(n_shared);
+        }
+        if (n_context > n_shared) {
+            want(n_context);
         }
         if (n1 == slot.task->n_tokens()) {
             want(n1 - 4);
@@ -2184,7 +2195,7 @@ private:
         at.erase(std::unique(at.begin(), at.end()), at.end());
 
         for (const int64_t n : at) {
-            const bool shared = n == n_shared;
+            const bool shared = n == n_shared || (n == n_context && n_context > n_shared);
             // no need to create checkpoints that are too close together
             if (!shared && !slot.prompt.checkpoints.empty() && n <= slot.prompt.checkpoints.back().n_tokens + 64) {
                 continue;
@@ -3229,8 +3240,10 @@ private:
                         // checkpoint_decoded_prompt() keeps. Upstream also stops n_ubatch tokens earlier
                         // (ggml-org/llama.cpp#20288), for a checkpoint that the end one replaces at once with
                         // --ctx-checkpoints 1; each extra prompt batch streams the experts again.
-                        if (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
-                                                                       slot.task->n_shared_prefix, n_batch)) {
+                        if (do_checkpoint && (server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->n_shared_prefix, n_batch) ||
+                                              server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->n_context_prefix, n_batch))) {
                             break;
                         }
                     }
@@ -3238,9 +3251,13 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
-                    // the batch starts at the end of the shared prefix, where the one before it stopped
-                    const bool at_shared = do_checkpoint && slot.task->n_shared_prefix >= 64 &&
-                        slot.prompt.n_tokens() - n_tokens_cur == slot.task->n_shared_prefix;
+                    // the batch starts at the end of the shared prefix or of the context prefix, where the one
+                    // before it stopped
+                    const int64_t n_batch_start = slot.prompt.n_tokens() - n_tokens_cur;
+                    const int64_t n_at_shared   = !do_checkpoint ? 0 :
+                        slot.task->n_shared_prefix >= 64 && n_batch_start == slot.task->n_shared_prefix ? slot.task->n_shared_prefix :
+                        slot.task->n_context_prefix > slot.task->n_shared_prefix && slot.task->n_context_prefix >= 64 &&
+                            n_batch_start == slot.task->n_context_prefix ? slot.task->n_context_prefix : 0;
 
                     if (checkpoint_after_decode && n_tokens_cur > 0 && !has_mtmd) {
                         slot.prompt_batch.n0      = slot.prompt.n_tokens() - n_tokens_cur;
@@ -3263,8 +3280,8 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
-                        if (at_shared || slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
-                            // after the shared prefix, or near the end of the prompt
+                        if (n_at_shared > 0 || slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                            // after the shared or the context prefix, or near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
                             // only do non-end checkpoints if the "checkpoint every n tokens" option is set
@@ -3307,8 +3324,8 @@ private:
                     }
                     // The state is still the one after the shared prefix, computed by this task rather than reused
                     // (the prompt cache holds those already); a later checkpoint may push its own out.
-                    if (at_shared && slot.n_prompt_tokens_cache < slot.task->n_shared_prefix && pos_min >= 0 && !has_mtmd) {
-                        keep_shared_prefix(slot, slot.task->n_shared_prefix, true);
+                    if (n_at_shared > 0 && slot.n_prompt_tokens_cache < n_at_shared && pos_min >= 0 && !has_mtmd) {
+                        keep_shared_prefix(slot, n_at_shared, true);
                     }
                 }
 
@@ -3848,6 +3865,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
+        int64_t n_context_prefix = 0;
         int64_t n_conversation_prefix = 0;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
@@ -3866,6 +3884,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             n_shared_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
                     "shared_prefix_chars");
             if (n_shared_prefix > 0) {
+                n_context_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                        "context_prefix_chars");
                 n_conversation_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
                         "conversation_prefix_chars");
             }
@@ -3883,6 +3903,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.n_shared_prefix = n_shared_prefix;
+            task.n_context_prefix = n_context_prefix > n_shared_prefix ? n_context_prefix : 0;
             task.n_conversation_prefix = n_conversation_prefix;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
