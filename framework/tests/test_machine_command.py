@@ -14,7 +14,7 @@ import pytest
 from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
-from test_strategy_inputs import Q4_K, Q8_0, engine_facts
+from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts
 
 from inferssd.app import catalog
 from inferssd.cli import main
@@ -438,6 +438,42 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
     full = sum(t["bytes"] for t in raw["tensors"])
     assert result["components"]["graph_expert_store_bytes"] == full
     assert result["components"]["dense_read_bytes"] == full // 4
+
+
+@pytest.mark.parametrize(
+    ("architecture", "extra_tensor", "refusal"),
+    [
+        ("qwen3moe", None, "no routed SSD executor"),
+        ("gemma4", None, "no routed SSD executor"),
+        ("qwen35moe", "ffn_up_exps.scale", "unsupported per-expert scales"),
+        ("qwen4exp", "ffn_gate_up_exps.weight", "fused gate/up"),
+        ("qwen35moe", None, ""),
+    ],
+)
+def test_explicit_target_requires_a_supported_ssd_path(
+    tmp_path, architecture, extra_tensor, refusal
+):
+    host, paths, build = machine(tmp_path)
+    model = json.loads(ENGINE_FIXTURE.read_text())
+    model["architecture"] = architecture
+    if extra_tensor:
+        model["tensors"].append(dict(model["tensors"][-1], name="blk.0." + extra_tensor))
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps(model))
+    code, out, _ = execute(
+        ["--build", str(build), "--model", paths[0], "--estimate-facts", str(facts), "--json"],
+        host,
+        FakeRunner(replies()),
+        tmp_path,
+    )
+    (row,) = json.loads(out[0])["estimates"]
+    assert code == 0
+    if refusal:
+        assert row["decode_tokens_per_second"] is None
+        assert refusal in row["detail"]
+        assert not row["scenarios"]
+    else:
+        assert row["decode_tokens_per_second"] == row["scenarios"]["rank_serial"] > 0
 
 
 def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):

@@ -12,12 +12,13 @@ from collections.abc import Callable, Mapping
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from inferssd.app import catalog
 from inferssd.contracts import ContractError
 from inferssd.engine import model as engine_model
 from inferssd.launch.resources import executable, installed_resources, read_resources
+from inferssd.launch.typed import SSD_ARCHITECTURES
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
     STORAGE_PREFIX,
@@ -219,6 +220,27 @@ def summary(value: Characteristics, path: Path) -> list[str]:
     return lines
 
 
+def ssd_target_refusal(raw: Mapping[str, Any]) -> Optional[str]:
+    """Reject SSD paths that the model header rules out before pricing the target."""
+    layout = raw["experts"]
+    if layout is None:
+        return None
+    architecture = raw["architecture"]
+    if architecture not in SSD_ARCHITECTURES:
+        return f"the engine has no routed SSD executor for architecture {architecture}"
+    if architecture in ("qwen35moe", "qwen4exp"):
+        # These graph builders prefer fused gate/up and pass per-expert scales
+        # to the adapter. The SSD adapter accepts separate, unscaled roles.
+        names = {tensor["name"] for tensor in raw["tensors"]}
+        for layer in range(raw["layers"]):
+            prefix = f"blk.{layer}.ffn_"
+            if prefix + "gate_up_exps.weight" in names:
+                return f"SSD expert layer {layer} uses fused gate/up weights"
+            if any(prefix + role + "_exps.scale" in names for role in ("gate", "up", "down")):
+                return f"SSD expert layer {layer} uses unsupported per-expert scales"
+    return None
+
+
 def estimates(
     value: Characteristics,
     drive_key: Optional[str],
@@ -230,8 +252,11 @@ def estimates(
     target: Optional[catalog.Model] = None,
     weights: Optional[DenseWeights] = None,
     observed_hits: Optional[tuple[float, float]] = None,
+    target_refusal: Optional[str] = None,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
+    if target and target_refusal:
+        return [(target, Estimate(None, target_refusal))]
     reason = "pass --model with the directory that holds the models"
     models = (target,) if target else catalog.MODELS
     if drive_key is not None or target is not None:
@@ -384,6 +409,7 @@ def run(
                 "or pass --build DIR or --resources FILE"
             )
     target = None
+    target_refusal = None
     weights = None
     observed_hits = None
     target_layers = 0
@@ -422,6 +448,7 @@ def run(
                     layout["used"],
                 )
         target_layers = raw["layers"]
+        target_refusal = ssd_target_refusal(raw)
         facts = facts_from_engine(raw)
         weights = dense_weights(raw)
         read_bytes = weights.active_bytes
@@ -450,6 +477,7 @@ def run(
                 target=target,
                 weights=weights,
                 observed_hits=observed_hits,
+                target_refusal=target_refusal,
             )
             if args.calibrate_from or args.calibration:
                 key = calibration.machine_key(value, estimate_runtime())

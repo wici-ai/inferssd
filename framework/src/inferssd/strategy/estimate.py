@@ -270,6 +270,36 @@ def tier_gpu(
     return gpu, room, gpu.get("decode_compute", [])
 
 
+def moved_fraction(
+    used: int, hit: float, slots: int, cpu_s: float, gpu_s: float, copy_s: float
+) -> float:
+    """Expected whole-expert moves per route, for the mean number of hits in a layer."""
+    if not copy_s or slots == 0:
+        return 0.0
+
+    def best_moves(resident: int) -> int:
+        # Ready host experts are copied as one group. Resident GPU work can run
+        # during those copies, then the GPU computes the group. Prefer fewer
+        # moves on a tie, as the native ready-expert planner does.
+        host = used - resident
+        limit = min(host, max(0, slots - resident))
+
+        def finish(moved: int) -> float:
+            cpu = (host - moved) * cpu_s
+            gpu = max(resident * gpu_s, moved * copy_s) + moved * gpu_s
+            return max(cpu, gpu)
+
+        return min(range(limit + 1), key=finish)
+
+    hits = used * hit
+    lower = math.floor(hits)
+    fraction = hits - lower
+    moved = best_moves(lower)
+    if fraction:
+        return (moved + fraction * (best_moves(lower + 1) - moved)) / used
+    return moved / used
+
+
 def decode_estimate(
     characteristics: Characteristics,
     model: ModelFacts,
@@ -437,19 +467,18 @@ def decode_estimate(
     gpu_fraction = min(1.0, gpu_cache / routed)
     # A VRAM copy may also occupy RAM: summing the two capacities double-counts it.
     hit = max(ram_fraction, gpu_fraction)
-    routes = experts.layers * experts.used
-    cpu_all_s = routes * cpu_expert_s
-    gpu_all_s = routes * gpu_expert_s
+    top_k = experts.used
+    routes = experts.layers * top_k
     io_all_s = routes * experts.mean_read_bytes / drive_Bps if drive_Bps else 0.0
 
     pinned = link_rates(characteristics, runtime)[0].get("link_gbps") if use_gpu else None
     # The copy contains the role payloads, without the drive read's page padding.
-    copy_all_s = experts.used * routed / experts.count / (pinned * GB) if pinned else 0.0
+    copy_expert_s = routed / total_slots / (pinned * GB) if pinned else 0.0
     if use_gpu:
         assumptions.append(
-            "Estimated dispatch balances CPU service against GPU matvec and pinned H2D service "
-            "for ready experts. Runtime slot availability, page locking and batch refusals are "
-            "unknown; cache events measure residency only."
+            "Dispatch chooses whole ready experts per layer, including zero moves. Fractional "
+            "mean hit counts mix the two adjacent integer counts. Slot capacity bounds moves; "
+            "live free slots, page locking and read readiness are unknown."
             if pinned
             else "No pinned H2D measurement; host-sourced experts are priced on the CPU."
         )
@@ -457,21 +486,15 @@ def decode_estimate(
     def terms(
         gpu_hit: float, storage_miss: float, legacy: bool = False
     ) -> tuple[float, float, float, float, float]:
-        ct = routes * legacy_cpu_expert_s if legacy else cpu_all_s
-        gt = routes * legacy_gpu_expert_s if legacy else gpu_all_s
-        # Balance the two lanes. Resident hits already occupy GPU time; each moved
-        # route releases CPU work and adds both a transfer and a GPU matvec.
-        moved = 0.0
-        if pinned and gpu_cache >= gpu_slot_bytes:
-            moved = max(
-                0.0, min(1 - gpu_hit, (ct * (1 - gpu_hit) - gt * gpu_hit) / (ct + gt + copy_all_s))
-            )
+        cpu = legacy_cpu_expert_s if legacy else cpu_expert_s
+        gpu = legacy_gpu_expert_s if legacy else gpu_expert_s
+        moved = moved_fraction(top_k, gpu_hit, gpu_slots, cpu, gpu, copy_expert_s)
         executed = gpu_hit + moved
         return (
-            ct * (1 - executed),
-            gt * executed,
+            routes * cpu * (1 - executed),
+            routes * gpu * executed,
             io_all_s * storage_miss,
-            copy_all_s * moved,
+            routes * copy_expert_s * moved,
             executed,
         )
 

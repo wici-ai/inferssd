@@ -18,6 +18,7 @@ from inferssd.strategy.estimate import (
     dense_decode_estimate,
     format_proxies,
     matvec_rate,
+    moved_fraction,
 )
 from inferssd.strategy.inputs import GPUState, RuntimeFacts
 from inferssd.strategy.weights import dense_weights
@@ -168,6 +169,29 @@ def test_host_sourced_experts_can_run_on_gpu_without_a_vram_hit(miss):
     c["gpus"][0]["h2d"]["pinned"] = []
     fallback = estimate(c, rt, observed_hits=(0, miss)).components
     assert fallback["gpu_execution_fraction"] == fallback["h2d_ms"] == 0
+
+
+@pytest.mark.parametrize(("link_gbps", "moves"), [(10, 0), (100, 3)])
+def test_observed_ram_hits_choose_whole_experts_per_layer(link_gbps, moves):
+    c, rt = setup()
+    for row in c["gpus"][0]["h2d"]["pinned"]:
+        row["Bps"] = link_gbps * 1e9
+    terms = estimate(c, rt, observed_hits=(0, 0)).components
+    experts = MODEL.facts.experts
+    assert experts.used == 6
+    assert terms["gpu_hit_fraction"] == terms["storage_ms"] == 0
+    assert terms["gpu_execution_fraction"] == moves / experts.used
+    payload = experts.routed_bytes / (experts.layers * experts.count)
+    assert terms["h2d_ms"] == pytest.approx(experts.layers * moves * payload / (link_gbps * 1e6))
+
+
+def test_dispatch_respects_slots_and_preserves_mean_hits():
+    # One slot: empty layers can move one expert; a layer with a resident cannot.
+    assert moved_fraction(6, 0, 1, 1.0, 0.1, 0.2) == 1 / 6
+    assert moved_fraction(6, 1 / 6, 1, 1.0, 0.1, 0.2) == 0
+    assert moved_fraction(6, 0.5 / 6, 1, 1.0, 0.1, 0.2) == 0.5 / 6
+    # Moving the one host expert would tie the CPU time.
+    assert moved_fraction(1, 0, 1, 3.0, 1.0, 2.0) == 0
 
 
 def test_scenarios_are_conditional_not_a_fitted_scalar():

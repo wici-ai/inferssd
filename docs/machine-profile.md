@@ -242,6 +242,9 @@ times, `assumptions` records proxies, and `scenarios` lets readers compare
 routing and overlap assumptions. The reported range spans those scenarios
 without assigning probabilities. `--memory-gib`, `--host-work-mib` and
 `--gpu-work-mib` set available host memory and known working allocations.
+For an explicit target, a separated expert layout also needs a supported SSD
+execution path. If the header rules out that path, the JSON row gives a null
+speed and the reason.
 
 **Routed experts.** The old capacity-only estimate treated a cache with space
 for 10% of the expert store as serving 10% of the routes. Hot experts can serve
@@ -251,10 +254,12 @@ hold popular experts. The share of accesses at rank `r` is
 select an expert at most once. The estimate converts host and device bytes to
 whole aligned slots. Their distinct coverage lies between the larger cache's
 slot count and their sum capped at the full store. The reference uses the
-midpoint and exposes both endpoints. Device hits run on the GPU. For RAM and
-drive sources, the estimate balances CPU service against GPU compute and pinned
-host-to-device transfer time using measured rates. The reported
-`gpu_execution_fraction` includes these transfers, priced in `h2d_ms`.
+midpoint and exposes both endpoints. Device hits run on the GPU. For ready
+host-sourced experts, the estimate compares moving zero or more whole experts
+in each layer and chooses the fewest moves that minimize completion time. A
+fractional mean number of resident hits interpolates between its neighboring
+integer counts. `gpu_execution_fraction` includes experts moved to the GPU,
+and `h2d_ms` prices their payload at the measured pinned link rate.
 Without a measured link or space for a device slot, host-sourced work stays
 on the CPU in the estimate. A miss in both caches also incurs a drive read. Prefetch and
 changing working sets can move the actual miss rate substantially.
