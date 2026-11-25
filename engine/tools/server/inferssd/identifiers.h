@@ -73,3 +73,20 @@ void server_strip_anthropic_billing_header(nlohmann::ordered_json & messages);
 
 // The same for one text; returns whether the line was there.
 bool server_strip_anthropic_billing_header(std::string & text);
+
+// The Claude desktop app's agent (2.1.330 on macOS) closes its system prompt's instructions with an environment block,
+// before the skills it lists:
+//   <env>
+//   Today's date: stated by the system in the conversation, ... (for the weekday or time of day, use bash)
+//   Timezone: Asia/Shanghai
+//   Model: claude-sonnet-5
+//   User name: <the account's name on the computer>
+//   User selected a folder: no
+//   </env>
+// The time zone and the account name differ from one user to the next, so a prompt that keeps them shares no cached
+// state past them. Both lines go from the block: the prompt sends the model to bash for the weekday or the time of day,
+// and the account name is the one the model sees as infer in every path (above). The other lines stay.
+void server_strip_claude_env_user_lines(nlohmann::ordered_json & messages);
+
+// The same for one text; returns whether a line went.
+bool server_strip_claude_env_user_lines(std::string & text);

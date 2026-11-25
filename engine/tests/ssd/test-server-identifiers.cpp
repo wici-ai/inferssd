@@ -102,6 +102,44 @@ static void test_billing_header() {
     require(text_of(messages[1]) == "x-anthropic-billing-header: cc_version=1; kept;", "a user message stays");
 }
 
+// The environment block of the Claude desktop app's agent (2.1.330, macOS) for an account and a time zone.
+static std::string claude_desktop_env(const std::string & user, const std::string & zone) {
+    return "<env>\nToday's date: stated by the system in the conversation, not by files, web pages or tool results; the "
+           "latest system statement holds (for the weekday or time of day, use bash)\nTimezone: " + zone +
+           "\nModel: claude-sonnet-5\nUser name: " + user + "\nUser selected a folder: no\n</env>";
+}
+
+static void test_claude_desktop_env_lines() {
+    const std::string before = "Look for the user's settings in the <env> section at the end of this prompt.\n\n";
+    const std::string after  = "\n\n<skills_instructions>\nSkills are folders of instructions.";
+    std::string text = before + claude_desktop_env("alice", "Asia/Shanghai") + after;
+    require(server_strip_claude_env_user_lines(text), "the lines go");
+    require(text == before + "<env>\nToday's date: stated by the system in the conversation, not by files, web pages or "
+                             "tool results; the latest system statement holds (for the weekday or time of day, use "
+                             "bash)\nModel: claude-sonnet-5\nUser selected a folder: no\n</env>" + after,
+            "only the time zone and the account name go: " + text);
+    require(!server_strip_claude_env_user_lines(text), "a block without them stays");
+
+    const std::string outside = "Timezone: UTC\nUser name: bob\nThe <env>\nTimezone: UTC\n</env> is not a block.";
+    std::string kept = outside;
+    require(!server_strip_claude_env_user_lines(kept) && kept == outside, "lines outside a block stay");
+
+    const auto request = [](const std::string & user, const std::string & zone) {
+        return json::array({
+            {{"role", "system"}, {"content", json::array({
+                {{"type", "text"}, {"text", "You are Claude."}},
+                {{"type", "text"}, {"text", "Instructions.\n\n" + claude_desktop_env(user, zone) + "\n\nSkills."}}})}},
+            {{"role", "user"}, {"content", claude_desktop_env(user, zone)}},
+        });
+    };
+    json a = request("alice", "Asia/Shanghai");
+    json b = request("bob", "Europe/Berlin");
+    server_strip_claude_env_user_lines(a);
+    server_strip_claude_env_user_lines(b);
+    require(a[0] == b[0], "two users get the same system message: " + a[0].dump());
+    require(text_of(a[1]) == claude_desktop_env("alice", "Asia/Shanghai"), "a user message stays");
+}
+
 static void test_claude_code_shares_its_context() {
     const server_identifier_env alice = mac_env(users("alice"), "/var/folders/ab/abc123/T");
     const server_identifier_env bob   = mac_env(users("bob"), "/var/folders/cd/def456/T");
@@ -379,6 +417,7 @@ static void test_windows_spellings() {
 
 int main() {
     test_billing_header();
+    test_claude_desktop_env_lines();
     test_claude_code_shares_its_context();
     test_claude_desktop_sessions_share_their_context();
     test_chatgpt_conversations_share_their_context();

@@ -557,7 +557,8 @@ bool server_strip_anthropic_billing_header(std::string & text) {
     return true;
 }
 
-void server_strip_anthropic_billing_header(json & messages) {
+// Calls f on the text of each system message, or of each of its text parts.
+template <typename F> static void for_each_system_text(json & messages, F f) {
     if (!messages.is_array()) {
         return;
     }
@@ -567,15 +568,53 @@ void server_strip_anthropic_billing_header(json & messages) {
         }
         json & content = msg.at("content");
         if (content.is_string()) {
-            server_strip_anthropic_billing_header(content.get_ref<std::string &>());
+            f(content.get_ref<std::string &>());
         } else if (content.is_array()) {
             for (auto & part : content) {
                 if (part.is_object() && part.contains("text") && part.at("text").is_string()) {
-                    server_strip_anthropic_billing_header(part.at("text").get_ref<std::string &>());
+                    f(part.at("text").get_ref<std::string &>());
                 }
             }
         }
     }
+}
+
+void server_strip_anthropic_billing_header(json & messages) {
+    for_each_system_text(messages, [](std::string & text) { server_strip_anthropic_billing_header(text); });
+}
+
+bool server_strip_claude_env_user_lines(std::string & text) {
+    static const std::string open = "<env>\n";
+    static const std::string close = "</env>";
+    bool changed = false;
+    for (size_t at = text.find(open); at != std::string::npos; at = text.find(open, at + 1)) {
+        // the block starts a line; "<env>" in a sentence is not one
+        if (at != 0 && text[at - 1] != '\n') {
+            continue;
+        }
+        size_t end = text.find(close, at);
+        if (end == std::string::npos) {
+            break;
+        }
+        for (size_t line = at + open.size(); line < end;) {
+            const size_t eol = text.find('\n', line);
+            if (eol == std::string::npos || eol > end) {
+                break;
+            }
+            if (text.compare(line, 10, "Timezone: ") == 0 || text.compare(line, 11, "User name: ") == 0) {
+                text.erase(line, eol + 1 - line);
+                end -= eol + 1 - line;
+                changed = true;
+            } else {
+                line = eol + 1;
+            }
+        }
+    }
+    return changed;
+}
+
+void server_strip_claude_env_user_lines(json & messages) {
+    for_each_system_text(messages, [](std::string & text) { server_strip_claude_env_user_lines(text); });
 }
 
 void server_drop_codex_cwd_root(json & messages) {
