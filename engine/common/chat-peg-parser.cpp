@@ -272,7 +272,8 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     bool is_tool_args  = node.tag == common_chat_peg_builder::TOOL_ARGS;
     bool is_arg_open   = node.tag == common_chat_peg_builder::TOOL_ARG_OPEN;
     bool is_arg_close  = node.tag == common_chat_peg_builder::TOOL_ARG_CLOSE;
-    bool is_arg_name         = node.tag == common_chat_peg_builder::TOOL_ARG_NAME;
+    bool is_xtml_name        = node.tag == common_chat_peg_builder::TOOL_ARG_XTML_NAME;
+    bool is_arg_name         = node.tag == common_chat_peg_builder::TOOL_ARG_NAME || is_xtml_name;
     bool is_arg_value        = node.tag == common_chat_peg_builder::TOOL_ARG_VALUE;
     bool is_arg_raw_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_RAW_STRING_VALUE;
     bool is_arg_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_STRING_VALUE || is_arg_raw_string_value;
@@ -328,7 +329,13 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         if (arg_count > 0) {
             arg_entry = ",";
         }
-        arg_entry += ordered_json(trim(node.text)).dump() + ":";
+        std::string key(is_xtml_name ? node.text : trim(node.text));
+        if (is_xtml_name) {
+            // Reverse the checkpoint template's two substitutions, once.
+            string_replace_all(key, "&quot;", "\"");
+            string_replace_all(key, "&amp;", "&");
+        }
+        arg_entry += ordered_json(key).dump() + ":";
         ++arg_count;
 
         auto & target = args_target();

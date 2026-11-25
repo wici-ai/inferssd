@@ -54,7 +54,7 @@ static void check(const char * path) {
                     }
                     // Internal required state must come from the public choice.
                     json body = {{"messages", messages}, {"tools", tools}, {"tool_choice", choice},
-                        {"stream", stream}, {"tool_call_required", choice != "required"},
+                        {"stream", stream}, {"tool_call_required", choice != "required"}, {"parallel_tool_calls", false},
                         {"max_tokens", 64}, {"cache_prompt", false}};
                     std::vector<raw_buffer> files;
                     const auto parsed = oaicompat_chat_params_parse(body, options, files);
@@ -62,7 +62,9 @@ static void check(const char * path) {
                     require(params.chat_parser_params.parse_tool_calls == (choice != "none"), "tool parsing choice lost");
                     require(params.tool_call_required == (choice == "required"), "required choice lost in task parameters");
                     require(params.stream == stream, "stream flag changed");
-                    require(!common_grammar_needs_prefill(params.sampling.grammar), "TAGS would reject the tool request");
+                    require(common_grammar_needs_prefill(params.sampling.grammar) == (choice != "none"),
+                            "tool grammar lost at the request boundary");
+                    require(params.sampling.grammar_lazy == (choice == "auto"), "wrong grammar activation mode");
                     require(!params.chat_parser_params.parser.empty(), "specialized output parser missing");
                     require(!params.chat_parser_params.control_token_pieces.empty(), "output token provenance missing");
                     const auto prompt = parsed.at("prompt").get<std::string>();

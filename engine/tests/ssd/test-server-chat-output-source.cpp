@@ -1,6 +1,7 @@
 #include "server-task.h"
 #include "llama-cpp.h"
 #include <algorithm>
+#include <cmath>
 #include <iostream>
 #include <stdexcept>
 
@@ -123,7 +124,7 @@ int main(int argc, char ** argv) {
     {
         common_chat_templates_inputs tool_in = in;
         tool_in.tools = {{"web_search", "Search the web.",
-            R"({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"}},"required":["query"]})"}};
+            R"({"type":"object","properties":{"query":{"type":"string"},"max_results":{"type":"integer"},"R&D":{"type":"string"}},"required":["query"]})"}};
         tool_in.parallel_tool_calls = true;
         const auto tool_rendered = common_chat_templates_apply(templates.get(), tool_in);
         require(tool_rendered.prompt.find("tool-declare") != std::string::npos, "tool declaration missing from prompt");
@@ -143,7 +144,7 @@ int main(int argc, char ** argv) {
         const std::string call_end = "<|close|>call<|sep|>";
         const std::string tail = "<|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
         struct segment { std::string text; bool structural; };
-        struct tool_case { std::string name; std::vector<segment> segments; std::string content; json calls; };
+        struct tool_case { std::string name; std::vector<segment> segments; std::string content; json calls; bool parallel = true; };
         auto call = [](const std::string & query_text) {
             return json{{"name", "web_search"}, {"arguments", {{"query", query_text}}}};
         };
@@ -152,6 +153,10 @@ int main(int argc, char ** argv) {
         const std::vector<tool_case> tool_cases = {
             {"tagged-string", {{opened + tools_open + call1 + query, true}, {"Kimi K3 发布", false},
                 {arg_end + call_end + tail, true}}, "", json::array({call("Kimi K3 发布")})},
+            {"escaped-key-raw-value", {{opened + tools_open + call1 +
+                "<|open|>argument key=\"R&amp;D\" type=\"string\"<|sep|>", true}, {"  a &amp; b  ", false},
+                {arg_end + call_end + tail, true}}, "",
+                json::array({{{"name", "web_search"}, {"arguments", {{"R&D", "  a &amp; b  "}}}}})},
             {"tagged-literal-markers", {{opened + tools_open + call1 + query, true}, {literal_value, false},
                 {arg_end + call_end + tail, true}}, "", json::array({call(literal_value)})},
             {"typed-number", {{opened + tools_open + call1 + query, true}, {"Kimi", false},
@@ -164,12 +169,45 @@ int main(int argc, char ** argv) {
             {"parallel-calls", {{opened + tools_open + call1 + query, true}, {"A", false},
                 {arg_end + call_end + call2 + query, true}, {"B", false}, {arg_end + call_end + tail, true}}, "",
                 json::array({call("A"), call("B")})},
+            {"single-call-limit", {{opened + tools_open + call1 + query, true}, {"A", false},
+                {arg_end + call_end + call2 + query, true}, {"B", false}, {arg_end + call_end + tail, true}}, "",
+                json::array({call("A")}), false},
             {"content-then-call", {{opened, true}, {"我先搜索一下。", false}, {tools_open + call1 + query, true},
                 {"天气", false}, {arg_end + call_end + tail, true}}, "我先搜索一下。", json::array({call("天气")})},
             {"content-literal-tools-marker", {{opened, true}, {"字面 <|open|>tools<|sep|> 标记", false},
                 {"<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>", true}},
                 "字面 <|open|>tools<|sep|> 标记", json::array()},
         };
+        // Feed the same generated tokens that the chat completion sampler sees.
+        for (bool parallel : {false, true}) {
+            tool_in.parallel_tool_calls = parallel;
+            tool_in.tool_choice = COMMON_CHAT_TOOL_CHOICE_REQUIRED;
+            auto required = common_chat_templates_apply(templates.get(), tool_in);
+            require(!required.grammar.empty() && !required.grammar_lazy, "missing required grammar");
+            llama_sampler_ptr grammar(llama_sampler_init_grammar(vocab, required.grammar.c_str(), "root"));
+            auto allowed = [&](llama_token id) {
+                llama_token_data token = {id, 0, 0};
+                llama_token_data_array data = {&token, 1, -1, false};
+                llama_sampler_apply(grammar.get(), &data);
+                return std::isfinite(token.logit);
+            };
+            auto feed = [&](const std::string & text) {
+                for (auto id : common_tokenize(vocab, text, false, true)) {
+                    if (!allowed(id)) { return false; }
+                    llama_sampler_accept(grammar.get(), id);
+                }
+                return true;
+            };
+            require(feed(required.generation_prompt), "generation prompt rejected");
+            require(!allowed(llama_vocab_eos(vocab)), "required request accepted immediate stop");
+            require(feed(opened + tools_open + call1 + query + "abc" + arg_end + call_end),
+                    "required call rejected");
+            llama_sampler_ptr after_one(llama_sampler_clone(grammar.get()));
+            require(feed(call2 + query + "b" + arg_end + call_end) == parallel, "wrong call limit");
+            grammar.swap(after_one);
+            require(feed(tail.substr(0, tail.find("<|end_of_msg|>"))) && allowed(llama_vocab_eos(vocab)),
+                    "cannot stop after a completed call");
+        }
         auto calls_json = [](const common_chat_msg & msg) {
             json out = json::array();
             for (const auto & c : msg.tool_calls) {
@@ -180,6 +218,12 @@ int main(int argc, char ** argv) {
             return out;
         };
         for (const auto & item : tool_cases) {
+            auto params = tool_pp;
+            if (!item.parallel) {
+                tool_in.parallel_tool_calls = false;
+                tool_in.tool_choice = COMMON_CHAT_TOOL_CHOICE_AUTO;
+                params.parser.load(common_chat_templates_apply(templates.get(), tool_in).parser);
+            }
             std::string text;
             llama_tokens ids;
             common_chat_output_source source; source.valid = true;
@@ -199,7 +243,7 @@ int main(int argc, char ** argv) {
             };
             json row = {{"name", item.name}, {"text", text}, {"expected_content", item.content}, {"expected_calls", item.calls}};
             try {
-                task_result_state state(tool_pp);
+                task_result_state state(params);
                 server_task_result_cmpl_final final{};
                 final.content = text; final.stream = false; final.output_source = source;
                 final.update(state);
@@ -207,8 +251,21 @@ int main(int argc, char ** argv) {
                                     {"calls", calls_json(final.oaicompat_msg)}, {"correct", correct(final.oaicompat_msg)}};
             } catch (const std::exception & e) { row["nonstream"] = {{"correct", false}, {"error", e.what()}}; }
             try {
-                task_result_state state(tool_pp);
+                task_result_state state(params);
                 std::string pending, all, wire_content;
+                common_chat_msg wire;
+                auto collect = [&](const std::vector<common_chat_msg_diff> & diffs) {
+                    for (const auto & diff : diffs) {
+                        wire_content += diff.content_delta;
+                        if (diff.tool_call_index == std::string::npos) { continue; }
+                        if (wire.tool_calls.size() <= diff.tool_call_index) {
+                            wire.tool_calls.resize(diff.tool_call_index + 1);
+                        }
+                        auto & call = wire.tool_calls[diff.tool_call_index];
+                        call.name += diff.tool_call_delta.name;
+                        call.arguments += diff.tool_call_delta.arguments;
+                    }
+                };
                 for (size_t i = 0; i < ids.size(); ++i) {
                     const auto piece = common_token_to_piece(vocab, ids[i], true);
                     all += piece; pending += piece;
@@ -218,16 +275,16 @@ int main(int argc, char ** argv) {
                     partial.output_source.valid = true;
                     for (const auto & t : source.controls) if (t.begin < all.size()) partial.output_source.controls.push_back(t);
                     partial.update(state);
-                    for (const auto & diff : partial.oaicompat_msg_diffs) wire_content += diff.content_delta;
+                    collect(partial.oaicompat_msg_diffs);
                     pending.clear();
                 }
                 server_task_result_cmpl_final final{};
                 final.content = pending; final.stream = true; final.output_source = source;
                 final.update(state);
-                for (const auto & diff : final.oaicompat_msg_diffs) wire_content += diff.content_delta;
+                collect(final.oaicompat_msg_diffs);
                 row["stream"] = {{"content", final.oaicompat_msg.content}, {"wire_content", wire_content},
                                  {"calls", calls_json(final.oaicompat_msg)},
-                                 {"correct", correct(final.oaicompat_msg) && wire_content == item.content}};
+                                 {"correct", correct(final.oaicompat_msg) && wire_content == item.content && calls_json(wire) == item.calls}};
             } catch (const std::exception & e) { row["stream"] = {{"correct", false}, {"error", e.what()}}; }
             tool_rows.push_back(row);
         }
