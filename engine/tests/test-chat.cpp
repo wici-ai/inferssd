@@ -1893,6 +1893,15 @@ static void test_muse_spark_peg_parsers(bool detailed_debug) {
             R"({% for m in messages %}<|open|>message role="{{ m.role }}"<|sep|>{{ m.content }}<|close|>message<|sep|><|end_of_msg|>{% endfor %})"
             R"({% if add_generation_prompt %}<|open|>message role="assistant"<|sep|>{% if enable_thinking %}<|open|>think<|sep|>{% else %}<|open|>response<|sep|>{% endif %}{% endif %})";
         common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, tmpl));
+        test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+            tc.params.enable_thinking = false;
+            tc.params.tools = {{"measure", "", R"({"type":"object","properties":{"value":{"type":"number"}}})"}};
+            tc.input = "<|close|>response<|sep|><|open|>tools<|sep|>"
+                       "<|open|>call tool=\"measure\" index=\"1\"<|sep|>"
+                       "<|open|>argument key=\"value\" type=\"number\"<|sep|>-0.125<|close|>argument<|sep|>"
+                       "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
+            tc.expect = simple_assist_msg("", "", "measure", R"({"value":-0.125})");
+        }, detailed_debug);
         for (bool thinking : {false, true}) {
             test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
                 tc.params.enable_thinking = thinking;

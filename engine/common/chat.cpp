@@ -1564,7 +1564,7 @@ static common_peg_parser common_chat_kimi_k3_tool_section(common_chat_peg_builde
     // The type attribute selects the encoding: strings verbatim, other types as JSON text.
     auto typed_value  = p.choice({
         p.literal("\" type=\"string\"<|sep|>") + string_value,
-        any_type + p.tool_arg_value(p.until(ARG_CLOSE)),
+        any_type + p.tool_arg_json_value(p.until(ARG_CLOSE)),
     });
 
     auto argument = [&](const common_peg_parser & key, const common_peg_parser & value) {
