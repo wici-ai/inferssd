@@ -20,23 +20,10 @@ source tree.
    https://github.com/ggml-org/llama.cpp
    The bundled engine is based on llama.cpp revision
    f42e29fdf199481effd31f281bf095ec6067757b (upstream build b8961,
-   2026-04-28). Muse Spark model support is ported from upstream revision
-   ba3c05f71d. Q2_0 CPU format support is ported from upstream revision
-   9581154 (group-64 layout, including x86 and ARM dot products). Q2_0 CUDA
-   support is ported from upstream revision 9b2a088, adapted to
-   the bundled matrix kernels and SSD expert dispatch. Copyright (c) 2023-2026
-   The ggml authors. MIT (engine/LICENSE).
-
-   The stable CPU softplus formula in engine/ggml/src/ggml-cpu/unary-ops.cpp
-   follows ggml-org/llama.cpp revision 9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e
-   under the same MIT license, using log1pf(expf(x)) to retain the negative
-   tail while preserving the existing positive-input fast path.
-
-   A model's extra GGUF shards (--shard, --ple) are ported from that same
-   upstream revision: the option in engine/common/arg.cpp, the model's paths in
-   engine/common/common.h, common.cpp and fit.cpp, and the loading of shards
-   given by path, including a table kept outside a split model, in
-   engine/src/llama-model-loader.cpp.
+   2026-04-28). Code from later upstream revisions, such as support for newer
+   models and tensor formats, is ported into the engine under the same notice;
+   the commit that ports a change names its upstream commit. Copyright (c)
+   2023-2026 The ggml authors. MIT (engine/LICENSE).
 
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
@@ -53,23 +40,6 @@ source tree.
    latter two originate in upstream llama.cpp pull requests 24162 and 25585.
    Copyright (c) 2023-2026 The ggml authors. The MIT permission notice below
    applies.
-
-   The DeepSeek-V4.1 Engram hash (its stops at the start of a sequence and at
-   tokens the token map marks -1) and gate in
-   engine/src/models/deepseek41-engram.h, the skipped Engram of an embedding
-   batch in engine/src/models/deepseek41.cpp and the shared table's row count
-   in engine/src/llama-model.cpp are ported from src/models/deepseek41.cpp in
-   upstream ggml-org/llama.cpp revision
-   9581154a2250cc9e6948e4c2a2fc4b4e19d1a57e, whose file SHA-256 is
-   73916d555f7d664c43e54eecb0da8392693d940271a5268d0291ab98b0f8283d. One
-   reader per GGUF layout maps its metadata onto them.
-   engine/tests/ssd/test-dsv41-engram.cpp keeps a transcription of the
-   upstream hash as the reference it is tested against.
-
-   DeepSeek-V4.1 router normalization in engine/src/llama-graph.h also follows
-   src/llama-graph.cpp at that revision: the selected scores use a sum-plus-
-   epsilon denominator instead of the generic F16 floor. The CPU graph
-   regression is engine/tests/ssd/test-moe-router-norm.cpp.
 
 4. Engram decode reference
    https://github.com/antirez/ds4
@@ -90,19 +60,13 @@ source tree.
    The MIT permission notice below applies.
 
 6. Model chat templates
-   engine/models/templates/deepseek-ai-DeepSeek-V4.1.jinja is chat_template.jinja
-   from https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash (revision
-   314113f8a7da). Copyright (c) 2023 DeepSeek. The MIT permission notice below
-   applies.
-   engine/models/templates/muse-spark.jinja is chat_template.jinja from
-   https://huggingface.co/meta-models/Muse-Spark-Open-816B-A42B (revision
-   0fb02478b025), under the Muse model license.
-   engine/models/templates/unsloth-Qwen3.6-35B-A3B.jinja is the chat template in
-   https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF (revision a483e9e6cbd5),
-   under Apache-2.0.
+   The chat templates InferSSD adds under engine/models/templates/ are copied
+   from the models' repositories and keep the models' licenses.
+   engine/models/templates/README.md lists each one's source, revision and
+   license. The other templates there come with llama.cpp (entry 1).
 
-MIT permission notice for entries 1-5 and the DeepSeek template in entry 6
---------------------------------------------------------------------------
+MIT permission notice for entries 1-5 and the MIT templates of entry 6
+----------------------------------------------------------------------
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
