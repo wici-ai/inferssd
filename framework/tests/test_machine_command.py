@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+from dataclasses import replace
 from functools import partial
 from pathlib import Path
 
@@ -16,7 +17,7 @@ from test_decode_profiling import setup as gpu_machine
 from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
-from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts
+from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts, moe
 
 from inferssd.app import catalog
 from inferssd.cli import main
@@ -24,8 +25,10 @@ from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
 from inferssd.machine.probes import Completed
 from inferssd.machine.store import exclusive, save
-from inferssd.strategy.inputs import RuntimeFacts
+from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine
 from inferssd.strategy.kernels import INPUT_BLOCK, VEC_DOT_TYPE, WEIGHT_BLOCK
+from inferssd.strategy.routing import cache_slot_bytes
+from inferssd.strategy.weights import dense_weights
 
 
 def parse(argv):
@@ -451,6 +454,49 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
     assert result["components"]["dense_read_bytes"] == full // 4
 
 
+def test_routed_estimate_reserves_vram_for_other_compute_processes(tmp_path):
+    host, _, _ = machine(tmp_path)
+    profile, runtime = gpu_machine()
+    profile["compute"]["cpu"] = []
+    saved = tmp_path / "machine.json"
+    save(profile, saved)
+    tensors, kv = moe(
+        "qwen35moe",
+        layers=2,
+        experts=256,
+        used=2,
+        latent=1024,
+        hidden=2048,
+        gate=Q4_K,
+        up=Q4_K,
+        down=Q4_K,
+    )
+    raw = engine_facts(tensors, kv)
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps(raw))
+    experts = facts_from_engine(raw).experts
+    _, slot_bytes = cache_slot_bytes(experts)
+    full = dense_weights(raw).active_bytes + slot_bytes * experts.layers * experts.count
+    args = ["--show", "--output", str(saved), "--estimate-facts", str(facts), "--json"]
+
+    def report(free, processes):
+        gpu = replace(runtime.gpus[0], free_bytes=free, processes=processes)
+        code, out, _ = execute(
+            args, host, FakeRunner({}), tmp_path, runtime=replace(runtime, gpus=(gpu,))
+        )
+        assert code == 0
+        return json.loads(out[0])["estimates"][0]
+
+    idle = report(full, 0)
+    assert idle["decode_tokens_per_second"] > 0 and idle["components"]["gpu_hit_fraction"] == 1
+    busy = report(full, 1)
+    assert busy["decode_tokens_per_second"] is None
+    assert "no CPU compute measurement of Q4_K" in busy["detail"]
+    restored = report(full + GIB, 1)
+    assert restored["decode_tokens_per_second"] == idle["decode_tokens_per_second"]
+    assert restored["components"]["gpu_hit_fraction"] == 1
+
+
 @pytest.mark.parametrize(
     ("architecture", "extra_tensor", "refusal"),
     [
@@ -558,6 +604,61 @@ def test_expert_rows_must_contain_whole_weight_blocks(weight, width):
     for fmt in raw["experts"]["formats"]:
         fmt["down"]["type"] = weight
     assert f"cannot compute {weight.upper()} experts" in (command.launch_refusal(raw) or "")
+
+
+@pytest.mark.parametrize(("clamps", "refused"), [([7, 7], False), ([0, 7], True)])
+def test_deepseek_clamp_admission_matches_on_gguf_and_saved_facts(tmp_path, clamps, refused):
+    host, paths, build = machine(tmp_path)
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    raw["architecture"] = "deepseek41"
+    raw["metadata"]["deepseek41.swiglu_clamp_exp"] = clamps
+    target = tmp_path / "facts.json"
+    target.write_text(json.dumps(raw))
+    runner = FakeRunner(replies(**{"inferssd-server": Completed(0, json.dumps(raw))}))
+    args = ["--build", str(build), "--model", paths[0], "--json"]
+    estimates = []
+    for entry in (["--estimate-gguf", paths[0]], ["--show", "--estimate-facts", str(target)]):
+        code, out, _ = execute([*args, *entry], host, runner, tmp_path)
+        assert code == 0
+        estimates.append(json.loads(out[0])["estimates"][0])
+    row, replay = estimates
+    assert row == replay
+    if refused:
+        assert row["decode_tokens_per_second"] is None and not row["scenarios"]
+        assert row["detail"] == "layer 0: the model's SwiGLU clamp must be finite and positive"
+    else:
+        assert row["decode_tokens_per_second"] > 0
+
+
+@pytest.mark.parametrize(
+    ("canonical", "legacy", "encoding", "bad_layer"),
+    [
+        (7, 0, "", None),  # canonical scalar broadcasts to all layers
+        ([7, None], 7, "", 1),  # the native facts writer encodes non-finite floats as null
+        ([7, 7, 0], 0, "", None),  # a dropped NextN block
+        ([0, 0], 7, "e4m3_e8m0_32_row264", None),
+        ([7, 7], 0, "e4m3_e8m0_32_row264", 0),
+        ([7, 9.999999974752427e-7], 7, "", 1),  # 1e-6f
+        ([7, 1.0000001111620804e-6], 7, "", None),  # next representable float32
+    ],
+)
+def test_deepseek_clamp_uses_the_native_layout_and_active_layers(
+    canonical, legacy, encoding, bad_layer
+):
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    raw["architecture"] = "deepseek41"
+    raw["metadata"].update(
+        {
+            "deepseek41.swiglu_clamp_exp": canonical,
+            "deepseek41.swiglu_limit": legacy,
+            "deepseek41.engram.encoding": encoding,
+        }
+    )
+    reason = command.launch_refusal(raw)
+    if bad_layer is None:
+        assert reason is None
+    else:
+        assert reason == f"layer {bad_layer}: the model's SwiGLU clamp must be finite and positive"
 
 
 def test_expert_input_types_follow_the_cpu_type_traits():

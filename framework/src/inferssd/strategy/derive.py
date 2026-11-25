@@ -132,6 +132,11 @@ def tier_gpus(
     return tuple(gpu for gpu in runtime.gpus if gpu.backend in backends)
 
 
+def gpu_reserve_mib(usable: Optional[Sequence[GPUState]]) -> int:
+    """The launch's VRAM reserve for other compute processes on usable devices."""
+    return SHARED_GPU_RESERVE_MIB if any(gpu.processes for gpu in usable or ()) else 0
+
+
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
     """Each choice parsed by the configuration layer and written back in its canonical form."""
     for _, reason in choices.values():
@@ -704,14 +709,15 @@ def derive(
                     "vram.budget: default auto; the usable GPU is not in the characteristics, "
                     "run inferssd profile again"
                 )
-            busy = [
-                f"{gpu.uuid} runs {gpu.processes} compute process(es)"
-                for gpu in usable
-                if gpu.processes
-            ]
-            if busy:
-                why = ", ".join(busy) + f"; {SHARED_GPU_RESERVE_MIB} MiB stays free for them"
-                choices["vram.reserve_mib"] = (str(SHARED_GPU_RESERVE_MIB), why)
+            reserve = gpu_reserve_mib(usable)
+            if reserve:
+                busy = [
+                    f"{gpu.uuid} runs {gpu.processes} compute process(es)"
+                    for gpu in usable
+                    if gpu.processes
+                ]
+                why = ", ".join(busy) + f"; {reserve} MiB stays free for them"
+                choices["vram.reserve_mib"] = (str(reserve), why)
                 notes.append("vram.reserve_mib: " + why)
         device = single_gpu(characteristics, runtime)
         if host_headroom_mib(characteristics, runtime, platform) == UNIFIED_HEADROOM_MIB:

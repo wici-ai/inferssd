@@ -1,13 +1,18 @@
 # SPDX-License-Identifier: Apache-2.0
 """GPU estimates follow the native CUDA/ROCm expert executor's per-layer formats."""
 
+import json
 import re
 from dataclasses import replace
+from pathlib import Path
 
 import pytest
 from test_decode_profiling import setup
-from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, TYPES, engine_facts, moe
+from test_machine_command import execute, machine, resource_descriptor
+from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, TYPES, dense, engine_facts, moe
 
+from inferssd.machine.probes import Completed
+from inferssd.machine.store import save
 from inferssd.strategy.estimate import decode_estimate
 from inferssd.strategy.inputs import facts_from_engine, model_facts_from, model_facts_json
 from inferssd.strategy.kernels import GPU_EXPERT_TYPES
@@ -63,7 +68,7 @@ def test_the_gpu_launch_checks_actual_formats_before_pricing(monkeypatch, up, ga
     assert cpu.tokens_per_second > 0 and cpu.components["gpu_experts_ms"] == 0
 
 
-@pytest.mark.parametrize("device", ["untimed", "unified", "multiple", "rocm"])
+@pytest.mark.parametrize("device", ["untimed", "unified", "rocm"])
 def test_an_active_gpu_tier_checks_formats_even_without_a_single_measured_device(
     monkeypatch, device
 ):
@@ -72,12 +77,132 @@ def test_an_active_gpu_tier_checks_formats_even_without_a_single_measured_device
         c["gpus"][0].pop("decode_compute")
     if device == "unified":
         c["memory"]["unified"] = True
-    if device == "multiple":
-        rt = replace(rt, gpus=(*rt.gpus, replace(rt.gpus[0], uuid="other")))
     if device == "rocm":
         rt = replace(rt, gpu_backends=("ROCm",), gpus=(replace(rt.gpus[0], backend="ROCm"),))
     result = estimate(c, rt, model(monkeypatch, TQ2_0, TQ2_0, TQ2_0))
     assert result.tokens_per_second is None and "no CUDA matrix-vector kernel" in result.detail
+
+
+@pytest.mark.parametrize("target", ["gguf", "facts"])
+@pytest.mark.parametrize("routed", [True, False], ids=["routed", "dense"])
+def test_profile_uses_default_device_visibility_of_the_selected_server(tmp_path, target, routed):
+    host, files, build = machine(tmp_path)
+    descriptor = resource_descriptor(tmp_path, build)
+    resources = json.loads(descriptor.read_text())
+    resources["capabilities"]["gpu_backends"] = ["ROCm", "Vulkan"]
+    descriptor.write_text(json.dumps(resources))
+    Path(resources["binary"]).touch()
+    profile, runtime = setup()
+    # The host's utilities see only one card. The selected driver can enumerate both.
+    runtime = replace(runtime, gpus=(replace(runtime.gpus[0], backend="ROCm"),))
+    save(profile, tmp_path / "machine.json")
+    if routed:
+        tensors, kv = moe(
+            "deepseek41",
+            layers=2,
+            experts=8,
+            used=4,
+            latent=512,
+            hidden=256,
+            up=Q8_0,
+            gate=Q8_0,
+            down=Q8_0,
+        )
+        kv["deepseek41.swiglu_clamp_exp"] = [7.0, 7.0]
+    else:
+        tensors, kv = dense("qwen35")
+    raw = engine_facts(tensors, kv, path=files[0])
+    exported = tmp_path / "model.json"
+    exported.write_text(json.dumps(raw))
+    args = [
+        "--show",
+        "--output",
+        str(tmp_path / "machine.json"),
+        "--resources",
+        str(descriptor),
+        "--json",
+        "--estimate-" + target,
+        files[0] if target == "gguf" else str(exported),
+    ]
+    # Vulkan aliases and accelerators are not additional CUDA/ROCm tiers. A legacy
+    # binary that cannot list devices falls back to live runtime visibility.
+    devices = "Available devices:\n  Vulkan0: integrated\n  BLAS: accelerator\n"
+    one = devices + "  ROCm0: Radeon AI PRO R9700\n"
+    for listing, refused in (
+        (Completed(0, one + "  ROCm1: Radeon AI PRO R9700\n"), True),
+        (Completed(0, one), False),
+        (Completed(0, devices), False),
+        (Completed(1, "", "unknown argument"), False),
+    ):
+
+        def server(argv, timeout_s, environ):
+            assert argv[0] == resources["binary"]
+            if argv[1:] == ["--list-devices"]:
+                return listing
+            assert argv[1:] == ["--ssd-model-facts", files[0]]
+            return Completed(0, json.dumps(raw))
+
+        code, out, _ = execute(args, host, server, tmp_path, runtime=runtime)
+        assert code == 0
+        (row,) = json.loads(out[0])["estimates"]
+        if refused:
+            assert row["detail"] == "one GPU expert executor per context is supported"
+            assert row["decode_tokens_per_second"] is None and not row["scenarios"]
+        else:
+            assert row["decode_tokens_per_second"] > 0
+
+        if refused:
+            for settings in (
+                {"LLAMA_ARG_DEVICE": "ROCm1"},
+                {"LLAMA_ARG_SPLIT_MODE": "none"},
+                {"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_MAIN_GPU": "1"},
+                {"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_MAIN_GPU": "-1"},
+                {"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_DEVICE": "ROCm1,ROCm0"},
+            ):
+                code, out, _ = execute(args, host, server, tmp_path, settings, runtime=runtime)
+                assert code == 0
+                assert json.loads(out[0])["estimates"][0]["decode_tokens_per_second"] > 0
+
+
+def test_device_selection_uses_native_ordinals_and_propagates_driver_errors():
+    from inferssd.machine.command import DeviceSelectionError, engine_tier_devices
+
+    _, runtime = setup()
+    first = runtime.gpus[0]
+    second = replace(first, uuid="other", free_bytes=12345, processes=2)
+    runtime = replace(runtime, gpus=(first, second))
+    listing = Completed(0, "Available devices:\n  CUDA0: first\n  CUDA1: second\n")
+
+    def devices(environ, response=listing):
+        return engine_tier_devices(Path("server"), lambda *args: response, environ, runtime)
+
+    assert devices({"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_MAIN_GPU": "1"}) == (second,)
+    assert devices({"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_DEVICE": "CUDA1,CUDA0"}) == (second,)
+    assert devices({"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_MAIN_GPU": "-1"}) == ()
+    for backend in ("MTL0", "Vulkan0"):
+        assert (
+            devices(
+                {"LLAMA_ARG_SPLIT_MODE": "none"},
+                Completed(0, f"Available devices:\n  {backend}: GPU\n"),
+            )
+            == ()
+        )
+    with pytest.raises(DeviceSelectionError, match="invalid value for main_gpu: 2"):
+        devices({"LLAMA_ARG_SPLIT_MODE": "none", "LLAMA_ARG_MAIN_GPU": "2"})
+    with pytest.raises(DeviceSelectionError, match="invalid device: CUDA19"):
+        error = (
+            'error while handling environment variable "LLAMA_ARG_DEVICE": invalid device: CUDA19'
+        )
+        devices({"LLAMA_ARG_DEVICE": "CUDA19"}, Completed(1, "", error))
+
+
+def test_an_unreadable_gpu_inventory_leaves_cpu_only_estimates_available(monkeypatch):
+    c, rt = setup()
+    facts = model(monkeypatch, Q8_0, Q8_0, Q8_0)
+    rt = replace(rt, gpus=None)
+    result = estimate(c, rt, facts)
+    assert result.tokens_per_second is None and "cannot determine which GPU" in result.detail
+    assert estimate(c, replace(rt, gpu_backends=()), facts).tokens_per_second > 0
 
 
 def test_gpu_expert_types_match_the_native_mmvq_switch():

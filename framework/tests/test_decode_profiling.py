@@ -571,15 +571,14 @@ def test_mixed_ssd_and_graph_moe_reserves_the_graph_store_before_allocating_ssd_
     assert value.components["gpu_cache_capacity_bytes"] == 30 * GIB - 16 * GIB
 
 
-def test_dense_host_can_use_a_measured_cpu_matvec_without_dram_and_labels_multigpu_fallback():
+def test_dense_host_can_use_a_measured_cpu_matvec_without_dram():
     c, rt = setup()
-    rt = replace(rt, gpus=(*rt.gpus, replace(rt.gpus[0], uuid="other-gpu")))
+    rt = replace(rt, gpus=())
     c["memory"]["dram_read_Bps"] = []
     c["compute"]["cpu"] = [synthetic_row("Q4_K", rate=15e9)]
     result = dense_decode_estimate(c, GIB, rt)
     assert result.tokens_per_second == pytest.approx(15e9 / GIB)
     assert result.reference_scenario == "dense_host_serial"
-    assert any("Multiple GPUs" in note for note in result.assumptions)
     assert any("Q4_K matvec proxy" in note for note in result.assumptions)
     c["compute"]["cpu"].clear()
     assert dense_decode_estimate(c, GIB, rt).tokens_per_second is None
