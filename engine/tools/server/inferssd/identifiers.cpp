@@ -325,6 +325,36 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
         std::string stand_in = text.substr(at, date - at) + "0000-00-00" + text[date + 10] + "task";
         found(4, text.substr(at, end - at), stand_in);
     }
+
+    // the folder of a ChatGPT desktop app conversation's visualizations, one of its writable roots:
+    // ~/.codex/visualizations/<yyyy>/<mm>/<dd>/<uuid>
+    for (size_t at = text.find(".codex"); at != std::string::npos; at = text.find(".codex", at + 1)) {
+        size_t i = literal_end(text, at, ".codex/visualizations");
+        if (i == std::string::npos) {
+            continue;
+        }
+        std::string stand_in = text.substr(at, i - at);
+        bool        ok       = true;
+        for (const size_t digits : {4, 2, 2}) {
+            ok = ok && sep_at(i) && i + 1 + digits <= text.size();
+            for (size_t k = 1; ok && k <= digits; ++k) {
+                ok = std::isdigit((unsigned char) text[i + k]) != 0;
+            }
+            if (ok) {
+                stand_in += text[i] + std::string(digits, '0');
+                i += 1 + digits;
+            }
+        }
+        const size_t end = ok && sep_at(i) ? run_end(text, i + 1, is_hex_or_dash) : i;
+        if (!ok || end != i + 37 || (end < text.size() && is_name_byte(text[end]))) {
+            continue;
+        }
+        stand_in += text[i];
+        for (size_t j = i + 1; j < end; ++j) {
+            stand_in += text[j] == '-' ? '-' : '0';
+        }
+        found(6, text.substr(at, end - at), stand_in);
+    }
 }
 
 // Takes the root that is the cwd out of Codex's sentences " The writable root is `<root>`." and " The writable
