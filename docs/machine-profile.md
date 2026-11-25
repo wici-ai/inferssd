@@ -241,9 +241,11 @@ times, `assumptions` records proxies, and `scenarios` compares the bounds on
 cache coverage. The reported range adds I/O overlap and the measured timing
 spread, without assigning probabilities. `--memory-gib`, `--host-work-mib` and
 `--gpu-work-mib` set available host memory and known working allocations.
-An explicit target must have an architecture InferSSD launches, and a separated
-expert layout must be one the SSD path runs. Otherwise the JSON row gives a
-null speed and the reason.
+An explicit target is estimated where a launch runs it as its header describes it: a
+decoder needs no model profile; separated routed experts need one, a layout the SSD
+path runs and expert formats its CPU executor computes. GPU placement follows the GPU
+backends of the engine the estimate is for. Otherwise the JSON row gives a null speed
+and the reason.
 
 **Routed experts.** Routing is not uniform: a few experts take many of the
 routes, so a cache with space for 10% of the expert store serves far more than
@@ -311,8 +313,8 @@ therefore masks countervailing errors in individual service times. The routing
 assumption put 70.7% of DeepSeek's routes in VRAM, against 73.6% observed, and
 86% to 97% of Qwen3.8's, against 97% to 99%.
 
-The dense formula, checked on Qwen2.5-7B-Instruct Q8_0 (an architecture
-InferSSD does not launch), estimated 123.09 tok/s against 152.06 measured.
+The dense formula, checked on Qwen2.5-7B-Instruct Q8_0, estimated 123.09 tok/s
+against 152.06 measured.
 On a mechanical model drive, four identical 19-token prompts in one server
 increased from 0.78 to 6.86 tok/s as the cache warmed, while the estimate gave
 0.25 tok/s each time: it does not model a cache warmed by earlier requests.

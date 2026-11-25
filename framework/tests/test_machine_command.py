@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from functools import partial
 from pathlib import Path
@@ -23,6 +24,7 @@ from inferssd.machine import command
 from inferssd.machine.probes import Completed
 from inferssd.machine.store import exclusive
 from inferssd.strategy.inputs import RuntimeFacts
+from inferssd.strategy.kernels import VEC_DOT_TYPE
 
 
 def parse(argv):
@@ -342,7 +344,7 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
 
 
-def test_cli_estimates_a_split_gguf_and_can_replay_its_exported_facts(
+def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(
     tmp_path, monkeypatch, capsys
 ):
     host, files, build = machine(tmp_path)
@@ -352,7 +354,7 @@ def test_cli_estimates_a_split_gguf_and_can_replay_its_exported_facts(
             ("output.weight", (256, 256), Q8_0),
             ("blk.0.ffn_up.weight", (256, 256), Q4_K),
         ],
-        {"general.architecture": "gemma4"},
+        {"general.architecture": "unlisted-test-decoder"},
         path=files[0],
     )
     raw["files"] = files
@@ -418,9 +420,9 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
             ("blk.0.ffn_down_exps.weight", (256, 256, 8), Q4_K),
         ],
         {
-            "general.architecture": "gemma4",
-            "gemma4.expert_count": 8,
-            "gemma4.expert_used_count": 2,
+            "general.architecture": "test-moe",
+            "test-moe.expert_count": 8,
+            "test-moe.expert_used_count": 2,
         },
         path=paths[0],
     )
@@ -443,14 +445,14 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
 @pytest.mark.parametrize(
     ("architecture", "extra_tensor", "refusal"),
     [
-        ("qwen3moe", None, "no launch profile for architecture qwen3moe"),
+        ("qwen3moe", None, "no model profile for the GGUF architecture qwen3moe"),
         ("gemma4", None, "no routed SSD executor"),
         ("qwen35moe", "ffn_up_exps.scale", "unsupported per-expert scales"),
         ("qwen4exp", "ffn_gate_up_exps.weight", "fused gate/up"),
         ("qwen35moe", None, ""),
     ],
 )
-def test_explicit_target_requires_a_launch_profile_and_a_supported_ssd_path(
+def test_explicit_target_requires_a_supported_ssd_path(
     tmp_path, architecture, extra_tensor, refusal
 ):
     host, paths, build = machine(tmp_path)
@@ -476,11 +478,26 @@ def test_explicit_target_requires_a_launch_profile_and_a_supported_ssd_path(
         assert row["decode_tokens_per_second"] == row["scenarios"]["rank_serial"] > 0
 
 
-def test_explicit_dense_target_without_a_launch_profile_has_no_estimate(tmp_path):
+@pytest.mark.parametrize(
+    ("architecture", "kv", "tensor", "refusal"),
+    [
+        ("qwen35", {}, "blk.0.ffn_up.weight", None),
+        (
+            "bert",
+            {"bert.attention.causal": False},
+            "blk.0.ffn_up.weight",
+            "the bert model is an encoder",
+        ),
+        ("t5encoder", {}, "enc.blk.0.ffn_up.weight", "the t5encoder model is an encoder"),
+    ],
+)
+def test_a_dense_decoder_needs_no_profile_and_an_encoder_has_no_estimate(
+    tmp_path, architecture, kv, tensor, refusal
+):
     host, paths, build = machine(tmp_path)
     raw = engine_facts(
-        [("token_embd.weight", (256, 256), Q8_0), ("blk.0.ffn_up.weight", (256, 256), Q4_K)],
-        {"general.architecture": "unlisted-test-decoder"},
+        [("token_embd.weight", (256, 256), Q8_0), (tensor, (256, 256), Q4_K)],
+        {"general.architecture": architecture, **kv},
         path=paths[0],
     )
     facts = tmp_path / "facts.json"
@@ -492,8 +509,81 @@ def test_explicit_dense_target_without_a_launch_profile_has_no_estimate(tmp_path
         tmp_path,
     )
     (row,) = json.loads(out[0])["estimates"]
-    assert code == 0 and row["decode_tokens_per_second"] is None
-    assert "no launch profile for architecture unlisted-test-decoder" in row["detail"]
+    assert code == 0
+    if refusal:
+        assert row["decode_tokens_per_second"] is None and refusal in row["detail"]
+    else:
+        assert row["decode_tokens_per_second"] > 0
+
+
+@pytest.mark.parametrize(
+    ("up", "gate", "down", "refusal"),
+    [
+        ("f32", "f32", "f32", "cannot compute F32 experts"),
+        ("q8_0", "q4_K", "q4_K", "up=Q8_0 and gate=Q4_K"),
+        ("q4_K", "q4_K", "q6_K", None),
+        ("iq4_nl", "q4_0", "q8_0", None),
+    ],
+)
+def test_routed_formats_are_those_the_cpu_expert_executor_computes(up, gate, down, refusal):
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    raw["architecture"] = "qwen35moe"
+    layout = raw["experts"]
+    layout["latent"] = layout["hidden"] = 256
+    for roles in layout["formats"]:
+        roles["up"]["type"], roles["gate"]["type"], roles["down"]["type"] = up, gate, down
+    reason = command.launch_refusal(raw)
+    assert reason is None if refusal is None else refusal in reason
+
+
+def test_expert_input_types_follow_the_cpu_type_traits():
+    source = (ENGINE_FIXTURE.parents[4] / "engine/ggml/src/ggml-cpu/ggml-cpu.c").read_text()
+    table = source[source.index("type_traits_cpu[GGML_TYPE_COUNT] = {") :]
+    table = table[table.index("{") + 1 : table.index("\n};")]
+    found = {}
+    for name, block in re.findall(r"\[GGML_TYPE_(\w+)\]\s*=\s*\{(.*?)\n    \}", table, re.S):
+        input_type = re.search(r"\.vec_dot_type\s*=\s*GGML_TYPE_(\w+)", block)
+        if re.search(r"\.vec_dot\s*=", block) and input_type:
+            found[name] = input_type.group(1)
+    assert found == VEC_DOT_TYPE
+
+
+def test_estimates_use_the_gpu_backends_of_the_engine_they_are_for(tmp_path, monkeypatch):
+    host, paths, build = machine(tmp_path)
+    seen = []
+    estimates = command.estimates
+
+    def spy(value, drive_key, platform, runtime, **kwargs):
+        seen.append(runtime().gpu_backends)
+        return estimates(value, drive_key, platform, runtime, **kwargs)
+
+    monkeypatch.setattr(command, "estimates", spy)
+    # A CPU-only build, as its CMake cache names it.
+    (build / "CMakeCache.txt").write_text("GGML_CUDA:BOOL=OFF\nGGML_VULKAN:BOOL=OFF\n")
+    assert (
+        execute(
+            ["--build", str(build), "--model", paths[0], "--json"],
+            host,
+            FakeRunner(replies()),
+            tmp_path,
+        )[0]
+        == 0
+    )
+    # The resource descriptor's capabilities.
+    descriptor = resource_descriptor(tmp_path, build)
+    value = json.loads(descriptor.read_text())
+    value["capabilities"]["gpu_backends"] = ["CUDA"]
+    descriptor.write_text(json.dumps(value))
+    assert (
+        execute(
+            ["--resources", str(descriptor), "--model", paths[0], "--json"],
+            host,
+            FakeRunner(replies()),
+            tmp_path,
+        )[0]
+        == 0
+    )
+    assert seen == [(), ("CUDA",)]
 
 
 def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):

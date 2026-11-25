@@ -233,37 +233,26 @@ the **estimated host budget** (it does not set a process limit). Optional
 `--host-work-mib` and `--gpu-work-mib` reserve known KV/graph working memory. Without
 these, cache capacity is an upper estimate; these options do not alter launches.
 
-The command leads with a **conditional scenario range**, not a single precise
-prediction. JSON retains `decode_tokens_per_second` as the uniform/serial reference
-and adds `routing_scenarios`, `scenario_range_tokens_per_second`, component times
-and assumptions. The scenario table uses:
+Routed experts follow one routing assumption for every model, since routing cannot be
+observed before the model runs: warmed caches hold the most popular experts, and the
+share of accesses at rank `r` is `min(1/top_k, a/r)` (`strategy/routing.py`). JSON
+gives that reference in `decode_tokens_per_second`, its name in `reference_scenario`
+(`rank_serial` for routed experts), component times in `components` and the
+assumptions taken. `scenarios` and `routing_scenarios` bound how much the RAM and
+VRAM caches overlap (`rank_inclusive`, `rank_disjoint`), and
+`scenario_range_tokens_per_second` adds I/O overlap and the measured CPU, GPU and
+drive quartiles. The range carries **no probabilities**: it is not a confidence
+interval or a guaranteed bound, and microbenchmark quartiles describe only the
+profiling window. No historical tokens/s multiplier is used.
 
-| Expert-access hypothesis | Fraction of experts | Fraction of accesses |
-| --- | ---: | ---: |
-| Uniform | 100% | 100% |
-| Moderate concentration | 50% | 75% |
-| Concentrated | 20% | 80% |
-| Strongly concentrated | 20% | 95% |
-
-The remaining accesses still reach the rest of the experts. Caches are assumed to
-admit hotter experts first after warm-up. Each row reports no overlap, half-hidden
-I/O and a conditional range combining measured CPU/GPU/drive quartiles with serial
-to ideal overlap. Inclusive RAM/VRAM capacity avoids double-counting copies; a
-separate disjoint-cache scenario shows the alternative. The Python API accepts
-explicit `RoutingPattern` inputs when model-specific routing evidence exists.
-
-These hypotheses carry **no probabilities**. They are not a measured typical
-range, confidence interval, or guaranteed bound on execution. Microbenchmark
-quartiles describe only the profiling window; they cannot anticipate future shared
-SSD stalls. No historical tokens/s multiplier is used.
-
-Dense CUDA computation currently uses a measured Q8_0 matvec proxy because catalog
-facts do not retain each dense tensor's shape and type. Attention, non-matmul graph
-work, lookup I/O, warm-up and the actual routing distribution remain unpriced.
-CPU-only/unified-memory or missing-GPU-measurement cases retain a CPU cost estimate;
-they do not claim to model GPU execution. Estimates still use the catalog's pinned
-model facts; `--model` selects the storage drive, not arbitrary model metadata.
-A different quantization needs matching model facts before its estimate is valid.
+`--estimate-gguf FILE` and `--estimate-facts JSON` estimate another checkpoint from
+its own header, where a launch runs it as the header describes: a decoder needs no
+model profile; routed experts need one, a layout the SSD path executes and formats
+its CPU expert executor computes (`strategy/kernels.py`). Placement uses the GPU
+backends of the engine the estimate is for. Catalog models keep only aggregate facts,
+so their dense matrices take a measured Q8_0 matvec rate; an explicit target uses each
+tensor's shape and type. Attention, non-matmul graph work, lookup I/O and warm-up
+remain unpriced (issue #395).
 
 Two defaults stand in for measurements the profile lacks. An expert format the
 probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight

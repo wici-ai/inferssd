@@ -16,7 +16,12 @@ from typing import Any, Optional
 from inferssd.app import catalog
 from inferssd.contracts import ContractError
 from inferssd.engine import model as engine_model
-from inferssd.launch.resources import executable, installed_resources, read_resources
+from inferssd.launch.resources import (
+    cmake_gpu_backends,
+    executable,
+    installed_resources,
+    read_resources,
+)
 from inferssd.launch.typed import ARCHITECTURES, SSD_ARCHITECTURES
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
@@ -39,6 +44,7 @@ from inferssd.machine.profile import (
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine, read_runtime
+from inferssd.strategy.kernels import expert_format_refusal
 from inferssd.strategy.weights import DenseWeights, dense_weights
 
 GIB = float(1 << 30)
@@ -198,27 +204,50 @@ def summary(value: Characteristics, path: Path) -> list[str]:
     return lines
 
 
-def ssd_target_refusal(raw: Mapping[str, Any]) -> Optional[str]:
-    """Why InferSSD cannot run the target as its header describes it, or None: the estimate
-    covers only models a launch runs, and a routed layout only on the SSD path."""
-    architecture = raw["architecture"]
-    if architecture not in ARCHITECTURES:
-        return f"InferSSD has no launch profile for architecture {architecture}"
+def launch_refusal(raw: Mapping[str, Any]) -> Optional[str]:
+    """Why a launch cannot run the target as its header describes it, or None, as the launcher
+    decides (launch/typed.py): a decoder runs as an ordinary graph without a model profile; routed
+    experts need a profile, a layout the SSD path executes and formats its CPU executor computes."""
+    architecture = raw["architecture"] or ""
+    names = {tensor["name"] for tensor in raw["tensors"]}
+    encoder_only = any(n.startswith("enc.blk.") for n in names) and not any(
+        n.startswith("dec.blk.") for n in names
+    )
+    if encoder_only or raw.get("metadata", {}).get(architecture + ".attention.causal") is False:
+        return f"the {architecture} model is an encoder; a launch runs decoder models"
     layout = raw["experts"]
     if layout is None:
         return None
+    if architecture not in ARCHITECTURES:
+        return (
+            f"no model profile for the GGUF architecture {architecture}, which routed experts need"
+        )
     if architecture not in SSD_ARCHITECTURES:
         return f"the engine has no routed SSD executor for architecture {architecture}"
     if architecture in ("qwen35moe", "qwen4exp"):
         # These graph builders prefer fused gate/up and pass per-expert scales
         # to the adapter. The SSD adapter accepts separate, unscaled roles.
-        names = {tensor["name"] for tensor in raw["tensors"]}
         for layer in range(raw["layers"]):
             prefix = f"blk.{layer}.ffn_"
             if prefix + "gate_up_exps.weight" in names:
                 return f"SSD expert layer {layer} uses fused gate/up weights"
             if any(prefix + role + "_exps.scale" in names for role in ("gate", "up", "down")):
                 return f"SSD expert layer {layer} uses unsupported per-expert scales"
+    return expert_format_refusal(layout)
+
+
+def engine_gpu_backends(
+    resources: Optional[Path], build: Optional[Path]
+) -> Optional[tuple[str, ...]]:
+    """The GPU backends of the engine the estimate is for, as a launch reads them: the resource
+    descriptor's, else the build's CMake cache; None when neither says."""
+    if resources is not None:
+        return read_resources(resources).gpu_backends
+    if build is not None:
+        try:
+            return cmake_gpu_backends((build / "CMakeCache.txt").read_text(encoding="utf-8"))
+        except OSError:
+            return None
     return None
 
 
@@ -407,7 +436,7 @@ def run(
                 paths = raw["files"]
         else:
             raw = engine_model.validate(json.loads(args.estimate_facts.read_text(encoding="utf-8")))
-        target_refusal = ssd_target_refusal(raw)
+        target_refusal = launch_refusal(raw)
         facts = facts_from_engine(raw)
         weights = dense_weights(raw)
         read_bytes = weights.active_bytes
@@ -421,6 +450,14 @@ def run(
             facts.dense_bytes - read_bytes,
         )
 
+    # Placement uses the GPU backends of the engine the estimate is for, as a launch does, so a
+    # CPU-only engine gets a host estimate even where the profile holds GPU measurements.
+    backends = engine_gpu_backends(resources, args.build)
+
+    def estimate_runtime() -> RuntimeFacts:
+        facts = runtime()
+        return facts if backends is None else replace(facts, gpu_backends=backends)
+
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
         if args.json or args.model or target:
@@ -428,7 +465,7 @@ def run(
                 value,
                 drive_key,
                 host.platform(),
-                runtime,
+                estimate_runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
                 target=target,
