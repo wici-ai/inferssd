@@ -43,8 +43,7 @@
   "protocol": {
     "prompts": "bench/prompts/prompt-{tier}.txt, one user message, chat template applied, greedy decoding, 256 output tokens, ignore EOS, prompt cache off, one sequence, context 8192.",
     "actual": "128 / (arrival of token 256 - arrival of token 128) on the loopback streaming endpoint. Token ID hashes use the UTF-8 decimal JSON integer array without whitespace.",
-    "static": "All rows use the same estimator implementation, no calibration input. The comparison applies both algorithms retrospectively.",
-    "transfer": "The native server starts its timer at the first generated token. Transfer uses predicted_ms / (predicted_n - 1) milliseconds per interval. One resident Qwen MoE Q2_0 512-token-tier reference on machine A supplies residual milliseconds per layer via calibration.fit. The same scalar applies to all machine A targets including DeepSeek. Machine B uses its own resident 512-tier dense reference where explicitly stated.",
+    "static": "All rows use the same estimator implementation. The comparison applies both algorithms retrospectively.",
     "direct_reference": "Previous-request and first32 rates are same-deployment diagnostics in decode intervals per second. For each Qwen MoE 4K sample it comes from the earlier 512-tier request in a separate server. Prefix timing uses 32 intervals from T1 to T33 of the target request and excludes every interval in the test window.",
     "server_failures": [
       {
@@ -74,25 +73,11 @@
   "machines": {
     "A": {
       "gpu": "RTX 5090",
-      "cpu": "AMD EPYC 7B13 64-Core Processor",
-      "calibration_reference": "Qwen3.8-Flash-Next Q2_0, earlier 512-tier fresh server, 2048 MiB reserve",
-      "reference_static_tps": 50.7369324101616,
-      "timings": {
-        "predicted_n": 256,
-        "predicted_ms": 7517.735
-      },
-      "residual_ms_per_layer": 0.20357927577823812
+      "cpu": "AMD EPYC 7B13 64-Core Processor"
     },
     "B": {
       "gpu": "one visible RTX 5090",
-      "cpu": "INTEL(R) XEON(R) GOLD 6526Y",
-      "calibration_reference": "same local dense model, preceding 512-tier request",
-      "reference_static_tps": 123.08976569157794,
-      "timings": {
-        "predicted_n": 256,
-        "predicted_ms": 1739.528
-      },
-      "residual_ms_per_layer": 0.0
+      "cpu": "INTEL(R) XEON(R) GOLD 6526Y"
     }
   },
   "runs": [
@@ -121,13 +106,11 @@
       "tps": {
         "v1_static": 3.492128,
         "v2_static": 11.359042,
-        "v2_machine_calibrated": 10.397306,
         "first32_rate": 7.843186
       },
       "signed_errors_percent": {
         "v1_static": -68.226,
         "v2_static": 3.355,
-        "v2_machine_calibrated": -5.396,
         "first32_rate": -28.636
       },
       "v2_components_ms": {
@@ -174,13 +157,11 @@
       "tps": {
         "v1_static": 3.485925,
         "v2_static": 11.158848,
-        "v2_machine_calibrated": 10.229325,
         "first32_rate": 9.020439
       },
       "signed_errors_percent": {
         "v1_static": -67.146,
         "v2_static": 5.171,
-        "v2_machine_calibrated": -3.59,
         "first32_rate": -14.983
       },
       "v2_components_ms": {
@@ -231,14 +212,12 @@
       "tps": {
         "v1_static": 3.485925,
         "v2_static": 11.158848,
-        "v2_machine_calibrated": 10.229325,
         "prior_request_rate": 10.285395,
         "first32_rate": 9.642259
       },
       "signed_errors_percent": {
         "v1_static": -67.923,
         "v2_static": 2.684,
-        "v2_machine_calibrated": -5.87,
         "prior_request_rate": -5.354,
         "first32_rate": -11.272
       },
@@ -288,14 +267,12 @@
       "tps": {
         "v1_static": 137.083841,
         "v2_static": 50.736932,
-        "v2_machine_calibrated": 33.919791,
         "prior_request_rate": 33.919791,
         "first32_rate": 26.993717
       },
       "signed_errors_percent": {
         "v1_static": 324.941,
         "v2_static": 57.278,
-        "v2_machine_calibrated": 5.147,
         "prior_request_rate": 5.147,
         "first32_rate": -16.323
       },
@@ -345,14 +322,12 @@
       "tps": {
         "v1_static": 127.696833,
         "v2_static": 50.718083,
-        "v2_machine_calibrated": 33.911365,
         "prior_request_rate": 31.455284,
         "first32_rate": 24.51136
       },
       "signed_errors_percent": {
         "v1_static": 308.004,
         "v2_static": 62.049,
-        "v2_machine_calibrated": 8.35,
         "prior_request_rate": 0.503,
         "first32_rate": -21.684
       },
@@ -402,14 +377,12 @@
       "tps": {
         "v1_static": 96.768919,
         "v2_static": 50.450626,
-        "v2_machine_calibrated": 33.791587,
         "prior_request_rate": 25.44204,
         "first32_rate": 21.522758
       },
       "signed_errors_percent": {
         "v1_static": 251.63,
         "v2_static": 83.323,
-        "v2_machine_calibrated": 22.789,
         "prior_request_rate": -7.551,
         "first32_rate": -21.793
       },
@@ -459,14 +432,12 @@
       "tps": {
         "v1_static": 77.482754,
         "v2_static": 48.665476,
-        "v2_machine_calibrated": 32.981255,
         "prior_request_rate": 24.08782,
         "first32_rate": 19.341711
       },
       "signed_errors_percent": {
         "v1_static": 169.225,
         "v2_static": 69.095,
-        "v2_machine_calibrated": 14.598,
         "prior_request_rate": -16.303,
         "first32_rate": -32.794
       },
@@ -549,14 +520,12 @@
       "tps": {
         "v1_static": 123.422976,
         "v2_static": 123.089766,
-        "v2_machine_calibrated": 123.089766,
         "prior_request_rate": 146.591489,
         "first32_rate": 151.726918
       },
       "signed_errors_percent": {
         "v1_static": -18.832,
         "v2_static": -19.051,
-        "v2_machine_calibrated": -19.051,
         "prior_request_rate": -3.596,
         "first32_rate": -0.219
       },
@@ -575,7 +544,7 @@
     "drive_Bps": 143686000.0,
     "static_uniform_tps": 0.07550211640262887,
     "static_generic_tps": 0.2529647307555528,
-    "measurement": "Four consecutive identical 19-input/24-output requests on a shared SATA HDD. Full wait: 23 token intervals. Preceding request hit fractions used for next whole request. First 8 decode intervals supply hit fractions for last 15 intervals of the same request. These are cache telemetry priors, with no use of target latency in the estimate.",
+    "measurement": "Four consecutive identical 19-input/24-output requests on a shared SATA HDD. Full wait: 23 token intervals.",
     "requests": [
       {
         "request": "warmup",
@@ -584,14 +553,7 @@
         "logical_read_bytes_per_token": 182318480.6956522,
         "mean_vram_hit": 0.9077898550724638,
         "mean_storage_miss": 0.07898550724637682,
-        "static_ratio": 0.3237504362550504,
-        "first_8_hits": [
-          0.8682291666666667,
-          0.10208333333333333
-        ],
-        "first_8_prediction": 0.5960091681823063,
-        "remaining_15_tps": 0.9186900248147291,
-        "disjoint_ratio": 0.6487598124323846
+        "static_ratio": 0.3237504362550504
       },
       {
         "request": "measure-1",
@@ -600,20 +562,7 @@
         "logical_read_bytes_per_token": 41673060.17391305,
         "mean_vram_hit": 0.9791666666666666,
         "mean_storage_miss": 0.017572463768115942,
-        "static_ratio": 0.08588920178689848,
-        "prior_request_hits": [
-          0.9077898550724638,
-          0.07898550724637682
-        ],
-        "prior_request_tps": 0.7686357515393664,
-        "prior_request_ratio": 0.26097516032139534,
-        "first_8_hits": [
-          0.98125,
-          0.015104166666666667
-        ],
-        "first_8_prediction": 3.840380423532846,
-        "remaining_15_tps": 2.757478422487647,
-        "disjoint_ratio": 1.3927145874339295
+        "static_ratio": 0.08588920178689848
       },
       {
         "request": "measure-2",
@@ -622,20 +571,7 @@
         "logical_read_bytes_per_token": 28250112.0,
         "mean_vram_hit": 0.9875,
         "mean_storage_miss": 0.011956521739130435,
-        "static_ratio": 0.06001891570676156,
-        "prior_request_hits": [
-          0.9791666666666666,
-          0.017572463768115942
-        ],
-        "prior_request_tps": 3.327051737361531,
-        "prior_request_ratio": 0.7893829198256842,
-        "first_8_hits": [
-          0.9895833333333334,
-          0.009895833333333333
-        ],
-        "first_8_prediction": 5.69972877246562,
-        "remaining_15_tps": 3.908986235507694,
-        "disjoint_ratio": 1.4581091948320322
+        "static_ratio": 0.06001891570676156
       },
       {
         "request": "measure-3",
@@ -644,20 +580,7 @@
         "logical_read_bytes_per_token": 15249229.913043479,
         "mean_vram_hit": 0.9925724637681159,
         "mean_storage_miss": 0.006340579710144928,
-        "static_ratio": 0.036850527255837276,
-        "prior_request_hits": [
-          0.9875,
-          0.011956521739130435
-        ],
-        "prior_request_tps": 4.784624118085254,
-        "prior_request_ratio": 0.6969980397892552,
-        "first_8_hits": [
-          0.9911458333333333,
-          0.0078125
-        ],
-        "first_8_prediction": 7.0648528300605,
-        "remaining_15_tps": 7.82865853379463,
-        "disjoint_ratio": 0.9024346635586485
+        "static_ratio": 0.036850527255837276
       }
     ]
   }

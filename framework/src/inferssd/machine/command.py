@@ -10,7 +10,6 @@ import os
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -18,7 +17,7 @@ from inferssd.app import catalog
 from inferssd.contracts import ContractError
 from inferssd.engine import model as engine_model
 from inferssd.launch.resources import executable, installed_resources, read_resources
-from inferssd.launch.typed import SSD_ARCHITECTURES
+from inferssd.launch.typed import ARCHITECTURES, SSD_ARCHITECTURES
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
     STORAGE_PREFIX,
@@ -38,11 +37,9 @@ from inferssd.machine.profile import (
     survey,
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
-from inferssd.strategy import calibration
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
 from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine, read_runtime
 from inferssd.strategy.weights import DenseWeights, dense_weights
-from inferssd.telemetry.routing import last_request_hits
 
 GIB = float(1 << 30)
 
@@ -95,25 +92,6 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         default=[],
         metavar="FILE,...",
         help="additional GGUF files for --estimate-gguf",
-    )
-    command.add_argument(
-        "--routing-events",
-        type=Path,
-        metavar="NATIVE-EVENTS.jsonl",
-        help="use cache hits from the last request in a representative single-stream run",
-    )
-    calibration_args = command.add_mutually_exclusive_group()
-    calibration_args.add_argument(
-        "--calibrate-from",
-        type=Path,
-        metavar="RESPONSE.json",
-        help="derive a machine calibration from a resident reference model's response timings",
-    )
-    calibration_args.add_argument(
-        "--calibration",
-        type=Path,
-        metavar="PROFILE.json",
-        help="apply an existing machine calibration to the requested GGUF",
     )
     command.add_argument(
         "--host-work-mib",
@@ -221,11 +199,14 @@ def summary(value: Characteristics, path: Path) -> list[str]:
 
 
 def ssd_target_refusal(raw: Mapping[str, Any]) -> Optional[str]:
-    """Reject SSD paths that the model header rules out before pricing the target."""
+    """Why InferSSD cannot run the target as its header describes it, or None: the estimate
+    covers only models a launch runs, and a routed layout only on the SSD path."""
+    architecture = raw["architecture"]
+    if architecture not in ARCHITECTURES:
+        return f"InferSSD has no launch profile for architecture {architecture}"
     layout = raw["experts"]
     if layout is None:
         return None
-    architecture = raw["architecture"]
     if architecture not in SSD_ARCHITECTURES:
         return f"the engine has no routed SSD executor for architecture {architecture}"
     if architecture in ("qwen35moe", "qwen4exp"):
@@ -251,7 +232,6 @@ def estimates(
     gpu_work_bytes: int = 0,
     target: Optional[catalog.Model] = None,
     weights: Optional[DenseWeights] = None,
-    observed_hits: Optional[tuple[float, float]] = None,
     target_refusal: Optional[str] = None,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
@@ -277,7 +257,6 @@ def estimates(
                         drive_key,
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
-                        observed_hits=observed_hits,
                         graph_weights=weights if weights and weights.graph_store_bytes else None,
                     )
                     if model.facts.experts is not None
@@ -411,14 +390,6 @@ def run(
     target = None
     target_refusal = None
     weights = None
-    observed_hits = None
-    target_layers = 0
-    if (args.calibrate_from or args.calibration) and not (
-        args.estimate_gguf or args.estimate_facts
-    ):
-        raise ValueError("calibration requires --estimate-gguf or --estimate-facts")
-    if args.routing_events and not (args.estimate_gguf or args.estimate_facts):
-        raise ValueError("--routing-events requires --estimate-gguf or --estimate-facts")
     if args.estimate_gguf is not None or args.estimate_facts is not None:
         if args.estimate_gguf is not None:
             binary = (
@@ -436,18 +407,6 @@ def run(
                 paths = raw["files"]
         else:
             raw = engine_model.validate(json.loads(args.estimate_facts.read_text(encoding="utf-8")))
-        if args.routing_events:
-            layout = raw["experts"]
-            if not layout or not layout["used"]:
-                raise ValueError("--routing-events requires a model with known routed experts")
-            with args.routing_events.open(encoding="utf-8") as stream:
-                observed_hits = last_request_hits(
-                    stream,
-                    {layer for layer, _ in layout["layers"]},
-                    layout["count"],
-                    layout["used"],
-                )
-        target_layers = raw["layers"]
         target_refusal = ssd_target_refusal(raw)
         facts = facts_from_engine(raw)
         weights = dense_weights(raw)
@@ -465,35 +424,19 @@ def run(
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
         if args.json or args.model or target:
-            sample = None
-            estimate_runtime = lru_cache(maxsize=1)(runtime)
             rows = estimates(
                 value,
                 drive_key,
                 host.platform(),
-                estimate_runtime,
+                runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
                 target=target,
                 weights=weights,
-                observed_hits=observed_hits,
                 target_refusal=target_refusal,
             )
-            if args.calibrate_from or args.calibration:
-                key = calibration.machine_key(value, estimate_runtime())
-                if args.calibrate_from:
-                    response = json.loads(args.calibrate_from.read_text(encoding="utf-8"))
-                    sample = calibration.fit(response, rows[0][1], target_layers, key)
-                else:
-                    saved_calibration = json.loads(args.calibration.read_text(encoding="utf-8"))
-                    sample = calibration.load(saved_calibration, key)
-                    rows = [(m, calibration.apply(e, sample, target_layers)) for m, e in rows]
-            if args.json or args.calibrate_from:
-                result = report(value, path, drive_key, rows)
-                if sample is not None:
-                    result["calibration"] = sample
-                    result["calibration_applied"] = bool(args.calibration)
-                emit(json.dumps(result, separators=(",", ":")))
+            if args.json:
+                emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
                 return
             lines += estimate_lines(rows)
         for line in lines:
@@ -545,7 +488,7 @@ def run(
     partial = [name for name, rec in changed.items() if rec["status"] == "partial"]
     failed = [name for name, rec in changed.items() if rec["status"] == "failed"]
     # With --json, stdout holds the one JSON object; the run's problems go to stderr.
-    note = progress if args.json or args.calibrate_from else emit
+    note = progress if args.json else emit
     if partial:
         note(f"{len(partial)} section(s) partial: {', '.join(partial)}")
     if failed:

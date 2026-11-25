@@ -2,9 +2,9 @@
 """Pre-inference decode cost model, with explicit placement and routing assumptions.
 
 Synthetic matrix measurements price arithmetic. The MoE reference uses one rank-based
-routing prior and whole expert-cache slots for every checkpoint. Hypothetical routing
-and overlap scenarios bound assumptions. Attention, graph overhead and cache warm-up
-remain outside the service-time estimate.
+routing prior and whole expert-cache slots for every checkpoint; scenarios vary cache
+overlap, I/O overlap and the measured timing spread, not the routing prior. Attention,
+graph overhead and cache warm-up remain outside the service-time estimate.
 """
 
 from __future__ import annotations
@@ -43,35 +43,7 @@ class Estimate:
     components: dict[str, float] = field(default_factory=dict)
     scenario_details: tuple[dict[str, object], ...] = ()
     scenario_range: Optional[tuple[float, float]] = None
-    reference_scenario: str = "uniform_serial"
-
-
-@dataclass(frozen=True)
-class RoutingPattern:
-    name: str
-    expert_fraction: float  # hot experts' fraction of the store
-    traffic_fraction: float  # their share of routed requests
-
-
-# Illustrative hypotheses, NOT a learned distribution or a "typical" confidence band.
-ROUTING_PATTERNS = (
-    RoutingPattern("uniform", 1.0, 1.0),
-    RoutingPattern("hot50_traffic75", 0.5, 0.75),
-    RoutingPattern("hot20_traffic80", 0.2, 0.80),
-    RoutingPattern("hot20_traffic95", 0.2, 0.95),
-)
-
-
-def routing_hit(capacity: float, hot_fraction: float, traffic_fraction: float) -> float:
-    """Two uniform zones with hotter experts admitted first; a nonzero tail remains."""
-    if not (0 < hot_fraction <= traffic_fraction <= 1):
-        raise ValueError("routing fractions require 0 < hot <= traffic <= 1")
-    capacity = max(0.0, min(1.0, capacity))
-    if capacity <= hot_fraction:
-        return traffic_fraction * capacity / hot_fraction
-    return traffic_fraction + (1 - traffic_fraction) * (capacity - hot_fraction) / (
-        1 - hot_fraction
-    )
+    reference_scenario: str = "rank_serial"
 
 
 def drive_iqr(
@@ -310,7 +282,6 @@ def decode_estimate(
     *,
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
-    routing_patterns: tuple[RoutingPattern, ...] = ROUTING_PATTERNS,
     observed_hits: Optional[tuple[float, float]] = None,
     graph_weights: Optional[DenseWeights] = None,
 ) -> Estimate:
@@ -318,13 +289,10 @@ def decode_estimate(
 
     Work reserves are additional to the engine's host margin. They must come from
     the intended context/graph allocation, not fitting a measured tokens/s value.
-    Zero means unknown and makes cache capacities upper estimates. Observed hits optionally
-    provide the fraction hitting VRAM and the fraction missing both VRAM and host cache.
+    Zero means unknown and makes cache capacities upper estimates. OBSERVED_HITS, the
+    fraction of routes hitting VRAM and the fraction missing both VRAM and the host cache,
+    replace the routing prior in the reference, for checking the prior against a measured run.
     """
-    if not routing_patterns:
-        raise ValueError("at least one routing pattern is required")
-    for pattern in routing_patterns:
-        routing_hit(0, pattern.expert_fraction, pattern.traffic_fraction)
     if min(host_work_bytes, gpu_work_bytes, dense_read_bytes) < 0:
         raise ValueError("memory sizes must be nonnegative")
     if observed_hits is not None and (
@@ -359,7 +327,6 @@ def decode_estimate(
         "Equal slots per layer. Distinct host/device coverage is the midpoint of completely "
         "overlapping and disjoint slot counts.",
         "Serial I/O plus CPU/GPU service time; prefetch overlap is a separate scenario.",
-        "Hot-set scenarios are hypotheses, not empirical probabilities or typical ranges.",
         "Hot experts are cached first, after warm-up; routing order and replacement are unknown.",
         "Below the smallest profiled expert matrix, two same-format probe sizes estimate a "
         "fixed call time plus time per weight byte when both terms are nonnegative.",
@@ -374,7 +341,6 @@ def decode_estimate(
     # never substitute a GPU's peak bandwidth for measured quantized computation.
     dense_rate = matvec_rate(rows, "Q8_0", 4096, 4096)
     gpu_expert_s = 0.0
-    legacy_gpu_expert_s = 0.0
     gpu_fast_s = 0.0
     gpu_slow_s = 0.0
     missing = []
@@ -391,7 +357,6 @@ def decode_estimate(
                 missing.append(name)
             else:
                 weight = layers * size / experts.layers
-                legacy_gpu_expert_s += weight / rate
                 for_median = (
                     matvec_rate(rows, used, role.rows, role.cols, target_bytes=size) or rate
                 )
@@ -436,17 +401,15 @@ def decode_estimate(
     gpu_slots = min(total_slots, gpu_cache // gpu_slot_bytes)
     if not use_gpu and memory_Bps <= 0:
         return Estimate(None, "no memory read rate in the profile")
-    cpu_time, cpu_reason = cpu_decode_seconds(characteristics, experts, threads.decode or 1)
+    cpu_time, cpu_reason = cpu_decode_seconds(
+        characteristics, experts, threads.decode or 1, small_matrix_cost=True
+    )
     if cpu_time is None and (
         gpu_slots < total_slots or (observed_hits is not None and observed_hits[0] < 1)
     ):
         return Estimate(None, cpu_reason)
-    # For full VRAM residency all reference and comparison routes execute on the GPU.
-    legacy_cpu_expert_s = cpu_time or 0.0
-    cpu_expert_s = (
-        cpu_decode_seconds(characteristics, experts, threads.decode or 1, small_matrix_cost=True)[0]
-        or legacy_cpu_expert_s
-    )
+    # For full VRAM residency every route executes on the GPU.
+    cpu_expert_s = cpu_time or 0.0
     inclusive_slots = max(host_slots, gpu_slots)
     disjoint_slots = min(total_slots, host_slots + gpu_slots)
     spill = 0 if use_gpu else dense_read_bytes - resident
@@ -463,10 +426,6 @@ def decode_estimate(
         assumptions.append("The dense weights and routed store fit; no drive timing is needed.")
     if not use_gpu:
         dense_s = resident / memory_Bps + (spill / drive_Bps if spill else 0)
-    ram_fraction = min(1.0, cache / routed)
-    gpu_fraction = min(1.0, gpu_cache / routed)
-    # A VRAM copy may also occupy RAM: summing the two capacities double-counts it.
-    hit = max(ram_fraction, gpu_fraction)
     top_k = experts.used
     routes = experts.layers * top_k
     io_all_s = routes * experts.mean_read_bytes / drive_Bps if drive_Bps else 0.0
@@ -483,32 +442,17 @@ def decode_estimate(
             else "No pinned H2D measurement; host-sourced experts are priced on the CPU."
         )
 
-    def terms(
-        gpu_hit: float, storage_miss: float, legacy: bool = False
-    ) -> tuple[float, float, float, float, float]:
-        cpu = legacy_cpu_expert_s if legacy else cpu_expert_s
-        gpu = legacy_gpu_expert_s if legacy else gpu_expert_s
-        moved = moved_fraction(top_k, gpu_hit, gpu_slots, cpu, gpu, copy_expert_s)
+    def terms(gpu_hit: float, storage_miss: float) -> tuple[float, float, float, float, float]:
+        moved = moved_fraction(top_k, gpu_hit, gpu_slots, cpu_expert_s, gpu_expert_s, copy_expert_s)
         executed = gpu_hit + moved
         return (
-            routes * cpu * (1 - executed),
-            routes * gpu * executed,
+            routes * cpu_expert_s * (1 - executed),
+            routes * gpu_expert_s * executed,
             io_all_s * storage_miss,
             routes * copy_expert_s * moved,
             executed,
         )
 
-    cpu_s, gpu_s, drive_s, copy_s, _ = terms(gpu_fraction, 1 - hit, legacy=True)
-    seconds = dense_s + cpu_s + gpu_s + copy_s + drive_s
-    serial = 1 / seconds
-    scenarios = {
-        "uniform_serial": serial,
-        "uniform_perfect_overlap": 1 / (dense_s + max(cpu_s, gpu_s + copy_s, drive_s)),
-    }
-    disjoint_miss = 1 - min(1.0, ram_fraction + gpu_fraction)
-    scenarios["uniform_disjoint_serial"] = 1 / (
-        dense_s + cpu_s + gpu_s + copy_s + io_all_s * disjoint_miss
-    )
     io_low, io_high, io_samples = (
         drive_iqr(characteristics, experts, drive_key, drive_Bps) if drive_Bps else (0.0, 0.0, 0)
     )
@@ -528,19 +472,7 @@ def decode_estimate(
     else:
         dense_fast = resident / memory_Bps + (spill / io_high if spill else 0)
         dense_slow = resident / memory_Bps + (spill / io_low if spill else 0)
-    cases: list[tuple[str, float, float, bool, dict[str, object]]] = [
-        (
-            pattern.name,
-            routing_hit(gpu_fraction, pattern.expert_fraction, pattern.traffic_fraction),
-            1 - routing_hit(hit, pattern.expert_fraction, pattern.traffic_fraction),
-            True,
-            {
-                "hot_expert_fraction": pattern.expert_fraction,
-                "hot_traffic_fraction": pattern.traffic_fraction,
-            },
-        )
-        for pattern in routing_patterns
-    ]
+    cases: list[tuple[str, float, float, dict[str, object]]] = []
     hits = rank_hit_curve(experts.count, experts.used)
     gpu_hit = hit_at_slots(hits, gpu_slots / experts.layers)
     shared_slots = (inclusive_slots + disjoint_slots) / 2
@@ -555,7 +487,6 @@ def decode_estimate(
                 name,
                 gpu_hit,
                 1 - hit_at_slots(hits, slots / experts.layers),
-                False,
                 {
                     "gpu_slots": gpu_slots,
                     "host_slots": host_slots,
@@ -567,17 +498,18 @@ def decode_estimate(
     route_detail = "rank-based routing estimate"
     if observed_hits is not None:
         gpu_hit, disk_miss = observed_hits
-        cases.append(("observed", gpu_hit, disk_miss, False, {}))
+        cases.append(("observed", gpu_hit, disk_miss, {}))
         reference = "observed_serial"
-        route_detail = "observed cache fractions"
+        route_detail = "supplied cache fractions"
         assumptions.append(
-            "Reference VRAM hits and misses of both caches come from supplied observations; "
-            "the rank scenarios retain the uncalibrated routing prior."
+            "Reference VRAM hits and misses of both caches are supplied; "
+            "the rank scenarios keep the routing prior."
         )
+    scenarios: dict[str, float] = {}
     details: list[dict[str, object]] = []
     lows, highs = [], []
-    for name, gh, miss, legacy, parameters in cases:
-        ct, gt, it, copy_s, executed = terms(gh, miss, legacy=legacy)
+    for name, gh, miss, parameters in cases:
+        ct, gt, it, copy_s, executed = terms(gh, miss)
         no_overlap = 1 / (dense_s + ct + gt + copy_s + it)
         # Only half of the smaller I/O/compute service time is hidden in this
         # intermediate scenario; the optimistic endpoint allows full overlap.
@@ -640,8 +572,6 @@ def decode_estimate(
             "gpu_execution_fraction": executed,
             "h2d_ms": copy_s * 1e3,
             "storage_miss_fraction": disk_miss,
-            "uniform_gpu_hit_fraction": gpu_fraction,
-            "uniform_storage_miss_fraction": 1 - hit,
             "decode_threads": float(threads.decode or 1),
             "memory_budget_bytes": float(available),
             "drive_Bps": drive_Bps,

@@ -342,7 +342,7 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
 
 
-def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(
+def test_cli_estimates_a_split_gguf_and_can_replay_its_exported_facts(
     tmp_path, monkeypatch, capsys
 ):
     host, files, build = machine(tmp_path)
@@ -352,7 +352,7 @@ def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(
             ("output.weight", (256, 256), Q8_0),
             ("blk.0.ffn_up.weight", (256, 256), Q4_K),
         ],
-        {"general.architecture": "unlisted-test-decoder"},
+        {"general.architecture": "gemma4"},
         path=files[0],
     )
     raw["files"] = files
@@ -418,9 +418,9 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
             ("blk.0.ffn_down_exps.weight", (256, 256, 8), Q4_K),
         ],
         {
-            "general.architecture": "test-moe",
-            "test-moe.expert_count": 8,
-            "test-moe.expert_used_count": 2,
+            "general.architecture": "gemma4",
+            "gemma4.expert_count": 8,
+            "gemma4.expert_used_count": 2,
         },
         path=paths[0],
     )
@@ -443,14 +443,14 @@ def test_cli_reports_active_and_stored_bytes_for_native_graph_moe(tmp_path):
 @pytest.mark.parametrize(
     ("architecture", "extra_tensor", "refusal"),
     [
-        ("qwen3moe", None, "no routed SSD executor"),
+        ("qwen3moe", None, "no launch profile for architecture qwen3moe"),
         ("gemma4", None, "no routed SSD executor"),
         ("qwen35moe", "ffn_up_exps.scale", "unsupported per-expert scales"),
         ("qwen4exp", "ffn_gate_up_exps.weight", "fused gate/up"),
         ("qwen35moe", None, ""),
     ],
 )
-def test_explicit_target_requires_a_supported_ssd_path(
+def test_explicit_target_requires_a_launch_profile_and_a_supported_ssd_path(
     tmp_path, architecture, extra_tensor, refusal
 ):
     host, paths, build = machine(tmp_path)
@@ -474,6 +474,26 @@ def test_explicit_target_requires_a_supported_ssd_path(
         assert not row["scenarios"]
     else:
         assert row["decode_tokens_per_second"] == row["scenarios"]["rank_serial"] > 0
+
+
+def test_explicit_dense_target_without_a_launch_profile_has_no_estimate(tmp_path):
+    host, paths, build = machine(tmp_path)
+    raw = engine_facts(
+        [("token_embd.weight", (256, 256), Q8_0), ("blk.0.ffn_up.weight", (256, 256), Q4_K)],
+        {"general.architecture": "unlisted-test-decoder"},
+        path=paths[0],
+    )
+    facts = tmp_path / "facts.json"
+    facts.write_text(json.dumps(raw))
+    code, out, _ = execute(
+        ["--build", str(build), "--model", paths[0], "--estimate-facts", str(facts), "--json"],
+        host,
+        FakeRunner(replies()),
+        tmp_path,
+    )
+    (row,) = json.loads(out[0])["estimates"]
+    assert code == 0 and row["decode_tokens_per_second"] is None
+    assert "no launch profile for architecture unlisted-test-decoder" in row["detail"]
 
 
 def test_cli_rejects_missing_gguf_and_invalid_shard_combinations(tmp_path, monkeypatch, capsys):

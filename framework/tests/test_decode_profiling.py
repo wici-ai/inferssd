@@ -87,14 +87,13 @@ def test_decode_pool_not_prefill_pool_prices_cpu_work():
     assert estimate(c, rt).components["cpu_experts_ms"] == pytest.approx(expected)
 
 
-def test_inclusive_caches_are_not_added_and_reserves_reduce_capacity():
+def test_cache_coverage_lies_between_inclusive_and_disjoint_and_reserves_reduce_capacity():
     c, rt = setup()
     value = estimate(c, rt)
     comp = value.components
-    coverage = max(comp["host_cache_capacity_bytes"], comp["gpu_cache_capacity_bytes"])
-    assert comp["uniform_storage_miss_fraction"] == pytest.approx(
-        1 - coverage / MODEL.facts.experts.routed_bytes
-    )
+    misses = {row["name"]: row["disk_miss_fraction"] for row in value.scenario_details}
+    assert misses["rank_disjoint"] <= comp["storage_miss_fraction"] <= misses["rank_inclusive"]
+    assert misses["rank"] == comp["storage_miss_fraction"]
     reserved = estimate(c, rt, host_work_bytes=2 * GIB, gpu_work_bytes=4 * GIB)
     assert (
         reserved.components["host_cache_capacity_bytes"]
@@ -194,12 +193,13 @@ def test_dispatch_respects_slots_and_preserves_mean_hits():
     assert moved_fraction(1, 0, 1, 3.0, 1.0, 2.0) == 0
 
 
-def test_scenarios_are_conditional_not_a_fitted_scalar():
+def test_scenarios_vary_cache_overlap_and_timing_not_the_routing_prior():
     c, rt = setup()
     value = estimate(c, rt)
     assert value.tokens_per_second == value.scenarios["rank_serial"]
-    assert value.scenarios["uniform_perfect_overlap"] >= value.scenarios["uniform_serial"]
-    assert value.scenarios["hot20_traffic95_serial"] >= value.scenarios["hot50_traffic75_serial"]
+    assert set(value.scenarios) == {"rank_serial", "rank_inclusive_serial", "rank_disjoint_serial"}
+    for row in value.scenario_details:
+        assert row["no_overlap_tps"] <= row["half_io_overlap_tps"] <= row["scenario_high_tps"]
     assert any("not observed" in s for s in value.assumptions)
 
 
@@ -324,18 +324,6 @@ def test_cpu_decode_does_not_need_prefill_measurements_and_prices_mixed_types():
     assert not why
 
 
-def test_routing_tail_survives_when_hot_set_fits():
-    from inferssd.strategy.estimate import routing_hit
-
-    assert routing_hit(0.2, 0.2, 0.8) == pytest.approx(0.8)
-    assert routing_hit(0.6, 0.2, 0.8) == pytest.approx(0.9)
-    assert routing_hit(1.0, 0.2, 0.8) == 1
-    assert routing_hit(0.0, 0.2, 0.8) == 0
-    assert routing_hit(0.6, 1.0, 1.0) == 0.6
-    with pytest.raises(ValueError):
-        routing_hit(0.6, 0.8, 0.2)
-
-
 def test_compute_variability_widens_scenarios_without_changing_reference():
     c, rt = setup()
     before = estimate(c, rt)
@@ -348,22 +336,6 @@ def test_compute_variability_widens_scenarios_without_changing_reference():
     assert after.scenario_range[1] > before.scenario_range[1]
     for row in after.scenario_details:
         assert row["scenario_low_tps"] <= row["no_overlap_tps"] <= row["scenario_high_tps"]
-
-
-def test_routing_patterns_may_be_supplied_but_cannot_be_empty():
-    from inferssd.strategy.estimate import RoutingPattern
-
-    c, rt = setup()
-    one = estimate(c, rt, routing_patterns=(RoutingPattern("hypothesis", 0.3, 0.7),))
-    assert {row["name"] for row in one.scenario_details} == {
-        "hypothesis",
-        "rank",
-        "rank_inclusive",
-        "rank_disjoint",
-    }
-    assert one.scenario_details[0]["name"] == "hypothesis"
-    with pytest.raises(ValueError):
-        estimate(c, rt, routing_patterns=())
 
 
 def test_an_unmeasured_format_takes_the_nearest_measured_one_in_bits_per_weight():
