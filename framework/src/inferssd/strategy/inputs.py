@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from collections import Counter
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any, Optional, Protocol, cast
 
@@ -32,6 +32,7 @@ from inferssd.machine.characteristics import (
     record,
 )
 from inferssd.platform import cuda_devices
+from inferssd.strategy.kernels import GPU_EXPERT_TYPES, gpu_expert_refusal
 
 ROLES = ("gate", "up", "down")
 
@@ -80,6 +81,10 @@ class Experts:
     expert_read_bytes: int  # the most one expert's three role reads (whole 4 KiB pages) take
     format_bytes: tuple[tuple[str, int], ...]  # routed bytes per ggml type, the most first
 
+    # Ordered, distinct (up, gate, down) combinations when counts cannot recover the GPU result.
+    # Only these models need an additional field in the existing recording format.
+    layer_formats: tuple[tuple[str, str, str], ...] = ()
+
     @property
     def roles(self) -> tuple[Role, Role, Role]:
         return self.gate, self.up, self.down
@@ -113,8 +118,8 @@ class ModelFacts:
     paths: tuple[str, ...]
     architecture: Optional[str]
     dense_bytes: int  # every tensor that is not a routed expert
-    # The layers' tensors (blk.N.*) that are not routed experts: bytes per ggml type, the most
-    # first. The lookup tables outside the layers (token and per-layer embeddings) are not in it.
+    # Repeating dense tensor bytes by ggml type, the largest share first. When the native
+    # model has layers but lacks conventional block names, use its aggregate dense types.
     layer_format_bytes: tuple[tuple[str, int], ...]
     experts: Optional[Experts]  # None for a model without routed experts
     # CUDA weight allocation for each repeating layer, followed by the output layer.
@@ -157,6 +162,9 @@ def _cuda_layer_bytes(
             shape = t["shape"]
             size += size * (-shape[0] % 512) // prod(shape)
         size = (size + 127) // 128 * 128
+        # Both encoder and decoder weights are resident when a model loads.
+        if name.startswith(("enc.blk.", "dec.blk.")):
+            name = name[4:]
         if name.startswith("blk."):
             parts = name.split(".", 2)
             index = block_indices.get(parts[1])
@@ -215,11 +223,35 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             expert_read_bytes=experts["expert_read_bytes"],
             format_bytes=_ranked(per_format),
         )
+        possible_retired = "IQ2_XXS" in counts["up"] and "Q2_K" in counts["down"]
+        if len(formats) > 1 and (possible_retired or not GPU_EXPERT_TYPES.issuperset(per_format)):
+            actual = tuple(
+                dict.fromkeys(
+                    (
+                        formats[index]["up"]["type"].upper(),
+                        formats[index]["gate"]["type"].upper(),
+                        formats[index]["down"]["type"].upper(),
+                    )
+                    for _, index in layers
+                )
+            )
+            # Preserve the existing recording when its counts prove the same first native
+            # refusal (or successful admission) as the actual ordered layer formats.
+            if gpu_expert_refusal(found, layer_formats=actual) != gpu_expert_refusal(found):
+                found = replace(found, layer_formats=actual)
     dense = [t for t in model["tensors"] if t["name"] not in routed]
     per_type: Counter[str] = Counter()
+    has_decoder = any(t["name"].startswith("dec.blk.") for t in dense)
     for t in dense:
-        if t["name"].startswith("blk."):
+        if t["name"].startswith(("blk.", "dec.blk.")) or (
+            not has_decoder and t["name"].startswith("enc.blk.")
+        ):
             per_type[t["type"].upper()] += t["bytes"]
+    has_block_layout = bool(per_type)
+    if not has_block_layout and model["layers"] > 0:
+        for t in dense:
+            if t["bytes"] > 0:
+                per_type[t["type"].upper()] += t["bytes"]
     if not per_type:
         raise ValueError(f"{model['files'][0]}: the model has no layer tensors")
     return ModelFacts(
@@ -228,7 +260,7 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
         dense_bytes=sum(t["bytes"] for t in dense),
         layer_format_bytes=_ranked(per_type),
         experts=found,
-        cuda_layer_bytes=_cuda_layer_bytes(model, dense) if found else (),
+        cuda_layer_bytes=_cuda_layer_bytes(model, dense) if found and has_block_layout else (),
     )
 
 
@@ -263,7 +295,8 @@ EXPERTS_RECORD = record(
         "expert_bytes": POSITIVE,
         "expert_read_bytes": POSITIVE,
         "format_bytes": _type_bytes,
-    }
+    },
+    optional={"layer_formats": array(record({role: TEXT for role in ROLES}), minimum=1)},
 )
 MODEL_RECORD = record(
     {
@@ -292,6 +325,16 @@ def model_facts_json(facts: ModelFacts) -> dict[str, object]:
             "layers": experts.layers,
             "count": experts.count,
             "used": experts.used,
+            **(
+                {
+                    "layer_formats": [
+                        {"up": up, "gate": gate, "down": down}
+                        for up, gate, down in experts.layer_formats
+                    ]
+                }
+                if experts.layer_formats
+                else {}
+            ),
             "roles": {
                 role.name: {
                     "formats": [list(item) for item in role.formats],
@@ -318,7 +361,10 @@ def model_facts_from(value: object) -> ModelFacts:
         built = {
             name: Role(
                 name,
-                tuple((format, layers, size) for format, layers, size in roles[name]["formats"]),
+                tuple(
+                    (format.upper(), layers, size)
+                    for format, layers, size in roles[name]["formats"]
+                ),
                 roles[name]["rows"],
                 roles[name]["cols"],
             )
@@ -334,6 +380,10 @@ def model_facts_from(value: object) -> ModelFacts:
             expert_bytes=experts["expert_bytes"],
             expert_read_bytes=experts["expert_read_bytes"],
             format_bytes=tuple((name, size) for name, size in experts["format_bytes"]),
+            layer_formats=tuple(
+                (fmt["up"].upper(), fmt["gate"].upper(), fmt["down"].upper())
+                for fmt in experts.get("layer_formats", ())
+            ),
         )
     return ModelFacts(
         paths=tuple(item["paths"]),

@@ -49,6 +49,25 @@ def native_contract(tmp_path_factory):
     return binary
 
 
+def test_retired_prefill_limit_in_settings_file(native_contract, tmp_path, capsys):
+    source = tmp_path / "legacy.ssd"
+    source.write_text(
+        "inferssd-settings 1\nprefill.cpu_max_tokens = 4294967295\nprefetch.depth = 7\n"
+    )
+    expected = parse(source.read_text(), str(source))
+    native = subprocess.run(
+        [str(native_contract), "--parse", str(source), "linux"],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    warning = f"prefill.cpu_max_tokens ({source}:2): ignoring retired setting"
+    assert warning in capsys.readouterr().err and warning in native.stderr
+    assert json.loads(native.stdout) == expected.document()
+    assert "prefill.cpu_max_tokens" not in render(expected)
+    assert expected.document()["values"]["prefetch.depth"] == 7
+
+
 def test_registry_generated_schema_exact(native_contract):
     actual = json.loads(subprocess.check_output([str(native_contract), "--schema"], text=True))
     assert actual == schema()
@@ -112,6 +131,8 @@ def test_cpp_python_snapshot_exact(native_contract, tmp_path, platform, text):
         "cpu.io_cpus=1,1",
         "cpu.io_cpus=2-0",
         "unknown=0",
+        "prefill.cpu_max_tokens=-1",
+        "prefill.cpu_max_tokens=1\nprefill.cpu_max_tokens=2",
         "place.costs=cpu_fixed_us=nan",
         "place.costs=link_gbps=0",
         "place.costs=unknown=1",

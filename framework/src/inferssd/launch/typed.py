@@ -49,18 +49,21 @@ MODEL_OPTIONS = frozenset(
 PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
+    "kimi-k3": None,
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
     "gemma4": None,  # Gemma 4
 }
-# The profile of each GGUF general.architecture; --profile overrides it.
-ARCHITECTURES = {
+# Architectures with a routed SSD executor in llama_ssd::describe_experts.
+SSD_ARCHITECTURES = {
     "deepseek41": "dsv",
     "muse-spark": "muse",
+    "kimi-k3": "kimi-k3",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
-    "gemma4": "gemma4",
 }
+# The default launch profile also covers ordinary-graph models.
+ARCHITECTURES = {**SSD_ARCHITECTURES, "gemma4": "gemma4"}
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
 SAMPLING: dict[str, tuple[str, ...]] = {
@@ -429,6 +432,8 @@ def _resolve(
     if gpu_backends is None:
         built = s.value("engine_gpu_backends", binary)
         gpu_backends = None if built is None else tuple(cast(list[str], built))
+    # K3 fits its non-expert weights before the SSD tier takes the remaining memory.
+    fit_layers = profile == "kimi-k3" and bool(gpu_backends)
     bundled = PROFILES[profile] if profile else None
     template_path = spec.template
     if not template_path and profile and bundled:
@@ -442,7 +447,13 @@ def _resolve(
         raise ValueError("missing chat template: " + template)
     if configured is None:
         text = s.text("read_text", spec.settings_file) if spec.settings_file else None
-        value = parse(text, spec.settings_file or "", overrides=spec.overrides, platform=platform)
+        value = parse(
+            text,
+            spec.settings_file or "",
+            overrides=spec.overrides,
+            platform=platform,
+            warn=lambda message: s.emit(message + "\n", "stderr"),
+        )
     else:
         value = configured
     if value.platform != platform:
@@ -477,6 +488,7 @@ def _resolve(
             spec.threads,
             gpu_backends,
             placement,
+            fit_layers=fit_layers,
         )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(
@@ -623,10 +635,10 @@ def _resolve(
         "--mmap",
         "--no-repack",
         "--fit",
-        "off",
+        "on" if fit_layers else "off",
         "--no-warmup",
         "-ngl",
-        str(GPU_LAYERS),
+        "auto" if fit_layers else str(GPU_LAYERS),
         "-c",
         str(context),
         "-b",

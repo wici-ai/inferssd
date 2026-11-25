@@ -77,6 +77,13 @@ cache: the server saves the state after the shared prefix. The request is the on
 the configuration the desktop app gives it, with the user's identifiers already replaced by the server's stand-ins
 (`tools/server/inferssd/identifiers.h`), so the tokens are the ones every user's server renders.
 
+The stand-ins are those of the system the server runs on, so a server renders another system's requests as that
+system's servers do only when told which system they come from. With `INFERSSD_IDENTIFIERS_OS` set to `macos`,
+`windows` or `linux`, the server uses that system's stand-ins and spellings for the home directory in `HOME`
+(`USERPROFILE` for `windows`) and, for `macos`, the temporary directory in `TMPDIR`: set them to the folders the app
+ran with, and a faster machine of any system makes the prefix caches of all of them. Only the state's numbers then
+differ, as between two backends.
+
 For a new engine, each published prefix cache is made again. If the new state differs from the published one by no
 more than two backends differ, the file is kept and the new engine is added to its `engines`; otherwise the new file
 is published for it. A state computed twice on one GPU is not the same bytes either, so the comparison is by size of

@@ -49,7 +49,7 @@ enum stop_type {
 };
 
 struct task_params {
-    bool stream          = true;
+    bool stream          = false;
     bool include_usage   = false;
     bool cache_prompt    = true; // remember the prompt to avoid reprocessing all prompt
     bool return_tokens   = false;
@@ -182,8 +182,11 @@ struct server_task {
     server_tokens tokens;
 
     // tokens of the prompt that other conversations with the same setup share: the leading system messages with
-    // the tools (0 if unknown); the server keeps a state there that later conversations start from
-    int64_t n_shared_prefix = 0;
+    // the tools (0 if unknown); the server keeps a state there that later conversations start from. When the last
+    // leading system message holds the user's context, it is the app's system message with the tools, and
+    // n_context_prefix is the end of all of them, which the users with the same context share: a second state
+    int64_t n_shared_prefix  = 0;
+    int64_t n_context_prefix = 0;
 
     // tokens of the prompt that every state of its conversation starts with: the shared prefix and the user
     // messages before the first reply (0 if unknown); the prompt cache keeps one state per conversation by them
@@ -468,6 +471,7 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     bool post_sampling_probs;
     bool is_progress = false;
+    bool is_begin = false; // signal the HTTP headers before streaming any model output
     completion_token_output prob_output;
     result_timings timings;
     result_prompt_progress progress;

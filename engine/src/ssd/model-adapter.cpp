@@ -10,6 +10,8 @@ namespace llama_ssd {
 expert_requirements describe_experts(
         llm_arch architecture, const llama_hparams & hparams, int layer) noexcept {
     switch (architecture) {
+        case LLM_ARCH_KIMI_K3:
+            return {expert_quantization::executor_checked, expert_activation::situ};
         case LLM_ARCH_DEEPSEEK41:
             return {expert_quantization::executor_checked, expert_activation::swiglu_clamp,
                 layer >= 0 ? hparams.swiglu_clamp_exp[layer] : 0.0f, true, false, true};
@@ -51,7 +53,7 @@ expert_refusal first_refusal(const expert_requirements & requirements, const exp
     if (!separate_contiguous_experts(in)) { return expert_refusal::layout; }
     if (has_extra_parameters(in)) { return expert_refusal::extra_parameters; }
     if (in.has_lora) { return expert_refusal::lora; }
-    if (!in.silu) { return expert_refusal::not_silu_gated; }
+    if (!in.gate_matches_model) { return expert_refusal::incompatible_gate; }
     if (requirements.single_token_or_prefill && in.n_tokens != 1 && !in.prefill) {
         return expert_refusal::token_batch;
     }
@@ -81,7 +83,7 @@ std::string describe_refusal(expert_refusal refusal) {
         case expert_refusal::extra_parameters:
             return "routed experts with biases, scales or weights applied before the layer are not supported";
         case expert_refusal::lora: return "LoRA adapters are not supported with SSD experts";
-        case expert_refusal::not_silu_gated: return "routed experts must be SiLU-gated";
+        case expert_refusal::incompatible_gate: return "routed expert activation does not match the model";
         case expert_refusal::token_batch: return "this model runs routed experts one token at a time outside prefill";
         case expert_refusal::invalid_clamp: return "the model's SwiGLU clamp must be finite and positive";
         case expert_refusal::missing_post_norm: return "this model requires a normalization tensor after its experts";

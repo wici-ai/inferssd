@@ -1552,9 +1552,165 @@ static common_chat_params common_chat_params_init_kimi_k2(const common_chat_temp
 // <|close|>call<|sep|>...<|close|>tools<|sep|>
 // Every marker is a literal, so with output provenance only generated CONTROL
 // tokens delimit calls and values; the same spelling in ordinary text stays in the value.
+static common_peg_parser common_chat_kimi_k3_tool_section(common_chat_peg_builder & p, const json & tools, bool parallel) {
+    const std::string ARG_OPEN  = "<|open|>argument key=\"";
+    const std::string ARG_CLOSE = "<|close|>argument<|sep|>";
 
+    // Template attribute values are escaped and never contain a raw quote.
+    auto attr_value   = p.chars("[^\"]", 1, -1);
+    auto attr_end     = p.literal("\"<|sep|>");
+    auto string_value = p.tool_arg_raw_string_value(p.until(ARG_CLOSE));
+    auto any_type     = p.literal("\" type=\"") + attr_value + attr_end;
+    // The type attribute selects the encoding: strings verbatim, other types as JSON text.
+    auto typed_value  = p.choice({
+        p.literal("\" type=\"string\"<|sep|>") + string_value,
+        any_type + p.tool_arg_json_value(p.until(ARG_CLOSE)),
+    });
 
+    auto argument = [&](const common_peg_parser & key, const common_peg_parser & value) {
+        return p.tool_arg(p.tool_arg_open(p.literal(ARG_OPEN)) + p.tool_arg_xtml_name(key) + value +
+                          p.tool_arg_close(p.literal(ARG_CLOSE)));
+    };
+    auto arguments = [&](const json & schema) {
+        auto arg = p.choice();
+        if (schema.is_object() && schema.contains("properties") && schema.at("properties").is_object()) {
+            for (const auto & item : schema.at("properties").items()) {
+                const auto & def = item.value();
+                // A declared string stays a string whatever type the model writes.
+                const bool is_string = def.is_object() && def.contains("type") && def.at("type") == "string";
+                std::string key = item.key();
+                string_replace_all(key, "&", "&amp;");
+                string_replace_all(key, "\"", "&quot;");
+                arg |= argument(p.literal(key), is_string ? any_type + string_value : typed_value);
+            }
+        }
+        arg |= argument(attr_value, typed_value);
+        return p.choice({
+            p.literal("<|open|>json type=\"object\"<|sep|>") + p.tool_args(p.json()) + p.literal("<|close|>json<|sep|>"),
+            p.tool_args(p.zero_or_more(arg)),
+        });
+    };
+    auto call = [&](const common_peg_parser & name, const common_peg_parser & args) {
+        return p.tool(p.tool_open(p.literal("<|open|>call tool=\"") + p.tool_name(name) +
+                                  p.literal("\" index=\"") + p.chars("[0-9]", 1, -1) + attr_end) +
+                      args + p.tool_close(p.literal("<|close|>call<|sep|>")));
+    };
 
+    auto calls = p.choice();
+    foreach_function(tools, [&](const json & tool) {
+        const auto & function = tool.at("function");
+        calls |= call(p.literal(function.at("name").get<std::string>()),
+                      arguments(function.contains("parameters") ? function.at("parameters") : json::object()));
+    });
+
+    // Preserve undeclared names when parsing a supplied completion. Constrain generation
+    // to the request's declarations.
+    auto declared = p.rule("declared-call", calls);
+    auto parsed_call = p.gbnf(declared | call(attr_value, arguments(json::object())), "declared-call");
+    const std::string end = "<|close|>tools<|sep|>";
+    auto selected = p.repeat(parsed_call, 1, parallel ? -1 : 1);
+    if (!parallel) {
+        // A supplied sequence can exceed the sampling limit. Ignore extra calls in delivery
+        // so partial and final results both retain the first call, including its arguments.
+        auto excess = p.optional(p.literal("<|open|>call tool=\"") + p.until(end));
+        selected = selected + p.gbnf(excess, "");
+    }
+    return p.literal("<|open|>tools<|sep|>") + selected + p.optional(p.literal(end));
+}
+
+static common_chat_params common_chat_params_init_kimi_k3(const common_chat_template &    tmpl,
+                                                          const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    // The K3 template itself renders the required/none notice from tool_choice.
+    const bool has_tools = inputs.tools.is_array() && !inputs.tools.empty();
+    std::optional<json> tool_choice;
+    if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_AUTO) {
+        tool_choice = json{{"tool_choice", inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? "required" : "none"}};
+    }
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs, std::nullopt, std::nullopt, tool_choice, &data.prompt_input_spans);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    data.preserved_tokens  = {
+        "<|open|>",
+        "<|close|>",
+        "<|sep|>",
+        "<|end_of_msg|>",
+    };
+
+    const std::string THINK_START    = "<|open|>think<|sep|>";
+    const std::string THINK_END      = "<|close|>think<|sep|>";
+    const std::string RESPONSE_START = "<|open|>response<|sep|>";
+    const std::string RESPONSE_END   = "<|close|>response<|sep|>";
+    const std::string MESSAGE_END    = "<|close|>message<|sep|>";
+    const std::string END_OF_MESSAGE = "<|end_of_msg|>";
+
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tag   = THINK_END;
+
+    const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        // A request's template kwargs can select a different channel than the server default.
+        bool thinking = inputs.enable_thinking;
+        if (string_ends_with(inputs.generation_prompt, THINK_START)) {
+            thinking = true;
+        } else if (string_ends_with(inputs.generation_prompt, RESPONSE_START)) {
+            thinking = false;
+        }
+        const std::string & generation_start = thinking ? THINK_START : RESPONSE_START;
+        auto generation_prompt = p.prefix(inputs.generation_prompt, generation_start);
+
+        auto response =
+            RESPONSE_START +
+            p.content(p.until(RESPONSE_END)) +
+            p.optional(p.literal(RESPONSE_END));
+
+        // A repeated message closer is structural tail, not new content. Keep
+        // the completed parse stable while streaming each partial/extra closer.
+        auto tail = p.zero_or_more(p.literal(MESSAGE_END)) + p.optional(p.literal(END_OF_MESSAGE));
+
+        auto ending = tail;
+        if (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            // Ignore any tool section after the response when calls are disabled.
+            const std::string tools_end = "<|close|>tools<|sep|>";
+            ending = p.optional(p.literal("<|open|>tools<|sep|>") +
+                                      p.until(tools_end) + p.optional(p.literal(tools_end))) + tail;
+        } else if (has_tools) {
+            auto calls = p.trigger_rule("tool-section",
+                common_chat_kimi_k3_tool_section(p, inputs.tools, inputs.parallel_tool_calls) +
+                tail);
+            ending = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? calls : (calls | tail);
+        }
+
+        if (!thinking) {
+            return generation_prompt +
+                   response +
+                   ending +
+                   p.end();
+        }
+
+        auto thought = p.until(THINK_END);
+        auto thought_end = p.optional(p.literal(THINK_END));
+        auto reasoning = extract_reasoning ? THINK_START + p.reasoning(thought) + thought_end
+                                           : p.content(THINK_START + thought + thought_end);
+
+        return generation_prompt +
+               reasoning +
+               p.optional(response) +
+               ending +
+               p.end();
+    });
+
+    data.parser = parser.save();
+    if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+        data.grammar_triggers = {{ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|open|>tools<|sep|>" }};
+    }
+    return data;
+}
 
 // LFM2 format: uses <|tool_list_start|>[...]<|tool_list_end|> in system prompt
 // and <|tool_call_start|>[name(arg="val")]<|tool_call_end|> for tool calls.
@@ -2034,6 +2190,13 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|tool_call_begin|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Kimi K2 Thinking\n");
         return common_chat_params_init_kimi_k2(tmpl, params);
+    }
+
+    // The GGUF templates use different Jinja macro names for the same XTML tokens.
+    if (src.find("<|open|>") != std::string::npos && src.find("<|close|>") != std::string::npos &&
+            src.find("<|end_of_msg|>") != std::string::npos &&
+            (!params.json_schema.is_object() || params.json_schema.empty())) {
+        return common_chat_params_init_kimi_k3(tmpl, params);
     }
 
     if (is_lfm2_template(src)) {

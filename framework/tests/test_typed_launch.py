@@ -661,7 +661,7 @@ def test_qwen_profiles_launch_with_the_template_in_their_gguf(tmp_path, profile)
 
 def test_unknown_profile_refused_before_native_file(tmp_path):
     inputs, spec, _, adapter, out = setup(tmp_path)
-    with pytest.raises(ValueError, match="dsv, muse, qwen4exp, qwen35moe"):
+    with pytest.raises(ValueError, match="dsv, muse, kimi-k3, qwen4exp, qwen35moe"):
         resolve(replace(inputs, profile="qwen"), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
 
@@ -687,6 +687,7 @@ def qwen_like(arch="qwen4exp"):
         (muse_like, "muse"),
         (qwen_like, "qwen4exp"),
         (partial(qwen_like, "qwen35moe"), "qwen35moe"),
+        (partial(qwen_like, "kimi-k3"), "kimi-k3"),
     ],
 )
 def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
@@ -696,6 +697,8 @@ def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
     result = resolve(replace(inputs, profile=""), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == profile
     argv = list(result.argv)
+    assert argv[argv.index("--fit") + 1] == ("on" if profile == "kimi-k3" else "off")
+    assert argv[argv.index("-ngl") + 1] == ("auto" if profile == "kimi-k3" else "99")
     templates = {"dsv": "deepseek-ai-DeepSeek-V4.1.jinja", "muse": "muse-spark.jinja"}
     if profile in templates:
         assert argv[argv.index("--chat-template-file") + 1].endswith(templates[profile])

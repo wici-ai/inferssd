@@ -46,6 +46,8 @@ def plan(
     threads: Threads,
     gpu_backends: Optional[tuple[str, ...]] = None,
     placement: Sequence[str] = (),
+    *,
+    fit_layers: bool = False,
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
@@ -91,6 +93,7 @@ def plan(
             model_drive_key=key,
             vram_reserve_mib=cast(int, reserve.value) if reserve.origin != "default" else None,
             force_unified="GGML_CUDA_ENABLE_UNIFIED_MEMORY" in s.env,
+            fit_layers=fit_layers,
         )
     except ValueError as error:
         return skipped(str(error))

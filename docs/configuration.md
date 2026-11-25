@@ -198,6 +198,8 @@ fills keys still at their registry default with choices for the machine (see
 file. A file must have
 exactly the v1 header. Duplicate file keys, unknown keys, wrong types, bad ranges
 and dependency errors fail with key/source context; later CLI occurrences win.
+Older files may contain `prefill.cpu_max_tokens`. The file reader warns and skips
+this retired prefill limit. Remove it when updating the file.
 Trailing file comments are retained exactly after the `#` byte. CLI overrides
 receive `origin=cli`; file and default values retain their own location/receipt.
 Each context owns a copy of the immutable snapshot; no mutable global or ambient

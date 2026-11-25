@@ -54,6 +54,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
     }, &ud);
 
     llama_model_params mparams_copy = *mparams;
+    // Estimate the same device placement as the eventual deferred mmap load.
+    mparams_copy.defer_experts = mparams->defer_experts && mparams->use_mmap &&
+                                !mparams->use_mlock && !mparams->check_tensors;
     mparams_copy.no_alloc  = true;
     mparams_copy.use_mmap  = false;
     mparams_copy.use_mlock = false;
@@ -64,7 +67,11 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
         throw std::runtime_error("failed to load model");
     }
 
-    llama_context * ctx = llama_init_from_model(model, *cparams);
+    // A sizing probe must not open the live request's exclusive telemetry file or
+    // allocate its expert caches. Those are created once, after placement is chosen.
+    llama_context_params probe_context = *cparams;
+    probe_context.ssd_options = nullptr;
+    llama_context * ctx = llama_init_from_model(model, probe_context);
     if (ctx == nullptr) {
         llama_model_free(model);
         llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
@@ -132,7 +139,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data(
 
     hp_ngl         = llama_model_n_layer(model);
     hp_n_ctx_train = llama_model_n_ctx_train(model);
-    hp_n_expert    = llama_model_n_expert(model);
+    // Routed experts have already been placed in CPU buffers for SSD execution.
+    hp_n_expert    = mparams_copy.defer_experts && cparams->ssd_options ? 0 : llama_model_n_expert(model);
 
     common_memory_breakdown_print(ctx);
 

@@ -46,13 +46,13 @@ static inline bool llama_is_kimi_k2_deepseek2_layout(llm_arch arch, const llama_
 // With --defer-experts (mmap), Kimi's routed-expert tensors stay in plain mmap-backed
 // CPU buffers, with or without offloaded layers: never repacked or uploaded to VRAM.
 static inline bool llama_should_map_kimi_experts(llm_arch arch, const std::string & name) {
-    return arch == LLM_ARCH_KIMI_LINEAR ||
+    return arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_KIMI_K3 ||
         (arch == LLM_ARCH_DEEPSEEK2 && llama_model_name_is_kimi(name));
 }
 
 static inline bool llama_moe_should_use_plain_top_k(llm_arch arch, const llama_hparams & hparams) {
     return arch == LLM_ARCH_MISTRAL4 ||
-        arch == LLM_ARCH_KIMI_LINEAR ||
+        arch == LLM_ARCH_KIMI_LINEAR || arch == LLM_ARCH_KIMI_K3 ||
         llama_is_kimi_k2_deepseek2_layout(arch, hparams);
 }
 

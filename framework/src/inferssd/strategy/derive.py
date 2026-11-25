@@ -132,6 +132,11 @@ def tier_gpus(
     return tuple(gpu for gpu in runtime.gpus if gpu.backend in backends)
 
 
+def gpu_reserve_mib(usable: Optional[Sequence[GPUState]]) -> int:
+    """The launch's VRAM reserve for other compute processes on usable devices."""
+    return SHARED_GPU_RESERVE_MIB if any(gpu.processes for gpu in usable or ()) else 0
+
+
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
     """Each choice parsed by the configuration layer and written back in its canonical form."""
     for _, reason in choices.values():
@@ -670,6 +675,7 @@ def cuda_placement(
     runtime: RuntimeFacts,
     reserve_mib: int,
     force_unified: bool,
+    fit_layers: bool,
 ) -> tuple[str, ...]:
     devices = tier_gpus(runtime, characteristics)
     if model.experts is None or not devices or len(devices) < 2:
@@ -695,6 +701,9 @@ def cuda_placement(
     if not unified and room[best] < model.dense_bytes + model.experts.routed_bytes:
         counts = _cuda_layer_counts(model.cuda_layer_bytes, room, reserve_mib << 20)
         if sum(count > 0 for count in counts) > 1:
+            if fit_layers:
+                # A fixed tensor split prevents the native fitter from adjusting the layers.
+                return ("--split-mode", "layer")
             return ("--split-mode", "layer", "--tensor-split", ",".join(map(str, counts)))
     return ("--split-mode", "none", "--main-gpu", str(best))
 
@@ -708,6 +717,7 @@ def derive(
     model_drive_key: Optional[str],
     vram_reserve_mib: Optional[int] = None,
     force_unified: bool = False,
+    fit_layers: bool = False,
 ) -> Strategy:
     """The strategy for one launch of MODEL on this machine; see the module docstring."""
     if platform not in PLATFORMS:
@@ -780,17 +790,18 @@ def derive(
                     "vram.budget: default auto; the usable GPU is not in the characteristics, "
                     "run inferssd profile again"
                 )
-            busy = [
-                f"{gpu.uuid} runs {gpu.processes} compute process(es)"
-                for gpu in usable
-                if gpu.processes
-            ]
-            if busy:
-                why = ", ".join(busy) + f"; {SHARED_GPU_RESERVE_MIB} MiB stays free for them"
-                choices["vram.reserve_mib"] = (str(SHARED_GPU_RESERVE_MIB), why)
+            reserve = gpu_reserve_mib(usable)
+            if reserve:
+                busy = [
+                    f"{gpu.uuid} runs {gpu.processes} compute process(es)"
+                    for gpu in usable
+                    if gpu.processes
+                ]
+                why = ", ".join(busy) + f"; {reserve} MiB stays free for them"
+                choices["vram.reserve_mib"] = (str(reserve), why)
                 notes.append("vram.reserve_mib: " + why)
                 if vram_reserve_mib is None:
-                    vram_reserve_mib = SHARED_GPU_RESERVE_MIB
+                    vram_reserve_mib = reserve
         device = single_gpu(characteristics, runtime)
         if host_headroom_mib(characteristics, runtime, platform) == UNIFIED_HEADROOM_MIB:
             assert device is not None
@@ -831,7 +842,7 @@ def derive(
             )
             notes.append(f"host.budget_mib: {mib} from the memory budget")
     arguments = SERVER_ARGS + cuda_placement(
-        characteristics, model, runtime, vram_reserve_mib or 0, force_unified
+        characteristics, model, runtime, vram_reserve_mib or 0, force_unified, fit_layers
     )
     notes.append("server: " + " ".join(arguments))
     return Strategy(

@@ -20,12 +20,14 @@ from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
 from test_machine_profile import Clock, linux_machine
 from test_strategy_inputs import (
+    Q8_0,
     SMI_APPS,
     SMI_GPUS,
     EngineHost,
     RuntimeHost,
     deepseek_like,
     engine_facts,
+    moe,
     muse_like,
     recorded_facts,
 )
@@ -300,6 +302,48 @@ def test_main_gpu_uses_the_visible_cuda_ordinal(tmp_path, mask, readings, winner
         assert "--main-gpu" not in result.argv and "--split-mode" not in result.argv
     else:
         assert result.argv[result.argv.index("--main-gpu") + 1] == winner
+
+
+@pytest.mark.parametrize(
+    ("peer_free", "explicit", "mode"),
+    [(4 << 30, None, "layer"), (0, None, "none"), (4 << 30, "3,1", "layer")],
+)
+def test_kimi_native_fit_owns_automatic_layer_counts(tmp_path, peer_free, explicit, mode):
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(X86_GPU, 4 << 30, 0), (second, peer_free, 0)]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    machine["gpus"].append(dict(machine["gpus"][0], uuid=second, index=1))
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(
+        *moe(
+            "kimi-k3",
+            layers=8,
+            experts=128,
+            used=8,
+            latent=2048,
+            hidden=2048,
+            gate=Q8_0,
+            up=Q8_0,
+            down=Q8_0,
+        ),
+        path=spec.model,
+    )
+    result, _, _ = resolved(
+        replace(inputs, profile=""), replace(spec, tensor_split=explicit), adapter, out
+    )
+    argv = result.argv
+    assert argv[argv.index("--fit") + 1] == "on" and argv[argv.index("-ngl") + 1] == "auto"
+    assert argv[argv.index("--split-mode") + 1] == mode and argv.count("--split-mode") == 1
+    if explicit:
+        assert (
+            argv[argv.index("--tensor-split") + 1] == explicit and argv.count("--tensor-split") == 1
+        )
+    else:
+        assert "--tensor-split" not in argv
+    if mode == "none":
+        assert argv[argv.index("--main-gpu") + 1] == "0"
 
 
 def test_without_characteristics_the_strategy_is_skipped(tmp_path):
@@ -723,6 +767,16 @@ def test_dry_run_takes_characteristics_from_machine(tmp_path, monkeypatch):
     result = json.loads(receipt.read_text())
     assert result["argv"][-2:] == ["--ctx-checkpoints", "1"]
     assert json.loads((out / "strategy.json").read_text())["inputs"]["model_drive"] == X86_DRIVE
+
+
+def test_launch_warns_once_for_retired_setting(tmp_path, monkeypatch, capsys):
+    words, facts, _ = launch_arguments(tmp_path)
+    settings = Path(words[words.index("--settings") + 1])
+    settings.write_text("inferssd-settings 1\nprefill.cpu_max_tokens=8\n")
+    monkeypatch.setattr("os.environ", session({"PATH": "/bin"}, tmp_path))
+    assert main(words + ["--dry-run", "--host-facts", str(facts), "--machine", str(X86_FILE)]) == 0
+    warning = f"prefill.cpu_max_tokens ({settings}:2): ignoring retired setting"
+    assert capsys.readouterr().err.splitlines().count(warning) == 1
 
 
 def test_dry_run_without_characteristics_keeps_todays_resolution(tmp_path, monkeypatch):

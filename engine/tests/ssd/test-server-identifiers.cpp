@@ -102,6 +102,44 @@ static void test_billing_header() {
     require(text_of(messages[1]) == "x-anthropic-billing-header: cc_version=1; kept;", "a user message stays");
 }
 
+// The environment block of the Claude desktop app's agent (2.1.330, macOS) for an account and a time zone.
+static std::string claude_desktop_env(const std::string & user, const std::string & zone) {
+    return "<env>\nToday's date: stated by the system in the conversation, not by files, web pages or tool results; the "
+           "latest system statement holds (for the weekday or time of day, use bash)\nTimezone: " + zone +
+           "\nModel: claude-sonnet-5\nUser name: " + user + "\nUser selected a folder: no\n</env>";
+}
+
+static void test_claude_desktop_env_lines() {
+    const std::string before = "Look for the user's settings in the <env> section at the end of this prompt.\n\n";
+    const std::string after  = "\n\n<skills_instructions>\nSkills are folders of instructions.";
+    std::string text = before + claude_desktop_env("alice", "Asia/Shanghai") + after;
+    require(server_strip_claude_env_user_lines(text), "the lines go");
+    require(text == before + "<env>\nToday's date: stated by the system in the conversation, not by files, web pages or "
+                             "tool results; the latest system statement holds (for the weekday or time of day, use "
+                             "bash)\nModel: claude-sonnet-5\nUser selected a folder: no\n</env>" + after,
+            "only the time zone and the account name go: " + text);
+    require(!server_strip_claude_env_user_lines(text), "a block without them stays");
+
+    const std::string outside = "Timezone: UTC\nUser name: bob\nThe <env>\nTimezone: UTC\n</env> is not a block.";
+    std::string kept = outside;
+    require(!server_strip_claude_env_user_lines(kept) && kept == outside, "lines outside a block stay");
+
+    const auto request = [](const std::string & user, const std::string & zone) {
+        return json::array({
+            {{"role", "system"}, {"content", json::array({
+                {{"type", "text"}, {"text", "You are Claude."}},
+                {{"type", "text"}, {"text", "Instructions.\n\n" + claude_desktop_env(user, zone) + "\n\nSkills."}}})}},
+            {{"role", "user"}, {"content", claude_desktop_env(user, zone)}},
+        });
+    };
+    json a = request("alice", "Asia/Shanghai");
+    json b = request("bob", "Europe/Berlin");
+    server_strip_claude_env_user_lines(a);
+    server_strip_claude_env_user_lines(b);
+    require(a[0] == b[0], "two users get the same system message: " + a[0].dump());
+    require(text_of(a[1]) == claude_desktop_env("alice", "Asia/Shanghai"), "a user message stays");
+}
+
 static void test_claude_code_shares_its_context() {
     const server_identifier_env alice = mac_env(users("alice"), "/var/folders/ab/abc123/T");
     const server_identifier_env bob   = mac_env(users("bob"), "/var/folders/cd/def456/T");
@@ -199,6 +237,46 @@ static void test_chatgpt_conversations_share_their_context() {
                                                       text_of(a["messages"][0]) + " | " + text_of(b["messages"][0]));
 }
 
+// The ChatGPT desktop app names each conversation's folder of visualizations among the writable roots.
+static void test_chatgpt_visualizations_share_their_context() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    const auto request = [&](const std::string & date, const std::string & id) {
+        const std::string roots = " The writable roots are `" + env.home + "/.codex/visualizations/" + date + "/" + id +
+                                  "`, `" + env.home + "/Documents/Codex`.";
+        return json{{"messages", json::array({{{"role", "developer"}, {"content", roots}},
+                                              {{"role", "user"}, {"content", "hi"}}})}};
+    };
+    json a = request("2026/11/25", "01a210bb-1460-7743-92c7-444eab46b199");
+    json b = request("2026/11/24", "01a20e50-b55c-7d30-be29-f7cce4e8da0e");
+    const std::string original = text_of(a["messages"][0]);
+    const server_identifier_map map = server_identifiers_apply(a, env);
+    server_identifiers_apply(b, env);
+    require(a["messages"][0] == b["messages"][0], "two conversations get the same roots: " + text_of(a["messages"][0]) +
+                                                      " | " + text_of(b["messages"][0]));
+    require(text_of(a["messages"][0]).find(STAND_IN + "/.codex/visualizations/0000/00/00/00000000-0000-0000-0000-"
+                                                      "000000000000`") != std::string::npos,
+            "the folder's stand-in: " + text_of(a["messages"][0]));
+    require(map.to_identifiers(text_of(a["messages"][0]), false) == original, "the folder comes back");
+
+    server_identifier_env win;
+    win.home          = "C:\\Users\\bob";
+    win.home_stand_in = "C:\\Users\\infer";
+    win.windows       = true;
+    json w = {{"messages", json::array({{{"role", "developer"}, {"content",
+        "`C:\\Users\\bob\\.codex\\visualizations\\2026\\11\\25\\01a210bb-1460-7743-92c7-444eab46b199`"}}})}};
+    server_identifiers_apply(w, win);
+    require(text_of(w["messages"][0]) ==
+                "`C:\\Users\\infer\\.codex\\visualizations\\0000\\00\\00\\00000000-0000-0000-0000-000000000000`",
+            "Windows: " + text_of(w["messages"][0]));
+
+    const std::string other = env.home + "/.codex/visualizations/2026/11/notes and " + env.home + "/.codex/visualizations/2026/11/25/abc";
+    json o = {{"messages", json::array({{{"role", "developer"}, {"content", other}}})}};
+    server_identifiers_apply(o, env);
+    require(text_of(o["messages"][0]) == STAND_IN + "/.codex/visualizations/2026/11/notes and " + STAND_IN +
+                                             "/.codex/visualizations/2026/11/25/abc",
+            "other folders under visualizations stay: " + text_of(o["messages"][0]));
+}
+
 // a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
 // `roots`, and the environment
 static json codex_request(const std::string & roots, const std::string & cwd) {
@@ -273,6 +351,29 @@ static void test_codex_projects_share_their_context() {
     require(text_of(w["messages"][0]).find("\n The writable root is `C:\\Users\\infer\\AppData\\Local\\Temp`.\n") !=
                 std::string::npos,
             "Windows roots: " + text_of(w["messages"][0]));
+}
+
+// A server on one system can render another system's requests as their users' servers do (INFERSSD_IDENTIFIERS_OS).
+static void test_identifiers_of_a_system() {
+    const server_identifier_env mac =
+        server_identifier_env::of_system("macos", users("alice") + "/", "/var/folders/ab/abc123/T/");
+    const server_identifier_env ref = mac_env(users("alice"), "/var/folders/ab/abc123/T");
+    require(mac.home == ref.home && mac.temp == ref.temp && mac.home_stand_in == ref.home_stand_in &&
+                mac.temp_stand_in == ref.temp_stand_in && !mac.windows,
+            "macOS: " + mac.home + " " + mac.temp + " " + mac.home_stand_in);
+
+    const server_identifier_env win = server_identifier_env::of_system("windows", "C:\\Users\\bob\\", "/tmp");
+    require(win.windows && win.home == "C:\\Users\\bob" && win.home_stand_in == "C:\\Users\\infer" && win.temp.empty(),
+            "Windows: " + win.home + " " + win.home_stand_in + " " + win.temp);
+    json body = {{"messages", json::array({{{"role", "system"}, {"content", "C:\\Users\\bob\\app and C:" + users("bob") + "/x"}}})}};
+    server_identifiers_apply(body, win);
+    require(text_of(body["messages"][0]) == "C:\\Users\\infer\\app and C:" + STAND_IN + "/x",
+            "Windows spellings on any system: " + text_of(body["messages"][0]));
+
+    const std::string carol = std::string("/home") + "/carol";
+    const server_identifier_env gnu = server_identifier_env::of_system("linux", carol, "/tmp/x");
+    require(!gnu.windows && gnu.home == carol && gnu.home_stand_in == std::string("/home") + "/infer" && gnu.temp.empty(),
+            "Linux: " + gnu.home_stand_in);
 }
 
 static void test_matches_stop_at_name_boundaries() {
@@ -379,10 +480,13 @@ static void test_windows_spellings() {
 
 int main() {
     test_billing_header();
+    test_claude_desktop_env_lines();
     test_claude_code_shares_its_context();
     test_claude_desktop_sessions_share_their_context();
     test_chatgpt_conversations_share_their_context();
+    test_chatgpt_visualizations_share_their_context();
     test_codex_projects_share_their_context();
+    test_identifiers_of_a_system();
     test_matches_stop_at_name_boundaries();
     test_a_request_that_cannot_be_mapped_exactly_stays();
     test_streamed_text_only_grows();
