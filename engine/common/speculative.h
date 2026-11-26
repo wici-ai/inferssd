@@ -53,7 +53,7 @@ void common_speculative_print_stats(const common_speculative * spec);
 struct common_speculative_adapt {
     static constexpr int    warmup      = 2;    // rounds of 0 .. n_max before the measurements are used
     static constexpr int    probe_every = 16;
-    static constexpr double rate        = 0.25; // the weight of a new measurement
+    static constexpr double rate        = 0.1;  // the weight of a new measurement: a step varies by a third and more
 
     std::vector<double> t_len; // ms a step at length n took, index n; 0 while unmeasured
     std::vector<double> n_len; // tokens it gave
