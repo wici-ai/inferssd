@@ -196,3 +196,26 @@ Contributions are welcome, including hardware results and improvements to expert
 Built on [llama.cpp and ggml](https://github.com/ggml-org/llama.cpp), with thanks to their contributors and the model-adaptation community.
 
 InferSSD is licensed under [Apache-2.0](LICENSE); bundled llama.cpp/ggml and other third-party components keep their original licenses and notices; see [NOTICE](NOTICE). Model weights remain subject to their publishers' licenses.
+
+## Experimental phase-specific resident routing
+
+This research branch combines two approximate DeepSeek41 policies: a miss-aware
+expert union budget during multi-token prefill (budget 4, retaining all ready
+hits), and bounded-rank resident selection during single-token SSD decode
+(top-J=1, top-M=16). The policies activate only for DeepSeek41's SSD sink path.
+They omit or substitute expert contributions and are not numerically equivalent
+to full routing; speed results alone do not establish acceptable model quality.
+Prefill may leave a token with no routed contribution. Other architectures keep
+the original route selection.
+
+GPU residency ABI v5 keeps separate prefill and decode readiness snapshots so
+the two source policies retain their original eligibility conditions. Decode's
+threadpool callback still executes only on worker zero. Selection, readiness,
+graph reuse and unchanged expert-compute paths have focused native tests.
+Source attribution and upstream revisions are recorded in NOTICE.
+
+The measured combination fails manual summary-quality review despite higher
+throughput. See the [design sources, measurements and accuracy concerns](docs/development/approximate-expert-routing.md)
+for exact tested revisions and the distinction between measured code and this
+branch after integration with current main. There is no separate opt-in switch
+for these experimental policies yet.

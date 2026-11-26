@@ -133,3 +133,25 @@ External runtime dependencies
 
 Binary distributions built with CUDA must comply with the NVIDIA CUDA runtime
 terms.
+
+Miss-aware prefill expert budget
+-------------------------------
+
+The batch-union selection mechanism in
+engine/ggml/src/ggml-cpu/ssd/prefill-union-budget.h is adapted from
+woolcoxm's Colibri PR #254 (Apache-2.0):
+https://github.com/JustVugg/colibri/pull/254
+Pinned revision: dd0d60692d338c01ee03e3854284a3eca8601da6.
+This adaptation applies only to multi-token DeepSeek41 prefill, with budget 4.
+It deliberately omits expert contributions and can leave tokens with none;
+outputs depend on the token batch and ready-residency snapshot. This prefill policy does not alter single-token decode.
+
+Bounded-rank resident expert selection
+-------------------------------------
+
+The decode selector independently implements the top-J / resident top-M fill
+mechanism described by JustVugg/colibri PR #199 and issue #811:
+https://github.com/JustVugg/colibri/commit/47b5f075e266384e6a6445089b638babb5f945de
+https://github.com/JustVugg/colibri/issues/811
+Only the max-rank selection mechanism is adapted; other Colibri tuning and
+kernels are not included. This changes expert identities and can reduce quality.

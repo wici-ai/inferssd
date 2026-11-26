@@ -1,0 +1,743 @@
+{
+  "schema": "experimental-resident-routing/1",
+  "status": "throughput-gain-with-observed-task-quality-regression",
+  "measured_commit": "5e5bcc242552b4f45a57dd95be07ab85e5895e30",
+  "baseline_commit": "8b1b6500e6b69bc37605ab1b0f1f9eff17c45ef4",
+  "integration_base": "910afae91c3c2578f890df7ffd9a1e55b6237680",
+  "performance_rerun_after_main_integration": false,
+  "hardware": {
+    "platform": "Linux aarch64",
+    "device": "NVIDIA DGX Spark / GB10",
+    "cpu_cores": 20,
+    "physical_memory_bytes": 130663170048
+  },
+  "model": {
+    "name": "DeepSeek-V4.1-Flash-1017",
+    "gguf_filename": "DeepSeek-V4.1-Flash-1017-Q8_0-00001-of-00010.gguf",
+    "reported_file_type": "MXFP4 MoE",
+    "tensor_counts": {
+      "f32": 529,
+      "q8_0": 332,
+      "bf16": 65,
+      "mxfp4": 120
+    },
+    "expert_bridge": "mxfp4/mxfp4",
+    "hidden_quantizer": "cuda_q8_1",
+    "same_formats_in_all_arms": true
+  },
+  "workload": {
+    "prompt": "bench/prompts/prompt-4096.txt",
+    "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+    "rendered_prompt_sha256": "010e19e02176e6e4ed7069a80c3836d6d2885fdfcb320127377a99e4d40457c8",
+    "input_tokens": 4104,
+    "output_tokens": 256,
+    "context": 8192,
+    "batch": 4104,
+    "ubatch": 4104,
+    "decode_threads": 10,
+    "batch_threads": 19,
+    "memory_budget_bytes": 130663170048,
+    "swap_bytes": 0,
+    "sampling": {
+      "temperature": 0,
+      "top_k": 1,
+      "samplers": [
+        "top_k"
+      ],
+      "seed": 0,
+      "ignore_eos": true
+    },
+    "primary_decode_metric": "tokens 129-256",
+    "cuda_expert_tier": true
+  },
+  "build": {
+    "type": "Release",
+    "cuda": "13.0",
+    "cuda_architectures": "121a-real",
+    "host_compiler": "GCC 13",
+    "GGML_CUDA": "ON",
+    "GGML_CUDA_SSD_VRAM_TIER": "ON",
+    "build_profile_sha256": "9ef6dc5034781ad5047945a775ed660443c99db69485f6398a1b75ff02aecdf8"
+  },
+  "variants": {
+    "baseline": {
+      "source": "8b1b6500e6b69bc37605ab1b0f1f9eff17c45ef4",
+      "samples": 5,
+      "summary": {
+        "server_prefill_tps": {
+          "n": 5,
+          "values": [
+            152.1202538777321,
+            152.45515203315142,
+            153.0946208690425,
+            152.5830140454449,
+            152.41640726971298
+          ],
+          "mean": 152.53388961901678,
+          "sample_sd_ddof1": 0.35634568200038413,
+          "cv": 0.002336173835797587,
+          "mean_plus_minus_2sd": [
+            151.82119825501601,
+            153.24658098301754
+          ]
+        },
+        "decode_second128_tps": {
+          "n": 5,
+          "values": [
+            7.277360828735945,
+            7.326904868498907,
+            7.291297961725926,
+            7.289818839910699,
+            7.16183121409298
+          ],
+          "mean": 7.269442742592891,
+          "sample_sd_ddof1": 0.06292390049327952,
+          "cv": 0.008655945540996943,
+          "mean_plus_minus_2sd": [
+            7.143594941606332,
+            7.39529054357945
+          ]
+        },
+        "decode_tps": {
+          "n": 5,
+          "values": [
+            5.333340972071943,
+            5.208798925591463,
+            5.2930912732905515,
+            5.258924536682233,
+            5.272751050172757
+          ],
+          "mean": 5.273381351561789,
+          "sample_sd_ddof1": 0.045727244687360634,
+          "cv": 0.008671332801261915,
+          "mean_plus_minus_2sd": [
+            5.181926862187068,
+            5.36483584093651
+          ]
+        },
+        "decode_first128_tps": {
+          "n": 5,
+          "values": [
+            4.202009094326493,
+            4.0335689504766785,
+            4.147503082138701,
+            4.106010576259132,
+            4.165392052188922
+          ],
+          "mean": 4.1308967510779855,
+          "sample_sd_ddof1": 0.06444897954841503,
+          "cv": 0.015601692182598518,
+          "mean_plus_minus_2sd": [
+            4.001998791981156,
+            4.259794710174815
+          ]
+        },
+        "ttft_s": {
+          "n": 5,
+          "values": [
+            26.982333703,
+            26.922932893,
+            26.810604665,
+            26.89966337,
+            26.930066751
+          ],
+          "mean": 26.9091202764,
+          "sample_sd_ddof1": 0.0628182055183737,
+          "cv": 0.002334457792493012,
+          "mean_plus_minus_2sd": [
+            26.78348386536325,
+            27.034756687436747
+          ]
+        },
+        "request_wall_s": {
+          "n": 5,
+          "values": [
+            74.795590117,
+            75.879138826,
+            74.986915938,
+            75.38920469,
+            75.292506871
+          ],
+          "mean": 75.2686712884,
+          "sample_sd_ddof1": 0.41561969472547267,
+          "cv": 0.005521815220212685,
+          "mean_plus_minus_2sd": [
+            74.43743189894906,
+            76.09991067785094
+          ]
+        }
+      },
+      "change_vs_baseline_percent": {
+        "server_prefill_tps": 0.0,
+        "decode_second128_tps": 0.0,
+        "decode_tps": 0.0,
+        "decode_first128_tps": 0.0,
+        "ttft_s": 0.0,
+        "request_wall_s": 0.0
+      },
+      "basic_output_valid": true
+    },
+    "prefill_only": {
+      "source": "bb9b744b0cbd5ac6c15f91b2940cf488119f1d5f",
+      "samples": 2,
+      "summary": {
+        "server_prefill_tps": {
+          "n": 2,
+          "values": [
+            395.80890068514293,
+            384.23926196850533
+          ],
+          "mean": 390.0240813268241,
+          "sample_sd_ddof1": 8.180969992412871,
+          "cv": 0.020975550957217832,
+          "mean_plus_minus_2sd": [
+            373.66214134199834,
+            406.38602131164987
+          ]
+        },
+        "decode_second128_tps": {
+          "n": 2,
+          "values": [
+            6.776971048332507,
+            7.131755416193041
+          ],
+          "mean": 6.954363232262774,
+          "sample_sd_ddof1": 0.2508704323731659,
+          "cv": 0.03607381783127526,
+          "mean_plus_minus_2sd": [
+            6.452622367516442,
+            7.456104097009106
+          ]
+        },
+        "decode_tps": {
+          "n": 2,
+          "values": [
+            5.330292432409372,
+            5.1066926517359175
+          ],
+          "mean": 5.218492542072645,
+          "sample_sd_ddof1": 0.15810892118602468,
+          "cv": 0.030297814917107858,
+          "mean_plus_minus_2sd": [
+            4.9022746997005955,
+            5.534710384444694
+          ]
+        },
+        "decode_first128_tps": {
+          "n": 2,
+          "values": [
+            4.38652803546832,
+            3.970415540805853
+          ],
+          "mean": 4.178471788137086,
+          "sample_sd_ddof1": 0.29423596671228147,
+          "cv": 0.07041712416190861,
+          "mean_plus_minus_2sd": [
+            3.5899998547125236,
+            4.766943721561649
+          ]
+        },
+        "ttft_s": {
+          "n": 2,
+          "values": [
+            10.377333762,
+            10.69057678
+          ],
+          "mean": 10.533955271,
+          "sample_sd_ddof1": 0.22149626218714077,
+          "cv": 0.021026884630592692,
+          "mean_plus_minus_2sd": [
+            10.090962746625719,
+            10.976947795374281
+          ]
+        },
+        "request_wall_s": {
+          "n": 2,
+          "values": [
+            58.217626716,
+            60.625819078
+          ],
+          "mean": 59.421722896999995,
+          "sample_sd_ddof1": 1.7028491495718499,
+          "cv": 0.028657014077554138,
+          "mean_plus_minus_2sd": [
+            56.016024597856294,
+            62.827421196143696
+          ]
+        }
+      },
+      "change_vs_baseline_percent": {
+        "server_prefill_tps": 155.6966732448674,
+        "decode_second128_tps": -4.334300736478913,
+        "decode_tps": -1.0408655439434145,
+        "decode_first128_tps": 1.1516878761660188,
+        "ttft_s": -60.85358732355679,
+        "request_wall_s": -21.053843677777596
+      },
+      "basic_output_valid": true
+    },
+    "decode_only": {
+      "source": "b493ac15e03cc89a2ea4478344ab726f44247b1e",
+      "samples": 2,
+      "summary": {
+        "server_prefill_tps": {
+          "n": 2,
+          "values": [
+            151.6669562160336,
+            152.13457148039507
+          ],
+          "mean": 151.90076384821435,
+          "sample_sd_ddof1": 0.33065392441632546,
+          "cv": 0.0021767759163260616,
+          "mean_plus_minus_2sd": [
+            151.2394559993817,
+            152.562071697047
+          ]
+        },
+        "decode_second128_tps": {
+          "n": 2,
+          "values": [
+            8.055661524741062,
+            8.109640638920524
+          ],
+          "mean": 8.082651081830793,
+          "sample_sd_ddof1": 0.03816899767874073,
+          "cv": 0.004722336432973315,
+          "mean_plus_minus_2sd": [
+            8.00631308647331,
+            8.158989077188275
+          ]
+        },
+        "decode_tps": {
+          "n": 2,
+          "values": [
+            7.386160994617485,
+            7.390387812065764
+          ],
+          "mean": 7.388274403341624,
+          "sample_sd_ddof1": 0.0029888112805156347,
+          "cv": 0.00040453441728745656,
+          "mean_plus_minus_2sd": [
+            7.382296780780593,
+            7.394252025902655
+          ]
+        },
+        "decode_first128_tps": {
+          "n": 2,
+          "values": [
+            6.815287178016402,
+            6.7839723252492
+          ],
+          "mean": 6.799629751632802,
+          "sample_sd_ddof1": 0.02214294474354672,
+          "cv": 0.0032564927139201237,
+          "mean_plus_minus_2sd": [
+            6.7553438621457085,
+            6.843915641119895
+          ]
+        },
+        "ttft_s": {
+          "n": 2,
+          "values": [
+            27.063440954,
+            26.980148924
+          ],
+          "mean": 27.021794939000003,
+          "sample_sd_ddof1": 0.0588963592317927,
+          "cv": 0.002179587231889943,
+          "mean_plus_minus_2sd": [
+            26.904002220536416,
+            27.13958765746359
+          ]
+        },
+        "request_wall_s": {
+          "n": 2,
+          "values": [
+            61.587791559,
+            61.485162774
+          ],
+          "mean": 61.536477166500006,
+          "sample_sd_ddof1": 0.07256950981843643,
+          "cv": 0.0011792925620698795,
+          "mean_plus_minus_2sd": [
+            61.391338146863134,
+            61.68161618613688
+          ]
+        }
+      },
+      "change_vs_baseline_percent": {
+        "server_prefill_tps": -0.41507219961660624,
+        "decode_second128_tps": 11.186666819358493,
+        "decode_tps": 40.105065626506956,
+        "decode_first128_tps": 64.6042048825934,
+        "ttft_s": 0.41872295133640325,
+        "request_wall_s": -18.244236130173753
+      },
+      "basic_output_valid": true
+    },
+    "combined": {
+      "source": "5e5bcc242552b4f45a57dd95be07ab85e5895e30",
+      "samples": 2,
+      "summary": {
+        "server_prefill_tps": {
+          "n": 2,
+          "values": [
+            390.2618634281272,
+            396.94603033174496
+          ],
+          "mean": 393.6039468799361,
+          "sample_sd_ddof1": 4.72641974413082,
+          "cv": 0.01200805983170833,
+          "mean_plus_minus_2sd": [
+            384.15110739167443,
+            403.0567863681977
+          ]
+        },
+        "decode_second128_tps": {
+          "n": 2,
+          "values": [
+            8.005797447757665,
+            8.097857577011938
+          ],
+          "mean": 8.0518275123848,
+          "sample_sd_ddof1": 0.06509634167260657,
+          "cv": 0.008084666688708816,
+          "mean_plus_minus_2sd": [
+            7.921634829039587,
+            8.182020195730013
+          ]
+        },
+        "decode_tps": {
+          "n": 2,
+          "values": [
+            7.151297506008547,
+            7.499347390467973
+          ],
+          "mean": 7.32532244823826,
+          "sample_sd_ddof1": 0.24610843349245462,
+          "cv": 0.03359694200924134,
+          "mean_plus_minus_2sd": [
+            6.83310558125335,
+            7.817539315223169
+          ]
+        },
+        "decode_first128_tps": {
+          "n": 2,
+          "values": [
+            6.4567128854171045,
+            6.979437495380752
+          ],
+          "mean": 6.718075190398928,
+          "sample_sd_ddof1": 0.3696221163983885,
+          "cv": 0.05501905023728081,
+          "mean_plus_minus_2sd": [
+            5.978830957602152,
+            7.457319423195705
+          ]
+        },
+        "ttft_s": {
+          "n": 2,
+          "values": [
+            10.526339777,
+            10.349085989
+          ],
+          "mean": 10.437712883,
+          "sample_sd_ddof1": 0.12533735548580255,
+          "cv": 0.012008124470442243,
+          "mean_plus_minus_2sd": [
+            10.187038172028394,
+            10.688387593971605
+          ]
+        },
+        "request_wall_s": {
+          "n": 2,
+          "values": [
+            46.184819967,
+            44.352725567
+          ],
+          "mean": 45.268772767,
+          "sample_sd_ddof1": 1.2954863740139009,
+          "cv": 0.028617660582093,
+          "mean_plus_minus_2sd": [
+            42.6778000189722,
+            47.859745515027804
+          ]
+        }
+      },
+      "change_vs_baseline_percent": {
+        "server_prefill_tps": 158.0436045150615,
+        "decode_second128_tps": 10.76265124433522,
+        "decode_tps": 38.91129732289811,
+        "decode_first128_tps": 62.629946842554254,
+        "ttft_s": -61.21124445619968,
+        "request_wall_s": -39.85708530239914
+      },
+      "basic_output_valid": true
+    }
+  },
+  "routing_statistics": {
+    "A": [
+      {
+        "run": "A1",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 185606.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 799354.0,
+          "ssd_bytes": 196068320992.0,
+          "ssd_read_us": 17025764.1,
+          "gpu_expert_us": 847890.4,
+          "gpu_read_wait_us": 7530394.902,
+          "vram_experts": 2529.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10422.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": []
+      },
+      {
+        "run": "A2",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 185508.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 799452.0,
+          "ssd_bytes": 195635623648.0,
+          "ssd_read_us": 16952431.8,
+          "gpu_expert_us": 844263.04,
+          "gpu_read_wait_us": 7673463.698,
+          "vram_experts": 2516.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10399.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": []
+      },
+      {
+        "run": "A3",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 185656.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 799304.0,
+          "ssd_bytes": 195597997792.0,
+          "ssd_read_us": 16928460.2,
+          "gpu_expert_us": 848446.208,
+          "gpu_read_wait_us": 7586913.066,
+          "vram_experts": 2503.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10397.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": []
+      },
+      {
+        "run": "A4",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 185512.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 799448.0,
+          "ssd_bytes": 195710872288.0,
+          "ssd_read_us": 16982109.6,
+          "gpu_expert_us": 849880.224,
+          "gpu_read_wait_us": 7655434.924,
+          "vram_experts": 2512.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10403.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": []
+      },
+      {
+        "run": "A5",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 185704.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 799256.0,
+          "ssd_bytes": 196143572704.0,
+          "ssd_read_us": 17004785.0,
+          "gpu_expert_us": 846652.576,
+          "gpu_read_wait_us": 7672245.701,
+          "vram_experts": 2500.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10426.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": []
+      }
+    ],
+    "prefill": [
+      {
+        "run": "B1",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 186502.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 13.0,
+          "ssd_bytes": 18812928.0,
+          "ssd_read_us": 11511.6,
+          "gpu_expert_us": 833899.072,
+          "gpu_read_wait_us": 0.0,
+          "vram_experts": 2541.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 1.0,
+          "total_routes": 186515.0
+        },
+        "decode_substitutions": []
+      },
+      {
+        "run": "B2",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 188076.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 41.0,
+          "ssd_bytes": 18812928.0,
+          "ssd_read_us": 11524.1,
+          "gpu_expert_us": 846872.384,
+          "gpu_read_wait_us": 0.0,
+          "vram_experts": 2562.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 1.0,
+          "total_routes": 188117.0
+        },
+        "decode_substitutions": []
+      }
+    ],
+    "decode": [
+      {
+        "run": "B1",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 184664.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 800296.0,
+          "ssd_bytes": 195993066208.0,
+          "ssd_read_us": 16981600.4,
+          "gpu_expert_us": 850174.016,
+          "gpu_read_wait_us": 7674347.528,
+          "vram_experts": 2493.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10418.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": [
+          "[ssd_bounded_rank] slots=61200 substitutions=11443 j=1 m=16"
+        ]
+      },
+      {
+        "run": "B2",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 184784.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 800176.0,
+          "ssd_bytes": 195955443424.0,
+          "ssd_read_us": 17018481.2,
+          "gpu_expert_us": 841788.64,
+          "gpu_read_wait_us": 7761971.765,
+          "vram_experts": 2491.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 10416.0,
+          "total_routes": 984960.0
+        },
+        "decode_substitutions": [
+          "[ssd_bounded_rank] slots=61200 substitutions=11260 j=1 m=16"
+        ]
+      }
+    ],
+    "combined": [
+      {
+        "run": "B1",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 188078.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 41.0,
+          "ssd_bytes": 18812928.0,
+          "ssd_read_us": 11357.2,
+          "gpu_expert_us": 855361.408,
+          "gpu_read_wait_us": 0.0,
+          "vram_experts": 2570.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 1.0,
+          "total_routes": 188119.0
+        },
+        "decode_substitutions": [
+          "[ssd_bounded_rank] slots=61200 substitutions=12771 j=1 m=16"
+        ]
+      },
+      {
+        "run": "B2",
+        "prefill_source_lines": 40,
+        "all_prefill_source_lines": 120,
+        "counters": {
+          "vram_routes": 188546.0,
+          "ram_routes": 0.0,
+          "ssd_routes": 41.0,
+          "ssd_bytes": 18812928.0,
+          "ssd_read_us": 11384.6,
+          "gpu_expert_us": 836132.384,
+          "gpu_read_wait_us": 0.0,
+          "vram_experts": 2539.0,
+          "ram_experts": 0.0,
+          "ssd_experts": 1.0,
+          "total_routes": 188587.0
+        },
+        "decode_substitutions": [
+          "[ssd_bounded_rank] slots=61200 substitutions=8705 j=1 m=16"
+        ]
+      }
+    ]
+  },
+  "quality": {
+    "manual_review": "failed",
+    "aggregate_accuracy_drop_percent": null,
+    "perplexity_measured": false,
+    "prefill_omitted_fraction": 0.8087709145549058,
+    "decode_replacements": [
+      {
+        "run": "B1",
+        "routed_slots": 61200,
+        "substitutions": 12771,
+        "fraction": 0.2086764705882353
+      },
+      {
+        "run": "B2",
+        "routed_slots": 61200,
+        "substitutions": 8705,
+        "fraction": 0.14223856209150326
+      }
+    ],
+    "observations": {
+      "baseline": "On-topic summaries in five retained samples.",
+      "prefill_only": "One outline-like output; one mainly reproduces the source introduction.",
+      "decode_only": "On-topic summaries in two samples; this does not establish no quality loss.",
+      "combined": "One mainly reproduces the introduction; one is off-topic and repetitive."
+    },
+    "combined_outputs": [
+      {
+        "sample": "B1",
+        "text": ": 1. The Orrin Valley network runs 214 kilometres of double track between the port of Calder Reach and the upland towns around Mirror Lake. Every one of its 61 electric trainsets carries roughly 1,900 sensors: axle-box thermometers, pantograph force gauges, door controllers, traction inverter monitors, brake cylinder pressure transducers and a few dozen accelerometers bolted to the bogie frames. Until the last refit, the readings were written to removable flash cards that depot staff collected once a week. A failing bearing therefore announced itself, at best, seven days after the first warning sign, and twice in that period the first sign anyone noticed was smoke.\n\nTessaline is the storage service that replaced the flash cards. It receives a continuous stream from every trainset over the cellular modems fitted during the refit, keeps eighteen months of full-resolution history online, and answers the queries that maintenance planners, the control room and two external research partners send it. This document describes how the service is built, why the main decisions were made, what has gone wrong in its first two years of operation, and which problems remain open. It is written for engineers who will change the system, so it spends more time on trade-offs and failure behaviour than",
+        "sha256": "d97e2d61a1f3952da685c75c24075bfc323a8735d60fd6ae3e054f94e7275567"
+      },
+      {
+        "sample": "B2",
+        "text": " to the question of the day, and the day of the year, and the year of the decade, and the decade of the century, and the century of the millennium, and the millennium of the epoch, and the epoch of the era, and the era of the age, and the age of the universe, and the universe of the multiverse, and the multiverse of the omniverse, and the omniverse of the metaverse, and the metaverse of the hyperverse, and the hyperverse of the ultraverse, and the ultraverse of the megaverse, and the megaverse of the gigaverse, and the gigaverse of the teraverse, and the teraverse of the petaverse, and the petaverse of the exaverse, and the exaverse of the zettaverse, and the zettaverse of the yottaverse, and the yottaverse of the brontoverse, and the brontoverse of the gigaverse, and the gigaverse of the teraverse, and the teraverse of the petaverse, and the petaverse of the exaverse, and the exaverse of the zettaverse, and the zettaverse of the yottaverse, and the yottaverse of the brontoverse,",
+        "sha256": "7e14676cad0844d169277f31254ed52758743c0113aac104899fdc8349c173cf"
+      }
+    ]
+  }
+}

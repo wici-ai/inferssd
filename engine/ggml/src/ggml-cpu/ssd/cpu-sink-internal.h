@@ -93,3 +93,8 @@ bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink, int32_t layer, const
 
 // Borrowed immutable selection; the prefill owner never outlives its sink.
 const ssd::telemetry::debug_channels & ssd_cpu_sink_debug(const ssd_cpu_sink * sink) noexcept;
+
+// The context's model-scoped policy; first prefill preparation emits its activation receipt.
+bool ssd_cpu_sink_prefill_union_budget(ssd_cpu_sink * sink);
+void ssd_cpu_sink_prefill_ready(ssd_cpu_sink * sink, int32_t layer,
+        const int32_t * ids, int count, uint8_t * ready);

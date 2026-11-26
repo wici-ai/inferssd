@@ -2,6 +2,7 @@
 
 #include "ggml-cpu/ssd/cpu-sink.h"
 #include "cpu-prefill.h"
+#include "ggml-ssd/place/bounded-rank.h"
 #include "ggml-ssd/settings/settings.h"
 #include "ggml-ssd/telemetry/telemetry.h"
 #include "ggml-ssd/store/expert-layout.h"
@@ -36,9 +37,13 @@ struct llama_ssd_cpu_sink_node {
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
     bool prefill = false;
+    std::vector<uint8_t> route_ready; // graph-owned selector scratch; no allocation in its callback
 };
 
 struct llama_ssd_cpu_sink_runtime {
+    const bool bounded_rank;
+    bool bounded_rank_receipt = false;
+    uint64_t route_slots = 0, route_swaps = 0;
     const ssd::settings::snapshot & settings;
     const ssd::runtime_services & services;
     // The routed experts, described once from the model's expert tensors and the source index; the sink and its GPU
@@ -87,8 +92,8 @@ struct llama_ssd_cpu_sink_runtime {
     llama_ssd_cpu_sink_runtime(uint64_t context_epoch,
             const std::vector<ssd::store::expert_layout::routed_layer> & routed,
             const ssd::settings::snapshot & configured, const ssd::runtime_services & runtime_services,
-            const ssd::store::source_view & source)
-        : settings(configured), services(runtime_services), layout(ssd::store::expert_layout::build(routed, source)),
+            const ssd::store::source_view & source, bool resident_fill = false)
+        : bounded_rank(resident_fill), settings(configured), services(runtime_services), layout(ssd::store::expert_layout::build(routed, source)),
           epoch(context_epoch) {
         // Supported v0.1 profile: resource-sized RAM cache, model-order priority,
         // fixed eight-expert read ring.
@@ -108,6 +113,10 @@ struct llama_ssd_cpu_sink_runtime {
                 " read_bytes=%" PRIu64 " total_us=%.0f read_errors=%" PRIu64
                 " fallback_count=%" PRIu64 "\n",
                 calls, read_requests, read_bytes, total_us, read_errors, fallback_count);
+            if (bounded_rank) {
+                std::fprintf(stderr, "[ssd_bounded_rank] slots=%" PRIu64 " substitutions=%" PRIu64 " j=1 m=16\n",
+                    route_slots, route_swaps);
+            }
             print_cache_stats("before_destroy", cache_decode_active, 0);
             destroy(sink);
         }
@@ -361,6 +370,40 @@ struct llama_ssd_cpu_sink_call {
     llama_ssd_cpu_sink_call & operator=(const llama_ssd_cpu_sink_call &) = delete;
 };
 
+inline void llama_ssd_bounded_rank_receipt(llama_ssd_cpu_sink_runtime & runtime) {
+    if (runtime.bounded_rank_receipt) { return; }
+    runtime.bounded_rank_receipt = true;
+    std::fprintf(stderr, "rsi.design.active {\"consumer\":\"deepseek41-bounded-rank-resident-fill\","
+        "\"model\":\"deepseek\",\"enabled\":%s,\"once_per_context\":true}\n",
+        runtime.bounded_rank ? "true" : "false");
+}
+
+// CPU custom graph op runs after top-M and before the existing unbiased weight
+// gather/normalization. Only metadata crosses devices; experts retain MXFP4.
+inline void llama_ssd_bounded_rank_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
+    GGML_ASSERT(ith >= 0 && ith < nth);
+    // A mixed graph's CPU pool invokes every worker even with n_tasks=1.
+    // Only worker 0 may touch selector scratch, runtime state or telemetry.
+    // The executor's node barrier publishes its IDs before downstream gather.
+    if (ith != 0) { return; }
+    auto & node = *static_cast<llama_ssd_cpu_sink_node *>(userdata);
+    auto & runtime = *node.runtime;
+    std::lock_guard<std::mutex> lock(runtime.mutex);
+    GGML_ASSERT(runtime.sink && runtime.bounded_rank);
+    const auto * ranked = static_cast<const int32_t *>(dst->src[0]->data);
+    const auto * scores = static_cast<const float *>(dst->src[1]->data);
+    const int m = int(dst->src[0]->ne[0]), k = int(dst->ne[0]);
+    // DeepSeek's fixed window is at least K, at most max(K,16).
+    auto & ready = node.route_ready;
+    GGML_ASSERT(int(ready.size()) == m);
+    runtime.cpu_api->route_ready(runtime.sink, node.layer, ranked, m, ready.data());
+    const int swaps = ssd::place::bounded_rank_fill(ranked, scores, ready.data(), m, k, 1,
+        true, static_cast<int32_t *>(dst->data));
+    runtime.route_slots += k;
+    runtime.route_swaps += swaps;
+    llama_ssd_bounded_rank_receipt(runtime);
+}
+
 inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Every CPU-backend ggml thread enters (n_tasks = GGML_N_TASKS_MAX). No C++
     // exception may escape this callback.
@@ -376,6 +419,7 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     }
     const llama_ssd_cpu_sink_call call(runtime, nth);
     std::lock_guard<std::mutex> lock(runtime.mutex);
+    if (!runtime.bounded_rank) { llama_ssd_bounded_rank_receipt(runtime); }
     const int64_t latent = runtime.layout.abi()->latent;
 
     const ggml_tensor * input = dst->src[0];

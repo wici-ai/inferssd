@@ -181,6 +181,11 @@ GGML_BACKEND_API bool ssd_cpu_sink_run_activation(
         const struct ssd_cpu_sink_activation * activation, float * output,
         struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
 
+// Advisory ready-residency snapshot only. Does not train cache policy, wait for
+// reads, reserve slots or lend payloads. Normal execution rechecks and leases.
+GGML_BACKEND_API void ssd_cpu_sink_route_ready(struct ssd_cpu_sink * sink,
+    int32_t layer, const int32_t * ids, int count, uint8_t * ready);
+
 #ifdef __cplusplus
 }
 #endif

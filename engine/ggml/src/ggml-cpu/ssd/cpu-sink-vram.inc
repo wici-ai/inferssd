@@ -140,7 +140,7 @@ struct sink_vram {
         if (!prefill_only) {
             // what the tier holds: the next-layer prefetch asks, and the RAM cache, whose copy of such an expert is a backup
             residency = configuration.gpu.residency;
-            if (!residency || residency->version != 3 || residency->size != sizeof(*residency) || !residency->held) {
+            if (!residency || residency->version != 5 || residency->size != sizeof(*residency) || !residency->held || !residency->ready || !residency->route_ready) {
                 throw std::runtime_error("GPU residency ABI missing or incompatible; no fallback");
             }
         }
@@ -372,6 +372,14 @@ struct sink_vram {
     void held(int32_t layer, const int32_t * experts, int count, uint8_t * out) const {
         std::fill(out, out + count, uint8_t(0));
         if (context && residency) { residency->held(context, layer, experts, count, out); }
+    }
+    void ready(int32_t layer, const int32_t * experts, int count, uint8_t * out) const {
+        std::fill(out, out + count, uint8_t(0));
+        if (context && residency) { residency->ready(context, layer, experts, count, out); }
+    }
+    void route_ready(int32_t layer, const int32_t * experts, int count, uint8_t * out) const {
+        std::fill(out, out + count, uint8_t(0));
+        if (context && residency) { residency->route_ready(context, layer, experts, count, out); }
     }
     // A tier that keeps experts across layers, not one that serves grouped prefill alone (the graph lane).
     bool holds_experts() const { return context && !prefill_only; }

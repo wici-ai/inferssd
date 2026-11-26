@@ -351,9 +351,11 @@ llama_context::llama_context(
                         routed.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
                     }
                 }
+                ssd_runtime->services.deepseek41_prefill_union_budget = model.arch == LLM_ARCH_DEEPSEEK41;
                 cpu_sink_runtime = std::make_unique<llama_ssd_cpu_sink_runtime>(
                     ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-                    routed, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                    routed, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources,
+                    model.arch == LLM_ARCH_DEEPSEEK41);
             }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(

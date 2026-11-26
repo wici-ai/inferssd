@@ -2410,12 +2410,21 @@ struct tier {
         std::lock_guard<std::mutex> lock(mutex);
         if(!failure.empty())throw std::runtime_error(failure);
     }
-    // The residency ABI's held(): under lifecycle_mutex, which every resize from another thread (host or OOM reclaim,
+    // The residency ABI's metadata queries: under lifecycle_mutex, which every resize from another thread (host or OOM reclaim,
     // a prefill's seeds) takes.
+    void ready(int32_t layer,const int32_t * experts,int count,uint8_t * out){
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        for(int i=0;i<count;++i)out[i]=table && table->ready(layer,experts[i]);
+    }
     void held(int32_t layer,const int32_t * experts,int count,uint8_t * out){
         std::lock_guard<std::mutex> lock(lifecycle_mutex);
         for(int i=0;i<count;++i)out[i]=table && table->holds(layer,experts[i]);
     }
+    void route_ready(int32_t layer, const int32_t * experts, int count, uint8_t * out) {
+        std::lock_guard<std::mutex> lock(lifecycle_mutex);
+        for (int i = 0; i < count; ++i) { out[i] = table && table->route_ready(layer, experts[i]); }
+    }
+
 };
 int fail(tier * t,char * error,size_t size,const std::exception & e){
     if(size)std::snprintf(error,size,"%s",e.what());
@@ -2492,9 +2501,17 @@ int prefill_admit_cold(void * p,const ssd_vram_request *,const void *,const void
     if(admitted)*admitted=0;
     return reject_implicit_format(p,e,n,"Q2 cold admission retired; use ordinary explicit-format prefill");
 }
+void residency_ready(void * p,int32_t layer,const int32_t * experts,int count,uint8_t * out){
+    if(!out || count<=0)return;
+    std::fill(out,out+count,uint8_t(0));if(p && experts)static_cast<tier *>(p)->ready(layer,experts,count,out);}
 void residency_held(void * p,int32_t layer,const int32_t * experts,int count,uint8_t * out){
     if(!out || count<=0)return;
     std::fill(out,out+count,uint8_t(0));if(p && experts)static_cast<tier *>(p)->held(layer,experts,count,out);}
+void residency_route_ready(void * p, int32_t layer, const int32_t * experts, int count, uint8_t * out) {
+    if (!out || count <= 0) { return; }
+    std::fill(out, out + count, uint8_t(0));
+    if (p && experts) { static_cast<tier *>(p)->route_ready(layer, experts, count, out); }
+}
 int host_available(void * p){return p && static_cast<tier *>(p)->format_mode;}
 int host_launch(void * p,const ssd_vram_host_job * jobs,int count,int * accepted,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_host(jobs,count,accepted);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
@@ -2628,7 +2645,7 @@ extern "C" const ssd_vram_tier_api * ssd_vram_tier_get_api(){
     static const ssd_vram_tier_api api={3,sizeof(ssd_vram_tier_api),api_create,api_destroy,api_declare,api_begin,api_admit,api_finish,api_cancel};return &api;
 }
 extern "C" const ssd_vram_residency_api * ssd_vram_residency_get_api(){
-    static const ssd_vram_residency_api api={3,sizeof(ssd_vram_residency_api),residency_held};return &api;
+    static const ssd_vram_residency_api api={5,sizeof(ssd_vram_residency_api),residency_held,residency_ready,residency_route_ready};return &api;
 }
 extern "C" const ssd_vram_deferred_api * ssd_vram_deferred_get_api(){
     static const ssd_vram_deferred_api api={3,sizeof(ssd_vram_deferred_api),deferred_admit,deferred_collect,deferred_wait};return &api;

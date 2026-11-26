@@ -36,3 +36,6 @@
 
 - [GPU prefill overhead](development/prefill-overhead.md): the placement cost model for batched GPU work.
 
+
+- [Experimental resident expert routing](development/approximate-expert-routing.md):
+  Colibri-derived phase-specific policies, throughput measurements and observed quality regression.

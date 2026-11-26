@@ -184,6 +184,26 @@ public:
         return layer>=0 && size_t(layer)<layers.size() && expert>=0 && size_t(expert)<layers[layer].held.size() &&
             layers[layer].held[size_t(expert)]>0;
     }
+    bool ready(int layer, int expert) const {
+        if (layer < 0 || size_t(layer) >= layers.size() || expert < 0 ||
+                size_t(expert) >= layers[layer].keyed.size()) { return false; }
+        for (uint32_t slot : layers[layer].keyed[size_t(expert)]) {
+            const auto & e = slots[slot];
+            if (e.valid && !e.uploading) { return true; }
+        }
+        return false;
+    }
+    // Preserve decode's narrower snapshot independently of grouped prefill.
+    bool route_ready(int layer, int expert) const {
+        if (layer < 0 || size_t(layer) >= layers.size() || expert < 0 ||
+                size_t(expert) >= layers[layer].keyed.size()) { return false; }
+        const auto & l = layers[layer];
+        for (uint32_t index : l.keyed[size_t(expert)]) {
+            const auto & e = slots[index];
+            if (index >= l.begin && index < l.begin + l.count && e.valid && !e.uploading) { return true; }
+        }
+        return false;
+    }
     static bool held_by(const entry & e) { return e.valid || (e.uploading && !e.seed); }
     template<class F> void change(entry & e,F && update) {
         const uint32_t slot=uint32_t(&e-slots.data());

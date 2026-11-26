@@ -23,5 +23,7 @@ struct runtime_services {
     const store::source_view * source = nullptr;
     void * gpu_transport = nullptr;
     size_t gpu_reserve_bytes = 0;
+    // Model-scoped once per context, before an executor or GPU tier is constructed.
+    bool deepseek41_prefill_union_budget = false;
 };
 }  // namespace ssd

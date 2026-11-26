@@ -1152,6 +1152,20 @@ struct expert_cache {
         }
         return false;
     }
+    // Nontraining decode snapshot: unfinished reservations and reads are absent.
+    // The sink's run mutex protects metadata; byte access still needs normal leases.
+    bool ready(int32_t layer_id, int32_t expert) const {
+        if (!active || !arena) { return false; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return false; }
+        const size_t layer_index = size_t(found - layers.begin());
+        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
+            const auto & e = entries[i];
+            if (e.enabled && e.valid && e.resident && !e.reserved && !e.inflight && !e.lent &&
+                    e.layer_index == layer_index && e.id == expert) { return true; }
+        }
+        return false;
+    }
     // Whether a grouped prefill's read of the layer's retained entries (prepare_prefill_read) could serve the expert, its
     // sources aside. holds() answers for decode: a prefill phase leaves the cache inactive, its retained entries readable.
     bool prefill_holds(int32_t layer_id, int32_t expert) const {
@@ -1166,6 +1180,22 @@ struct expert_cache {
         for (size_t i = found->begin; i < found->begin + found->count; ++i) {
             const auto & e = entries[i];
             if (e.enabled && e.valid && e.resident && e.layer_index == layer_index && e.id == expert) { return true; }
+        }
+        return false;
+    }
+    // Completed, retained payloads only; unlike holds(), an in-flight reservation is a miss.
+    bool prefill_ready(int32_t layer_id, int32_t expert) const {
+        if (!prefill_read || !arena || !stride || !stats.valid_bytes) { return false; }
+        const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
+        if (found == layers.end()) { return false; }
+        const size_t layer_index = size_t(found - layers.begin());
+        const auto ready = [&](const entry & e) {
+            return e.valid && e.resident && !e.reserved && !e.inflight &&
+                e.layer_index == layer_index && e.id == expert;
+        };
+        for (size_t i : lent) { if (ready(entries[i])) { return true; } }
+        for (size_t i = found->begin; i < found->begin + found->count; ++i) {
+            if (entries[i].enabled && ready(entries[i])) { return true; }
         }
         return false;
     }

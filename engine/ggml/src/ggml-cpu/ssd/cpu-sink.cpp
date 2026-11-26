@@ -195,6 +195,7 @@ static ssd_cpu_expert_kernels sink_expert_kernels(const ssd_expert_format & f, s
 
 struct sink_configuration {
     bool production = false;
+    bool prefill_union_budget = false;
     ssd::settings::snapshot settings;
     ssd::telemetry::debug_channels debug;
     ssd::telemetry::writer * events = nullptr;
@@ -304,6 +305,7 @@ static bool sink_unified_memory(const sink_configuration & value) {
 
 static void sink_copy_services(sink_configuration & value, const ssd::runtime_services * services) {
     if (!services) { return; }
+    value.prefill_union_budget = services->deepseek41_prefill_union_budget;
     value.host = services->host;
     value.source = services->source;
     value.gpu_transport = services->gpu_transport;
@@ -580,6 +582,7 @@ struct ssd_cpu_sink {
     // The host memory the RAM cache may still commit (sink_cache::pending_bytes), which the GPU tier leaves it.
     uint64_t host_demand() const { return cache.pending_bytes(reads[0] + reads[1] + reads[2]); }
     sink_run_mutex run_mutex;
+    bool prefill_budget_receipt = false;
     sink_ring ring;
     std::vector<sink_slot> slots;
     // The read ring's buffers page-locked for the GPU tier's copies (ring_lock, ggml-ssd/host/page-lock.h): once per
@@ -3867,6 +3870,17 @@ struct ssd_cpu_sink {
     }
 };
 
+void ssd_cpu_sink_route_ready(ssd_cpu_sink * sink, int32_t layer,
+        const int32_t * ids, int count, uint8_t * ready) {
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    // route_ready() takes the tier's lifecycle mutex. No pointer or lease escapes this
+    // snapshot; eviction afterward is safe because the ordinary sink rechecks.
+    sink->vram.route_ready(layer, ids, count, ready);
+    for (int i = 0; i < count; ++i) {
+        ready[i] = ready[i] || sink->cache.ready(layer, ids[i]);
+    }
+}
+
 // A prefill consumer runs while the stream owns run_mutex, so its phases and
 // the role buffers cannot concurrently be used by decode. The phase runs on
 // every participant of the open call.
@@ -4427,6 +4441,30 @@ ssd_cpu_sink * create(int ring_experts, const execution_policy & policy,
 }  // namespace testing
 }  // namespace cpu
 }  // namespace ssd
+
+// Queries copy only ready metadata; no payload is borrowed and no lease survives this call.
+// Reclaim after the snapshot can turn a retained hit into a normal stream miss, never a dangling pointer.
+void ssd_cpu_sink_prefill_ready(ssd_cpu_sink * sink, int32_t layer,
+        const int32_t * ids, int count, uint8_t * ready) {
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    sink->prefetch_drain();
+    sink->vram.ready(layer, ids, count, ready);
+    for (int i = 0; i < count; ++i) {
+        ready[i] |= sink->cache.prefill_ready(layer, ids[i]);
+    }
+}
+
+bool ssd_cpu_sink_prefill_union_budget(ssd_cpu_sink * sink) {
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    const bool enabled = sink->configuration.prefill_union_budget;
+    if (sink->configuration.production && !sink->prefill_budget_receipt) {
+        std::fprintf(stderr, "rsi.design.active {\"consumer\":\"deepseek41-prefill-miss-aware-union-v1\","
+                "\"model\":\"%s\",\"enabled\":%s,\"once_per_context\":true}\n",
+                enabled ? "deepseek" : "other", enabled ? "true" : "false");
+        sink->prefill_budget_receipt = true;
+    }
+    return enabled;
+}
 
 const ssd::telemetry::debug_channels & ssd_cpu_sink_debug(const ssd_cpu_sink * sink) noexcept {
     static const ssd::telemetry::debug_channels off;

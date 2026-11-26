@@ -160,7 +160,12 @@ int main() {
         const auto * residency = ssd_vram_residency_get_api();
         uint8_t held = 0;
         residency->held(&t, g.layer, &g.expert, 1, &held);
-        require(residency->version == 3 && held == 1, "a deferred upload in flight was not held");
+        require(residency->version == 5 && held == 1, "a deferred upload in flight was not held");
+        uint8_t ready = 1;
+        residency->route_ready(&t, g.layer, &g.expert, 1, &ready);
+        require(ready == 0, "routing snapshot exposed a deferred upload in flight");
+        residency->ready(&t, g.layer, &g.expert, 1, &ready);
+        require(ready == 0, "prefill snapshot exposed a deferred upload in flight");
         auto reclaim = std::async(std::launch::async, [&] { return t.reclaim_one(4096, &freed); });
         require(!done_within(reclaim, 150), "the reclaim did not wait for the deferred copy");
         open_gate();
@@ -169,6 +174,10 @@ int main() {
                 "the reclaim did not give the block back");
         residency->held(&t, g.layer, &g.expert, 1, &held);
         require(held == 0, "an upload whose block was given back is still held");
+        residency->route_ready(&t, g.layer, &g.expert, 1, &ready);
+        require(ready == 0, "routing snapshot exposed a reclaimed upload");
+        residency->ready(&t, g.layer, &g.expert, 1, &ready);
+        require(ready == 0, "prefill snapshot exposed a reclaimed upload");
         ssd_vram_request collected[4] = {};
         int32_t aborted[4] = {};
         int count = -1;

@@ -1,4 +1,5 @@
 #include "ssd/cpu-prefill.h"
+#include "ssd/prefill-union-budget.h"
 #include "ssd/cpu-sink-internal.h"
 #include "../quants.h"
 #include "../vec.h"
@@ -83,6 +84,7 @@ struct prefill_group {
 
 struct ssd_cpu_prefill {
     ssd_cpu_sink * sink;
+    ssd::cpu::prefill_union_budget union_budget;
     std::mutex mutex;
     std::vector<prefill_group> groups;
     std::vector<int32_t> expert_ids;
@@ -148,6 +150,19 @@ struct ssd_cpu_prefill {
         row_bytes_down = k->row_bytes[SSD_EXPERT_DOWN];
         quant_bytes_input = k->input_row_bytes;
         quant_bytes_hidden = k->hidden_row_bytes;
+        const bool union_budget_enabled = ssd_cpu_sink_prefill_union_budget(sink);
+        if (union_budget_enabled && ntokens > 1 && nslots > 0) {
+            const size_t routes = size_t(ntokens) * nslots;
+            ssd_cpu_sink_host_grow(sink, union_budget.growth(routes, size_t(layout.experts)), [&] {
+                union_budget.reserve(routes, size_t(layout.experts));
+            });
+            ssd_cpu_sink_prefill_ready(sink, layer, union_budget.experts.data(), layout.experts,
+                    union_budget.ready.data());
+            if (union_budget.apply(ids, route_weights, nslots, ntokens)) {
+                ids = union_budget.ids.data();
+                route_weights = union_budget.weights.data();
+            }
+        }
         weights = route_weights;
         groups.clear(); expert_ids.clear();
         group_of_expert.assign(static_cast<size_t>(layout.experts), -1);
@@ -219,7 +234,7 @@ struct ssd_cpu_prefill {
             workspace += group.columns.capacity() * sizeof(prefill_column);
             for (const auto & column : group.columns) { workspace += column.slots.capacity() * sizeof(int); }
         }
-        current.workspace_bytes = workspace;
+        current.workspace_bytes = workspace + union_budget.bytes();
     }
 
     static void parallel_rows(void * userdata, int, int) {
@@ -504,7 +519,7 @@ extern "C" bool ssd_cpu_prefill_run_activation(
         batch.f32_input = input;
         batch.f32_stride = size_t(prefill->latent) * sizeof(float);
         batch.route_request_index = prefill->route_request_index.data();
-        batch.weights = weights;
+        batch.weights = prefill->weights;
         batch.nslots = nslots;
         batch.ntokens = ntokens;
         batch.activation = *activation;

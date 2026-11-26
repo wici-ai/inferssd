@@ -67,8 +67,14 @@ struct ssd_vram_tier_api {
 // an expert into RAM, and the RAM cache before it takes a slot (its copy of an expert the tier holds goes first); the
 // answer may change at the next admission, eviction or resize.
 struct ssd_vram_residency_api {
-    uint32_t version, size;   // 3
+    uint32_t version, size;   // 5: separate grouped-prefill and decode readiness
     void (*held)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
+    // Only published bytes, excluding deferred uploads and unpublished seeds.
+    // Nontraining and nonmutating; a caller still needs normal execution leases.
+    void (*ready)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
+    // Decode requires slots in the layer's current allocation; grouped prefill
+    // may also see published slots outside that range. Neither query leases bytes.
+    void (*route_ready)(void * context, int32_t layer, const int32_t * experts, int count, uint8_t * out);
 };
 // The decode extension: prepare names a layer's selected experts (requests of one routed layer, whose format is the
 // declared layout's) and launch runs them with the activation; admit, finish, cancel, begin and the residency ABI

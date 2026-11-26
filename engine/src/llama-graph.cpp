@@ -1857,6 +1857,24 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     cb(selected_experts->src[0], "ffn_moe_argsort", il);
     cb(selected_experts, "ffn_moe_topk", il);
 
+    if (cpu_sink_runtime && cpu_sink_runtime->bounded_rank && n_tokens == 1 &&
+            cpu_sink_decode && !cpu_sink_prefill) {
+        // This design retains K and must not combine with route omission.
+        GGML_ASSERT(expert_hard_top_k == 0 && expert_mass_threshold == 0.0f && norm_w);
+        const int64_t m = std::min(n_expert, std::max<int64_t>(n_expert_used, 16));
+        ggml_tensor * ranked = ggml_argsort_top_k(ctx0, selection_probs, m);
+        auto descriptor = std::make_unique<llama_ssd_cpu_sink_node>();
+        descriptor->runtime = cpu_sink_runtime;
+        descriptor->layer = il;
+        descriptor->route_ready.resize(m);
+        ggml_tensor * args[] = { ggml_cont(ctx0, ranked), ggml_cont(ctx0, selection_probs) };
+        selected_experts = ggml_custom_4d(ctx0, GGML_TYPE_I32, n_expert_used, 1, 1, 1,
+            args, 2, llama_ssd_bounded_rank_compute, 1, descriptor.get());
+        res->cpu_sink_nodes.emplace_back(std::move(descriptor));
+        cb(selected_experts, "ffn_moe_resident_fill", il);
+        ggml_backend_sched_set_tensor_backend(sched, selected_experts, backend_cpu);
+    }
+
     const bool expert_hard_reduction =
         expert_hard_top_k > 0 && expert_hard_top_k < n_expert_used;
     const bool expert_mass_reduction = expert_mass_threshold > 0.0f;

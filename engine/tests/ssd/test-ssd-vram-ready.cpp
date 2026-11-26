@@ -15,7 +15,10 @@ int main() { try {
     for (int i = 0; i < 3; ++i) r.role[i] = {1,2,1000000,uint64_t(i)*4096,4096,3,4,5,6,0};
     table.next_token(); table.prepare(&r,1); int ready = -1;
     rejected([&] { table.acquire_slots(&r,1,&ready); });
+    require(!table.ready(1,0), "unpublished expert counted ready");
     table.publish(0); table.finish();
+    require(table.ready(1,0), "published expert missing from ready snapshot");
+    require(!table.ready(-1,0) && !table.ready(1,-1) && !table.ready(1,99), "invalid ready key accepted");
     auto generation = table.acquire_slots(&r,1,&ready);
     require(ready >= 0 && table.slots[size_t(ready)].locked, "resident copy not pinned");
     rejected([&] { table.next_token(); });
@@ -39,8 +42,17 @@ int main() { try {
     next = table.acquire_slots(&r,1,&ready);
     require(ready < 0, "stale packed-file contents accepted"); table.release_ready(next);
     table.clear();
+    require(!table.ready(1,0), "cleared expert counted ready");
     next = table.acquire_slots(&r,1,&ready);
     require(next > generation && ready < 0, "clear recycled a lease");
     table.abort(); rejected([&] { table.validate_ready(next); });
+    // A held deferred upload must not count as a ready prefill hit.
+    table.clear(); table.next_token(); table.prepare(&r,1);
+    const int uploading = table.admissions[0];
+    require(uploading >= 0, "deferred test lacked a reservation");
+    table.reserve_upload(0); table.finish();
+    require(table.holds(1,0) && !table.ready(1,0), "unfinished upload counted ready");
+    table.publish_upload(size_t(uploading),r);
+    require(table.ready(1,0), "completed upload not ready after publication");
     std::printf("VRAM_READY_LEASE_PASS assertions=%d\n", checks); return 0;
 } catch (const std::exception & e) { std::fprintf(stderr,"READY_LEASE_FAIL: %s\n",e.what()); return 1; } }
