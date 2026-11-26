@@ -3600,7 +3600,8 @@ void llama_model::keep_nextn_blocks(llama_model_loader & ml) {
         hparams.is_ple_impl.reset(il);
         hparams.nextn_predict_layers = 1;
     }
-    if (hparams.nextn_predict_layers != 1 || hparams.is_recurrent(hparams.n_layer) || hparams.is_ple(hparams.n_layer)) {
+    // the block's per-layer metadata, read directly: the accessors cover it once n_mtp is set
+    if (hparams.nextn_predict_layers != 1 || hparams.recurrent_layer_arr[hparams.n_layer] || hparams.is_ple_impl[hparams.n_layer]) {
         throw std::runtime_error(format("%s drafts with one NextN attention block, the file has %u",
             llm_arch_name(arch), hparams.nextn_predict_layers));
     }

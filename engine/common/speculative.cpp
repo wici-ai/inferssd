@@ -654,12 +654,20 @@ struct common_speculative_state_draft_mtp : public common_speculative_state {
 
     bool process(const llama_batch & b, llama_seq_id target_seq_id) override {
         std::vector<int32_t> rows;
+        bool has_seq = false;
         for (int32_t i = 0; i < b.n_tokens; ++i) {
-            if (b.logits && b.logits[i] && b.n_seq_id[i] > 0 && b.seq_id[i][0] == target_seq_id) {
-                rows.push_back(i);
+            if (b.n_seq_id[i] > 0 && b.seq_id[i][0] == target_seq_id) {
+                has_seq = true;
+                if (b.logits && b.logits[i]) {
+                    rows.push_back(i);
+                }
             }
         }
         if (rows.empty()) {
+            // a decode of the sequence without outputs (a prompt's earlier batches) moves it past the rows kept
+            if (has_seq) {
+                h_pos.clear();
+            }
             return true;
         }
         seq_id = target_seq_id;
