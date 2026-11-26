@@ -72,6 +72,7 @@ struct llama_ssd_cpu_sink_runtime {
     int cache_max_per_layer = 8;
     std::vector<int32_t> layer_priority;
     decltype(&ssd_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
+    decltype(&ssd_cpu_sink_decode_rows) decode_rows = nullptr;
     decltype(&ssd_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
     llama_seq_id sequence = 0;
@@ -157,6 +158,7 @@ struct llama_ssd_cpu_sink_runtime {
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
+        decode_rows = cpu_api->decode_rows;
         prefill_hint = cpu_api->prefill_hint;
         constexpr int ring_experts = 8;
         char error[512] = {};
@@ -535,6 +537,8 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
         const auto * id = static_cast<const int32_t *>(ids->data);
         const auto * wt = static_cast<const float *>(weights->data);
         auto * out = static_cast<float *>(dst->data);
+        // the layer's next runs are the ubatch's rows: each keeps the prefetches its later rows take
+        if (ntokens > 1) { runtime.decode_rows(runtime.sink, node.layer, id, nslots, ntokens); }
         ok = true;
         for (int row = 0; row < ntokens && ok; ++row) {
             // The next layer's predicted experts, for the sink's prefetch, before the last row only: a run drops the

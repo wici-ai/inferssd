@@ -707,6 +707,13 @@ struct ssd_cpu_sink {
         sink_clock::time_point spill_since;
         uint64_t started_r[64] = {}, spill_us_r[64] = {};
     } prefetch;
+    // The rows of a decode ubatch at `layer` (ssd_cpu_sink_decode_rows): `count` runs of `slots` experts each, `next`
+    // of them begun.
+    struct {
+        int32_t layer = -1;
+        int slots = 0, count = 0, next = 0;
+        std::vector<int32_t> ids;
+    } rows;
 
     // Unified memory: the ledger's floor at every point, not only at decode token boundaries (floor_watch_loop).
     std::mutex watch_mutex;
@@ -1205,8 +1212,19 @@ struct ssd_cpu_sink {
     void prefetch_drain(int32_t layer = -1, const int32_t * ids = nullptr, int nids = 0) {
         uint8_t held[1024] = {}; // per id: the tier holds it, so this run's prepare pins it as a hit
         if (prefetch.topk && ids && nids > 0 && nids <= 1024) { vram.held(layer, ids, nids, held); }
+        // A decode run that is a row of a decode ubatch (ssd_cpu_sink_decode_rows): the experts the layer's later rows
+        // select. Their prefetches stay queued for those rows, behind this row's own reads.
+        const int32_t * later = nullptr;
+        int nlater = 0;
+        if (ids && rows.layer == layer && rows.next < rows.count) {
+            ++rows.next;
+            later = rows.ids.data() + size_t(rows.next) * size_t(rows.slots);
+            nlater = (rows.count - rows.next) * rows.slots;
+            if (rows.next == rows.count) { rows.layer = -1; }
+        }
+        auto later_selects = [&](int32_t expert) { return std::find(later, later + nlater, expert) != later + nlater; };
         std::unique_lock<std::mutex> lock(prefetch.mutex);
-        prefetch_check(layer, ids, nids, held);
+        prefetch_check(layer, ids, nids, held, later, nlater);
         if (!prefetch.topk) { return; }
         prefetch.pending.clear();
         prefetch.gate_open = false;
@@ -1215,34 +1233,41 @@ struct ssd_cpu_sink {
             for (int i = 0; i < nids; ++i) { if (ids[i] == job.expert && !held[i]) { return true; } }
             return false;
         };
+        auto kept = [&](const prefetch_job & job) {
+            return ids && job.layer == layer && !job.failed && later_selects(job.expert);
+        };
         // the window closes: the reads running for experts this entry does not take spill from now on (a read still
         // running from an earlier window spills again, and counts once)
         const auto closed = sink_clock::now();
         for (auto & r : prefetch.reading) {
-            if (!r.job || r.urgent || r.spill || needed(*r.job)) { continue; }
+            if (!r.job || r.urgent || r.spill || needed(*r.job) || kept(*r.job)) { continue; }
             r.spill = true; r.since = closed;
             if (!r.spilled) { r.spilled = true; ++prefetch.spills; }
             if (!prefetch.spilling++) { prefetch.spill_since = closed; }
         }
         if (ids) {
             // every allocation comes before the first change, so a failure leaves the queues for the full drain
-            std::deque<std::pair<prefetch_job *, int>> urgent;
+            std::deque<std::pair<prefetch_job *, int>> urgent, queue;
             for (auto * q : { &prefetch.urgent, &prefetch.queue }) {
                 for (const auto & item : *q) {
                     if (needed(*item.first)) {
                         prefetch_alloc(prefetch.throw_drain, prefetch.allocs_drain);
                         urgent.push_back(item);
+                    } else if (kept(*item.first)) {
+                        prefetch_alloc(prefetch.throw_drain, prefetch.allocs_drain);
+                        queue.push_back(item);
                     }
                 }
             }
             prefetch.pending.reserve(prefetch.jobs.size());
             for (auto * q : { &prefetch.urgent, &prefetch.queue }) {
                 for (const auto & item : *q) {
-                    if (!needed(*item.first)) { --item.first->queued; prefetch_settle(*item.first); }
+                    if (!needed(*item.first) && !kept(*item.first)) { --item.first->queued; prefetch_settle(*item.first); }
                 }
                 q->clear();
             }
             prefetch.urgent.swap(urgent);
+            prefetch.queue.swap(queue);
         } else {
             for (auto * q : { &prefetch.urgent, &prefetch.queue }) {
                 for (const auto & item : *q) { --item.first->queued; prefetch_settle(*item.first); }
@@ -1275,8 +1300,13 @@ struct ssd_cpu_sink {
     // Under the prefetch mutex, as an entry starts: a decode run (layer and ids given, held[i] whether the GPU tier
     // holds ids[i]) counts the ranks of the last hint that were novel, notes the reads that it selects, and ends the
     // drive's idle window; any other entry ends the layer sequence.
-    void prefetch_check(int32_t layer, const int32_t * ids, int nids, const uint8_t * held) {
-        auto selected = [&](int32_t expert) { return expert >= 0 && std::find(ids, ids + nids, expert) != ids + nids; };
+    // A row of a decode ubatch selects what its later rows do as well (`later`): the first row checks the hint once.
+    void prefetch_check(int32_t layer, const int32_t * ids, int nids, const uint8_t * held,
+            const int32_t * later = nullptr, int nlater = 0) {
+        auto selected = [&](int32_t expert) {
+            return expert >= 0 && (std::find(ids, ids + nids, expert) != ids + nids ||
+                std::find(later, later + nlater, expert) != later + nlater);
+        };
         auto tier_holds = [&](int32_t expert) {
             const ptrdiff_t at = std::find(ids, ids + nids, expert) - ids;
             return at < nids && at < 1024 && held[at];
@@ -4444,6 +4474,17 @@ extern "C" void ssd_cpu_sink_prefetch_hint(struct ssd_cpu_sink * sink, int32_t l
     sink->prefetch.hint_layer = layer;
 }
 
+extern "C" void ssd_cpu_sink_decode_rows(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts,
+        int slots, int count) {
+    if (!sink) { return; }
+    std::lock_guard<sink_run_mutex> serial(sink->run_mutex);
+    auto & rows = sink->rows;
+    rows.layer = -1;
+    if (!experts || slots <= 0 || count <= 1) { return; }
+    rows.ids.assign(experts, experts + size_t(slots) * size_t(count));
+    rows.layer = layer; rows.slots = slots; rows.count = count; rows.next = 0;
+}
+
 extern "C" void ssd_cpu_sink_prefill_hint(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts,
         int ntokens, int k) {
     if (!sink || !experts || layer < 0 || ntokens < 1 || k < 1 || k > 16 ||
@@ -4489,6 +4530,7 @@ static bool sink_phase_begin(struct ssd_cpu_sink * sink, uint64_t epoch, uint64_
     sink_error(error, error_size, "");
     if (!sink) { sink_error(error, error_size, "null CPU sink"); return false; }
     std::lock_guard<sink_run_mutex> serial(sink->run_mutex); sink->prefetch_drain();
+    sink->rows.layer = -1; // a step's rows are given within it
     try {
         sink->end_margin_interval(decode, epoch, token);
         sink->measure_decode_share(decode, epoch, token);

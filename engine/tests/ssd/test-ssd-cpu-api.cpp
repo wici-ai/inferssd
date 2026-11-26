@@ -39,6 +39,9 @@ int main() {
     changed = *api;
     changed.vram_reserve_pass = nullptr;
     if (ssd::cpu::valid(&changed)) { return 9; }
+    changed = *api;
+    changed.decode_rows = nullptr;
+    if (ssd::cpu::valid(&changed)) { return 10; }
     std::puts("CPU_EXECUTOR_REGISTRY_ABI_PASS");
     return 0;
 }
