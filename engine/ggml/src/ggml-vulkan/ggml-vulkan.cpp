@@ -3054,6 +3054,28 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
     );
 }
 
+// Makes what the submission wrote visible to the host once a wait on its fence returns. A fence's memory dependency
+// covers device accesses only, so a host read after the wait needs a barrier into the host stage; without one, some
+// integrated GPUs return stale data from host-visible memory.
+static void ggml_vk_sync_host(vk_context& subctx) {
+    if (subctx->s == nullptr) {
+        return;
+    }
+    const bool transfer_queue = subctx->p->q->transfer_only;
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        subctx->p->q->stage_flags,
+        vk::PipelineStageFlagBits::eHost,
+        {},
+        { {
+          { !transfer_queue ? (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite) : vk::AccessFlagBits::eTransferWrite },
+          { vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite }
+        } },
+        {},
+        {}
+    );
+}
+
 static void ggml_vk_reset_event(vk_context& ctx, vk::Event& event) {
     VK_LOG_DEBUG("ggml_vk_set_event()");
 
@@ -7241,6 +7263,7 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
         ggml_vk_ctx_begin(src->device, subctx);
         bool ret = ggml_vk_buffer_read_async(subctx, src, offset, dst, size, true);
         GGML_ASSERT(ret);
+        ggml_vk_sync_host(subctx);
         ggml_vk_ctx_end(subctx);
 
         ggml_vk_submit(subctx, src->device->fence);
@@ -13771,6 +13794,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        if (last_node) {
+            ggml_vk_sync_host(compute_ctx);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -14440,6 +14466,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             cmd_buf = compute_ctx->s->buffer;
         }
 
+        ggml_vk_sync_host(compute_ctx);
         ggml_vk_ctx_end(compute_ctx);
 
         for (auto& cpy : compute_ctx->in_memcpys) {

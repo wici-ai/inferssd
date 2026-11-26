@@ -11,11 +11,18 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import replace
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from inferssd.app import catalog
 from inferssd.contracts import ContractError
-from inferssd.launch.resources import installed_resources
+from inferssd.engine import model as engine_model
+from inferssd.launch.resources import (
+    cmake_gpu_backends,
+    executable,
+    installed_resources,
+    read_resources,
+)
+from inferssd.launch.typed import ARCHITECTURES, SSD_ARCHITECTURES
 from inferssd.machine.characteristics import (
     BASE_SECTIONS,
     STORAGE_PREFIX,
@@ -36,7 +43,9 @@ from inferssd.machine.profile import (
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
 from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
-from inferssd.strategy.inputs import RuntimeFacts, read_runtime
+from inferssd.strategy.inputs import ModelFacts, RuntimeFacts, facts_from_engine, read_runtime
+from inferssd.strategy.kernels import expert_format_refusal
+from inferssd.strategy.weights import DenseWeights, dense_weights
 
 GIB = float(1 << 30)
 
@@ -68,6 +77,28 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
         "--build", type=Path, help="engine build directory holding bin/inferssd-*probe"
     )
     command.add_argument("--memory-gib", type=float, help="host memory budget for estimation only")
+    target = command.add_mutually_exclusive_group()
+    target.add_argument(
+        "--estimate-gguf",
+        type=Path,
+        metavar="FILE",
+        help="estimate this GGUF using the engine's header reader",
+    )
+    target.add_argument(
+        "--estimate-facts",
+        type=Path,
+        metavar="JSON",
+        help="estimate exported --ssd-model-facts on this machine",
+    )
+    command.add_argument(
+        "--shard",
+        "--ple",
+        dest="shards",
+        action="append",
+        default=[],
+        metavar="FILE,...",
+        help="additional GGUF files for --estimate-gguf",
+    )
     command.add_argument(
         "--host-work-mib",
         type=float,
@@ -173,6 +204,81 @@ def summary(value: Characteristics, path: Path) -> list[str]:
     return lines
 
 
+def launch_refusal(raw: Mapping[str, Any]) -> Optional[str]:
+    """Why a launch cannot run the target as its header describes it, or None, as the launcher
+    decides (launch/typed.py): a decoder runs as an ordinary graph without a model profile; routed
+    experts need a profile, a layout the SSD path executes and formats its CPU executor computes."""
+    architecture = raw["architecture"] or ""
+    names = {tensor["name"] for tensor in raw["tensors"]}
+    encoder_only = any(n.startswith("enc.blk.") for n in names) and not any(
+        n.startswith("dec.blk.") for n in names
+    )
+    # Some GGUFs omit attention.causal. These native graphs never build next-token
+    # logits (e.g. BERT uses ordinary blk.* names); diffusion logits price a denoising step.
+    if architecture in ("dream", "llada", "llada-moe", "rnd1"):
+        return f"the {architecture} diffusion graph does not run autoregressive decode"
+    if architecture in ("clip", "wavtokenizer-dec"):
+        return f"the {architecture} graph does not run autoregressive text decode"
+    if (
+        encoder_only
+        or architecture
+        in (
+            "bert",
+            "modern-bert",
+            "nomic-bert",
+            "nomic-bert-moe",
+            "neo-bert",
+            "jina-bert-v2",
+            "jina-bert-v3",
+            "eurobert",
+            "llama-embed",
+            "gemma-embedding",
+            "t5encoder",
+        )
+        or raw.get("metadata", {}).get(architecture + ".attention.causal") is False
+    ):
+        return f"the {architecture} model is an encoder; a launch runs decoder models"
+    layout = raw["experts"]
+    if layout is None:
+        return None
+    if architecture not in ARCHITECTURES:
+        return (
+            f"no model profile for the GGUF architecture {architecture}, which routed experts need"
+        )
+    if architecture not in SSD_ARCHITECTURES:
+        return f"the engine has no routed SSD executor for architecture {architecture}"
+    if architecture in ("qwen35moe", "qwen4exp"):
+        # These graph builders prefer fused gate/up and pass per-expert scales
+        # to the adapter. The SSD adapter accepts separate, unscaled roles.
+        for layer in range(raw["layers"]):
+            prefix = f"blk.{layer}.ffn_"
+            if prefix + "gate_up_exps.weight" in names:
+                return f"SSD expert layer {layer} uses fused gate/up weights"
+            if any(prefix + role + "_exps.scale" in names for role in ("gate", "up", "down")):
+                return f"SSD expert layer {layer} uses unsupported per-expert scales"
+    return expert_format_refusal(layout)
+
+
+def estimate_engine(
+    resources: Optional[Path], build: Optional[Path], platform: str
+) -> tuple[Optional[Path], Optional[tuple[str, ...]]]:
+    """The selected server and its GPU backends, as recorded by its descriptor or build."""
+    if resources is not None:
+        descriptor = read_resources(resources)
+        binary = Path(descriptor.binary)
+        if descriptor.gpu_backends is not None:
+            return binary, descriptor.gpu_backends
+        build = binary.parent.parent
+    elif build is not None:
+        binary = build / "bin" / executable(platform, "inferssd-server")
+    else:
+        return None, None
+    try:
+        return binary, cmake_gpu_backends((build / "CMakeCache.txt").read_text(encoding="utf-8"))
+    except OSError:
+        return binary, None
+
+
 def estimates(
     value: Characteristics,
     drive_key: Optional[str],
@@ -181,10 +287,16 @@ def estimates(
     *,
     host_work_bytes: int = 0,
     gpu_work_bytes: int = 0,
+    target: Optional[catalog.Model] = None,
+    weights: Optional[DenseWeights] = None,
+    target_refusal: Optional[str] = None,
 ) -> list[tuple[catalog.Model, Estimate]]:
     """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
+    if target and target_refusal:
+        return [(target, Estimate(None, target_refusal))]
     reason = "pass --model with the directory that holds the models"
-    if drive_key is not None:
+    models = (target,) if target else catalog.MODELS
+    if drive_key is not None or target is not None:
         try:
             facts = runtime()
         except UnsupportedPlatform as error:
@@ -202,15 +314,24 @@ def estimates(
                         drive_key,
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
+                        graph_weights=weights if weights and weights.graph_store_bytes else None,
                     )
                     if model.facts.experts is not None
                     else dense_decode_estimate(
-                        value, model.dense_read_bytes, facts, gpu_work_bytes=gpu_work_bytes
+                        value,
+                        model.dense_read_bytes,
+                        facts,
+                        model=model.facts,
+                        weights=weights,
+                        platform=platform,
+                        drive_key=drive_key,
+                        host_work_bytes=host_work_bytes,
+                        gpu_work_bytes=gpu_work_bytes,
                     ),
                 )
-                for model in catalog.MODELS
+                for model in models
             ]
-    return [(model, Estimate(None, reason)) for model in catalog.MODELS]
+    return [(model, Estimate(None, reason)) for model in models]
 
 
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
@@ -219,11 +340,12 @@ def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
         + (
             (
                 f"{estimate.scenario_range[0]:.1f}–{estimate.scenario_range[1]:.1f} tok/s "
-                "decode across routing/overlap scenarios (not a confidence interval); "
+                "across timing scenarios; "
                 if estimate.scenario_range
                 else ""
             )
-            + f"uniform serial reference {estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
+            + f"{estimate.reference_scenario.replace('_', ' ')} reference "
+            + f"{estimate.tokens_per_second:.1f} tok/s ({estimate.detail})"
             if estimate.tokens_per_second is not None
             else f"none: {estimate.detail}"
         )
@@ -263,7 +385,10 @@ def report(
                 "model": model.repo,
                 "quantization": model.quantization,
                 "decode_tokens_per_second": estimate.tokens_per_second,
-                "reference_scenario": "uniform_serial",
+                "reference_scenario": estimate.reference_scenario
+                if estimate.tokens_per_second is not None
+                else None,
+                "estimator_version": 2,
                 "detail": estimate.detail,
                 "assumptions": estimate.assumptions,
                 "scenarios": estimate.scenarios,
@@ -295,6 +420,8 @@ def run(
     emit: Callable[[str], None] = print,
     runtime: Callable[[], RuntimeFacts] = read_runtime,
 ) -> int:
+    if args.shards and args.estimate_gguf is None:
+        raise ValueError("--shard/--ple requires --estimate-gguf")
     for name in ("memory_gib", "host_work_mib", "gpu_work_mib"):
         number = getattr(args, name)
         if number is not None and (not math.isfinite(number) or number < 0):
@@ -309,17 +436,74 @@ def run(
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
+    resources = args.resources
+    needs_engine = not args.show or args.estimate_gguf is not None
+    has_estimate = bool(paths or args.estimate_gguf or args.estimate_facts)
+    if resources is None and args.build is None and (needs_engine or has_estimate):
+        installed = installed_resources(environ, home)
+        if installed.is_file():
+            resources = installed
+        elif needs_engine:
+            raise ValueError(
+                "engine not installed; run scripts/install.sh "
+                "or pass --build DIR or --resources FILE"
+            )
+    target = None
+    target_refusal = None
+    weights = None
+    binary, backends = estimate_engine(resources, args.build, host.platform())
+    if args.estimate_gguf is not None or args.estimate_facts is not None:
+        if args.estimate_gguf is not None:
+            assert binary is not None
+            raw = engine_model.query(
+                str(binary),
+                str(args.estimate_gguf),
+                lambda argv: (runner or run_process)(argv, engine_model.TIMEOUT_S, environ),
+                args.shards,
+            )
+            if not paths:
+                paths = raw["files"]
+        else:
+            raw = engine_model.validate(json.loads(args.estimate_facts.read_text(encoding="utf-8")))
+        target_refusal = launch_refusal(raw)
+        if target_refusal is not None:
+            # Only the name and the reason are reported. A non-decoder header may hold no
+            # layer tensors to read facts from.
+            facts = ModelFacts(tuple(raw["files"]), raw["architecture"], 0, (), None)
+            target = catalog.Model(facts.paths[0], "", "", facts, 0)
+        else:
+            facts = facts_from_engine(raw)
+            weights = dense_weights(raw)
+            read_bytes = weights.active_bytes
+            # Report the actual GGUF types. Mixed checkpoints need not have a canonical quant label.
+            formats = facts.experts.format_bytes if facts.experts else facts.layer_format_bytes
+            target = catalog.Model(
+                facts.paths[0],
+                "+".join(name for name, _ in formats),
+                "",
+                facts,
+                facts.dense_bytes - read_bytes,
+            )
+
+    # Placement uses the GPU backends of the engine the estimate is for, as a launch does, so a
+    # CPU-only engine gets a host estimate even where the profile holds GPU measurements.
+    def estimate_runtime() -> RuntimeFacts:
+        facts = runtime()
+        return facts if backends is None else replace(facts, gpu_backends=backends)
 
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
-        if args.json or args.model:
+        if args.json or args.model or target:
             rows = estimates(
                 value,
                 drive_key,
                 host.platform(),
-                runtime,
+                estimate_runtime,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
+                target=target,
+                weights=weights,
+                target_refusal=target_refusal,
             )
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
@@ -329,10 +513,14 @@ def run(
             emit(line)
 
     if args.show:
-        if args.reprofile or args.resources or args.build or args.estimate_compute:
+        if (
+            args.reprofile
+            or args.estimate_compute
+            or ((args.resources or args.build) and not has_estimate)
+        ):
             raise ValueError(
-                "--show measures nothing; omit --reprofile, --resources, "
-                "--build and --estimate-compute"
+                "--show measures nothing; omit --reprofile and --estimate-compute, "
+                "and use --resources or --build only with an estimate target"
             )
         saved = load_current(path)
         if saved is None:
@@ -340,14 +528,6 @@ def run(
         output(saved, models_drive(model_drives(host, paths)) if paths else None)
         return 0
     suffix = ".exe" if host.platform() == "windows" else ""
-    resources = args.resources
-    if resources is None and args.build is None:
-        resources = installed_resources(environ, home)
-        if not resources.is_file():
-            raise ValueError(
-                "engine not installed; run scripts/install.sh "
-                "or pass --build DIR or --resources FILE"
-            )
     probes = Probes(
         tuple(locate(resources, args.build, suffix=suffix).items()), runner or run_process
     )

@@ -159,8 +159,9 @@ static size_t save_slot_state(llama_context * ctx, const std::string & path, lla
     return 0;
 }
 
-// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars" or
-// "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes to a prefix of the
+// The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars",
+// "context_prefix_chars" or "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes
+// to a prefix of the
 // prompt's tokens; 0 otherwise.
 static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json & data, const llama_tokens & tokens,
         const char * key) {
@@ -1506,6 +1507,11 @@ private:
         } else if (task.n_shared_prefix > int64_t(n_before)) {
             task.n_shared_prefix = int64_t(n_before);
         }
+        if (task.n_context_prefix >= replaced_end) {
+            task.n_context_prefix += delta;
+        } else if (task.n_context_prefix > int64_t(n_before)) {
+            task.n_context_prefix = 0; // ends inside the replaced text: unknown
+        }
         if (task.n_conversation_prefix >= replaced_end) {
             task.n_conversation_prefix += delta;
         } else if (task.n_conversation_prefix > int64_t(n_before)) {
@@ -2029,11 +2035,12 @@ private:
         return true;
     }
 
-    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress) {
+    void send_partial_response(server_slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin = false) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
 
         res->id    = slot.task->id;
         res->index = slot.task->index;
+        res->is_begin = is_begin;
 
         if (is_progress) {
             res->is_progress        = true;
@@ -2041,7 +2048,7 @@ private:
             res->progress.cache     = slot.n_prompt_tokens_cache;
             res->progress.processed = slot.prompt.tokens.size();
             res->progress.time_ms   = (ggml_time_us() - slot.t_start_process_prompt) / 1000;
-        } else {
+        } else if (!is_begin) {
             res->content = tkn.text_to_send;
             res->tokens  = { tkn.tok };
             res->output_source = slot.output_source;
@@ -2304,25 +2311,22 @@ private:
         }
     }
 
-    // Persist a prefix ending at the batch boundary, or take checkpoints for a memory that can save an
+    // Checkpoints inside the prompt tokens of the slot that the last batch decoded, for a memory that can save an
     // earlier state (llama_state_seq_at_align), at the positions where a later prompt is likely to branch off: the
     // end of the prompt part other conversations share (the leading system messages and tools,
     // task->n_shared_prefix), a few tokens before the end of the prompt (the generation prompt may be rendered
     // differently in the next turn) and every checkpoint_every_nt tokens, each rounded down to a position the memory
-    // can save. The shared prefix also goes to the prompt cache, where a conversation started later, or after a
-    // restart, finds it.
+    // can save, and the end of the leading system messages with the user's context (task->n_context_prefix) when
+    // the shared prefix ends before it. The shared and the context prefix also go to the prompt cache, where a
+    // conversation started later, or after a restart, finds them.
     void checkpoint_decoded_prompt(server_slot & slot) {
         const int64_t n0 = slot.prompt_batch.n0;
         const int64_t n1 = slot.prompt_batch.n1;
         slot.prompt_batch.row_end = -1;
 
-        const int64_t align = checkpoint_at_align;
-        if (align == 0) {
-            // This batch stopped at the shared boundary and its state is still current.
-            keep_shared_prefix(slot, n1, true);
-            return;
-        }
-        const int64_t n_shared = slot.task->n_shared_prefix - slot.task->n_shared_prefix % align;
+        const int64_t align     = checkpoint_at_align;
+        const int64_t n_shared  = slot.task->n_shared_prefix - slot.task->n_shared_prefix % align;
+        const int64_t n_context = slot.task->n_context_prefix - slot.task->n_context_prefix % align;
 
         std::vector<int64_t> at;
         const auto want = [&](int64_t n) {
@@ -2333,6 +2337,9 @@ private:
         };
         if (n_shared > 0) {
             want(n_shared);
+        }
+        if (n_context > n_shared) {
+            want(n_context);
         }
         if (n1 == slot.task->n_tokens()) {
             want(n1 - 4);
@@ -2347,7 +2354,7 @@ private:
         at.erase(std::unique(at.begin(), at.end()), at.end());
 
         for (const int64_t n : at) {
-            const bool shared = n == n_shared;
+            const bool shared = n == n_shared || (n == n_context && n_context > n_shared);
             // no need to create checkpoints that are too close together
             if (!shared && !slot.prompt.checkpoints.empty() && n <= slot.prompt.checkpoints.back().n_tokens + 64) {
                 continue;
@@ -2366,7 +2373,7 @@ private:
                     add_checkpoint(slot, std::move(checkpoint));
                 }
             }
-            if (shared && slot.task->params.cache_prompt && !slot.task->tokens.has_mtmd) {
+            if (shared) {
                 keep_shared_prefix(slot, n, false);
             }
         }
@@ -3268,10 +3275,14 @@ private:
                         // from here on the slot holds a state of the task's conversation
                         slot.prompt.n_conversation = slot.task->n_conversation_prefix;
 
-                        // send initial 0% progress update if needed
                         // this is to signal the client that the request has started processing
-                        if (slot.task->params.stream && slot.task->params.return_progress) {
-                            send_partial_response(slot, {}, true);
+                        if (slot.task->params.stream) {
+                            if (slot.task->params.return_progress) {
+                                send_partial_response(slot, {}, true);
+                            } else if (!slot.task->cli) {
+                                // The CLI waits for model output before stopping its prefill spinner.
+                                send_partial_response(slot, {}, false, true);
+                            }
                         }
                     }
 
@@ -3368,12 +3379,6 @@ private:
                     const bool checkpoint_after_decode = checkpoint_at_align > 0 &&
                         slot.task->type == SERVER_TASK_TYPE_COMPLETION &&
                         (params_base.n_ctx_checkpoints > 0 || prompt_cache);
-                    // A disk cache for a memory that can only save its current state stops at the shared prefix. Persist
-                    // after that batch succeeds, before processing a cancellation or scheduling the next batch.
-                    const int64_t persist_at = !checkpoint_after_decode && prompt_cache && prompt_cache->on_disk() &&
-                        slot.prompt.adapter_key &&
-                        slot.task->type == SERVER_TASK_TYPE_COMPLETION && slot.task->params.cache_prompt &&
-                        !input_tokens.has_mtmd && slot.task->n_shared_prefix >= 64 ? slot.task->n_shared_prefix : 0;
                     if (checkpoint_after_decode) {
                         do_checkpoint = false;
                     }
@@ -3433,9 +3438,10 @@ private:
                         // checkpoint_decoded_prompt() keeps. Upstream also stops n_ubatch tokens earlier
                         // (ggml-org/llama.cpp#20288), for a checkpoint that the end one replaces at once with
                         // --ctx-checkpoints 1; each extra prompt batch streams the experts again.
-                        if (slot.prompt.n_tokens() == persist_at ||
-                            (do_checkpoint && server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
-                                                                        slot.task->n_shared_prefix, n_batch))) {
+                        if (do_checkpoint && (server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->n_shared_prefix, n_batch) ||
+                                              server_prompt_batch_stops(slot.prompt.n_tokens(), slot.task->n_tokens(),
+                                                                        slot.task->n_context_prefix, n_batch))) {
                             break;
                         }
                     }
@@ -3443,12 +3449,15 @@ private:
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.n_tokens - n_tokens_prev;
 
-                    // the batch starts at the end of the shared prefix, where the one before it stopped
-                    const bool at_shared = do_checkpoint && slot.task->n_shared_prefix >= 64 &&
-                        slot.prompt.n_tokens() - n_tokens_cur == slot.task->n_shared_prefix;
+                    // the batch starts at the end of the shared prefix or of the context prefix, where the one
+                    // before it stopped
+                    const int64_t n_batch_start = slot.prompt.n_tokens() - n_tokens_cur;
+                    const int64_t n_at_shared   = !do_checkpoint ? 0 :
+                        slot.task->n_shared_prefix >= 64 && n_batch_start == slot.task->n_shared_prefix ? slot.task->n_shared_prefix :
+                        slot.task->n_context_prefix > slot.task->n_shared_prefix && slot.task->n_context_prefix >= 64 &&
+                            n_batch_start == slot.task->n_context_prefix ? slot.task->n_context_prefix : 0;
 
-                    if ((checkpoint_after_decode || slot.prompt.n_tokens() == persist_at) &&
-                        n_tokens_cur > 0 && !has_mtmd) {
+                    if (checkpoint_after_decode && n_tokens_cur > 0 && !has_mtmd) {
                         slot.prompt_batch.n0      = slot.prompt.n_tokens() - n_tokens_cur;
                         slot.prompt_batch.n1      = slot.prompt.n_tokens();
                         slot.prompt_batch.row_end = batch.n_tokens;
@@ -3469,8 +3478,8 @@ private:
                         slot.init_sampler();
                         SLT_INF(slot, "prompt processing done, n_tokens = %d, batch.n_tokens = %d\n", slot.prompt.n_tokens(), batch.n_tokens);
                     } else {
-                        if (at_shared || slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
-                            // after the shared prefix, or near the end of the prompt
+                        if (n_at_shared > 0 || slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch) {
+                            // after the shared or the context prefix, or near the end of the prompt
                             do_checkpoint = do_checkpoint && true;
                         } else {
                             // only do non-end checkpoints if the "checkpoint every n tokens" option is set
@@ -3511,9 +3520,10 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
-                    if (prompt_cache && !prompt_cache->on_disk() && at_shared &&
-                        slot.n_prompt_tokens_cache < slot.task->n_shared_prefix && pos_min >= 0 && !has_mtmd) {
-                        keep_shared_prefix(slot, slot.task->n_shared_prefix, true);
+                    // The state is still the one after the shared prefix, computed by this task rather than reused
+                    // (the prompt cache holds those already); a later checkpoint may push its own out.
+                    if (n_at_shared > 0 && slot.n_prompt_tokens_cache < n_at_shared && pos_min >= 0 && !has_mtmd) {
+                        keep_shared_prefix(slot, n_at_shared, true);
                     }
                 }
 
@@ -4053,6 +4063,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         // process prompt
         std::vector<server_tokens> inputs;
         int64_t n_shared_prefix = 0;
+        int64_t n_context_prefix = 0;
         int64_t n_conversation_prefix = 0;
 
         if (res_type != TASK_RESPONSE_TYPE_NONE && ctx_server.mctx != nullptr) {
@@ -4071,6 +4082,8 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             n_shared_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
                     "shared_prefix_chars");
             if (n_shared_prefix > 0) {
+                n_context_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
+                        "context_prefix_chars");
                 n_conversation_prefix = server_prompt_prefix_tokens(ctx_server.vocab, data, inputs.back().get_tokens(),
                         "conversation_prefix_chars");
             }
@@ -4088,6 +4101,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.tokens = std::move(inputs[i]);
             task.n_shared_prefix = n_shared_prefix;
+            task.n_context_prefix = n_context_prefix > n_shared_prefix ? n_context_prefix : 0;
             task.n_conversation_prefix = n_conversation_prefix;
             task.params = server_task::params_from_json_cmpl(
                     ctx_server.vocab,
@@ -4161,8 +4175,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             }
         }
     } else {
-        // in streaming mode, the first error must be treated as non-stream response
-        // this is to match the OAI API behavior
+        // A slot-start result opens the stream. Errors before it still use an HTTP status.
         // ref: https://github.com/ggml-org/llama.cpp/pull/16486#discussion_r2419657309
         auto first_result = rd.next(req.should_stop);
         if (first_result == nullptr) {
@@ -4180,11 +4193,10 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             dynamic_cast<server_task_result_cmpl_partial*>(first_result.get()) != nullptr ||
             dynamic_cast<server_task_result_cmpl_final*>  (first_result.get()) != nullptr
         );
-
-        // next responses are streamed
-        // to be sent immediately
         json first_result_json = first_result->to_json();
-        if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+        if (first_result_json == nullptr) {
+            res->data.clear(); // send only the HTTP headers and status code
+        } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
             res->data = format_anthropic_sse(first_result_json);
         } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
             res->data = format_oai_resp_sse(first_result_json);
@@ -4193,7 +4205,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
         }
         res->status = 200;
         res->content_type = "text/event-stream";
-        res->next = [res_this = res.get(), res_type, &req](std::string & output) -> bool {
+        res->next = [res_this = res.get(), res_type, sse_ping_interval = params.sse_ping_interval, &req](std::string & output) -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({
@@ -4240,8 +4252,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                     return false; // no more data, terminate
                 }
 
-                // receive subsequent results
-                auto result = rd.next(req.should_stop);
+                // Receive subsequent results, yielding to an SSE ping on an idle stream.
+                bool timeout = false;
+                const int64_t start_time = ggml_time_ms();
+                auto result = rd.next([&]() {
+                    if (req.should_stop()) {
+                        return true;
+                    }
+                    timeout = sse_ping_interval > 0 &&
+                        ggml_time_ms() - start_time >= int64_t(sse_ping_interval) * 1000;
+                    return timeout;
+                });
+
+                if (timeout) {
+                    output = res_type == TASK_RESPONSE_TYPE_ANTHROPIC
+                        ? "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+                        : ":\n\n";
+                    return true;
+                }
+
                 if (result == nullptr) {
                     SRV_DBG("%s", "stopping streaming due to should_stop condition\n");
                     GGML_ASSERT(req.should_stop());
@@ -4264,7 +4293,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                         || dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                     );
                     json res_json = result->to_json();
-                    if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
+                    if (res_json == nullptr) {
+                        output.clear(); // another slot began within this request
+                    } else if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                         output = format_anthropic_sse(res_json);
                     } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
                         output = format_oai_resp_sse(res_json);

@@ -39,18 +39,21 @@ MODEL_OPTIONS = frozenset(
 PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
+    "kimi-k3": None,
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
     "gemma4": None,  # Gemma 4
 }
-# The profile of each GGUF general.architecture; --profile overrides it.
-ARCHITECTURES = {
+# Architectures with a routed SSD executor in llama_ssd::describe_experts.
+SSD_ARCHITECTURES = {
     "deepseek41": "dsv",
     "muse-spark": "muse",
+    "kimi-k3": "kimi-k3",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
-    "gemma4": "gemma4",
 }
+# The default launch profile also covers ordinary-graph models.
+ARCHITECTURES = {**SSD_ARCHITECTURES, "gemma4": "gemma4"}
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
 SAMPLING: dict[str, tuple[str, ...]] = {
@@ -581,14 +584,17 @@ def _resolve(
                 "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
                 literal(item, platform),
             ]
+    # K3's non-expert weights alone can exceed a single GPU. Fit those layers before
+    # the SSD tier takes its share of the remaining memory.
+    fit_layers = profile == "kimi-k3" and bool(gpu_backends)
     command += [
         "--mmap",
         "--no-repack",
         "--fit",
-        "off",
+        "on" if fit_layers else "off",
         "--no-warmup",
         "-ngl",
-        "99",
+        "auto" if fit_layers else "99",
         "-c",
         str(context),
         "-b",

@@ -60,6 +60,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     static constexpr const char * TOOL_ARG       = "tool-arg";
     static constexpr const char * TOOL_ARG_OPEN  = "tool-arg-open";
     static constexpr const char * TOOL_ARG_CLOSE = "tool-arg-close";
+    static constexpr const char * TOOL_ARG_XTML_NAME = "tool-arg-xtml-name";
     static constexpr const char * TOOL_ARG_NAME         = "tool-arg-name";
     static constexpr const char * TOOL_ARG_VALUE        = "tool-arg-value";
     static constexpr const char * TOOL_ARG_STRING_VALUE = "tool-arg-string-value";  // For schema-declared string types
@@ -86,6 +87,7 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     common_peg_parser tool_arg(const common_peg_parser & p) { return tag(TOOL_ARG, p); }
     common_peg_parser tool_arg_open(const common_peg_parser & p) { return atomic(tag(TOOL_ARG_OPEN, p)); }
     common_peg_parser tool_arg_close(const common_peg_parser & p) { return atomic(tag(TOOL_ARG_CLOSE, p)); }
+    common_peg_parser tool_arg_xtml_name(const common_peg_parser & p) { return atomic(tag(TOOL_ARG_XTML_NAME, p)); }
     common_peg_parser tool_arg_name(const common_peg_parser & p) { return atomic(tag(TOOL_ARG_NAME, p)); }
     common_peg_parser tool_arg_value(const common_peg_parser & p) { return tag(TOOL_ARG_VALUE, p); }
 

@@ -4,11 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
-#include <condition_variable>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
-#include <mutex>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -133,53 +131,16 @@ static bool has_prompt_file(const fs::path & cache) {
     return false;
 }
 
-// If the server got ahead of the reader, pause before computing the first batch
-// after the file appears. The reader can then queue cancellation before the
-// server gets through the rest of the prompt or generates an answer.
-struct suffix_gate {
-    fs::path cache;
-    std::mutex mutex;
-    std::condition_variable condition;
-    bool released = false;
-
-    explicit suffix_gate(fs::path cache) : cache(std::move(cache)) {}
-
-    static bool observe(ggml_tensor *, bool ask, void * user_data) {
-        if (ask) {
-            auto & gate = *static_cast<suffix_gate *>(user_data);
-            std::unique_lock<std::mutex> lock(gate.mutex);
-            if (!gate.released && has_prompt_file(gate.cache)) {
-                gate.condition.wait(lock, [&] { return gate.released; });
-            }
-        }
-        return false;
-    }
-
-    void release() {
-        std::lock_guard<std::mutex> lock(mutex);
-        released = true;
-        condition.notify_all();
-    }
-};
-
 struct server_run {
     server_context server;
-    suffix_gate * gate;
     std::thread worker;
 
-    explicit server_run(common_params params, suffix_gate * gate = nullptr) : gate(gate) {
-        if (gate) {
-            params.cb_eval = suffix_gate::observe;
-            params.cb_eval_user_data = gate;
-        }
+    explicit server_run(common_params params) {
         require(server.load_model(params), "could not load prompt-cache model fixture");
         worker = std::thread([this] { server.start_loop(); });
     }
 
     void stop() {
-        if (gate) {
-            gate->release();
-        }
         if (worker.joinable()) {
             server.terminate();
             worker.join();
@@ -204,53 +165,6 @@ static llama_tokens make_prompt(llama_token suffix, int count = prompt_tokens) {
     return prompt;
 }
 
-static void post_prompt(server_response_reader & reader, const llama_tokens & prompt, std::optional<float> scale, bool progress,
-        int id_slot = -1, int id_adapter = 0, int n_shared = prefix_tokens, int n_cache_reuse = 0) {
-    server_task task(SERVER_TASK_TYPE_COMPLETION);
-    task.id = reader.get_new_id();
-    task.id_slot = id_slot;
-    task.tokens = server_tokens(prompt, false);
-    task.n_shared_prefix = n_shared;
-    task.params.n_predict = 1;
-    task.params.n_cache_reuse = n_cache_reuse;
-    task.params.stream = progress;
-    task.params.return_progress = progress;
-    task.params.return_tokens = true;
-    task.params.sampling.temp = 0;
-    if (scale) {
-        task.params.lora[id_adapter] = *scale;
-    }
-    reader.post_task(std::move(task));
-}
-
-static void save_canceled_prefix(const common_params & params, std::optional<float> scale = {}) {
-    const fs::path cache = params.cache_disk;
-    require(fs::create_directory(cache), "could not create prompt-cache directory");
-    suffix_gate gate(cache);
-    server_run first(params, &gate);
-    auto reader = first.server.get_response_reader();
-    post_prompt(reader, make_prompt(3 + 'x'), scale, true);
-    // The server first acknowledges the request, before decoding any tokens.
-    receive(reader);
-    const auto result = receive(reader);
-    const auto * progress = dynamic_cast<const server_task_result_cmpl_partial *>(result.get());
-    require(progress && progress->is_progress && progress->progress.cache == 0 &&
-            progress->progress.processed == prefix_tokens, "first prefill batch did not end at the shared prefix");
-    require(has_prompt_file(cache), "first successful prefix batch was not saved");
-
-    reader.stop();
-    gate.release();
-    // This task runs after cancellation and before we destroy the server.
-    auto metrics = first.server.get_response_reader();
-    server_task request(SERVER_TASK_TYPE_METRICS);
-    request.id = metrics.get_new_id();
-    metrics.post_task(std::move(request));
-    const auto receipt = receive(metrics);
-    const auto * state = dynamic_cast<const server_task_result_metrics *>(receipt.get());
-    require(state && state->n_idle_slots == 1 && state->n_tokens_predicted_total == 0,
-            "the first request was not canceled during prefill");
-}
-
 struct completion {
     int cached;
     llama_token token;
@@ -267,7 +181,20 @@ static void require_completion(completion actual, int cached, llama_token token,
 static completion first_token(server_context & server, const llama_tokens & prompt, std::optional<float> scale,
         int id_slot, int id_adapter = 0, int n_shared = prefix_tokens, int n_cache_reuse = 0) {
     auto reader = server.get_response_reader();
-    post_prompt(reader, prompt, scale, false, id_slot, id_adapter, n_shared, n_cache_reuse);
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = reader.get_new_id();
+    task.id_slot = id_slot;
+    task.tokens = server_tokens(prompt, false);
+    task.n_shared_prefix = n_shared;
+    task.params.n_predict = 1;
+    task.params.n_cache_reuse = n_cache_reuse;
+    task.params.stream = false;
+    task.params.return_tokens = true;
+    task.params.sampling.temp = 0;
+    if (scale) {
+        task.params.lora[id_adapter] = *scale;
+    }
+    reader.post_task(std::move(task));
     const auto result = receive(reader);
     const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
     require(done && done->tokens.size() == 1, "the request did not complete with exactly one token");
@@ -281,6 +208,16 @@ static completion first_token(server_context & server, std::optional<float> scal
 static completion first_token(const common_params & params, std::optional<float> scale = {}) {
     server_run restarted(params);
     return first_token(restarted.server, scale);
+}
+
+static void save_completed_prefix(const common_params & params, std::optional<float> scale = {}) {
+    const fs::path cache = params.cache_disk;
+    require(fs::create_directory(cache), "could not create prompt-cache directory");
+    server_run original(params);
+    first_token(original.server, llama_tokens(prefix_tokens, base_token), scale, -1, 0, 0);
+    // A disjoint request reuses the one idle slot and saves its completed state to disk.
+    first_token(original.server, llama_tokens(prefix_tokens, 3 + 'x'), scale, -1, 0, 0);
+    require(has_prompt_file(cache), "the completed prefix was not saved on slot reuse");
 }
 
 static void test_import_replacement(common_params params, const fs::path & work) {
@@ -474,7 +411,7 @@ static void test_restart(const fs::path & work) {
     params.warmup = false;
     params.fit_params = false;
 
-    save_canceled_prefix(params);
+    save_completed_prefix(params);
     require_completion(first_token(params), prefix_tokens, base_token,
             "restart did not restore the exact shared prefix for a different suffix");
     test_import_replacement(params, work);
@@ -497,7 +434,7 @@ static void test_restart(const fs::path & work) {
 
     const fs::path adapted_cache = work / "adapted-cache";
     params.cache_disk = adapted_cache.string();
-    save_canceled_prefix(params, 1.0f);
+    save_completed_prefix(params, 1.0f);
 
     require_completion(first_token(params), 0, cold_base.token,
             "a default-scale request must match a cold base run after an adapted prefix was saved");

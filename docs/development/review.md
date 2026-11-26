@@ -20,7 +20,7 @@ and become rules here.
 
 1. **The contribution rules.** [CONTRIBUTING](../../CONTRIBUTING.md): one concern per pull request, the title
    format, no internal names, private addresses or links to private repositories, SPDX headers, the origin of
-   ported code in NOTICE, fixes to code taken from llama.cpp belong in llama.cpp.
+   ported code in NOTICE, a fix to code taken from llama.cpp shows that the problem affects InferSSD.
 2. **Hosted CI passes** on the head commit.
 3. **Existing paths are unchanged.** Existing models, a single GPU and the default configuration behave as on
    `main`: the reproducible configuration below is bitwise equal, work counters are not worse and times show

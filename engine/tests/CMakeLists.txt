@@ -814,6 +814,18 @@ if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
     llama_test(test-server-prompt-cache-restart)
     set_tests_properties(test-server-prompt-cache-restart PROPERTIES TIMEOUT 60)
     inferssd_ci_test(test-server-prompt-cache-restart test-server-prompt-cache-restart)
+
+    llama_build_and_test(ssd/test-server-response-reader.cpp)
+    target_include_directories(test-server-response-reader PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-response-reader PRIVATE server-context)
+    set_tests_properties(test-server-response-reader PROPERTIES TIMEOUT 10)
+    inferssd_ci_test(test-server-response-reader test-server-response-reader)
+
+    llama_build_and_test(ssd/test-server-anthropic-stream.cpp ../tools/server/server-http.cpp)
+    target_include_directories(test-server-anthropic-stream PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-anthropic-stream PRIVATE server-context cpp-httplib)
+    set_tests_properties(test-server-anthropic-stream PROPERTIES TIMEOUT 30)
+    inferssd_ci_test(test-server-anthropic-stream test-server-anthropic-stream)
 endif()
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
@@ -936,6 +948,8 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # On the hosted macOS runner's paravirtual GPU it aborts on a MUL_MAT the Metal backend does not encode.
     if (NOT APPLE)
         inferssd_ci_test(test-llama-archs test-kv-cache-grow test-dsv41-engram-layouts test-llama-archs-dense-ssd)
+        llama_test(test-llama-archs NAME test-kimi-k3-roundtrip ARGS -a kimi-k3 -s 42)
+        inferssd_ci_test(test-llama-archs test-kimi-k3-roundtrip)
     endif()
     # NextN blocks: every architecture, on the CPU alone
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)

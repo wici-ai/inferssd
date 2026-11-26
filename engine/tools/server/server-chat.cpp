@@ -22,80 +22,130 @@ static std::string responses_output_text(const json & output) {
     return text;
 }
 
-// The text of a system or developer message that holds only text, its parts joined by a blank line.
-static std::optional<std::string> responses_system_text(const json & message) {
+// The texts of the parts of a system or developer message that holds only text; empty parts are left out.
+static std::optional<std::vector<std::string>> responses_system_parts(const json & message) {
     const std::string role = json_value(message, "role", std::string());
     if (role != "system" && role != "developer") {
         return std::nullopt;
     }
     const json content = json_value(message, "content", json());
     if (content.is_string()) {
-        return content.get<std::string>();
+        const std::string text = content.get<std::string>();
+        return text.empty() ? std::vector<std::string>() : std::vector<std::string>{ text };
     }
     if (!content.is_array()) {
         return std::nullopt;
     }
-    std::string text;
+    std::vector<std::string> parts;
     for (const json & part : content) {
         if (json_value(part, "type", std::string()) != "text") {
             return std::nullopt;
         }
-        const std::string part_text = json_value(part, "text", std::string());
+        std::string part_text = json_value(part, "text", std::string());
         if (!part_text.empty()) {
-            text += (text.empty() ? "" : "\n\n") + part_text;
+            parts.push_back(std::move(part_text));
         }
     }
-    return text;
+    return parts;
+}
+
+static std::string join_texts(const std::vector<std::string> & texts) {
+    std::string joined;
+    for (const auto & text : texts) {
+        joined += (joined.empty() ? "" : "\n\n") + text;
+    }
+    return joined;
+}
+
+// Whether a part of Codex's leading developer messages depends on the user, the computer or the session rather than
+// on the app: its display mode and the folders it may write (app-context), the skills and plugins installed and the
+// account's (skills_instructions), the sandbox and approval settings and the commands approved
+// (permissions instructions), the mode the user chose (collaboration_mode) and the tools the account defers (tools).
+// The app's instructions before the first of them are the same for every user of an app version.
+static bool responses_user_context(const std::string & text) {
+    static const char * const tags[] = { "<app-context>", "<skills_instructions>", "<permissions instructions>",
+                                         "<collaboration_mode>", "<tools>" };
+    const size_t start = text.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return false;
+    }
+    for (const char * tag : tags) {
+        if (text.compare(start, std::char_traits<char>::length(tag), tag) == 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // Codex sends its instructions and several developer messages at the start, another developer message at the start
 // of a later turn, and now and then one inside a tool-call loop. Chat templates often take one system message at
-// the start and raise on the others or drop them. As CC Switch's Codex proxy converts them for Chat Completions:
-// - the leading ones (the instructions and the first developer messages) become one system message;
+// the start and raise on the others or drop them. As CC Switch's Codex proxy converts them for Chat Completions,
+// with the parts that depend on the user after everything that does not:
+// - the leading ones (the instructions and the first developer messages) become two system messages: the parts
+//   before the first that depends on the user (responses_user_context), then that one and all after it. No part
+//   moves: the app's later parts may refer to earlier ones (a mode that ends what earlier parts allowed), so the
+//   parts keep the order sent and only the cut between the two messages is new. The tools follow the first message
+//   in the templates that put them in the system turn after the text (Gemma 4), and come before both in those that
+//   put them first (Qwen3.6), so the parts that depend on the user come after the app's instructions and the tools
+//   either way, and the prompt of every user of the app starts with the same instructions and tools (see the shared
+//   prefix in oaicompat_chat_params_parse). Templates that take more than one system message take two (Qwen3.6
+//   drops a third);
 // - a later one whose next message other than a system message is a user message becomes a user message where it
 //   stands, so the request sent before stays a prefix of this one;
-// - any other later one joins the first system message, so a tool-call loop stays one turn.
-// Texts are joined by a blank line; an empty one is dropped.
-static std::vector<json> responses_collapse_system_messages(std::vector<json> messages) {
+// - any other later one joins the user's context, so a tool-call loop stays one turn and the app's part is the same.
+// Texts are joined by a blank line; an empty one is dropped. Returns whether the second system message is the user's
+// context.
+static bool responses_collapse_system_messages(std::vector<json> & messages) {
     std::vector<bool> followed_by_user(messages.size(), false);
     bool next_is_user = false;
     for (size_t i = messages.size(); i-- > 0;) {
         followed_by_user[i] = next_is_user;
-        if (!responses_system_text(messages[i])) {
+        if (!responses_system_parts(messages[i])) {
             next_is_user = json_value(messages[i], "role", std::string()) == "user";
         }
     }
 
-    std::vector<std::string> system_texts;
+    std::vector<std::string> app_texts;
+    std::vector<std::string> context_texts;
     std::vector<json> rest;
     bool seen_non_system = false;
+    bool in_context      = false; // a leading part that depends on the user came: it and all after it are context
     for (size_t i = 0; i < messages.size(); i++) {
-        const auto text = responses_system_text(messages[i]);
-        if (!text) {
+        const auto parts = responses_system_parts(messages[i]);
+        if (!parts) {
             seen_non_system = true;
             rest.push_back(std::move(messages[i]));
             continue;
         }
-        if (text->find_first_not_of(" \t\r\n") == std::string::npos) {
+        const std::string text = join_texts(*parts);
+        if (text.find_first_not_of(" \t\r\n") == std::string::npos) {
             continue;
         }
-        if (seen_non_system && followed_by_user[i]) {
-            rest.push_back({ { "role", "user" }, { "content", *text } });
+        if (!seen_non_system) {
+            for (const auto & part : *parts) {
+                if (part.find_first_not_of(" \t\r\n") != std::string::npos) {
+                    in_context = in_context || responses_user_context(part);
+                    (in_context ? context_texts : app_texts).push_back(part);
+                }
+            }
+        } else if (followed_by_user[i]) {
+            rest.push_back({ { "role", "user" }, { "content", text } });
         } else {
-            system_texts.push_back(*text);
+            context_texts.push_back(text);
         }
     }
 
     std::vector<json> out;
-    if (!system_texts.empty()) {
-        std::string joined;
-        for (const auto & text : system_texts) {
-            joined += (joined.empty() ? "" : "\n\n") + text;
-        }
-        out.push_back({ { "role", "system" }, { "content", joined } });
+    if (!app_texts.empty()) {
+        out.push_back({ { "role", "system" }, { "content", join_texts(app_texts) } });
     }
+    if (!context_texts.empty()) {
+        out.push_back({ { "role", "system" }, { "content", join_texts(context_texts) } });
+    }
+    const bool user_context = !app_texts.empty() && !context_texts.empty();
     out.insert(out.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
-    return out;
+    messages = std::move(out);
+    return user_context;
 }
 
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
@@ -378,7 +428,11 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
-    chatcmpl_body["messages"] = responses_collapse_system_messages(std::move(chatcmpl_messages));
+    if (responses_collapse_system_messages(chatcmpl_messages)) {
+        // read and removed by oaicompat_chat_params_parse: the shared prefix ends with the first system message
+        chatcmpl_body[SERVER_USER_CONTEXT_SYSTEM_MESSAGE] = true;
+    }
+    chatcmpl_body["messages"] = std::move(chatcmpl_messages);
 
     if (response_body.contains("tools") && !response_body.at("tools").is_array()) {
         throw std::invalid_argument("'tools' must be an array of objects");

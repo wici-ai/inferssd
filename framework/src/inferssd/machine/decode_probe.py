@@ -19,6 +19,7 @@ from inferssd.strategy.inputs import RuntimeFacts
 # The variable that leaves one GPU, by its UUID, to a probe of each backend's runtime; the probe
 # then names it device 0 of the backend.
 VISIBLE = {"CUDA": "CUDA_VISIBLE_DEVICES", "ROCm": "ROCR_VISIBLE_DEVICES"}
+FORMATS = "Q8_0,Q4_0,Q4_K,Q5_K,Q6_K,Q2_K,MXFP4,F16"
 
 
 def measure_decode_compute(
@@ -40,13 +41,21 @@ def measure_decode_compute(
     binary = Path(dict(probes.paths).get("cpu", ""))
     digest = hashlib.sha256(binary.read_bytes()).hexdigest() if binary.is_file() else "unknown"
     for gpu in result["gpus"]:
+        backend = backends.get(gpu["uuid"])
+        if backend is None:
+            continue
+        method = (
+            f"inferssd-cpuprobe/2 {backend} matvec; rotated 256 MiB; tokens=1; formats={FORMATS}"
+        )
+        measurement = gpu.get("decode_compute_measurement")
         cached = (
             gpu.get("decode_compute")
             and digest != "unknown"
             and gpu.get("decode_compute_probe_sha256") == digest
+            and measurement is not None
+            and measurement["method"] == method
         )
-        backend = backends.get(gpu["uuid"])
-        if backend is None or (cached and not force):
+        if cached and not force:
             continue
         state = states.get(gpu["uuid"])
         if state is None or state.processes:
@@ -59,8 +68,8 @@ def measure_decode_compute(
         isolated = Probes(probes.paths, probes.runner, env)
         started = time.monotonic()
         rows = []
-        # General shape plus both DeepSeek expert orientations. Rotated weights keep
-        # the working set above the GPU L2 cache; each point reports median and IQR.
+        # Use one square and a pair of transposed rectangles for every target. Rotated
+        # weights keep the working set above GPU L2. Each point reports median and IQR.
         for outputs, inputs in ((4096, 4096), (2304, 5120), (5120, 2304)):
             report = isolated.run(
                 "cpu",
@@ -76,7 +85,7 @@ def measure_decode_compute(
                     "--cols",
                     str(inputs),
                     "--formats",
-                    "Q8_0,Q4_K,Q5_K,Q6_K,Q2_K,MXFP4,F16",
+                    FORMATS,
                     "--min-seconds",
                     "0.25",
                 ],
@@ -92,7 +101,7 @@ def measure_decode_compute(
         gpu["decode_compute_measurement"] = {
             "measured_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "duration_s": time.monotonic() - started,
-            "method": f"inferssd-cpuprobe/2 {backend} matvec; rotated 256 MiB; tokens=1",
+            "method": method,
             "status": "ok",
             "detail": "Synthetic weights; shapes 4096x4096,2304x5120,5120x2304; "
             "no model inference; probe build: " + digest,

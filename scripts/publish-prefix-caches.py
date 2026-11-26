@@ -56,8 +56,8 @@ def fail(message: str) -> None:
     sys.exit("publish-prefix-caches: " + message)
 
 
-def prompt_tokens(path: Path, data: bytes) -> int:
-    """Check base-model provenance against the exact bytes to be uploaded."""
+def prompt_metadata(path: Path, data: bytes) -> tuple[int, bool]:
+    """Read the token count and adapter provenance from the supplied file."""
     if len(data) < 16:
         fail(f"{path} is not a cached prompt file")
     magic, version, n_fp = struct.unpack_from("<III", data)
@@ -68,10 +68,8 @@ def prompt_tokens(path: Path, data: bytes) -> int:
         fail(f"{path} is a prompt cache of one server, not a prefix cache (fingerprint {fingerprint[:40]!r})")
     if "|lora=" in fingerprint:
         fail(f"{path} was computed with LoRA adapters and is not a portable base-model prefix cache")
-    if not fingerprint.endswith(BASE_PROVENANCE):
-        fail(f"{path} lacks base-model provenance; regenerate the prefix with an adapter-aware engine")
     (n_tokens,) = struct.unpack_from("<I", data, 12 + n_fp)
-    return n_tokens
+    return n_tokens, fingerprint.endswith(BASE_PROVENANCE)
 
 
 def version_key(version: str) -> tuple[int, ...]:
@@ -115,11 +113,12 @@ def main() -> None:
         if not str(item.get("model", "")).endswith(".gguf") or "/" in item["model"] or "\\" in item["model"]:
             fail(f"{path}: model is the model's first GGUF file name")
         data = path.read_bytes()
-        tokens = prompt_tokens(path, data)
+        tokens, has_base_provenance = prompt_metadata(path, data)
         digest = hashlib.sha256(data).hexdigest()
-        planned.append((data, {"engines": sorted(item["engines"]), "os": item["os"], "model": item["model"],
-                               "app": item["app"], "app_version": item["app_version"],
-                               "tokens": tokens, "size": len(data), "sha256": digest}))
+        planned.append((path, data, has_base_provenance,
+                        {"engines": sorted(item["engines"]), "os": item["os"], "model": item["model"],
+                         "app": item["app"], "app_version": item["app_version"],
+                         "tokens": tokens, "size": len(data), "sha256": digest}))
 
     status, body = call("GET", f"{SERVICE}/config/{LIST}")
     if status == 200:
@@ -132,9 +131,27 @@ def main() -> None:
     else:
         fail(f"reading {LIST} answered {status}")
 
+    published = {}
+    for entry in current_files:
+        published.setdefault(entry["sha256"], entry)
+    for path, _, has_base_provenance, entry in planned:
+        existing = published.get(entry["sha256"])
+        if not has_base_provenance and (existing is None or existing["size"] != entry["size"]):
+            fail(f"{path} lacks base-model provenance; regenerate the prefix with an adapter-aware engine")
+
     new = []
-    for data, entry in planned:
+    for _, data, has_base_provenance, entry in planned:
         name = f"prefix-cache-{entry['sha256']}.prompt"
+        if not has_base_provenance:
+            # A verified legacy file only changes the engine list of the existing entry.
+            existing = published[entry["sha256"]]
+            if not dry_run:
+                status, served = call("GET", existing["url"])
+                if status != 200 or len(served) != entry["size"] or hashlib.sha256(served).hexdigest() != entry["sha256"]:
+                    fail(f"{existing['url']} does not serve {name} (status {status})")
+            print(f"{'would add engines' if dry_run else 'adding engines'} to already published {name}")
+            new.append({**existing, "engines": entry["engines"]})
+            continue
         if dry_run:
             print(f"would upload {name} ({len(data)} bytes, {entry['tokens']} tokens)")
             new.append({**entry, "url": f"https://cdn.wici.ai/apps/inferssd/{name}"})
@@ -170,7 +187,7 @@ def main() -> None:
     status, body = call("PUT", f"{SERVICE}/config/{LIST}", listing, {"Content-Type": "application/json"}, token)
     if status != 200:
         fail(f"writing {LIST} answered {status}: {body[:300]!r}")
-    print(f"{json.loads(body)['url']} names {len(new)} new prefix cache(s)")
+    print(f"{json.loads(body)['url']} updates {len(new)} prefix cache(s)")
 
 
 if __name__ == "__main__":

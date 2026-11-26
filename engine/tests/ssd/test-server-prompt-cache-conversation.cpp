@@ -224,43 +224,45 @@ static void test_chat_request_reports_the_opening() {
     require(!no_system.contains("shared_prefix_chars") && !no_system.contains("conversation_prefix_chars"),
             "a chat without a system message reports neither");
 
-    const std::string identity = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
-    const std::string preamble = "For this turn, use the user's requested units.\n\n"
-                                 "Available agent types for the Agent tool:\nExplore: inspect project files.";
-    const auto anthropic = [&](const std::string & question) {
-        auto body = server_chat_convert_anthropic_to_oai({
-            {"system", json::array({{{"type", "text"}, {"text", identity}}})},
-            {"tools", json::array({{{"name", "Agent"}, {"input_schema", {{"type", "object"}}}}})},
-            {"messages", json::array({{{"role", "user"}, {"content", question}},
-                                      {{"role", "system"}, {"content", preamble}}})},
-        });
+    // A Responses request whose second system message holds the user's context (SERVER_USER_CONTEXT_SYSTEM_MESSAGE):
+    // the shared prefix is the app's system message alone, the context prefix both, the opening still holds both.
+    const auto parse_with_context = [&](const server_chat_params & params) {
+        json body = json::parse(R"({"messages": [{"role": "system", "content": "Be brief.\nAnswer in English.\n"},
+                                                 {"role": "system", "content": "The folder is /work."},
+                                                 {"role": "user", "content": "What is two plus two?"}]})");
+        body[SERVER_USER_CONTEXT_SYSTEM_MESSAGE] = true;
         std::vector<raw_buffer> files;
-        return oaicompat_chat_params_parse(body, opt, files);
+        return oaicompat_chat_params_parse(body, params, files);
     };
-    const auto turn = [](const std::string & role, const std::string & text) -> std::string {
-        return "<|im_start|>" + role + "\n" + text + "<|im_end|>\n";
-    };
-    const std::string shared = turn("system", identity);
-    const auto check_anthropic = [&](const std::string & question) {
-        const auto params = anthropic(question);
-        const std::string opening = shared + turn("user", question) + turn("user", preamble);
-        require(params.at("prompt") == opening + "<|im_start|>assistant\n",
-                "the catalog heading must not move a turn-specific instruction ahead of the question");
-        require(prefix(params, "shared_prefix_chars") == shared, "the shared prefix stops before the question");
-        require(prefix(params, "conversation_prefix_chars") == opening,
-                "the conversation opening includes the question and its preamble in order");
-        return params;
-    };
-    const auto first_anthropic = check_anthropic("How far is that in kilometers?");
-    const auto next_anthropic  = check_anthropic("How far is that in miles?");
-    const std::string stored_prefix = prefix(first_anthropic, "shared_prefix_chars");
-    const std::string next_prompt   = next_anthropic.at("prompt").get<std::string>();
-    // Treat each byte as a token for this cache-matching check, without loading a model.
-    const auto stored = make_prompt(llama_tokens(stored_prefix.begin(), stored_prefix.end()), 0);
-    const server_tokens prompt(llama_tokens(next_prompt.begin(), next_prompt.end()), false);
-    const server_prompt_checkpoint * checkpoint = nullptr;
-    require(server_prompt_reuse_full(stored, prompt, &checkpoint) == stored.n_tokens() && !checkpoint,
-            "a changed user question can restore the exact shared prefix");
+    const json separate = parse_with_context(opt);
+    const std::string app     = "<|im_start|>system\nBe brief.\nAnswer in English.\n<|im_end|>\n";
+    const std::string context = "<|im_start|>system\nThe folder is /work.<|im_end|>\n";
+    require(prefix(separate, "shared_prefix_chars") == app, "the shared prefix ends after the app's system message");
+    require(prefix(separate, "context_prefix_chars") == app + context, "the context prefix ends after the user's context");
+    require(prefix(separate, "conversation_prefix_chars") == app + context + first, "the opening holds the user's context");
+    require(!parse(R"([{"role": "system", "content": "Be brief."}, {"role": "system", "content": "And kind."},
+                       {"role": "user", "content": "Hi."}])").contains("context_prefix_chars"),
+            "leading system messages that the request does not mark have no context prefix");
+    require(!separate.contains(SERVER_USER_CONTEXT_SYSTEM_MESSAGE), "the request field is not passed on");
+
+    // a template that merges the leading system messages into one turn and trims their texts: the shared prefix ends
+    // at the start of the app text's last line, where tokenizers start a token; the context prefix after the turn
+    server_chat_params merged{};
+    merged.use_jinja          = opt.use_jinja;
+    merged.prefill_assistant  = opt.prefill_assistant;
+    merged.reasoning_format   = opt.reasoning_format;
+    merged.force_pure_content = opt.force_pure_content;
+    merged.tmpls              = common_chat_templates_init(/* model= */ nullptr,
+            "<|im_start|>system\n{% for message in messages %}{% if message.role == 'system' %}{% if not loop.first %}{{ '\\n' }}{% endif %}"
+            "{{ message.content | trim }}{% endif %}{% endfor %}<|im_end|>\n{% for message in messages %}{% if message.role != 'system' %}"
+            "<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endif %}{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}");
+    const json one_turn_system = parse_with_context(merged);
+    require(prefix(one_turn_system, "shared_prefix_chars") == "<|im_start|>system\nBe brief.\n",
+            "the shared prefix of a merged system turn ends at the start of the app text's last line");
+    require(prefix(one_turn_system, "context_prefix_chars") ==
+            "<|im_start|>system\nBe brief.\nAnswer in English.\nThe folder is /work.<|im_end|>\n",
+            "the context prefix of a merged system turn ends with the turn");
 }
 
 int main() {

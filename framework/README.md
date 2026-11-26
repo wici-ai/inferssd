@@ -236,42 +236,40 @@ the **estimated host budget** (it does not set a process limit). Optional
 `--host-work-mib` and `--gpu-work-mib` reserve known KV/graph working memory. Without
 these, cache capacity is an upper estimate; these options do not alter launches.
 
-The command leads with a **conditional scenario range**, not a single precise
-prediction. JSON retains `decode_tokens_per_second` as the uniform/serial reference
-and adds `routing_scenarios`, `scenario_range_tokens_per_second`, component times
-and assumptions. The scenario table uses:
+Routed experts follow one routing assumption for every model, since routing cannot be
+observed before the model runs: warmed caches hold the most popular experts, and the
+share of accesses at rank `r` is `min(1/top_k, a/r)` (`strategy/routing.py`). JSON
+gives that reference in `decode_tokens_per_second`, its name in `reference_scenario`
+(`rank_serial` for routed experts), component times in `components` and the
+assumptions taken. `scenarios` and `routing_scenarios` bound how much the RAM and
+VRAM caches overlap (`rank_inclusive`, `rank_disjoint`), and
+`scenario_range_tokens_per_second` adds I/O overlap and the measured CPU, GPU and
+drive quartiles. The range carries **no probabilities**: it is not a confidence
+interval or a guaranteed bound, and microbenchmark quartiles describe only the
+profiling window. No historical tokens/s multiplier is used.
 
-| Expert-access hypothesis | Fraction of experts | Fraction of accesses |
-| --- | ---: | ---: |
-| Uniform | 100% | 100% |
-| Moderate concentration | 50% | 75% |
-| Concentrated | 20% | 80% |
-| Strongly concentrated | 20% | 95% |
+`--estimate-gguf FILE` and `--estimate-facts JSON` estimate a specific checkpoint.
+A dense decoder can run without a named model profile. Routed experts need a profile
+and a layout the SSD executor supports. An architecture or expert format that the
+engine cannot run yields a refusal reason in place of a decode rate. Placement uses the
+selected engine's GPU backends, including when replaying a saved machine profile.
+Checks the engine makes when it starts are left to the launch. These include the
+devices chosen through launch settings and values inside the model.
 
-The remaining accesses still reach the rest of the experts. Caches are assumed to
-admit hotter experts first after warm-up. Each row reports no overlap, half-hidden
-I/O and a conditional range combining measured CPU/GPU/drive quartiles with serial
-to ideal overlap. Inclusive RAM/VRAM capacity avoids double-counting copies; a
-separate disjoint-cache scenario shows the alternative. The Python API accepts
-explicit `RoutingPattern` inputs when model-specific routing evidence exists.
+For a routed model, the estimator prices dense GPU work at the measured Q8_0 matvec
+rate for both catalog entries and explicit checkpoints. It checks each routed layer's
+up, gate and down formats against the executors used by the launch. An executable
+expert format with no timing measurement can borrow the rate of the measured format
+nearest it in bits per weight. The estimate identifies these proxies in its assumptions.
+When another compute process is using the GPU, the estimate leaves the launcher's
+VRAM reserve free before counting how many routed experts fit. On unified memory, the
+GPU's working memory and that reserve come out of host memory.
 
-These hypotheses carry **no probabilities**. They are not a measured typical
-range, confidence interval, or guaranteed bound on execution. Microbenchmark
-quartiles describe only the profiling window; they cannot anticipate future shared
-SSD stalls. No historical tokens/s multiplier is used.
-
-Dense CUDA computation currently uses a measured Q8_0 matvec proxy because catalog
-facts do not retain each dense tensor's shape and type. Attention, non-matmul graph
-work, lookup I/O, warm-up and the actual routing distribution remain unpriced.
-CPU-only/unified-memory or missing-GPU-measurement cases retain a CPU cost estimate;
-they do not claim to model GPU execution. Estimates still use the catalog's pinned
-model facts; `--model` selects the storage drive, not arbitrary model metadata.
-A different quantization needs matching model facts before its estimate is valid.
-
-Two defaults stand in for measurements the profile lacks. An expert format the
-probe does not measure, such as IQ4_XS or IQ4_NL, takes the measured rate (weight
-bytes per second) of the measured format nearest it in bits per weight. A model
-without routed experts, such as Gemma 4 E4B, reads its dense weights once a
-token, on one CUDA GPU when they fit its free memory and otherwise at the fastest
-measured RAM read rate. Each estimate names the default it used in its
-assumptions; neither is calibrated against a run.
+For a dense model such as Gemma 4 E4B, the catalog records the bytes in each layer
+weight format. The estimator prices that mix using matvec measurements near
+4096 × 4096. An explicit checkpoint supplies individual matrix shapes and types.
+On a single profiled CUDA or ROCm GPU, non-streamable weights must fit in available
+VRAM. Other layers can stream from pinned host memory or the model drive. The
+`dense_pipeline` scenario overlaps GPU compute, host-to-device transfer and drive
+reads. The host scenario uses the measured CPU or RAM rates. Attention, lookup I/O
+and cache warm-up remain unpriced (issue #395).

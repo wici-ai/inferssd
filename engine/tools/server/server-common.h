@@ -319,6 +319,11 @@ json oaicompat_completion_params_parse(const json & body);
 // the request's "turn_context" (set by oaicompat_chat_params_parse): the turn is found after the same messages.
 void server_turn_memory_record(const common_chat_msg & msg, const std::string & context);
 
+// A chat request field set by the conversion of a Responses request (server_chat_convert_responses_to_chatcmpl): the
+// second of its two leading system messages holds the user's context and the first the app's own text, so the
+// shared prefix ends with the first. oaicompat_chat_params_parse reads and removes it.
+inline constexpr const char * SERVER_USER_CONTEXT_SYSTEM_MESSAGE = "inferssd_user_context_system_message";
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,

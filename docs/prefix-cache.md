@@ -99,3 +99,6 @@ For a new engine, each published prefix cache is made again. If the new state di
 more than two backends differ, the file is kept and the new engine is added to its `engines`; otherwise the new file
 is published for it. A state computed twice on one GPU is not the same bytes either, so the comparison is by size of
 difference, not equality.
+
+The publisher can add engines to an already published legacy file when its size and SHA-256 match the existing list
+entry. It keeps the existing download and verifies the bytes it serves before writing the updated list.

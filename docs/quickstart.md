@@ -201,6 +201,24 @@ For an AMD GPU on ROCm, see [Linux / AMD](#linux--amd). Without either, build
 `--preset linux-cpu` and leave out `inferssd-memprobe`; add `-DGGML_VULKAN=ON` with the
 Vulkan SDK to run an AMD or Intel GPU through Vulkan.
 
+### Try Kimi K3 text generation on one NVIDIA GPU
+
+Keep all 14 shards of the [UD-IQ1_S GGUF](https://huggingface.co/unsloth/Kimi-K3-GGUF/tree/a0836360ce58dfec088d966a97f2ddc8a606279b/UD-IQ1_S) together.
+Use the first shard with the Python package and CUDA engine built from this checkout:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 inferssd cli --resources engine-resources.json \
+  -m /path/to/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --context 512 -p "What is 2 + 3? Reply with just the number." -n 32
+```
+
+K3 can spend a short output budget on reasoning. If the command stops before printing a final answer,
+increase `-n`. For repeated prompts, use `inferssd serve` to keep the expert cache loaded between requests.
+
+The launcher fits the backbone layers to available GPU memory and uses SSD-backed routed experts.
+If part of the backbone stays on the CPU and decode repeatedly faults its weights back in,
+try `--set host.headroom_mib=20480` to reserve 20 GiB of host memory from the expert cache.
+
 ## Linux / AMD
 
 An AMD GPU that ROCm supports runs the same engine as an NVIDIA GPU: ggml's HIP backend
