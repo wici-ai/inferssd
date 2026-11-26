@@ -488,28 +488,52 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
                ggml_tensor * b,
                ggml_tensor * s,
                        int   il) {
+    const int64_t S_v    = v->ne[0];
+    const int64_t H_v    = v->ne[1];
     const int64_t n      = q->ne[2];
     const int64_t n_seqs = q->ne[3];
+
+    GGML_ASSERT(s->ne[0] == S_v && s->ne[1] == S_v && s->ne[2] == H_v && s->ne[3] == n_seqs);
+
+    const int64_t D        = S_v * S_v * H_v;
     const size_t  row_size = states_all->nb[1];
     const auto    head     = inp->mctx->get_head();
     const auto    size     = inp->mctx->get_size();
-    // token t of a [*, *, n_tokens, n_seqs] tensor
-    const auto token = [&](ggml_tensor * x, int64_t t) {
-        return ggml_cont(ctx0, ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], 1, x->ne[3], x->nb[1], x->nb[2], x->nb[3],
-                t * x->nb[2]));
+    GGML_ASSERT(states_all->ne[0] == D);
+
+    // One snapshot slot a token (K = n): the op reads slot 0 and leaves the state after token t in slot t, so slot
+    // n - 1 holds the ubatch's final state. The pad and the copies keep rows of S_v: the backends spread a pad or a
+    // copy over its rows, and a single row of the whole state would run on one workgroup.
+    ggml_tensor * state = ggml_pad(ctx0, ggml_reshape_4d(ctx0, s, S_v, S_v * H_v, 1, n_seqs), 0, 0, n - 1, 0);
+    state = ggml_reshape_3d(ctx0, state, D, n, n_seqs);
+    ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, state);
+    cb(result, LLAMA_TENSOR_NAME_FGDN_CH, il);
+
+    const size_t attn_size = ggml_row_size(result->type, S_v * H_v * n * n_seqs);
+    const size_t slot_size = ggml_row_size(result->type, D * n_seqs);
+
+    ggml_tensor * output = ggml_view_4d(ctx0, result,
+            S_v, H_v, n, n_seqs,
+            ggml_row_size(result->type, S_v),
+            ggml_row_size(result->type, S_v * H_v),
+            ggml_row_size(result->type, S_v * H_v * n), 0);
+
+    // slot t: the state after token t
+    const auto slot = [&](int64_t t) {
+        return ggml_view_4d(ctx0, result,
+                S_v, S_v, H_v, n_seqs,
+                ggml_row_size(result->type, S_v),
+                ggml_row_size(result->type, S_v * S_v),
+                ggml_row_size(result->type, D),
+                attn_size + size_t(t) * slot_size);
     };
-    ggml_tensor * output = nullptr;
-    ggml_tensor * state  = s;
-    for (int64_t t = 0; t < n; ++t) {
-        const auto step = build_delta_net(token(q, t), token(k, t), token(v, t), token(g, t), token(b, t), state, il);
-        output = output ? ggml_concat(ctx0, output, step.first, 2) : step.first;
-        state  = step.second;
-        if (t + 1 < n) {
-            // the state n - 1 - t tokens before the ubatch's end
-            ggml_tensor * dst = ggml_view_2d(ctx0, states_all, states_all->ne[0], n_seqs, row_size,
-                    (size_t(n - 1 - t) * size + head) * row_size);
-            ggml_build_forward_expand(gf, ggml_cpy(ctx0, state, dst));
-        }
+
+    // slot t, the state n - 1 - t tokens before the ubatch's end, into plane n - 1 - t; the caller writes plane 0
+    for (int64_t t = 0; t + 1 < n; ++t) {
+        ggml_tensor * dst = ggml_view_2d(ctx0, states_all, D, n_seqs, row_size,
+                (size_t(n - 1 - t) * size + head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, slot(t), dst));
     }
-    return { output, state };
+
+    return { output, slot(n - 1) };
 }

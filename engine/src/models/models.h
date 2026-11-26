@@ -88,8 +88,10 @@ struct llm_build_delta_net_base : public llm_graph_context {
                    int64_t   state_cols,
                    int64_t   channels) const;
 
-    // build_delta_net one token at a time, the states after the earlier tokens into planes 1 .. n - 1 of
-    // `states_all`. Each token runs the one-token recurrence, so its state is the one-token decode's.
+    // One ggml_gated_delta_net call with a snapshot slot per token (K = n), the states after the earlier tokens into
+    // planes 1 .. n - 1 of `states_all`; the caller writes plane 0. The op runs each token as a one-token call of it
+    // does, so its outputs and states are those of the fused one-token decode, bit for bit. A verification takes the
+    // op even where multi-token ubatches take build_delta_net_chunking, which keeps no per-token states.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_planes(
         llm_graph_input_rs * inp,
                ggml_tensor * states_all,
