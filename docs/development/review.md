@@ -42,9 +42,10 @@ and become rules here.
 | Bug fix | The bug reproduces on `main`, is gone with the fix, and a new test fails with the fix reverted |
 | Documentation, tests, tooling | The text is accurate and the tests or tools run |
 
-A pull request may combine several changes and is not asked to split them. Each change meets the row for its
-kind: a performance change inside a bug fix, for example, is measured faster on the devices it changes. A
-change that does not meet its row is sent back alone; the rest merges once the author fixes or removes it.
+A pull request that contains several changes is not sent back only to split them. Each change meets the row
+for its kind: a performance change inside a bug fix, for example, is measured faster on the devices it
+changes. A change that does not meet its row is sent back alone; the rest merges once the author fixes or
+removes it.
 
 ## Numerical differences
 

@@ -20,8 +20,7 @@ a review.
 ## Pull requests
 
 - Work on a short branch name without `/` and without the name of the tool that produced the change.
-- A pull request may combine several changes; list each one in its description. Each change meets the rule
-  for its kind in [pull request review](docs/development/review.md#what-merges-by-kind-of-change).
+- Keep each pull request to one concern. Separate numerical or algorithm changes from source-layout changes.
 - A fix to code that InferSSD takes from llama.cpp is accepted here when the problem affects InferSSD: show it
   in InferSSD, keep the change to what the fix needs and say whether current llama.cpp has the same problem.
   Sending the fix to [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) as well is welcome; a problem
