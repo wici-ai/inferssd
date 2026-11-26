@@ -830,6 +830,33 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
 WINDOWS = "windows-x64-igpu.json"  # 4 + 4 Intel cores with an integrated GPU, one NVMe drive
 
 
+@pytest.mark.parametrize(
+    "total,available,status", [(128, range(128), "partial"), (64, range(64, 96), "failed")]
+)
+def test_saved_windows_multigroup_fallback_uses_live_cpus(models, total, available, status):
+    c = machine(WINDOWS)
+    c["identity"]["hard"]["logical_cpus"] = total
+    # The old fallback numbered CPUs consecutively, even across partially filled groups.
+    c["cpu"]["logical"] = [
+        dict(c["cpu"]["logical"][0], id=i, core=None, capacity=None, smt_siblings=None)
+        for i in range(total)
+    ]
+    c["cpu"]["clusters"] = [{"id": 0, "kind": "uniform", "cpus": list(range(total))}]
+    c["cpu"]["affinity_supported"] = True
+    detail = (
+        "topology unavailable: more than one processor group "
+        "(over 64 logical CPUs) is not supported"
+    )
+    if status == "failed":
+        detail += "; ISA unknown: the CPU probe failed (see compute)"
+    c["sections"]["cpu"].update(status=status, detail=detail)
+    c["compute"]["cpu"] = []
+
+    s = derive(c, models["dsv"], runtime(available), "windows", model_drive_key=drive(c))
+    assert s.threads == Threads(len(available) - 1, len(available) - 1)
+    assert s.settings["cpu.io_cpus"].value_text == '""'
+
+
 def test_windows_runs_the_one_derivation(models):
     c = machine(WINDOWS)
     s = derive(

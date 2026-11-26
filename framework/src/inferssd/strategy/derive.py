@@ -293,8 +293,20 @@ def placement(
     pinned measurement placed them. The engine runs decode on fewer of them while the machine's
     other work needs their CPUs.
     """
-    logical = {row["id"] for row in characteristics["cpu"]["logical"]}
-    allowed = sorted(set(runtime.cpus) & logical)
+    # Old Windows profiles stored placeholder IDs 0..N-1 and advertised pinning
+    # when topology discovery refused multiple groups. Only the live IDs apply.
+    old_group_error = (
+        "topology unavailable: more than one processor group "
+        "(over 64 logical CPUs) is not supported"
+    )
+    legacy_groups = (
+        characteristics["identity"]["hard"]["platform"] == "windows"
+        and characteristics["sections"]["cpu"]["detail"].partition(";")[0] == old_group_error
+    )
+    available = set(runtime.cpus)
+    if not legacy_groups:
+        available.intersection_update(row["id"] for row in characteristics["cpu"]["logical"])
+    allowed = sorted(available)
     if not allowed:
         raise ValueError("none of the CPUs this process may use is in the machine characteristics")
     name = model.cpu_format.upper()
@@ -317,7 +329,7 @@ def placement(
     )
     notes.append(f"threads: decode {decode}, {decode_why}")
     notes.append(f"threads: prefill {batch}, {batch_why}")
-    if not characteristics["cpu"]["affinity_supported"]:
+    if legacy_groups or not characteristics["cpu"]["affinity_supported"]:
         return (
             Threads(decode, batch, ()),
             (),

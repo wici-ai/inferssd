@@ -7,8 +7,7 @@ Windows path on any OS. Win32 structures are read from raw bytes with their
 fixed layouts, never through ctypes.wintypes, whose sizes follow the OS Python
 runs on.
 
-Logical CPUs are logical processor indices of processor group 0, as in the
-engine's platform layer, which refuses machines with more than one group.
+A logical CPU number is 64 times its processor group plus its group-local index.
 """
 
 from __future__ import annotations
@@ -23,7 +22,6 @@ from typing import Any, Optional, Protocol, Union
 Value = Union[str, int, None]
 Registry = Callable[[str, str], Value]
 
-ALL_PROCESSOR_GROUPS = 0xFFFF
 CPU_SET_INFORMATION = 0  # CPU_SET_INFORMATION_TYPE CpuSetInformation
 DRIVE_REMOTE = 4
 FILE_SHARE_READ_WRITE = 0x1 | 0x2
@@ -42,19 +40,26 @@ MAX_ADAPTERS = 16
 
 @dataclass(frozen=True)
 class CPUSet:
-    """A CPU Set of processor group 0, as GetSystemCpuSetInformation reports it."""
+    """A Win32 CPU Set; index and core are qualified by processor group."""
 
-    index: int  # logical processor index in group 0
-    core: int  # CoreIndex: equal for the CPU Sets of one core
-    efficiency: int  # EfficiencyClass: a higher class is a faster core
+    index: int
+    core: int
+    efficiency: int
+    id: int  # opaque Win32 ID used by GetProcessDefaultCpuSets
 
 
 @dataclass(frozen=True)
 class Processors:
-    groups: int  # active processor groups
-    logical: int  # active logical processors in all groups
-    group0: int  # active logical processors in group 0
-    sets: tuple[CPUSet, ...]  # group 0's CPU Sets; empty where Windows has none
+    counts: tuple[int, ...]  # active logical processors per group
+    sets: tuple[CPUSet, ...]
+
+    @property
+    def logical(self) -> int:
+        return sum(self.counts)
+
+    @property
+    def ids(self) -> tuple[int, ...]:
+        return tuple(64 * group + cpu for group, n in enumerate(self.counts) for cpu in range(n))
 
 
 @dataclass(frozen=True)
@@ -103,7 +108,7 @@ class System(Protocol):
 
 
 def cpu_sets(data: bytes) -> list[CPUSet]:
-    """Group 0's CPU Sets in a SYSTEM_CPU_SET_INFORMATION array."""
+    """The CPU Sets in a SYSTEM_CPU_SET_INFORMATION array."""
     found = []
     at = 0
     while at + 8 <= len(data):
@@ -113,9 +118,10 @@ def cpu_sets(data: bytes) -> list[CPUSet]:
         if kind == CPU_SET_INFORMATION and size >= 19:
             # Id, Group, LogicalProcessorIndex, CoreIndex, LastLevelCacheIndex,
             # NumaNodeIndex, EfficiencyClass
-            _, group, index, core, _, _, efficiency = struct.unpack_from("<IHBBBBB", data, at + 8)
-            if group == 0:
-                found.append(CPUSet(index, core, efficiency))
+            set_id, group, index, core, _, _, efficiency = struct.unpack_from(
+                "<IHBBBBB", data, at + 8
+            )
+            found.append(CPUSet(group * 64 + index, group * 64 + core, efficiency, set_id))
         at += size
     return found
 
@@ -204,34 +210,81 @@ class Win32:
                 found.append(Adapter(name, device, memory if isinstance(memory, int) else 0))
         return tuple(found)
 
-    def processors(self) -> Processors:
+    def _cpu_sets(self) -> tuple[CPUSet, ...]:
         kernel32 = self.kernel32
-        groups = int(kernel32.GetActiveProcessorGroupCount())
-        logical = int(kernel32.GetActiveProcessorCount(ALL_PROCESSOR_GROUPS))
-        group0 = int(kernel32.GetActiveProcessorCount(0))
-        if not groups or not logical or not group0:
-            raise self.error("GetActiveProcessorCount")
         length = ctypes.c_uint32(0)
         kernel32.GetSystemCpuSetInformation(None, 0, ctypes.byref(length), None, 0)
         if not length.value:
-            return Processors(groups, logical, group0, ())
+            return ()
         buffer = ctypes.create_string_buffer(length.value)
         if not kernel32.GetSystemCpuSetInformation(
             buffer, length.value, ctypes.byref(length), None, 0
         ):
             raise self.error("GetSystemCpuSetInformation")
-        sets = cpu_sets(buffer.raw[: length.value])
-        return Processors(groups, logical, group0, tuple(s for s in sets if s.index < group0))
+        return tuple(cpu_sets(buffer.raw[: length.value]))
+
+    def _group_size(self, group: int) -> int:
+        count = int(self.kernel32.GetActiveProcessorCount(group))
+        if not 1 <= count <= 64:
+            raise self.error("GetActiveProcessorCount")
+        return count
+
+    def processors(self) -> Processors:
+        groups = int(self.kernel32.GetActiveProcessorGroupCount())
+        if not groups:
+            raise self.error("GetActiveProcessorGroupCount")
+        return Processors(
+            tuple(self._group_size(group) for group in range(groups)), self._cpu_sets()
+        )
 
     def process_cpus(self) -> tuple[int, ...]:
         kernel32 = self.kernel32
-        if int(kernel32.GetActiveProcessorGroupCount()) != 1:
-            raise OSError("more than one processor group (over 64 logical CPUs) is not supported")
-        process, system = ctypes.c_uint64(0), ctypes.c_uint64(0)
         handle = ctypes.c_void_p(kernel32.GetCurrentProcess())
-        if not kernel32.GetProcessAffinityMask(handle, ctypes.byref(process), ctypes.byref(system)):
-            raise self.error("GetProcessAffinityMask")
-        return tuple(cpu for cpu in range(64) if process.value >> cpu & 1)
+        total = int(kernel32.GetActiveProcessorGroupCount())
+        if not total:
+            raise self.error("GetActiveProcessorGroupCount")
+        groups = [0]
+        if total > 1:
+            count = ctypes.c_uint16(total)
+            numbers = (ctypes.c_uint16 * total)()
+            if not kernel32.GetProcessGroupAffinity(handle, ctypes.byref(count), numbers):
+                raise self.error("GetProcessGroupAffinity")
+            groups = sorted(numbers[: count.value])
+            if not groups:
+                raise OSError("GetProcessGroupAffinity returned no groups")
+        if len(groups) == 1:
+            process, system = ctypes.c_size_t(0), ctypes.c_size_t(0)
+            if not kernel32.GetProcessAffinityMask(
+                handle, ctypes.byref(process), ctypes.byref(system)
+            ):
+                raise self.error("GetProcessAffinityMask")
+            if not process.value:
+                raise OSError("GetProcessAffinityMask returned an empty mask")
+            allowed = tuple(groups[0] * 64 + cpu for cpu in range(64) if process.value >> cpu & 1)
+        else:
+            # GetProcessAffinityMask cannot represent more than one group.
+            allowed = tuple(64 * g + cpu for g in groups for cpu in range(self._group_size(g)))
+        if total == 1:
+            return allowed
+        # Process-default CPU Sets can further narrow the CPUs Windows will use.
+        size = ctypes.c_uint32(0)
+        if not kernel32.GetProcessDefaultCpuSets(handle, None, 0, ctypes.byref(size)):
+            if self.last_error() != 122:  # ERROR_INSUFFICIENT_BUFFER
+                raise self.error("GetProcessDefaultCpuSets")
+        if not size.value:
+            return allowed
+        selected = (ctypes.c_uint32 * size.value)()
+        if not kernel32.GetProcessDefaultCpuSets(
+            handle, selected, len(selected), ctypes.byref(size)
+        ):
+            raise self.error("GetProcessDefaultCpuSets")
+        by_id = {row.id: row.index for row in self._cpu_sets()}
+        try:
+            preferred = {by_id[set_id] for set_id in selected[: size.value]}
+        except KeyError as error:
+            raise OSError(f"unknown process-default CPU Set ID {error.args[0]}") from error
+        # A conflicting hard affinity takes precedence over the selected CPU Sets.
+        return tuple(cpu for cpu in allowed if cpu in preferred) or allowed
 
     def memory(self) -> Memory:
         # MEMORYSTATUSEX: dwLength must hold its size, 64 bytes.

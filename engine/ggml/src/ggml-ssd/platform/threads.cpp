@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
+#include <optional>
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -75,7 +76,7 @@ bool process_cpus(cpu_list & cpus, std::string * why) {
 // sched_getaffinity(0) reads the calling thread's mask.
 bool current_thread_cpus(cpu_list & cpus, std::string * why) { return process_cpus(cpus, why); }
 
-bool affinity_supported() { return true; }
+pin_policy thread_pinning() { return pin_policy::exact; }
 
 bool pin_thread(std::thread::native_handle_type thread, const cpu_list & cpus) {
     if (cpus.empty()) { return true; }
@@ -157,7 +158,7 @@ bool process_cpus(cpu_list & cpus, std::string * why) {
 bool current_thread_cpus(cpu_list & cpus, std::string * why) { return process_cpus(cpus, why); }
 
 // macOS has no thread affinity; QoS roles steer cluster placement instead.
-bool affinity_supported() { return false; }
+pin_policy thread_pinning() { return pin_policy::no_op; }
 
 bool pin_thread(std::thread::native_handle_type, const cpu_list &) { return true; }
 
@@ -215,21 +216,19 @@ void wake_all(const std::atomic<uint32_t> & word) noexcept {
 
 #elif defined(_WIN32)
 
-// CPU Sets of processor group 0, by logical processor index. Ids and
-// efficiency classes are fixed while the system runs.
+// A Windows processor number has a group and a local index in 0..63.
+constexpr int group_width = 64;
 struct cpu_set_table {
-    bool available = false;       // every active group-0 processor has a CPU Set
-    std::vector<ULONG> id;
-    std::vector<int> efficiency;  // -1: no CPU Set
-    ULONG total = 0;              // CPU Sets in all groups
+    bool available = false;       // every active processor of a single-group machine has a CPU Set
+    std::vector<std::optional<ULONG>> id;
 };
 
 static cpu_set_table read_cpu_sets() {
     cpu_set_table table;
-    const DWORD active = GetActiveProcessorCount(0);
-    if (active == 0 || active > sizeof(DWORD_PTR) * 8) { return table; }
-    table.id.assign(active, 0);
-    table.efficiency.assign(active, -1);
+    const WORD groups = GetActiveProcessorGroupCount();
+    const DWORD slots = groups == 1 ? GetActiveProcessorCount(0) : DWORD(groups) * group_width;
+    if (!slots) { return table; }
+    table.id.resize(slots);
     ULONG bytes = 0;
     GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
     if (bytes == 0) { return table; }
@@ -243,16 +242,12 @@ static cpu_set_table read_cpu_sets() {
         const auto * entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(base + at);
         if (entry->Size == 0 || at + entry->Size > bytes) { break; }
         if (entry->Type == CpuSetInformation) {
-            ++table.total;
-            const DWORD index = entry->CpuSet.LogicalProcessorIndex;
-            if (entry->CpuSet.Group == 0 && index < active) {
-                table.id[index] = entry->CpuSet.Id;
-                table.efficiency[index] = entry->CpuSet.EfficiencyClass;
-            }
+            const DWORD cpu = DWORD(entry->CpuSet.Group) * group_width + entry->CpuSet.LogicalProcessorIndex;
+            if (cpu < slots) { table.id[cpu] = entry->CpuSet.Id; }
         }
         at += entry->Size;
     }
-    table.available = std::all_of(table.efficiency.begin(), table.efficiency.end(), [](int e) { return e >= 0; });
+    table.available = groups == 1 && std::all_of(table.id.begin(), table.id.end(), [](auto id) { return id.has_value(); });
     return table;
 }
 
@@ -269,18 +264,80 @@ static bool single_group() { return GetActiveProcessorGroupCount() == 1; }
 static bool process_mask(DWORD_PTR & mask) {
     DWORD_PTR system = 0;
     mask = 0;
-    return single_group() && GetProcessAffinityMask(GetCurrentProcess(), &mask, &system) && mask != 0;
+    return GetProcessAffinityMask(GetCurrentProcess(), &mask, &system) && mask != 0;
+}
+
+// Windows 10 can start this process in just one group, and Windows 11 can schedule
+// it across several. A process affinity mask describes CPUs only in the former case.
+static bool grouped_process_cpus(USHORT count, cpu_list & cpus, std::string * why) {
+    const HANDLE process = GetCurrentProcess();
+    std::vector<USHORT> groups(count);
+    if (!GetProcessGroupAffinity(process, &count, groups.data()) || !count) {
+        set_why(why, "GetProcessGroupAffinity failed: error " + std::to_string(GetLastError()));
+        return false;
+    }
+    groups.resize(count);
+    std::sort(groups.begin(), groups.end());
+    DWORD_PTR mask = ~DWORD_PTR(0);
+    if (count == 1 && !process_mask(mask)) {
+        set_why(why, "GetProcessAffinityMask failed: error " + std::to_string(GetLastError()));
+        return false;
+    }
+    cpu_list hard;
+    for (USHORT group : groups) {
+        const DWORD active = GetActiveProcessorCount(group);
+        if (!active || active > DWORD(mask_bits)) {
+            set_why(why, "GetActiveProcessorCount failed for group " + std::to_string(group));
+            return false;
+        }
+        for (DWORD i = 0; i < active; ++i) {
+            if ((mask >> i) & 1) { hard.push_back(int(group) * group_width + int(i)); }
+        }
+    }
+    ULONG n = 0;
+    if (!GetProcessDefaultCpuSets(process, nullptr, 0, &n) && GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+        set_why(why, "GetProcessDefaultCpuSets failed: error " + std::to_string(GetLastError()));
+        return false;
+    }
+    if (n) {
+        std::vector<ULONG> defaults(n);
+        if (!GetProcessDefaultCpuSets(process, defaults.data(), n, &n)) {
+            set_why(why, "GetProcessDefaultCpuSets failed: error " + std::to_string(GetLastError()));
+            return false;
+        }
+        defaults.resize(n);
+        const auto & ids = cpu_sets().id;
+        cpu_list selected;
+        for (ULONG id : defaults) {
+            const auto at = std::find(ids.begin(), ids.end(), id);
+            if (at == ids.end()) {
+                set_why(why, "unknown process-default CPU Set " + std::to_string(id));
+                return false;
+            }
+            const int cpu = int(at - ids.begin());
+            if (std::binary_search(hard.begin(), hard.end(), cpu)) { selected.push_back(cpu); }
+        }
+        // When no selected CPU Set is within the hard affinity, Windows ignores the selection.
+        if (!selected.empty()) {
+            std::sort(selected.begin(), selected.end());
+            hard.swap(selected);
+        }
+    }
+    if (hard.empty()) {
+        set_why(why, "Windows reported no available CPUs in the process groups");
+        return false;
+    }
+    cpus.swap(hard);
+    return true;
 }
 
 bool process_cpus(cpu_list & cpus, std::string * why) {
     cpus.clear();
-    if (!single_group()) {
-        set_why(why, "more than one processor group (over 64 logical CPUs) is not supported");
-        return false;
-    }
+    const WORD groups = GetActiveProcessorGroupCount();
+    if (groups > 1) { return grouped_process_cpus(groups, cpus, why); }
     DWORD_PTR mask = 0;
-    if (!process_mask(mask)) {
-        set_why(why, "GetProcessAffinityMask failed: error " + std::to_string(GetLastError()));
+    if (!groups || !process_mask(mask)) {
+        set_why(why, "cannot read process affinity: error " + std::to_string(GetLastError()));
         return false;
     }
     for (int cpu = 0; cpu < mask_bits; ++cpu) {
@@ -289,7 +346,7 @@ bool process_cpus(cpu_list & cpus, std::string * why) {
     return true;
 }
 
-bool affinity_supported() { return true; }
+pin_policy thread_pinning() { return single_group() ? pin_policy::exact : pin_policy::unsupported; }
 
 static bool cpu_mask(const cpu_list & cpus, DWORD_PTR & mask) {
     mask = 0;
@@ -302,7 +359,7 @@ static bool cpu_mask(const cpu_list & cpus, DWORD_PTR & mask) {
 
 // A thread's selected CPU Sets as a group-0 mask (0: none selected).
 static bool selected_mask(HANDLE thread, const cpu_set_table & sets, DWORD_PTR & mask) {
-    std::vector<ULONG> ids(std::max<ULONG>(1, sets.total));
+    std::vector<ULONG> ids(sets.id.size());
     ULONG count = 0;
     if (!GetThreadSelectedCpuSets(thread, ids.data(), ULONG(ids.size()), &count)) { return false; }
     mask = 0;
@@ -317,7 +374,7 @@ static bool selected_mask(HANDLE thread, const cpu_set_table & sets, DWORD_PTR &
 static bool select_mask(HANDLE thread, const cpu_set_table & sets, DWORD_PTR mask) {
     std::vector<ULONG> ids;
     for (size_t cpu = 0; cpu < sets.id.size(); ++cpu) {
-        if ((mask >> cpu) & 1) { ids.push_back(sets.id[cpu]); }
+        if ((mask >> cpu) & 1) { ids.push_back(*sets.id[cpu]); }
     }
     return SetThreadSelectedCpuSets(thread, ids.empty() ? nullptr : ids.data(), ULONG(ids.size())) != 0;
 }
@@ -327,7 +384,7 @@ static bool select_mask(HANDLE thread, const cpu_set_table & sets, DWORD_PTR mas
 bool current_thread_cpus(cpu_list & cpus, std::string * why) {
     cpus.clear();
     if (!single_group()) {
-        set_why(why, "more than one processor group (over 64 logical CPUs) is not supported");
+        set_why(why, "the thread's exact affinity across Windows processor groups is unknown");
         return false;
     }
     const HANDLE thread = GetCurrentThread();
@@ -353,6 +410,7 @@ bool current_thread_cpus(cpu_list & cpus, std::string * why) {
 
 bool pin_thread(std::thread::native_handle_type handle, const cpu_list & cpus) {
     if (cpus.empty()) { return true; }
+    if (!single_group()) { return false; }
     const HANDLE thread = static_cast<HANDLE>(handle);
     DWORD_PTR wanted = 0, allowed = 0;
     // Like a Linux mask outside the allowed set, CPUs the process may not use are refused.
@@ -417,7 +475,7 @@ bool cpus_busy_ns(const cpu_list & cpus, uint64_t & busy_ns, uint64_t & tick_ns,
 int current_cpu() {
     PROCESSOR_NUMBER number = {};
     GetCurrentProcessorNumberEx(&number);
-    return number.Group == 0 ? int(number.Number) : -1;
+    return int(number.Group) * group_width + number.Number;
 }
 
 void wait_on(const std::atomic<uint32_t> & word, uint32_t expected) noexcept {
@@ -437,5 +495,7 @@ uint64_t thread_cpu_time_ns() {
     return uint64_t(value.tv_sec) * 1000000000ull + uint64_t(value.tv_nsec);
 }
 #endif
+
+bool affinity_supported() { return thread_pinning() == pin_policy::exact; }
 
 } } // namespace ssd::platform

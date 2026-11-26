@@ -16,7 +16,7 @@ from inferssd.app import command, hub
 from inferssd.configuration.settings import host_platform
 from inferssd.launch.resources import BUILDS, cache_directory, data_directory
 from inferssd.machine.identity import UnsupportedPlatform, drive_info, live_identity
-from inferssd.machine.profile import windows_topology
+from inferssd.machine.profile import pinned_sets, probe_threads, windows_topology
 from inferssd.platform.policy import Policy
 from inferssd.platform.windows import process as windows_process
 from inferssd.platform.windows import resources as windows_resources
@@ -45,9 +45,9 @@ class FakeSystem:
     """What machine profiling asks a Windows host, from tables."""
 
     sets: tuple[system.CPUSet, ...] = tuple(
-        system.CPUSet(cpu, cpu, 1 if cpu < 4 else 0) for cpu in range(8)
+        system.CPUSet(cpu, cpu, 1 if cpu < 4 else 0, 256 + cpu) for cpu in range(8)
     )
-    groups: int = 1
+    counts: tuple[int, ...] = (8,)
     listed: tuple[system.Adapter, ...] = (
         system.Adapter("Intel(R) Graphics", r"PCI\VEN_8086&DEV_B090&SUBSYS_389117AA", 0),
         system.Adapter("NVIDIA GeForce", r"PCI\VEN_10DE&DEV_2B85", 16 << 30),
@@ -64,7 +64,7 @@ class FakeSystem:
         return self.listed
 
     def processors(self) -> system.Processors:
-        return system.Processors(self.groups, 8, 8, self.sets)
+        return system.Processors(self.counts, self.sets)
 
     def process_cpus(self) -> tuple[int, ...]:
         return tuple(range(8))
@@ -91,13 +91,17 @@ class WindowsHost(FakeHost):
 def set_row(index: int, core: int, efficiency: int, group: int = 0) -> bytes:
     # Size, Type, then Id, Group, LogicalProcessorIndex, CoreIndex, LastLevelCacheIndex,
     # NumaNodeIndex, EfficiencyClass, padded to the record's 32 bytes.
-    body = struct.pack("<IHBBBBB", 256 + index, group, index, core, 0, 0, efficiency)
+    body = struct.pack("<IHBBBBB", 256 + 64 * group + index, group, index, core, 0, 0, efficiency)
     return struct.pack("<II", 32, 0) + body + b"\0" * (32 - 8 - len(body))
 
 
-def test_cpu_sets_keep_group_zero_and_stop_at_a_broken_record():
+def test_cpu_sets_qualify_cpu_and_core_by_group_and_stop_at_a_broken_record():
     rows = set_row(0, 0, 1) + set_row(1, 0, 1) + set_row(0, 4, 0, group=1)
-    assert system.cpu_sets(rows) == [system.CPUSet(0, 0, 1), system.CPUSet(1, 0, 1)]
+    assert system.cpu_sets(rows) == [
+        system.CPUSet(0, 0, 1, 256),
+        system.CPUSet(1, 0, 1, 257),
+        system.CPUSet(64, 68, 0, 320),
+    ]
     assert system.cpu_sets(rows + struct.pack("<II", 4, 0)) == system.cpu_sets(rows)
 
 
@@ -147,10 +151,64 @@ class FakeKernel:
         return 1
 
 
+class MultiGroupKernel(FakeKernel):
+    counts = (64, 64)
+    process_groups = (0, 1)
+    default_sets: tuple[int, ...] = ()
+
+    def GetActiveProcessorGroupCount(self) -> int:
+        return len(self.counts)
+
+    def GetActiveProcessorCount(self, group: int) -> int:
+        return self.counts[group]
+
+    def GetProcessGroupAffinity(self, _handle, size, numbers):
+        assert size._obj.value >= len(self.process_groups)
+        size._obj.value = len(self.process_groups)
+        numbers[: len(self.process_groups)] = self.process_groups
+        return 1
+
+    def GetSystemCpuSetInformation(self, buffer, size, length, _process, _flags):
+        data = b"".join(
+            set_row(cpu, cpu // 2, 1, group)
+            for group, count in enumerate(self.counts)
+            for cpu in range(count)
+        )
+        length._obj.value = len(data)
+        if buffer is None or size < len(data):
+            return 0
+        buffer.raw = data
+        return 1
+
+    def GetProcessDefaultCpuSets(self, _handle, ids, size, count):
+        count._obj.value = len(self.default_sets)
+        if size < len(self.default_sets):
+            return 0
+        if ids is not None:
+            ids[:] = self.default_sets
+        return 1
+
+
+def test_multigroup_process_cpus_respect_groups_hard_mask_and_default_cpu_sets():
+    kernel = MultiGroupKernel()
+    layer = system.Win32(kernel, last_error=lambda: 122)
+    assert layer.process_cpus() == tuple(range(128))
+    kernel.default_sets = (257, 321)
+    assert layer.process_cpus() == (1, 65)
+    # The process is restricted to bits 1 and 3 in its only allowed group.
+    kernel.process_groups = (1,)
+    assert layer.process_cpus() == (65,)
+    kernel.default_sets = (257,)
+    assert layer.process_cpus() == (65, 67)
+    kernel.default_sets = (999,)
+    with pytest.raises(OSError, match="unknown process-default CPU Set ID"):
+        layer.process_cpus()
+
+
 def test_win32_reads_processors_affinity_and_memory():
     layer = system.Win32(FakeKernel(), lambda _key, _name: None, lambda: 0)
     found = layer.processors()
-    assert (found.groups, found.logical, found.group0) == (1, 8, 8)
+    assert found.counts == (8,) and found.logical == 8
     assert [row.efficiency for row in found.sets] == [1, 1, 1, 1, 0, 0, 0, 0]
     assert layer.process_cpus() == (1, 3)
     assert layer.memory() == system.Memory(32 << 30, 24 << 30)
@@ -215,9 +273,26 @@ def test_windows_topology_without_cpu_sets_is_one_cluster(tmp_path):
     assert cpu["logical"][0]["core"] is None
 
 
-def test_windows_topology_refuses_several_processor_groups(tmp_path):
-    with pytest.raises(ValueError, match="processor group"):
-        windows_topology(WindowsHost(tmp_path, FakeSystem(groups=2)))
+def test_windows_topology_profiles_separate_groups_without_pinning(tmp_path):
+    kernel = MultiGroupKernel()
+    kernel.counts = (32, 64)
+    processors = system.Win32(kernel).processors()
+    host = WindowsHost(tmp_path, FakeSystem(counts=processors.counts, sets=processors.sets))
+    cpu = windows_topology(host)
+    assert processors.logical == 96
+    assert [row["id"] for row in cpu["logical"]] == [*range(32), *range(64, 128)]
+    assert cpu["logical"][0]["smt_siblings"] == [0, 1]
+    assert cpu["logical"][32]["smt_siblings"] == [64, 65]
+    assert not cpu["affinity_supported"] and not pinned_sets(cpu)
+    assert probe_threads(cpu) == [1, 2, 4, 8, 16, 32, 64, 95, 96]
+    assert probe_threads(cpu, 2) == [1, 2]
+
+
+def test_windows_probe_bounds_worker_count_for_large_machines(tmp_path):
+    host = WindowsHost(tmp_path, FakeSystem(counts=(64,) * 10, sets=()))
+    cpu = windows_topology(host)
+    assert len(cpu["logical"]) == 640
+    assert max(probe_threads(cpu)) == 512
 
 
 def test_windows_drive_keys(tmp_path):

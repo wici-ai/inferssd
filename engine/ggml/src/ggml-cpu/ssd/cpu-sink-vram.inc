@@ -208,6 +208,10 @@ struct sink_vram {
     // of them when none is left, its own when the process's are unknown). Set again when the coordinator's change.
     void place_threads() {
         if (!placement_due || !policy_api) { return; }
+        if (ssd::platform::thread_pinning() == ssd::platform::pin_policy::unsupported) {
+            placement_due = false;
+            return;
+        }
         std::string why;
         if (!ssd::platform::current_thread_cpus(coordinator_cpus, &why)) {
             throw std::runtime_error("GPU tier thread placement: " + why);

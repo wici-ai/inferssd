@@ -15,23 +15,27 @@
 namespace ssd { namespace platform {
 
 // Logical CPU numbers, the bit positions of affinity masks and of ggml
-// cpumasks: kernel CPU ids on Linux, group-0 logical processor indices on
+// cpumasks: kernel CPU ids on Linux, group * 64 + local processor index on
 // Windows. macOS cannot pin, so there the numbers only carry counts.
 using cpu_list = std::vector<int>;
 
 // The CPUs this code may run on, ascending. Linux: the calling thread's
 // sched_getaffinity mask (inherited from the process). Windows: the process
-// affinity mask; machines with more than one processor group are refused.
+// affinity mask for a single group, or its groups and process-default CPU Sets.
 // macOS: 0 .. hw.logicalcpu - 1.
 bool process_cpus(cpu_list & cpus, std::string * why = nullptr);
 
 // The CPUs the calling thread runs on now, ascending: its affinity mask
 // (Linux, as process_cpus reads it); its group-0 affinity narrowed by the CPU
 // Sets it selected where they meet it (Windows); process_cpus (macOS).
+// Windows does not expose an exact thread mask spanning processor groups.
 bool current_thread_cpus(cpu_list & cpus, std::string * why = nullptr);
 
-// False on macOS, where pinning is a successful no-op.
-bool affinity_supported();
+// macOS accepts pin requests as no-ops. Windows with multiple processor groups
+// leaves scheduling to the OS and rejects explicit CPU selections.
+enum class pin_policy { exact, no_op, unsupported };
+pin_policy thread_pinning();
+bool affinity_supported(); // true when a caller can observe and change exact placement
 
 // Restrict a thread to exactly `cpus` and read the result back; false if the
 // OS refused or the read-back differs. An empty list is a no-op. Windows uses
@@ -57,7 +61,7 @@ uint64_t thread_cpu_time_ns();
 // times cannot be read: Windows reads only every processor of the group.
 bool cpus_busy_ns(const cpu_list & cpus, uint64_t & busy_ns, uint64_t & tick_ns, std::string * why = nullptr);
 
-// The CPU the calling thread runs on, or -1 (macOS, or not in group 0).
+// The CPU the calling thread runs on, or -1 on macOS.
 int current_cpu();
 
 // A 32-bit word that threads park on until another thread changes it and

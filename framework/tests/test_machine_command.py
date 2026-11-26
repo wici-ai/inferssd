@@ -18,6 +18,7 @@ from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
 from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts, moe
+from test_windows_platform import REGISTRY, MultiGroupKernel, WindowsHost
 
 from inferssd.app import catalog
 from inferssd.cli import main
@@ -25,6 +26,7 @@ from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
 from inferssd.machine.probes import Completed
 from inferssd.machine.store import exclusive, save
+from inferssd.platform.windows.system import Volume, Win32
 from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine
 from inferssd.strategy.kernels import INPUT_BLOCK, VEC_DOT_TYPE, WEIGHT_BLOCK
 from inferssd.strategy.routing import cache_slot_bytes
@@ -354,6 +356,36 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as error:
         main(["profile", "--build", str(build), "--resources", str(output)])
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
+
+
+def test_desktop_profile_and_saved_report_on_two_windows_processor_groups(
+    tmp_path, monkeypatch, capsys
+):
+    models = tmp_path / "models"
+    models.mkdir()
+    windows = Win32(MultiGroupKernel(), lambda key, name: REGISTRY.get((key, name)))
+    monkeypatch.setattr(windows, "volume", lambda path: Volume("C:\\", "NTFS", ()))
+    host = WindowsHost(tmp_path, windows)
+    host.devices[str(models)] = (0, 1)
+    monkeypatch.setattr(command, "NativeHost", lambda: host)
+    monkeypatch.setattr("inferssd.strategy.inputs.NativeHost", lambda: host)
+    monkeypatch.setattr("inferssd.machine.profile.TEST_FILE_BYTES", 4096)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    descriptor = resource_descriptor(tmp_path, tmp_path / "build")
+    monkeypatch.setenv("INFERSSD_RESOURCES", str(descriptor))
+    simulated = replies()
+    monkeypatch.setattr(command, "run_process", lambda argv, *_: simulated[Path(argv[0]).name])
+
+    # Measure and read back what the desktop setup shows with its actual CLI arguments.
+    for flags in ([], ["--show"]):
+        assert main(["profile", "--model", str(models), *flags, "--json"]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["machine"]["logical_cpus"] == 128
+        assert report["machine"]["memory_bytes"] > 0 and report["machine"]["cpu"]
+        assert report["estimates"]
+    saved = json.loads(Path(report["profile"]).read_text())
+    assert saved["sections"]["cpu"]["status"] == "ok"
+    assert len(saved["cpu"]["logical"]) == 128
 
 
 def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(
