@@ -712,12 +712,12 @@ void llama_context::dense_graph_cache_end_phase() {
     dense_gpu_scheduler_graph_phase = 0;
 }
 
-static uint32_t ssd_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode) {
-    // CPU sink only executes one token at a time. Reserving the ubatch-sized
-    // fallback graph during decode needlessly allocates GPU expert workspace.
+static uint32_t ssd_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode, uint32_t decode_rows) {
+    // A decode graph holds the rows of one decode step: a token, or the most rows a draft verification has had
+    // (decode_rows). Reserving the ubatch-sized graph during decode needlessly allocates GPU expert workspace.
     // Keep the configured ubatch intact so the next prefill is unchanged.
     if (decode && params.n_seq_max == 1) {
-        return 1;
+        return std::min(params.n_ctx, std::max(1u, decode_rows));
     }
     return std::min(params.n_ctx, params.n_ubatch);
 }
@@ -1023,7 +1023,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = ssd_cpu_sink_reserve_tokens(cparams,
-        cpu_sink_enabled && cpu_sink_decode_active);
+        cpu_sink_enabled && cpu_sink_decode_active, cpu_sink_decode_rows);
     if (n_tokens < std::min(cparams.n_ctx, cparams.n_ubatch)) {
         LLAMA_LOG_INFO("[ssd_cpu_sink_decode_reserve] tokens=%u configured_ubatch=%u\n",
             n_tokens, cparams.n_ubatch);
@@ -1186,7 +1186,8 @@ void llama_context::sched_reserve() {
     // emit more outputs grow this reserve before building their next ubatch.
     // Pooled embeddings need all token outputs for their reduction graph.
     const uint32_t n_outputs_pp = cpu_prefill_output_sizing_enabled && !cparams.embeddings ?
-        std::min(n_tokens, std::max(n_seqs, sched_reserve_n_outputs)) : n_tokens;
+        std::min(n_tokens, std::max({n_seqs, sched_reserve_n_outputs,
+            cpu_sink_enabled && cpu_sink_decode_active ? cpu_sink_decode_rows : 0u})) : n_tokens;
     if (cpu_prefill_output_sizing_enabled) {
         LLAMA_LOG_INFO("[prefill_reserve_outputs] n_tokens=%u n_outputs=%u\n", n_tokens, n_outputs_pp);
     }
@@ -1639,7 +1640,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = ssd_cpu_sink_reserve_tokens(cparams,
-            cpu_sink_enabled && cpu_sink_decode_active);
+            cpu_sink_enabled && cpu_sink_decode_active, cpu_sink_decode_rows);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
         if (!gf) {
@@ -2639,6 +2640,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // Every batch between a prompt and the next request decodes: one token, or a token and the draft it verifies.
     cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active;
+    // A decode step of more rows than the decode graph's reserve holds (a longer draft than before) grows that reserve
+    // the way a decode step that outgrows it does, the VRAM tier giving blocks back for it: from then on steps of one
+    // row and of these rows alike fit what the reserve holds, and no step's graph needs device memory mid-decode.
+    if (cpu_sink_cache_batch_decode && cpu_prefill_actual_shape_enabled && cparams.n_seq_max == 1 &&
+            n_tokens_all > cpu_sink_decode_rows) {
+        LLAMA_LOG_INFO("[ssd_cpu_sink_decode_reserve] event=grow rows_from=%u rows_to=%u\n", cpu_sink_decode_rows,
+            n_tokens_all);
+        cpu_sink_decode_rows = n_tokens_all;
+        drop_scheduler();
+    }
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
         cpu_sink_runtime->has_cache();
 

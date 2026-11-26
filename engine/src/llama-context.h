@@ -382,6 +382,7 @@ private:
     uint32_t reserve_horizon_min = 0; // smallest horizon: the configured ubatch
     bool cpu_sink_decode_active = false;
     bool cpu_sink_cache_batch_decode = false;
+    uint32_t cpu_sink_decode_rows = 1; // rows of the largest decode step the decode graph's reserve holds
     std::unique_ptr<llama_ssd_executor_group> cpu_sink_runtime;
 
     llama_adapter_cvec_ptr  cvec;
