@@ -78,13 +78,18 @@ static bool ggml_metal_mul_mat_mma_type_ok(const struct ggml_tensor * op) {
     return step > 0 && src0->ne[0] % step == 0 && src0->nb[0] == ggml_type_size(src0->type);
 }
 
-// the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels (measured upstream on an M3 Ultra)
+// the fewest src1 rows at which the few-row MMA kernels beat the mat-vec kernels: upstream's, from an M3 Ultra, raised
+// where an M5 Max was slower with them (m=4096, k=14336: Q8_0 1.20x the mat-vec time at 2 rows and 1.00x at 4, Q5_K
+// 1.08x at 2 rows, BF16 1.08x at 4 rows)
 static int64_t ggml_metal_mul_mv_mma_rows_min(enum ggml_type type) {
     switch (type) {
         case GGML_TYPE_F32:
             return 6;
         case GGML_TYPE_BF16:
-            return 4;
+        case GGML_TYPE_Q8_0:
+            return 5;
+        case GGML_TYPE_Q5_K:
+            return 3;
         case GGML_TYPE_F16:
         case GGML_TYPE_Q4_K:
         case GGML_TYPE_Q5_0:
