@@ -16687,7 +16687,7 @@ static size_t ggml_backend_vk_buffer_get_committed(ggml_backend_buffer_t buffer)
 #ifdef _WIN32
 static uint32_t ggml_backend_vk_max_prefill_retry_ubatch(ggml_backend_dev_t) {
     // On a retry, a graph just below the size that failed can still trip the Windows GPU watchdog.
-    return 256;
+    return 1024;
 }
 #endif
 

@@ -44,11 +44,10 @@ struct llama_dense_stream_meter {
 };
 
 // Retry a refused prefill graph below its original size and within the devices' retry limits.
-// Each pass rereads its routed experts, so search for the largest size that fits, in steps of
-// the granularity, at least 256 tokens and at most half the search ceiling, and ending
-// with one token.  reserve(n): reserve the graph of n tokens.  Returns the selected ubatch, 0 if none fits.  Each
+// With a device ceiling, halve the probe on each refusal. Otherwise search for the largest fitting batch.
+// reserve(n): reserve the graph of n tokens. Returns the selected ubatch, 0 if none fits. Each
 // reserve replaces the graph the previous one left, so on return the graph reserved is the one of the size returned.
-uint32_t llama_prefill_ubatch_search(uint32_t original, uint32_t granularity, const std::vector<llama_device> & devices,
+uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::vector<llama_device> & devices,
         const std::function<bool(uint32_t)> & reserve);
 
 struct llama_context {

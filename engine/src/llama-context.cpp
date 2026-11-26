@@ -1507,9 +1507,7 @@ bool llama_context::reserve_graph_ubatch(uint32_t ubatch, uint32_t horizon) {
     return false;
 }
 
-// The prompt's first ubatch could not reserve its graph: the largest smaller ubatch whose stand-in graph fits
-// (llama_prefill_ubatch_search below the size that failed), the batch to be split again with it. Every pass of a smaller
-// ubatch reads its layers' experts again. Each failure lowers the bound, so a prompt ends in a graph that fits or none.
+// The prompt's first ubatch could not reserve its graph. Reserve a smaller graph before splitting the batch again.
 bool llama_context::prefill_refit() {
     if (!cpu_prefill_actual_shape_active || !cpu_prefill_reserve_pending || cparams.n_ubatch <= 1) { return false; }
     const int64_t start_us = ggml_time_us();
@@ -3578,15 +3576,20 @@ bool llama_context::ssd_preload() {
     return true;
 }
 
-uint32_t llama_prefill_ubatch_search(uint32_t original, uint32_t granularity, const std::vector<llama_device> & devices,
+uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::vector<llama_device> & devices,
         const std::function<bool(uint32_t)> & reserve) {
-    // The first graph has already failed. Keep the device limit local to this retry.
-    uint32_t target = original;
+    // A device with a retry ceiling opts into descending probes. A successful probe keeps its graph.
+    uint32_t ceiling = UINT32_MAX;
     for (const auto & device : devices) {
-        target = ggml_backend_dev_prefill_retry_ubatch(device.dev, target);
+        ceiling = ggml_backend_dev_prefill_retry_ubatch(device.dev, ceiling);
     }
-    if (target < original && reserve(target)) {
-        return target;
+    if (ceiling != UINT32_MAX) {
+        for (uint32_t probe = ceiling; probe > 0; probe /= 2) {
+            if (probe < target && reserve(probe)) {
+                return probe;
+            }
+        }
+        return 0;
     }
     const uint32_t step = std::min<uint32_t>(std::max<uint32_t>(256, granularity), std::max<uint32_t>(1, target / 2));
     // the largest size in (0, target) that reserve accepts, and the smallest it refused

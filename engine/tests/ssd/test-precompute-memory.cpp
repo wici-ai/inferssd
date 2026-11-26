@@ -242,23 +242,29 @@ static void device_limited_prefill_retry() {
     ggml_backend_reg reg{};
     ggml_backend_device dev{};
     dev.reg = &reg;
-    uint32_t advertised = 256;
+    uint32_t advertised = 1024;
     dev.context = &advertised;
     require(ggml_backend_dev_prefill_retry_ubatch(&dev, 37802) == 37802, "backend without a prefill limit");
     reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
         return std::strcmp(name, "ggml_backend_dev_max_prefill_retry_ubatch") == 0 ? (void *) device_limit : nullptr;
     };
-    std::vector<uint32_t> probes;
-    const auto limit = llama_prefill_ubatch_search(37802, 1, {{false, &dev}}, [&](uint32_t n) {
-        probes.push_back(n);
-        return true;
-    });
-    require(limit == 256 && probes == std::vector<uint32_t>{256}, "first retry must use the device limit");
-    const auto smaller = llama_prefill_ubatch_search(256, 1, {{false, &dev}}, [](uint32_t n) {
-        require(n < 256, "do not retry the failed graph size");
-        return true;
-    });
-    require(smaller > 0 && smaller < 256, "continue shrinking when the limited batch fails");
+    auto retry = [&](uint32_t failed, uint32_t fits, const std::vector<uint32_t> & expected) {
+        std::vector<uint32_t> probes;
+        const auto selected = llama_prefill_ubatch_search(failed, 1, {{false, &dev}}, [&](uint32_t n) {
+            probes.push_back(n);
+            return n <= fits;
+        });
+        require(probes == expected, "probe only lower tiers, in order, until the first success");
+        require(selected == (fits && !expected.empty() ? expected.back() : 0), "return the reserved tier or zero");
+        return selected;
+    };
+    retry(37802, 32512, {1024});
+    const auto limit = retry(37802, 300, {1024, 512, 256});
+    retry(1024, 1024, {512});
+    retry(63, 32, {32});
+    retry(3, 1, {2, 1});
+    retry(3, 0, {2, 1});
+    retry(1, 0, {});
     require(ggml_backend_dev_prefill_retry_ubatch(&dev, 64) == 64, "keep a smaller explicit ubatch");
     advertised = 0;
     require(ggml_backend_dev_prefill_retry_ubatch(&dev, 37802) == 37802, "zero means no device limit");
