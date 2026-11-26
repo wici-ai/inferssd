@@ -1,7 +1,9 @@
 // The draft length common_speculative_adapt picks from the costs it measures.
 #include "speculative.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <vector>
 #include <cstdlib>
 
 static void require(bool ok, const char * what) {
@@ -11,37 +13,45 @@ static void require(bool ok, const char * what) {
     }
 }
 
-// a machine: a decode of r rows takes t1 + (r - 1) * row_ms, a draft step step_ms; a block accepts its first `ok`
-// draft tokens; a head that is never sure enough (`propose` false) drafts nothing
-static int settle(double t1, double row_ms, double step_ms, int ok, int n_max, bool propose = true) {
+// a machine: a decode of r rows takes t1 + (r - 1) * row_ms, a draft step step_ms, and a change of length switch_ms
+// once; a block accepts its first `ok` draft tokens; a head that is never sure enough (`propose` false) drafts nothing.
+// The length it settles on: the one it runs most in its last 200 steps.
+static int settle(double t1, double row_ms, double step_ms, int ok, int n_max, bool propose = true,
+        double switch_ms = 0.0) {
     common_speculative_adapt a;
-    int last = -1;
-    for (int i = 0; i < 400; ++i) {
+    std::vector<int> runs(n_max + 1, 0);
+    int prev = -1;
+    for (int i = 0; i < 600; ++i) {
         const int n = a.choose(n_max);
+        const double extra = n != prev ? switch_ms : 0.0;
+        prev = n;
         if (n == 0) {
-            a.on_plain(t1);
+            a.on_plain(t1 + extra);
         } else if (!propose) {
             a.on_empty(n, step_ms);
-            a.on_plain(t1);
+            a.on_plain(t1 + extra);
         } else {
             const int accepted = ok < n ? ok : n;
-            a.on_block(n, accepted, t1 + n * row_ms + n * step_ms);
+            a.on_block(n, accepted, t1 + n * row_ms + n * step_ms + extra);
         }
-        if (i >= 300 && i % common_speculative_adapt::probe_every != 0) {
-            last = n;
+        if (i >= 400) {
+            runs[n]++;
         }
     }
-    return last;
+    return int(std::max_element(runs.begin(), runs.end()) - runs.begin());
 }
 
 int main() {
-    // warm-up goes round every length, twice
+    // every length runs a burst first
     {
         common_speculative_adapt a;
-        for (int i = 0; i < 2 * 4; ++i) {
-            require(a.choose(3) == i % 4, "warm-up order");
+        for (int i = 0; i < 4 * common_speculative_adapt::burst; ++i) {
+            require(a.choose(3) == i / common_speculative_adapt::burst, "warm-up order");
         }
     }
+    // a change of length that costs a lot once does not make the length that keeps running look slow
+    require(settle(100.0, 100.0, 5.0, 3, 3, true, 400.0) == 0, "switching cost, rows dear");
+    require(settle(100.0, 10.0, 2.0, 3, 3, true, 400.0) == 3, "switching cost, rows cheap");
     // a row costs little and every draft is accepted: the longest draft
     require(settle(100.0, 10.0, 2.0, 3, 3) == 3, "cheap rows, all accepted");
     // a row costs as much as a token (a decode bound by the drive): no draft

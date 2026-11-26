@@ -1396,7 +1396,9 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
 }
 
 static void common_speculative_adapt_add(common_speculative_adapt & a, int n, double ms, double tokens) {
-    if (n < 0 || ms <= 0.0) {
+    const bool measured = n == a.last;
+    a.last = n;
+    if (!measured || n < 0 || ms <= 0.0) {
         return;
     }
     if (a.t_len.size() <= size_t(n)) {
@@ -1435,27 +1437,38 @@ double common_speculative_adapt::rate_of(int n) const {
     return n_len[n] / t_len[n];
 }
 
+int common_speculative_adapt::best(int n_max) const {
+    int b = 0;
+    for (int n = 1; n <= n_max; ++n) {
+        if (rate_of(n) > rate_of(b)) {
+            b = n;
+        }
+    }
+    return b;
+}
+
 int common_speculative_adapt::choose(int n_max) {
     if (n_max <= 0) {
         return 0;
     }
-    const int pick = n_picks++;
-    if (pick < warmup * (n_max + 1)) {
-        return pick % (n_max + 1);
+    if (hold > 0 && held >= 0) {
+        --hold;
+        return std::min(held, n_max);
     }
-    if (pick % probe_every == 0) {
-        return n_probe++ % (n_max + 1);
+    if (n_warm < n_max + 1) {
+        held = n_warm++;
+    } else if (++n_best > probe_every) {
+        // the next length other than the best, for a burst
+        const int b = best(n_max);
+        held = (b + 1 + n_probe++ % n_max) % (n_max + 1);
+        n_best = 0;
+    } else {
+        held = best(n_max);
+        hold = 0;
+        return held;
     }
-    int best = 0;
-    double best_rate = rate_of(0);
-    for (int n = 1; n <= n_max; ++n) {
-        const double r = rate_of(n);
-        if (r > best_rate) {
-            best = n;
-            best_rate = r;
-        }
-    }
-    return best;
+    hold = burst - 1;
+    return std::min(held, n_max);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {

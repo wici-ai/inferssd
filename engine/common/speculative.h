@@ -46,22 +46,26 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
 void common_speculative_print_stats(const common_speculative * spec);
 
 // The draft length that pays on this machine, for a draft head whose steps cost time (MTP). Each length 0 .. n_max
-// keeps the tokens a step at that length gave and the time it took, draft steps included, as measured; the
-// length that gave the most tokens a second is picked, 0 running no draft step. The first picks go round 0 ..
-// n_max, and every probe_every-th pick takes the next length round again, so every length stays measured and
-// the choice follows the machine and the text.
+// keeps the tokens a step at that length gave and the time it took, draft steps included, as measured, and the
+// length that gives the most tokens a second runs. A length runs in steps of its own: every length first for a
+// burst, then the best one, and every probe_every steps the next other length for a burst again, so each stays
+// measured and the choice follows the machine and the text. The step after a change of length is not measured:
+// what a change costs once (another graph, other caches) is no measure of a length that keeps running.
 struct common_speculative_adapt {
-    static constexpr int    warmup      = 2;    // rounds of 0 .. n_max before the measurements are used
-    static constexpr int    probe_every = 8;
-    static constexpr double rate        = 0.1;  // the weight of a new measurement once a length has 1 / rate of them:
-                                                // a step varies by a third and more; the first ones are averaged
+    static constexpr int    burst       = 4;
+    static constexpr int    probe_every = 32;
+    static constexpr double rate        = 0.1; // a new measurement's weight once a length has 1 / rate of them
 
     std::vector<double> t_len; // ms a step at length n took, index n; 0 while unmeasured
     std::vector<double> n_len; // tokens it gave
     std::vector<int>    c_len; // its measurements
-    int    n_picks    = 0;
-    int    n_probe    = 0;
-    int    pending    = -1;  // a length whose head proposed nothing: the step decodes without drafts after its draft
+    int    held    = -1;       // the length running, and its steps left before the next choice
+    int    hold    = 0;
+    int    n_warm  = 0;        // lengths run so far for their first burst
+    int    n_probe = 0;
+    int    n_best  = 0;        // steps at the best length since the last probe
+    int    last    = -1;       // the length of the step before: a step at another length is not measured
+    int    pending = -1;       // a length whose head proposed nothing: the step decodes without drafts after its draft
     double pending_ms = 0.0;
 
     // the draft length for a step that may draft up to n_max tokens
@@ -73,9 +77,12 @@ struct common_speculative_adapt {
     void on_empty(int n_len, double draft_ms);
     // a step at length n_len verified drafts: n_accepted of them accepted, ms with the draft steps
     void on_block(int n_len, int n_accepted, double ms);
+    // forget the step before (a prompt came between): the next step is not measured
+    void interrupt() { last = -1; pending = -1; }
 
     // the tokens a second length n gave, 0 while unmeasured
     double rate_of(int n) const;
+    int    best(int n_max) const;
 };
 
 struct common_speculative_deleter {
