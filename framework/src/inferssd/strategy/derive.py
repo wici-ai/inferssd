@@ -743,7 +743,8 @@ def derive(
     if experts is not None:
         notes.append(
             "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
-            "expert it routes to once. The engine can split the prompt to meet device or memory limits."
+            "expert it routes to once. The engine can split the prompt to meet device or memory "
+            "limits."
         )
     else:
         notes.append(
