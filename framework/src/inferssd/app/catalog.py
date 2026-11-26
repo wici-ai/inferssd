@@ -23,6 +23,10 @@ class Model:
     revision: str  # the Hugging Face commit the facts were read at
     facts: ModelFacts
     lookup_bytes: int
+    # the MTP draft head file in the repository that the launch drafts with, "" for none: its
+    # routed experts read little more than the tested quantization's (a cache slot holds the
+    # largest expert)
+    head: str = ""
 
     @property
     def dense_read_bytes(self) -> int:
@@ -171,6 +175,8 @@ MODELS: tuple[Model, ...] = (
             }
         ),
         29137853440,
+        # Q4_0 experts: down as large as IQ4_NL's, gate and up 6 % larger than IQ4_XS's
+        head="mtp-Qwen3.8-Flash-Next-Q4_0.gguf",
     ),
     Model(
         "google/gemma-4-E4B-it-qat-q4_0-gguf",

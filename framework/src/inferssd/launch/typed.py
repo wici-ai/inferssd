@@ -10,6 +10,7 @@ import posixpath
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from types import ModuleType
 from typing import Optional, cast
 
 from inferssd.configuration.settings import (
@@ -35,6 +36,42 @@ from inferssd.launch.types import (
 from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
+
+# The architectures whose NextN block the engine drafts with (MTP), from a head file published
+# with the model.
+DRAFT_ARCHITECTURES = frozenset({"qwen4exp"})
+
+
+def head_model(name: str) -> str:
+    """The model an MTP head file names (mtp-Qwen3.8-Flash-Next-Q8_0.gguf: qwen3.8-flash-next)."""
+    stem = name.lower()[len("mtp-") : -len(".gguf")]
+    return stem.split("-shared-")[0] if "-shared-" in stem else stem.rsplit("-", 1)[0]
+
+
+def draft_head(s: State, model: str, os_path: ModuleType) -> Optional[str]:
+    """The MTP head published with MODEL that a launch drafts with, None for none.
+
+    A head file (mtp-*.gguf) lies beside the model's files, in the directory above
+    them (a repository with a directory a quantization), or in an MTP directory of
+    either, and names the model (head_model begins the model's file name). A head
+    that borrows the model's embedding and output (shared-) is taken first, then
+    the smallest, whose draft steps read the least.
+    """
+    here = os_path.dirname(model)
+    above = os_path.dirname(here)
+    name = os_path.basename(model).lower()
+    found: dict[str, int] = {}
+    for directory in dict.fromkeys(
+        (here, os_path.join(here, "MTP"), above, os_path.join(above, "MTP"))
+    ):
+        for head, size in cast(list[list[object]], s.value("draft_heads", directory)):
+            named = head_model(os_path.basename(cast(str, head)))
+            if named and name.startswith(named + "-"):
+                found[cast(str, head)] = cast(int, size)
+    if not found:
+        return None
+    return min(found, key=lambda h: ("shared-" not in os_path.basename(h).lower(), found[h], h))
+
 
 # The engine options that name a model: the launch names the model itself.
 MODEL_OPTIONS = frozenset(
@@ -477,6 +514,12 @@ def _resolve(
         )
     planned: Optional[Planned] = None
     if spec.strategy:
+        # the MTP head published with the model, looked for once the strategy runs
+        find_head = (
+            (lambda: draft_head(s, model, os_path))
+            if facts.architecture in DRAFT_ARCHITECTURES
+            else None
+        )
         # The strategy fills what the user left unset; the checks below see the result.
         planned = plan(
             s,
@@ -489,6 +532,7 @@ def _resolve(
             gpu_backends,
             placement,
             fit_layers=fit_layers,
+            draft_head=find_head,
         )
         value, threads = planned.settings, threadpools(planned.threads, platform)
         if any(
@@ -550,6 +594,19 @@ def _resolve(
         )
         value = replace(
             value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)
+        )
+    # The draft head's routed experts are read as the model's are.
+    head = planned.draft_head if planned is not None else None
+    sources = cast(tuple[str, ...], value.at("expert.source").value)
+    if experts and head is not None and head not in sources:
+        source = value.at("expert.source")
+        added = replace(
+            source,
+            value=sources + (head,),
+            receipt=source.receipt + "; draft head=" + head,
+        )
+        value = replace(
+            value, entries=tuple(added if x.key == added.key else x for x in value.entries)
         )
     for path in cast(tuple[str, ...], value.at("expert.source").value):
         if not isinstance(path, str) or not s.value("is_file", path):

@@ -29,6 +29,20 @@ class RecordedArtifacts:
             return Reply(Path(args[0]).is_file())
         if name == "is_executable":
             return Reply(os.access(args[0], os.X_OK))
+        if name == "draft_heads":
+            # [path, bytes] of the MTP head files (mtp-*.gguf) in the directory ARGS[0]
+            directory = Path(args[0])
+            if not directory.is_dir():
+                return Reply([])
+            return Reply(
+                sorted(
+                    [str(path), path.stat().st_size]
+                    for path in directory.iterdir()
+                    if path.name.lower().startswith("mtp-")
+                    and path.name.lower().endswith(".gguf")
+                    and path.is_file()
+                )
+            )
         if name == "read_text":
             with open(args[0], encoding="utf-8", newline="") as stream:
                 return Reply(stream.read())

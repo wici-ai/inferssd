@@ -11,7 +11,7 @@ and what it left out to agree with them.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Optional, cast
 
@@ -34,6 +34,20 @@ class Planned:
     # A derived strategy prefills each prompt in one pass (-b and -ub as large as the context);
     # a skipped one leaves the launch's sizes.
     one_pass: bool = False
+    # the MTP head the server drafts with, which the expert sources list too
+    draft_head: Optional[str] = None
+
+
+# The draft tokens a step verifies at most with an MTP head; the server drafts the length that pays.
+DRAFT_MAX = 3
+# The server's speculative decoding options: a user who sets one decides it all.
+SPEC_OPTIONS = ("--spec-", "-md", "--model-draft", "--draft")
+
+
+def user_speculates(extra: Sequence[str], environment: Mapping[str, str]) -> bool:
+    return any(argument.split("=", 1)[0].startswith(SPEC_OPTIONS) for argument in extra) or any(
+        key.startswith("LLAMA_ARG_SPEC") for key in environment
+    )
 
 
 def plan(
@@ -48,6 +62,7 @@ def plan(
     placement: Sequence[str] = (),
     *,
     fit_layers: bool = False,
+    draft_head: Optional[Callable[[], Optional[str]]] = None,
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
@@ -55,7 +70,10 @@ def plan(
     the launch's memory budget: it is the strategy's budget and bounds the
     memory available to it. GPU_BACKENDS are the engine's, None when unknown.
     Without characteristics, or when no strategy can be derived from them, the
-    launch keeps its inputs and the receipt names why.
+    launch keeps its inputs and the receipt names why. DRAFT_HEAD finds the MTP
+    head published with the model, which the launch drafts with (the server
+    drafts the length that pays on the machine, down to none) unless the user
+    configures speculative decoding.
     """
 
     def skipped(reason: str) -> Planned:
@@ -97,6 +115,22 @@ def plan(
         )
     except ValueError as error:
         return skipped(str(error))
+    head = draft_head() if draft_head is not None else None
+    if head is not None:
+        if user_speculates(s.inputs.extra, s.env):
+            strategy = replace(
+                strategy,
+                notes=strategy.notes + ("draft head: the user configures speculative decoding",),
+            )
+            head = None
+        else:
+            drafting: tuple[str, ...] = ("--spec-type", "draft-mtp", "--spec-draft-model", head)
+            drafting += ("--spec-draft-n-max", str(DRAFT_MAX))
+            strategy = replace(
+                strategy,
+                server_args=strategy.server_args + drafting,
+                notes=strategy.notes + (f"draft head: {head}, drafts of up to {DRAFT_MAX} tokens",),
+            )
     applied = apply(strategy, settings, threads)
     arguments = server_arguments(strategy, (*placement, *s.inputs.extra), s.env)
     pairs = strategy.server_args
@@ -134,5 +168,10 @@ def plan(
     # One pass a prompt saves the weight reads a pass makes: a model with routed experts reads the
     # experts each pass routes to; one without them reads none of its weights a pass.
     return Planned(
-        applied.settings, applied.threads, arguments, receipt, one_pass=model.experts is not None
+        applied.settings,
+        applied.threads,
+        arguments,
+        receipt,
+        one_pass=model.experts is not None,
+        draft_head=head,
     )

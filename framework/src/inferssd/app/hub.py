@@ -12,6 +12,7 @@ from pathlib import Path, PurePosixPath
 from inferssd.app import catalog
 
 MODELS = {model.repo: model.quantization for model in catalog.MODELS}
+HEADS = {model.repo: model.head for model in catalog.MODELS if model.head}
 SPLIT = re.compile(r"(.+)-(\d{5})-of-(\d{5})\.gguf$")
 
 
@@ -72,6 +73,9 @@ def download(reference: str, revision: str, root: Path) -> Path:
             raise ValueError("Hugging Face did not return a pinned commit")
         siblings = info.siblings or []
         files = select_files([item.rfilename for item in siblings], quant)
+        # the model's draft head, which the launch drafts with where it pays (MTP)
+        if repo in HEADS and any(item.rfilename == HEADS[repo] for item in siblings):
+            files.append(HEADS[repo])
         sizes = {
             item.rfilename: item.size
             for item in siblings
@@ -92,7 +96,7 @@ def download(reference: str, revision: str, root: Path) -> Path:
         if missing and shutil.disk_usage(directory).free < missing + 1024**3:
             raise ValueError(f"not enough SSD space: need {missing / 1024**3:.1f} GiB + 1 GiB")
         print(
-            f"{repo}:{quant}: {len(files)} shards, "
+            f"{repo}:{quant}: {len(files)} files, "
             f"{sum(sizes[name] for name in files) / 1024**3:.1f} GiB; {directory}",
             file=sys.stderr,
         )
