@@ -412,6 +412,7 @@ struct server_slot {
     common_speculative_adapt spec_adapt;
     int                      spec_draft_len   = 0; // the length the step drafts at most
     int64_t                  t_plain_start_us = 0; // a step without drafts, from its batch to its token
+    bool                     spec_measure     = false; // the step after a prompt's is no measure of decode
 
     void reset() {
         SLT_DBG(*this, "%s", "\n");
@@ -3834,6 +3835,7 @@ private:
 
                     if (slot.can_speculate()) {
                         common_speculative_begin(slot.spec.get(), slot.prompt.tokens.get_text_tokens());
+                        slot.spec_measure = false;
                     }
                 } else if (slot.state != SLOT_STATE_GENERATING) {
                     continue; // continue loop of slots
@@ -3862,7 +3864,12 @@ private:
                 const int64_t t_current = ggml_time_us();
 
                 if (slot.t_plain_start_us > 0) {
-                    slot.spec_adapt.on_plain((t_current - slot.t_plain_start_us) / 1e3);
+                    if (slot.spec_measure) {
+                        slot.spec_adapt.on_plain((t_current - slot.t_plain_start_us) / 1e3);
+                    } else {
+                        slot.spec_adapt.pending = -1;
+                    }
+                    slot.spec_measure = true;
                     slot.t_plain_start_us = 0;
                 }
 
@@ -3978,7 +3985,17 @@ private:
                 const double spec_step_ms = slot.t_spec_step_start_us > 0 ?
                     (t_current - slot.t_spec_step_start_us) / 1e3 : 0.0;
                 if (slot.spec_adaptive) {
-                    slot.spec_adapt.on_block(slot.spec_draft_len, (int) ids.size() - 1, spec_step_ms - spec_recompute_ms);
+                    if (slot.spec_measure) {
+                        slot.spec_adapt.on_block(slot.spec_draft_len, (int) ids.size() - 1, spec_step_ms - spec_recompute_ms);
+                    }
+                    slot.spec_measure = true;
+                    if (slot.n_spec_blocks % 16 == 0) {
+                        std::string rates;
+                        for (int n = 0; n < (int) slot.spec_adapt.t_len.size(); ++n) {
+                            rates += string_format(" %d:%.2f/%d", n, 1e3 * slot.spec_adapt.rate_of(n), slot.spec_adapt.c_len[n]);
+                        }
+                        SLT_INF(slot, "speculative lengths, tokens a second/measurements:%s\n", rates.c_str());
+                    }
                 }
                 SLT_INF(slot,
                         "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "

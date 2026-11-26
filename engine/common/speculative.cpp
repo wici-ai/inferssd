@@ -1402,14 +1402,12 @@ static void common_speculative_adapt_add(common_speculative_adapt & a, int n, do
     if (a.t_len.size() <= size_t(n)) {
         a.t_len.resize(n + 1, 0.0);
         a.n_len.resize(n + 1, 0.0);
+        a.c_len.resize(n + 1, 0);
     }
-    if (a.t_len[n] > 0.0) {
-        a.t_len[n] += common_speculative_adapt::rate * (ms - a.t_len[n]);
-        a.n_len[n] += common_speculative_adapt::rate * (tokens - a.n_len[n]);
-    } else {
-        a.t_len[n] = ms;
-        a.n_len[n] = tokens;
-    }
+    // the mean of the first measurements, then the recent ones weigh more
+    const double w = std::max(common_speculative_adapt::rate, 1.0 / ++a.c_len[n]);
+    a.t_len[n] += w * (ms - a.t_len[n]);
+    a.n_len[n] += w * (tokens - a.n_len[n]);
 }
 
 void common_speculative_adapt::on_plain(double ms) {
