@@ -482,7 +482,9 @@ struct expert_cache {
             regrow("decode", true);
         }
         adopt = false;
-        if (has_token && (next_epoch != epoch || token == UINT64_MAX || next_token != token + 1)) { release(); }
+        // A decode step may move past several positions (a verified draft's rows) or back to an earlier one (the rows
+        // it rejected): the experts held do not depend on the position, so only another epoch releases them.
+        if (has_token && next_epoch != epoch) { release(); }
         if (elastic) { grow_decode(); }
         epoch = next_epoch; token = next_token; active = has_token = true;
         if (policy == decay || policy == count_decay2) { ++age_steps; }
@@ -822,7 +824,10 @@ struct expert_cache {
         } catch (const std::bad_alloc &) { pause(requests, current, "metadata_allocation_failed"); return; }
         layer & l = *found;
         const size_t layer_index = size_t(found - layers.begin());
-        if (!l.count || (l.seen && l.token == token)) { return; }
+        if (!l.count) { return; }
+        // A later row of a decode ubatch (a draft's rows) runs the layer again within the token: it takes its hits and
+        // admissions as the first row did, but the token is counted, and the window kept, once.
+        const bool repeat = l.seen && l.token == token;
         // Entries from a skipped token are not a previous-token window.
         const bool previous = l.seen && l.token != UINT64_MAX && l.token + 1 == token;
         for (size_t i = l.begin; i < l.begin + l.count; ++i) {
@@ -833,13 +838,13 @@ struct expert_cache {
             if (!e.valid) { e.reserved = false; continue; }
             if (e.layer_index != layer_index) { continue; }
             auto r = std::find_if(requests.begin(), requests.end(), [&](const expert_request & request) { return request.id == e.id; });
-            if ((policy == window && (!previous || r == requests.end())) ||
+            if ((policy == window && !repeat && (!previous || r == requests.end())) ||
                     (r != requests.end() && !matches(e, *r))) {
                 e.valid = e.reserved = false; ++stats.evictions; stats.valid_bytes -= stride;
             }
         }
         l.seen = true; l.token = token;
-        if (policy == count_decay2) {
+        if (!repeat && policy == count_decay2) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += l.count_frequency.find(r.id) == l.count_frequency.end(); }
             auto frequency_ticket = take_guard(multiply(nodes, allocation_cost(sizeof(std::pair<const int32_t, double>) + 4 * sizeof(void *))));
@@ -860,7 +865,7 @@ struct expert_cache {
             } catch (const std::bad_alloc &) { pause(requests, current, "count_frequency_allocation_failed"); return; }
             frequency_ticket.value.commit();
         }
-        if (policy == lfu || policy == decay) {
+        if (!repeat && (policy == lfu || policy == decay)) {
             size_t nodes = 0;
             for (const auto & r : requests) { nodes += l.frequency.find(r.id) == l.frequency.end(); }
             // Each map node may fault a different allocator page/THP. Duplicate

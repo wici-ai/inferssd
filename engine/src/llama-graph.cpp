@@ -2056,7 +2056,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // The context's typed runtime selects CPU decode and grouped prefill.
-    if ((cpu_sink_decode && n_tokens == 1) || cpu_sink_prefill) {
+    if (cpu_sink_decode || cpu_sink_prefill) {
         GGML_ASSERT(n_tokens >= 1);
 
         const auto requirements = llama_ssd::describe_experts(arch, hparams, il);
@@ -2098,7 +2098,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
         descriptor->prefill = cpu_sink_prefill;
-        ggml_tensor * hint = cpu_sink_prefill || n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
+        ggml_tensor * hint = cpu_sink_prefetch_hint;
         // slots: input, ids, weights, then the post-expert norm, then the hint
         ggml_tensor * args[] = {
             ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts), ggml_cont(ctx0, weights),

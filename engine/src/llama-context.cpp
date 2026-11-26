@@ -2147,14 +2147,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
-        // the sink decodes one token at a time and its grouped prefill is for prefill: a larger decode ubatch (a draft
-        // to verify) runs ggml's MUL_MAT_ID over the mapped experts, where the scheduler puts it
-        LLAMA_LOG_WARN("[ssd_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID over the mapped experts; "
-            "the sink decodes one token\n", ubatch.n_tokens);
-        cpu_sink_multi_token_reported = true;
-    }
-
     ggml_backend_sched_ssd_set_dense_decode(
         sched.get(),
         !dense_gpu_phase_gate_enabled ||
@@ -2252,18 +2244,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Phase/token tracking is also required by a VRAM-only tier and by
     // zero-cache profiling. The runtime skips this when all are disabled.
     if (cpu_sink_cache_batch_decode && cpu_sink_runtime) {
-        // One begin per actual logical decode token, on new and reused graphs.
-        // Whole-batch eligibility excludes one-token tails of a larger batch.
+        // One begin per decode ubatch, on new and reused graphs: a token, or the rows a draft verification adds to
+        // one sequence, named by its first position. Rows of several sequences decode without the caches' sequence.
         ggml_backend_sched_synchronize(sched.get());
         const bool cache_decode = cpu_sink_cache_batch_decode &&
             gtype == LLM_GRAPH_TYPE_DECODER && !res->cpu_sink_nodes.empty() &&
-            ubatch.n_tokens == 1 && ubatch.n_seqs_unq == 1 &&
-            ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
+            ubatch.n_seqs_unq == 1 && ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
         auto * registry = backend_cpu ? ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)) : nullptr;
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    // a decode ubatch of several rows runs on the decode pool, the threads the sink's decode is sized for
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1 && !cpu_sink_decode_active, mctx);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2645,7 +2637,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
-    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active && n_tokens_all == 1;
+    // Every batch between a prompt and the next request decodes: one token, or a token and the draft it verifies.
+    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active;
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
         cpu_sink_runtime->has_cache();
 
@@ -2737,7 +2730,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         bool refit = false;
 
         while (true) {
-            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+            // The decode graph is reserved for one token (n_ubatch), but a decode batch stays one ubatch: its rows
+            // share each layer's dense weights and expert reads, and its graph takes its memory when it is built.
+            const uint32_t n_ubatch_split = cpu_sink_decode_active && cpu_prefill_actual_shape_enabled ?
+                std::max(cparams.n_ubatch, cpu_prefill_configured_ubatch) : cparams.n_ubatch;
+            mctx = memory->init_batch(*balloc, n_ubatch_split, output_all);
             if (!mctx) {
                 return -2;
             }
@@ -3076,7 +3073,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    if (batch_inp.n_tokens > 1) {
+    if (batch_inp.n_tokens > 1 && !cpu_sink_decode_active) {
         model.drop_expert_mmap_pages_after_prompt();
     }
 

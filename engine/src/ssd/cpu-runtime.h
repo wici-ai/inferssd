@@ -425,6 +425,48 @@ struct llama_ssd_cpu_sink_call {
     llama_ssd_cpu_sink_call & operator=(const llama_ssd_cpu_sink_call &) = delete;
 };
 
+// A decode ubatch's measures: the sum of its rows' runs (pending_reads, zero after every run, the last row's).
+inline void llama_ssd_add_row_stats(ssd_cpu_sink_stats & sum, const ssd_cpu_sink_stats & row) {
+    sum.experts += row.experts;
+    sum.read_requests += row.read_requests;
+    sum.read_bytes += row.read_bytes;
+    sum.read_errors += row.read_errors;
+    sum.fallback_count += row.fallback_count;
+    sum.ring_bytes += row.ring_bytes;
+    sum.total_us += row.total_us;
+    sum.io_us += row.io_us;
+    sum.compute_us += row.compute_us;
+    sum.wait_io_us += row.wait_io_us;
+    sum.input_quantize_us += row.input_quantize_us;
+    sum.hidden_quantize_us += row.hidden_quantize_us;
+    sum.up_gate_us += row.up_gate_us;
+    sum.down_reduce_us += row.down_reduce_us;
+    sum.demand_bytes += row.demand_bytes;
+    sum.cache_hits += row.cache_hits;
+    sum.cache_hit_bytes += row.cache_hit_bytes;
+    sum.cache_misses += row.cache_misses;
+    sum.cache_admitted += row.cache_admitted;
+    sum.cache_admitted_bytes += row.cache_admitted_bytes;
+    sum.cache_copy_us += row.cache_copy_us;
+    sum.cache_fill_read_requests += row.cache_fill_read_requests;
+    sum.cache_fill_read_bytes += row.cache_fill_read_bytes;
+    sum.ring_read_requests += row.ring_read_requests;
+    sum.ring_read_bytes += row.ring_read_bytes;
+    sum.fixed_read_requests += row.fixed_read_requests;
+    sum.read_completions += row.read_completions;
+    sum.pending_reads = row.pending_reads;
+    sum.cache_new_slot_bytes += row.cache_new_slot_bytes;
+    sum.compute_cpu_us += row.compute_cpu_us;
+    sum.caller_cpu_us += row.caller_cpu_us;
+    sum.io_cpu_us += row.io_cpu_us;
+    sum.io_wait_us += row.io_wait_us;
+    sum.io_credit_wait_us += row.io_credit_wait_us;
+    sum.other_us += row.other_us;
+    sum.ready_scratch_bytes = std::max(sum.ready_scratch_bytes, row.ready_scratch_bytes);
+    sum.ready_out_of_order_experts += row.ready_out_of_order_experts;
+    sum.ordered_reduce_us += row.ordered_reduce_us;
+}
+
 inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Every CPU-backend ggml thread enters (n_tasks = GGML_N_TASKS_MAX). No C++
     // exception may escape this callback.
@@ -482,25 +524,44 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
             &activation, static_cast<float *>(dst->data),
             &grouped_stats, error, sizeof(error));
         stats = grouped_stats.stream;
-    } else if (situ) {
-        GGML_ASSERT(ntokens == 1);
-        ok = runtime.run(runtime.sink, node.layer,
-            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
-            static_cast<const float *>(weights->data), nslots,
-            node.situ_beta, node.situ_linear_beta, static_cast<float *>(dst->data),
-            &stats, error, sizeof(error));
     } else {
-        GGML_ASSERT(ntokens == 1);
-        // the next layer's predicted experts, for the sink's prefetch
-        if (const ggml_tensor * hint = dst->src[4]; hint && runtime.prefetch_hint) {
-            GGML_ASSERT(hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint));
-            runtime.prefetch_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data),
-                static_cast<int>(ggml_nelements(hint)));
+        // A decode ubatch: one token, or a token and the draft rows it verifies. Each row is one decode run; the rows
+        // after the first find the experts the earlier rows read in the RAM cache, so the ubatch reads the union of
+        // its rows' experts once.
+        const ggml_tensor * hint = situ ? nullptr : dst->src[4];
+        GGML_ASSERT(!hint || (hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint) &&
+            ggml_nelements(hint) % ntokens == 0));
+        const auto * in = static_cast<const float *>(input->data);
+        const auto * id = static_cast<const int32_t *>(ids->data);
+        const auto * wt = static_cast<const float *>(weights->data);
+        auto * out = static_cast<float *>(dst->data);
+        ok = true;
+        for (int row = 0; row < ntokens && ok; ++row) {
+            // The next layer's predicted experts, for the sink's prefetch, before the last row only: a run drops the
+            // prefetches of layers other than its own. Every row's, likeliest first in each row, without repeats.
+            if (hint && runtime.prefetch_hint && row + 1 == ntokens) {
+                const auto * predicted = static_cast<const int32_t *>(hint->data);
+                const int per_row = static_cast<int>(ggml_nelements(hint) / ntokens);
+                int32_t merged[64];
+                int n = 0;
+                for (int rank = 0; rank < per_row && n < 64; ++rank) {
+                    for (int r = 0; r < ntokens && n < 64; ++r) {
+                        const int32_t expert = predicted[size_t(r) * per_row + rank];
+                        if (std::find(merged, merged + n, expert) == merged + n) { merged[n++] = expert; }
+                    }
+                }
+                runtime.prefetch_hint(runtime.sink, node.layer + 1, merged, n);
+            }
+            ssd_cpu_sink_stats row_stats = {};
+            const size_t in_offset = size_t(row) * size_t(latent);
+            const size_t slot_offset = size_t(row) * size_t(nslots);
+            ok = situ ?
+                runtime.run(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset, nslots,
+                    node.situ_beta, node.situ_linear_beta, out + in_offset, &row_stats, error, sizeof(error)) :
+                runtime.run_activation(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset,
+                    nslots, &activation, out + in_offset, &row_stats, error, sizeof(error));
+            llama_ssd_add_row_stats(stats, row_stats);
         }
-        ok = runtime.run_activation(runtime.sink, node.layer,
-            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
-            static_cast<const float *>(weights->data), nslots, &activation,
-            static_cast<float *>(dst->data), &stats, error, sizeof(error));
     }
     if (!ok) {
         GGML_ABORT("CPU sink layer=%d failed: %s read_errors=%" PRIu64

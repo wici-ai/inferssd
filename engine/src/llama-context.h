@@ -381,7 +381,6 @@ private:
     uint32_t sched_reserve_n_outputs = 0; // prompt outputs covered by the current scheduler
     uint32_t reserve_horizon_min = 0; // smallest horizon: the configured ubatch
     bool cpu_sink_decode_active = false;
-    bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
     std::unique_ptr<llama_ssd_executor_group> cpu_sink_runtime;
 

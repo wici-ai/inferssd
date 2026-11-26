@@ -239,8 +239,9 @@ struct sink_vram {
         // outside any request leaves its phase open.
         if (prefill_open && !decode && !request) { return; }
         if (deferred_upload) {
-            // Anything but the next decode token of this epoch may release the arena or the RAM cache.
-            const bool next = decode && this->decode && have_token && epoch == this->epoch && token == this->token + 1;
+            // Anything but a later decode step of this epoch (a token, or a draft's rows, at any position) may release
+            // the arena or the RAM cache.
+            const bool next = decode && this->decode && have_token && epoch == this->epoch;
             collect_deferred(cache, next ? SSD_VRAM_COLLECT_NONE : SSD_VRAM_COLLECT_ALL);
         }
         char error[512] = {};
