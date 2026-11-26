@@ -37,7 +37,6 @@
 #include <iterator>
 #include <map>
 #include <memory>
-#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -167,8 +166,8 @@ int available_cpus() {
 #elif defined(_WIN32)
     ssd::platform::cpu_list allowed;
     std::string why;
-    if (!ssd::platform::process_cpus(allowed, &why)) { throw std::runtime_error(why); }
-    return int(allowed.size());
+    if (ssd::platform::process_cpus(allowed, &why)) { return int(allowed.size()); }
+    if (!ssd::platform::affinity_supported()) { throw std::runtime_error(why); }
 #endif
     return (int) std::max(1u, std::thread::hardware_concurrency());
 }
@@ -429,12 +428,14 @@ struct affinity_guard {
 #elif defined(_WIN32)
     GROUP_AFFINITY saved = {};
     affinity_guard() {
+        // Restoring a group-local mask would restrict an unpinned multi-group process.
+        if (!ssd::platform::affinity_supported()) { return; }
         if (!GetThreadGroupAffinity(GetCurrentThread(), &saved)) {
             throw std::runtime_error("cannot save the calling thread's affinity");
         }
     }
     ~affinity_guard() {
-        SetThreadGroupAffinity(GetCurrentThread(), &saved, nullptr);
+        if (saved.Mask) { SetThreadGroupAffinity(GetCurrentThread(), &saved, nullptr); }
     }
 #endif
 };
@@ -528,8 +529,7 @@ bool measure_format(ggml_backend_t backend, const format_spec & format, int64_t 
     }
 
     for (int threads : thread_counts) {
-        std::optional<affinity_guard> affinity;
-        if (!cpus.empty()) { affinity.emplace(); }
+        affinity_guard affinity;
         const bool cpu = ggml_backend_is_cpu(backend);
         ggml_threadpool_t pool = cpu ? new_pool(threads, cpus) : nullptr;
         if (cpu && !pool) {

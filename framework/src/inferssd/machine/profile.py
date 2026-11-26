@@ -241,13 +241,15 @@ def curve_threads(count: int) -> list[int]:
     return counts + [count]
 
 
-def probe_threads(cpu: CPU, limit: int = MAX_PROBE_THREADS) -> list[int]:
+def probe_threads(cpu: CPU, limit: Optional[int] = None) -> list[int]:
     """1, 2, 4, ... up to every logical CPU, the performance-cluster size, and every CPU but one.
 
     A prompt pass runs on the measured count that computes fastest of those that
     leave the sink's I/O threads a CPU, so every CPU but one is measured as well.
     """
-    total = min(MAX_PROBE_THREADS, limit, len(cpu["logical"]))
+    total = len(cpu["logical"])
+    if limit is not None:
+        total = min(total, limit, MAX_PROBE_THREADS)
     fast = next(
         (len(row["cpus"]) for row in cpu["clusters"] if row["kind"] == "performance"), total
     )

@@ -169,6 +169,8 @@ def native_kernel32() -> Any:
         raise OSError("kernel32 exists on Windows only")
     kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
     # Handles are pointer sized; the default int result would truncate them.
+    kernel32.GetActiveProcessorGroupCount.restype = ctypes.c_uint16
+    kernel32.GetActiveProcessorCount.restype = ctypes.c_uint32
     kernel32.CreateFileW.restype = ctypes.c_void_p
     kernel32.GetCurrentProcess.restype = ctypes.c_void_p
     return kernel32

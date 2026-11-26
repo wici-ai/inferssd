@@ -292,7 +292,7 @@ def test_windows_probe_bounds_worker_count_for_large_machines(tmp_path):
     host = WindowsHost(tmp_path, FakeSystem(counts=(64,) * 10, sets=()))
     cpu = windows_topology(host)
     assert len(cpu["logical"]) == 640
-    assert max(probe_threads(cpu)) == 512
+    assert max(probe_threads(cpu, 640)) == 512
 
 
 def test_windows_drive_keys(tmp_path):
