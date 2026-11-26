@@ -175,6 +175,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_mtp(const llama_batch & batch_inp, const float * h);
 
     //
     // state save/load
@@ -384,6 +385,10 @@ private:
     bool cpu_sink_cache_batch_decode = false;
     uint32_t cpu_sink_decode_rows = 1; // rows of the largest decode step the decode graph's reserve holds
     std::unique_ptr<llama_ssd_executor_group> cpu_sink_runtime;
+
+    // an MTP draft step (decode_mtp): the next decode runs the MTP head's block over these hidden states
+    bool mtp_draft = false;
+    std::vector<float> mtp_h;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

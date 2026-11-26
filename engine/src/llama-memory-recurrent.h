@@ -132,6 +132,7 @@ public:
     void restore_metadata(metadata_undo & saved) noexcept;
 
     // per layer
+    std::vector<ggml_tensor *> h_l; // the MTP head's blocks: the hidden state of a sequence's last position
     std::vector<ggml_tensor *> p_l;
     std::vector<ggml_tensor *> r_l;
     std::vector<ggml_tensor *> s_l;
@@ -197,6 +198,7 @@ public:
     uint32_t get_size() const;
 
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_h_l(int32_t il) const;
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
 

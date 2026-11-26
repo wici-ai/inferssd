@@ -128,6 +128,10 @@ struct llama_memory_i {
     // simulate full cache, used for allocating worst-case compute buffers
     virtual llama_memory_context_ptr init_full() = 0;
 
+    // the memory an MTP draft step decodes into (llama_decode_mtp): the cache of the MTP head's block alone, which
+    // the step's rows may enter without the model's other states moving; nullptr where there is none
+    virtual llama_memory_i * get_mem_mtp() { return nullptr; }
+
     // like init_full(), but the worst case only has to cover the first n_ctx_reserve positions;
     // a module whose graph does not grow with the filled context keeps the full reserve
     virtual llama_memory_context_ptr init_reserve(uint32_t n_ctx_reserve) {

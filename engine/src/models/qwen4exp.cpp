@@ -121,6 +121,14 @@ llm_build_qwen4exp::llm_build_qwen4exp(const llama_model & model, const llm_grap
     ggml_tensor * inpL = build_inp_embd(model.tok_embd);
     cb(inpL, "model.input_embed", -1);
 
+    if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+        build_mtp_draft(inpL, sections);
+        return;
+    }
+
+    // with an MTP head the model's every row reaches the head's cache, so no row is dropped before the last layer
+    const bool mtp = hparams.n_mtp > 0;
+
     auto * inp = build_inp_mem_hybrid();
 
     // qwen4exp always builds llama_memory_hybrid_idx, so this downcast is safe
@@ -171,7 +179,7 @@ llm_build_qwen4exp::llm_build_qwen4exp(const llama_model & model, const llm_grap
             cur = build_layer_attn(inp->get_attn(), mctx_hyb, inp_kpool, cur, inp_pos, sections, il);
         }
 
-        if (il == n_layer - 1 && inp_out_ids) {
+        if (il == n_layer - 1 && inp_out_ids && !mtp) {
             // everything below is per token, so drop the rows that produce no output
             cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
             inject = ggml_get_rows(ctx0, inject, inp_out_ids);
@@ -202,6 +210,18 @@ llm_build_qwen4exp::llm_build_qwen4exp(const llama_model & model, const llm_grap
 
         // "l_last" is the layer output name that build_cvec and imatrix look for
         cb(res_hc, "l_last", il);
+    }
+
+    if (mtp) {
+        // every row's hidden state, before the final mixer: the MTP head's cache rows, and its input for a draft
+        ggml_tensor * h_all = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, n_tokens);
+        build_mtp_cache(inp, inpL, h_all, inp_pos, sections);
+        if (inp_out_ids) {
+            res_hc = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, h_all, inp_out_ids), n_embd, hc, inp_out_ids->ne[0]);
+        }
+        res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        cb(res->t_h_nextn, "h_nextn", -1);
+        ggml_build_forward_expand(gf, res->t_h_nextn);
     }
 
     // the final mixer is the output norm: there is no separate one
@@ -990,6 +1010,141 @@ ggml_tensor * llm_build_qwen4exp::build_conv_state_at(
     build_conv_planes(inp, conv_states_all, conv_input, state_cols, channels);
 
     return conv_input;
+}
+
+ggml_tensor * llm_build_qwen4exp::build_mtp_input(
+        ggml_tensor * embd,
+        ggml_tensor * h,
+        int           il) {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int64_t nt = embd->ne[1];
+    const auto & nextn = model.layers[il].nextn;
+
+    // [enorm(e) ; hnorm(h)] per hc stream: the embedding repeated, the hidden state normed per stream as the mixers do
+    ggml_tensor * e = build_norm(embd, nextn.enorm, nullptr, LLM_NORM_RMS, il);
+    e = ggml_repeat_4d(ctx0, ggml_reshape_3d(ctx0, e, n_embd, 1, nt), n_embd, hc, nt, 1);
+    cb(e, "mtp_enorm", il);
+
+    ggml_tensor * hn = ggml_rms_norm(ctx0, ggml_reshape_3d(ctx0, h, n_embd, hc, nt), hparams.f_norm_rms_eps);
+    hn = ggml_mul(ctx0, ggml_reshape_2d(ctx0, hn, n_embd*hc, nt), nextn.hnorm);
+    hn = ggml_reshape_3d(ctx0, hn, n_embd, hc, nt);
+    cb(hn, "mtp_hnorm", il);
+
+    ggml_tensor * cur = build_lora_mm(nextn.eh_proj, ggml_concat(ctx0, e, hn, 0)); // [n_embd, hc, nt]
+    cb(cur, "mtp_eh_proj", il);
+
+    return cur;
+}
+
+// The hidden state before each token is the ubatch's row before it, the first token's the state its sequence's last
+// ubatch left (zero for a new sequence). The ubatch's last row is that state for the next one, and a draft's
+// verification leaves the rows before it as rollback planes, as the conv histories do.
+ggml_tensor * llm_build_qwen4exp::build_mtp_h_prev(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        h_all,
+        int                  il) {
+    const int64_t n_h          = hparams.n_embd_h();
+    const int64_t n_seq_tokens = ubatch.n_seq_tokens;
+    const int64_t n_seqs       = ubatch.n_seqs;
+
+    ggml_tensor * states_all = inp->mctx->get_h_l(il);
+    ggml_tensor * prev = build_rs(inp, states_all, n_h, n_seqs);
+
+    // [n_h, 1 + n_seq_tokens, n_seqs]: the state, then the ubatch's rows
+    ggml_tensor * rows = ggml_concat(ctx0,
+            ggml_reshape_3d(ctx0, prev, n_h, 1, n_seqs),
+            ggml_reshape_3d(ctx0, h_all, n_h, n_seq_tokens, n_seqs), 1);
+    cb(rows, "mtp_h_rows", il);
+
+    const auto   head     = inp->mctx->get_head();
+    const auto   size     = inp->mctx->get_size();
+    const size_t row_size = states_all->nb[1];
+
+    // plane j: the state j tokens before the ubatch's last
+    const int64_t n_planes = keeps_planes() ? n_seq_tokens : 1;
+    for (int64_t j = 0; j < n_planes; ++j) {
+        ggml_tensor * src = ggml_view_2d(ctx0, rows, n_h, n_seqs, rows->nb[2], (n_seq_tokens - j) * rows->nb[1]);
+        ggml_tensor * dst = ggml_view_2d(ctx0, states_all, n_h, n_seqs, row_size, (size_t(j) * size + head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, src), dst));
+    }
+
+    ggml_tensor * h_prev = ggml_view_3d(ctx0, rows, n_h, n_seq_tokens, n_seqs, rows->nb[1], rows->nb[2], 0);
+    return ggml_reshape_2d(ctx0, ggml_cont(ctx0, h_prev), n_h, n_seq_tokens * n_seqs);
+}
+
+// A draft step attends to the head's cache rows of the tokens before it, so every token the model decodes leaves its
+// row, from its embedding and the hidden state before it. Only the attention's cache writes are kept here: nothing
+// reads the block's output, so neither its attention nor its experts run.
+void llm_build_qwen4exp::build_mtp_cache(
+        llm_graph_input_mem_hybrid * inp,
+        ggml_tensor *                embd,
+        ggml_tensor *                h_all,
+        ggml_tensor *                inp_pos,
+        int *                        sections) {
+    const int il = n_layer;
+    const auto & layer = model.layers[il];
+
+    ggml_tensor * h_prev = build_mtp_h_prev(inp->get_recr(), h_all, il);
+    ggml_tensor * cur = build_mtp_input(embd, h_prev, il);
+    cur = build_hc_mix(cur, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, nullptr, nullptr, il);
+    (void) build_layer_attn(inp->get_attn(), nullptr, nullptr, cur, inp_pos, sections, il);
+}
+
+// An MTP draft step: the head's block over the hidden states it is given (llm_graph_input_mtp_h), attending to the
+// head's cache rows of the model's tokens and of the earlier steps. Its output rows give the next token's logits and
+// the hidden state the next step reads. The cache is the attention cache alone: the step leaves the model's states.
+void llm_build_qwen4exp::build_mtp_draft(ggml_tensor * embd, int * sections) {
+    const int64_t hc = hparams.dsv4_hc_mult;
+    const int il = n_layer;
+    const auto & layer = model.layers[il];
+
+    GGML_ASSERT(hparams.n_mtp == 1 && layer.nextn.eh_proj && "the model has no MTP head");
+
+    ggml_tensor * h           = build_inp_mtp_h();
+    auto        * inp_attn    = build_attn_inp_kv();
+    ggml_tensor * inp_pos     = build_inp_pos();
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+
+    ggml_tensor * res_hc = build_mtp_input(embd, h, il);
+
+    ggml_tensor * inject = nullptr;
+    ggml_tensor * cur = build_hc_mix(res_hc, layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up,
+            layer.hc_attn_inject, &inject, il);
+    cur = build_layer_attn(inp_attn, nullptr, nullptr, cur, inp_pos, sections, il);
+
+    if (inp_out_ids) {
+        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
+        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
+
+        res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+        res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
+        res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
+    }
+
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
+
+    cur = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
+    if (cur->ne[1] > 0) {
+        cur = build_layer_ffn(cur, il);
+        cb(cur, "ffn_out", il);
+
+        res_hc = build_hc_combine(res_hc, cur, inject, il);
+    }
+
+    res->t_h_nextn = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
+    cb(res->t_h_nextn, "h_nextn", il);
+    ggml_build_forward_expand(gf, res->t_h_nextn);
+
+    cur = build_hc_mix(res_hc, layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
+            nullptr, nullptr, -1);
+    cb(cur, "result_norm", -1);
+    res->t_embd = cur;
+
+    cur = build_lora_mm(model.output, cur);
+    cb(cur, "result_output", -1);
+    res->t_logits = cur;
+
+    ggml_build_forward_expand(gf, cur);
 }
 
 ggml_tensor * llm_build_qwen4exp::build_ple(

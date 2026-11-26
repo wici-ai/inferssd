@@ -3543,17 +3543,69 @@ void llama_model::load_hparams(llama_model_loader & ml) {
     hparams.rope_type = llama_model_rope_type(this);
 }
 
+// A draft head published as a file of its own (an MTP head) holds the NextN block after the model's last one, the
+// model's own file saying nothing of it: the block is there when its tensors are.
+static bool llama_model_head_block(const llama_model_loader & ml, uint32_t il) {
+    const std::string name = format("blk.%u.nextn.eh_proj.weight", il);
+    return ml.get_weight(name.c_str()) != nullptr;
+}
+
 // The NextN blocks are not part of the model (load_hparams), but the file holds their tensors. A model
 // to run forgets them here, before anything is built from the file's tensors or indexes them.
 void llama_model::drop_nextn_blocks(llama_model_loader & ml) {
-    if (hparams.nextn_predict_layers == 0) {
+    const uint32_t n_blocks = hparams.nextn_predict_layers ? hparams.nextn_predict_layers :
+        (llama_model_head_block(ml, hparams.n_layer) ? 1u : 0u);
+    if (n_blocks == 0) {
         return;
     }
-    const auto dropped = ml.drop_blocks(hparams.n_layer, hparams.nextn_predict_layers);
+    const auto dropped = ml.drop_blocks(hparams.n_layer, n_blocks);
     pimpl->n_bytes = ml.n_bytes;
-    LLAMA_LOG_INFO("%s: not loading the %u NextN block(s) after block %u, which this engine does not run: "
-        "%zu tensors, %.2f MiB\n", __func__, hparams.nextn_predict_layers, hparams.n_layer - 1,
+    LLAMA_LOG_INFO("%s: not loading the %u NextN block(s) after block %u, which this model does not run: "
+        "%zu tensors, %.2f MiB\n", __func__, n_blocks, hparams.n_layer - 1,
         dropped.first, dropped.second / 1024.0 / 1024.0);
+}
+
+// The NextN block a model drafts with (MTP), layer n_layer: the file's own, or a head file's. A head file's block has
+// the per-block metadata of the model's last full-attention layer, as its attention is one. Models whose graphs do
+// not run their NextN block forget it as before.
+void llama_model::keep_nextn_blocks(llama_model_loader & ml) {
+    if (arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_WARN("%s: %s does not draft with its NextN blocks\n", __func__, llm_arch_name(arch));
+        drop_nextn_blocks(ml);
+        return;
+    }
+    if (hparams.nextn_predict_layers == 0) {
+        const uint32_t il = hparams.n_layer;
+        if (!llama_model_head_block(ml, il)) {
+            LLAMA_LOG_WARN("%s: the model has no NextN block to draft with\n", __func__);
+            return;
+        }
+        int32_t ref = -1;
+        for (int32_t i = int32_t(il) - 1; i >= 0; --i) {
+            if (!hparams.is_recurrent(i)) {
+                ref = i;
+                break;
+            }
+        }
+        if (ref < 0) {
+            throw std::runtime_error("the model has no attention layer for its NextN block to follow");
+        }
+        hparams.n_head_arr[il]           = hparams.n_head_arr[ref];
+        hparams.n_head_kv_arr[il]        = hparams.n_head_kv_arr[ref];
+        hparams.n_ff_arr[il]             = hparams.n_ff_arr[ref];
+        hparams.swa_layers[il]           = hparams.swa_layers[ref];
+        hparams.recurrent_layer_arr[il]  = false;
+        // the head's metadata gives its block no compress ratio: its attention is dense
+        hparams.dsv4_compress_ratios[il] = 0;
+        hparams.is_ple_impl.reset(il);
+        hparams.nextn_predict_layers = 1;
+    }
+    if (hparams.nextn_predict_layers != 1 || hparams.is_recurrent(hparams.n_layer) || hparams.is_ple(hparams.n_layer)) {
+        throw std::runtime_error(format("%s drafts with one NextN attention block, the file has %u",
+            llm_arch_name(arch), hparams.nextn_predict_layers));
+    }
+    hparams.n_mtp = hparams.nextn_predict_layers;
+    LLAMA_LOG_INFO("%s: drafting with the NextN block %u (MTP)\n", __func__, hparams.n_layer);
 }
 
 void llama_model::load_vocab(llama_model_loader & ml) {
@@ -3642,9 +3694,13 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
     pimpl->dev_input = { cpu_dev, &pimpl->cpu_buft_list };
 
     // assign the repeating layers to the devices according to the splits
-    pimpl->dev_layer.resize(n_layer);
+    pimpl->dev_layer.resize(hparams.n_layer_all());
     for (int il = 0; il < n_layer; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
+    }
+    // the MTP head reads the model's output matrix: its block is where the output layer is
+    for (uint32_t il = n_layer; il < hparams.n_layer_all(); ++il) {
+        pimpl->dev_layer[il] = get_layer_buft_list(n_layer);
     }
 
     // assign the output layer
@@ -3728,7 +3784,7 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                 tn, ne, flags);
         };
 
-        layers.resize(n_layer);
+        layers.resize(hparams.n_layer_all());
 
         // TODO: move to a separate function
         const auto tn = LLM_TN(arch);
@@ -8443,7 +8499,19 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
                                                        { hparams.ple_head_dim, ple_rows }, 0);
                 }
 
-                for (int il = 0; il < n_layer; ++il) {
+                // the MTP head's block (n_mtp) is a full-attention layer after the model's, fed by
+                // eh_proj([enorm(e) ; hnorm(h)]) per hc stream, with a final mixer of its own
+                for (uint32_t il = n_layer; il < hparams.n_layer_all(); ++il) {
+                    auto & nextn = layers[il].nextn;
+                    nextn.eh_proj      = create_tensor(tn(LLM_TENSOR_NEXTN_EH_PROJ,      "weight", il), { 2*n_embd, n_embd }, 0);
+                    nextn.enorm        = create_tensor(tn(LLM_TENSOR_NEXTN_ENORM,        "weight", il), { n_embd }, 0);
+                    nextn.hnorm        = create_tensor(tn(LLM_TENSOR_NEXTN_HNORM,        "weight", il), { hc_dim }, 0);
+                    nextn.hc_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_NORM, "weight", il), { hc_dim }, 0);
+                    nextn.hc_head_down = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_DOWN, "weight", il), { hc_dim, hc_lr }, 0);
+                    nextn.hc_head_up   = create_tensor(tn(LLM_TENSOR_NEXTN_HC_HEAD_UP,   "weight", il), { hc_lr, hc_dim }, 0);
+                }
+
+                for (int il = 0; il < (int) hparams.n_layer_all(); ++il) {
                     auto & layer = layers[il];
 
                     const int64_t n_ff_exp   = hparams.n_ff_exp   ? hparams.n_ff_exp   : n_ff / n_expert_used;
@@ -9729,7 +9797,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     }
 
                     if (arch == LLM_ARCH_QWEN4EXP) {
-                        llama_memory_i::layer_filter_cb idx = hparams.indexer_n_head > 0 ? llama_memory_i::layer_filter_cb([&](int32_t il) { return !hparams.is_recurrent(il); }) : nullptr;
+                        llama_memory_i::layer_filter_cb idx = hparams.indexer_n_head > 0 ? llama_memory_i::layer_filter_cb([&](int32_t il) { return il < (int32_t) hparams.n_layer && !hparams.is_recurrent(il); }) : nullptr;
                         res = new llama_memory_hybrid_idx(*this, params.type_k, params.type_v, !cparams.flash_attn,
                             cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
                             GGML_TYPE_F32, GGML_TYPE_F32, std::max((uint32_t) 1, cparams.n_seq_max),
@@ -10393,6 +10461,7 @@ llama_model_params llama_model_default_params() {
         /*.ssd_homes                   =*/ false,
         /*.no_alloc                    =*/ false,
         /*.check_tensor_split          =*/ false,
+        /*.mtp                         =*/ false,
     };
 
     return result;

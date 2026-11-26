@@ -358,7 +358,7 @@ llama_context::llama_context(
                 using layers = std::vector<ssd::store::expert_layout::routed_layer>;
                 std::vector<std::pair<const ssd::runtime_services *, layers>> groups;
                 const auto epoch = ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed);
-                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                for (uint32_t il = 0; il < model.hparams.n_layer_all(); ++il) {
                     const auto & layer = model.layers[il];
                     if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
                         const auto * target = &ssd_runtime->services_for(model.dev_layer(il));
@@ -1790,10 +1790,10 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         }
         const int64_t row = cparams.embeddings_nextn_masked ? output_resolve_row(i) :
             (i < 0 ? (int64_t) n_outputs + i : i);
-        if (row < 0 || (size_t) row * model.hparams.n_embd >= embd_nextn.size) {
+        if (row < 0 || (size_t) row * model.hparams.n_embd_h() >= embd_nextn.size) {
             throw std::runtime_error("nextn embedding index out of range");
         }
-        return embd_nextn.data + row * model.hparams.n_embd;
+        return embd_nextn.data + row * model.hparams.n_embd_h();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid nextn embeddings id %d, reason: %s\n", __func__, i, err.what());
         return nullptr;
@@ -2262,7 +2262,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // one sequence, named by its first position. Rows of several sequences decode without the caches' sequence.
         ggml_backend_sched_synchronize(sched.get());
         const bool cache_decode = cpu_sink_cache_batch_decode &&
-            gtype == LLM_GRAPH_TYPE_DECODER && !res->cpu_sink_nodes.empty() &&
+            (gtype == LLM_GRAPH_TYPE_DECODER || gtype == LLM_GRAPH_TYPE_DECODER_MTP) && !res->cpu_sink_nodes.empty() &&
             ubatch.n_seqs_unq == 1 && ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
         auto * registry = backend_cpu ? ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)) : nullptr;
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
@@ -2643,7 +2643,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    // an MTP draft step's rows enter the MTP head's cache alone
+    llama_memory_i * mem_batch = mtp_draft ? memory->get_mem_mtp() : memory.get();
+    if (!mem_batch) {
+        LLAMA_LOG_ERROR("%s: the model has no MTP head memory\n", __func__);
+        return -1;
+    }
+
+    if (!balloc->init(batch_inp, vocab, mem_batch, n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2758,7 +2765,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             // share each layer's dense weights and expert reads, and its graph takes its memory when it is built.
             const uint32_t n_ubatch_split = cpu_sink_decode_active && cpu_prefill_actual_shape_enabled ?
                 std::max(cparams.n_ubatch, cpu_prefill_configured_ubatch) : cparams.n_ubatch;
-            mctx = memory->init_batch(*balloc, n_ubatch_split, output_all);
+            mctx = mem_batch->init_batch(*balloc, n_ubatch_split, output_all);
             if (!mctx) {
                 return -2;
             }
@@ -2847,7 +2854,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_status status = GGML_STATUS_FAILED;
             const llm_graph_result * res = nullptr;
             try {
-                res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+                res = process_ubatch(ubatch, mtp_draft ? LLM_GRAPH_TYPE_DECODER_MTP : LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
             } catch (const std::exception & error) {
                 LLAMA_LOG_ERROR("%s: ubatch graph/runtime error: %s\n", __func__, error.what());
                 status = GGML_STATUS_FAILED;
@@ -3013,12 +3020,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const size_t n_rows = cparams.embeddings_nextn_masked ? n_outputs : ubatch.n_tokens;
                 const size_t row_offset = cparams.embeddings_nextn_masked ? n_outputs_prev : n_tokens_prev;
                 if (n_rows > 0) {
-                    GGML_ASSERT((row_offset + n_rows) * hparams.n_embd <= embd_nextn.size);
+                    const size_t n_embd_h = hparams.n_embd_h();
+                    GGML_ASSERT((row_offset + n_rows) * n_embd_h <= embd_nextn.size);
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
                     ggml_backend_tensor_get_async(
-                        backend_h, t_h_nextn, embd_nextn.data + row_offset * hparams.n_embd,
-                        0, n_rows * hparams.n_embd * sizeof(float));
+                        backend_h, t_h_nextn, embd_nextn.data + row_offset * n_embd_h,
+                        0, n_rows * n_embd_h * sizeof(float));
                 }
             }
 
@@ -3135,7 +3143,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
-    embd_nextn.size = cparams.embeddings_nextn ? (size_t) n_embd * n_batch : 0;
+    // the masked rows are the outputs', else every row of a batch
+    embd_nextn.size = cparams.embeddings_nextn ? (size_t) hparams.n_embd_h() *
+        (cparams.embeddings_nextn_masked ? (size_t) n_outputs_max : (size_t) n_batch) : 0;
 
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
@@ -3315,8 +3325,9 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
-            for (uint64_t k = 0; k < n_embd; ++k) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            const uint64_t n_embd_h = model.hparams.n_embd_h();
+            for (uint64_t k = 0; k < n_embd_h; ++k) {
+                std::swap(embd_nextn.data[i0*n_embd_h + k], embd_nextn.data[i1*n_embd_h + k]);
             }
         }
 
@@ -3653,7 +3664,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -3675,6 +3686,8 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.n_ctx_reserve =*/ sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx,
     };
+    params.mtp_h = gtype == LLM_GRAPH_TYPE_DECODER_MTP ? &mtp_h : nullptr;
+    return params;
 }
 
 ggml_status llama_context::graph_compute(
@@ -5257,6 +5270,39 @@ int32_t llama_encode(
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
 
+    return ret;
+}
+
+int llama_context::decode_mtp(const llama_batch & batch_inp, const float * h) {
+    if (model.hparams.n_mtp == 0 || h == nullptr || batch_inp.token == nullptr) {
+        LLAMA_LOG_ERROR("%s: an MTP draft step needs a model with an MTP head, tokens and their hidden states\n", __func__);
+        return -1;
+    }
+    mtp_h.assign(h, h + size_t(batch_inp.n_tokens) * model.hparams.n_embd_h());
+    struct reset { bool & flag; ~reset() { flag = false; } } guard{mtp_draft};
+    mtp_draft = true;
+    return decode(batch_inp);
+}
+
+bool llama_model_has_mtp(const llama_model * model) {
+    return model->hparams.n_mtp > 0;
+}
+
+int32_t llama_model_n_embd_h(const llama_model * model) {
+    return (int32_t) model->hparams.n_embd_h();
+}
+
+int32_t llama_decode_mtp(llama_context * ctx, llama_batch batch, const float * h) {
+    int ret = -3;
+    try {
+        ret = ctx->decode_mtp(batch, h);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     return ret;
 }
 

@@ -325,6 +325,8 @@ extern "C" {
                               // holds (the rest streamed)
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool check_tensor_split; // reject positive split weights outside the load's selected devices
+        bool mtp;             // keep the NextN block of a model that runs it as its draft head (MTP), from the file
+                              // or from a head file given as an extra file; without it NextN blocks are not loaded
     };
 
     struct llama_sampler_seq_config {

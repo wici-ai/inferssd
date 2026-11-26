@@ -118,6 +118,16 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_h::set_input(const llama_ubatch * ubatch) {
+    const size_t bytes = size_t(ubatch->n_tokens) * h->ne[0] * sizeof(float);
+    GGML_ASSERT(src != nullptr && src->size() * sizeof(float) >= bytes && "an MTP draft step needs its hidden states");
+    ggml_backend_tensor_set(h, src->data(), 0, bytes);
+}
+
+bool llm_graph_input_mtp_h::can_reuse(const llm_graph_params & params) {
+    return h && h->ne[1] == params.ubatch.n_tokens && src == params.mtp_h;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1273,6 +1283,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cpu_sink_prefill (params.cpu_sink_prefill),
     cpu_sink_prefill_hint (params.cpu_sink_prefill_hint),
     cpu_sink_runtime (params.cpu_sink_runtime),
+    mtp_h            (params.mtp_h),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -2460,6 +2471,20 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
     ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_h() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_h>(mtp_h);
+
+    auto & cur = inp->h;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_h(), n_tokens);
+    ggml_set_input(cur);
+    cb(cur, "inp_mtp_h", -1);
 
     res->add_input(std::move(inp));
 

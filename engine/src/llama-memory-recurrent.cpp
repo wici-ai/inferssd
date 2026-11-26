@@ -57,7 +57,7 @@ llama_memory_recurrent::llama_memory_recurrent(
         auto it = ctx_map.find(buft);
         if (it == ctx_map.end()) {
             ggml_init_params params = {
-                /*.mem_size   =*/ size_t((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer*ggml_tensor_overhead()),
+                /*.mem_size   =*/ size_t(((hparams.ple_conv_state() > 0 ? 3u : 2u)*n_layer + hparams.n_mtp)*ggml_tensor_overhead()),
                 /*.mem_buffer =*/ NULL,
                 /*.no_alloc   =*/ true,
             };
@@ -115,6 +115,20 @@ llama_memory_recurrent::llama_memory_recurrent(
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;
         }
+    }
+
+    // The MTP head reads the hidden state of the position before each token: a sequence's last one is a state as
+    // the conv histories are, with their rollback planes, and a new sequence's is zero.
+    h_l.resize(hparams.n_layer_all());
+    for (uint32_t i = hparams.n_layer; i < hparams.n_layer_all(); i++) {
+        ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(i)) : ggml_backend_cpu_buffer_type();
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            throw std::runtime_error("failed to create ggml context for rs cache");
+        }
+        ggml_tensor * h = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hparams.n_embd_h(), n_rows);
+        ggml_format_name(h, "cache_mtp_h_l%u", i);
+        h_l[i] = h;
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -766,6 +780,7 @@ size_t llama_memory_recurrent::size_r_bytes() const {
     }
 
     for (const auto & p : p_l) { if (p) size_r_bytes += ggml_nbytes(p); }
+    for (const auto & h : h_l) { if (h) size_r_bytes += ggml_nbytes(h); }
     return size_r_bytes;
 }
 
@@ -935,6 +950,16 @@ void llama_memory_recurrent::state_write_data(llama_io_write_i & io, const std::
             }
         }
 
+    }
+
+    // the MTP head's hidden states
+    for (const auto * h : h_l) {
+        if (h == nullptr) continue;
+        const uint64_t h_size_row = h->nb[1];
+        io.write(&h_size_row, sizeof(h_size_row));
+        for (const auto & range : cell_ranges) {
+            io.write_tensor(h, range.first * h_size_row, (range.second - range.first) * h_size_row);
+        }
     }
 
     if (!s_trans) {
@@ -1149,6 +1174,20 @@ bool llama_memory_recurrent::state_read_data(llama_io_read_i & io, uint32_t cell
 
     }
 
+    for (auto * h : h_l) {
+        if (h == nullptr) continue;
+        uint64_t h_size_row_ref;
+        io.read_to(&h_size_row_ref, sizeof(h_size_row_ref));
+        const size_t h_size_row = h->nb[1];
+        if (h_size_row != h_size_row_ref) {
+            LLAMA_LOG_ERROR("%s: mismatched MTP hidden state row size (%zu != %zu)\n", __func__, h_size_row, (size_t) h_size_row_ref);
+            return false;
+        }
+        if (cell_count) {
+            ggml_backend_tensor_set(h, io.read(cell_count * h_size_row), head * h_size_row, cell_count * h_size_row);
+        }
+    }
+
     if (!s_trans) {
         for (uint32_t il = 0; il < n_layer; ++il) {
             // skip null layers
@@ -1321,3 +1360,4 @@ int32_t llama_memory_recurrent_context::s_copy(int i) const {
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const { return mem->p_l[il]; }
+ggml_tensor * llama_memory_recurrent_context::get_h_l(int32_t il) const { return mem->h_l.at(il); }

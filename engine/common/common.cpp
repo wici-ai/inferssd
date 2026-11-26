@@ -1498,6 +1498,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.defer_experts   = params.defer_experts;
     mparams.ssd_homes       = params.ssd_enabled;
+    mparams.mtp             = params.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;

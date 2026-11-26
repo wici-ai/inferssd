@@ -942,6 +942,31 @@ struct llm_build_qwen4exp : public llm_build_delta_net_base {
                     ggml_tensor * hidden,
                             int   il);
 
+        // the MTP head's block input from the tokens' embeddings and the hidden states before them, [n_embd, hc, T]
+        ggml_tensor * build_mtp_input(
+                    ggml_tensor * embd,
+                    ggml_tensor * h,
+                            int   il);
+
+        // the hidden state of each token's previous position, [n_embd_h, T], from the model's rows of the ubatch
+        ggml_tensor * build_mtp_h_prev(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * h_all,
+                            int   il);
+
+        // the MTP head's attention cache rows of the ubatch's tokens
+        void build_mtp_cache(
+     llm_graph_input_mem_hybrid * inp,
+                    ggml_tensor * embd,
+                    ggml_tensor * h_all,
+                    ggml_tensor * inp_pos,
+                            int * sections);
+
+        // an MTP draft step (LLM_GRAPH_TYPE_DECODER_MTP)
+        void build_mtp_draft(
+                    ggml_tensor * embd,
+                            int * sections);
+
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(
                     ggml_tensor * input,

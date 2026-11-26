@@ -28,7 +28,7 @@ bool llama_hparams::is_swa_any() const {
 }
 
 uint32_t llama_hparams::n_head(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return n_head_arr[il];
     }
 
@@ -36,7 +36,7 @@ uint32_t llama_hparams::n_head(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_head_kv(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return n_head_kv_arr[il];
     }
 
@@ -44,7 +44,7 @@ uint32_t llama_hparams::n_head_kv(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_ff(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return n_ff_arr[il];
     }
 
@@ -63,7 +63,7 @@ uint32_t llama_hparams::n_gqa(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_rot(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return is_swa(il) ? n_rot_swa : n_rot_full;
     }
 
@@ -89,7 +89,7 @@ uint32_t llama_hparams::n_embd_out() const {
 }
 
 uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return is_swa(il) ? n_embd_head_k_swa : n_embd_head_k_full;
     }
 
@@ -97,7 +97,7 @@ uint32_t llama_hparams::n_embd_head_k(uint32_t il) const {
 }
 
 uint32_t llama_hparams::n_embd_head_v(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return is_swa(il) ? n_embd_head_v_swa : n_embd_head_v_full;
     }
 
@@ -198,7 +198,7 @@ uint32_t llama_hparams::n_embd_s() const {
 }
 
 bool llama_hparams::is_recurrent(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return recurrent_layer_arr[il];
     }
 
@@ -210,7 +210,7 @@ uint32_t llama_hparams::n_pos_per_embd() const {
 }
 
 bool llama_hparams::is_swa(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return swa_layers[il];
     }
 
@@ -275,7 +275,7 @@ uint32_t llama_hparams::ple_conv_state() const {
 }
 
 bool llama_hparams::is_ple(uint32_t il) const {
-    if (il < n_layer) {
+    if (il < n_layer_all()) {
         return is_ple_impl[il];
     }
 

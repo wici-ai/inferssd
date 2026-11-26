@@ -211,6 +211,11 @@ struct llama_layer_nextn {
     struct ggml_tensor * hnorm            = nullptr;
     struct ggml_tensor * shared_head_head = nullptr;
     struct ggml_tensor * shared_head_norm = nullptr;
+
+    // qwen4exp: the head's own final hyper-connection mixer
+    struct ggml_tensor * hc_head_norm     = nullptr;
+    struct ggml_tensor * hc_head_down     = nullptr;
+    struct ggml_tensor * hc_head_up       = nullptr;
 };
 
 struct llama_layer {
@@ -696,6 +701,7 @@ struct llama_model {
     void load_arch   (llama_model_loader & ml);
     void load_hparams(llama_model_loader & ml);
     void drop_nextn_blocks(llama_model_loader & ml); // after load_hparams, to run the model, not to rewrite its file
+    void keep_nextn_blocks(llama_model_loader & ml); // in its place, for a model that drafts with its MTP head
     void load_vocab  (llama_model_loader & ml);
     bool load_tensors(llama_model_loader & ml); // returns false if cancelled by progress_callback
 

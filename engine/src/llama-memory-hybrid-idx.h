@@ -62,6 +62,9 @@ public:
 
     llama_memory_context_ptr init_update(llama_context * lctx, bool optimize) override;
 
+    // the MTP head's block is a layer of the attention cache (and has no indexer rows)
+    llama_memory_i * get_mem_mtp() override;
+
     void clear(bool data) override;
 
     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
