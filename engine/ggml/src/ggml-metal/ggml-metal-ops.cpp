@@ -1656,10 +1656,14 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
 
     const int nsg = pipeline.nsg;
 
+    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
+    const int32_t K = op->src[5]->ne[1];
+
     // at most GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH tokens a dispatch; a dispatch after the first starts from the
-    // state the one before wrote after dst's attention rows
-    ggml_metal_buffer_id bid_state = ggml_metal_get_buffer_id(op);
-    bid_state.offs += (size_t) ne20*ne21*ne22*ne23*sizeof(float);
+    // state the one before wrote after dst's attention rows: the slot of its last token (slot 0 when no slot keeps
+    // that token, and always with K == 1)
+    ggml_metal_buffer_id bid_state0 = ggml_metal_get_buffer_id(op);
+    bid_state0.offs += (size_t) ne20*ne21*ne22*ne23*sizeof(float);
 
     for (int32_t t0 = 0; t0 < ne22; t0 += GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH) {
         if (t0 > 0) {
@@ -1667,6 +1671,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         }
         args.t0 = t0;
         args.t1 = std::min<int32_t>(t0 + GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH, ne22);
+
+        ggml_metal_buffer_id bid_state = bid_state0;
+        if (K > 1) {
+            bid_state.offs += (size_t) std::max<int32_t>(t0 - 1 - (ne22 - K), 0)*ne20*ne20*ne21*ne23*sizeof(float);
+        }
 
         ida = 0;
         ggml_metal_encoder_set_pipeline(enc, pipeline);

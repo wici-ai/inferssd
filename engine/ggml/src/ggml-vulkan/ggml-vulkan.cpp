@@ -864,6 +864,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    // the same with K > 1 snapshot slots of the state (spec constant K), created as ops need them
+    std::map<uint32_t, vk_pipeline> pipeline_gated_delta_net_slots[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -4958,6 +4960,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                for (auto & slots : device->pipeline_gated_delta_net_slots[si][kda]) {
+                    ggml_vk_create_pipeline2(device, slots.second,
+                        std::string(gdn_names[si][kda]) + "_K" + std::to_string(slots.first), gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
+                        wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH, slots.first}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                }
             }
         }
     }
@@ -10076,7 +10083,24 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
+            const uint32_t K = (uint32_t) dst->src[5]->ne[1];
+            if (K == 1) {
+                return ctx->device->pipeline_gated_delta_net[si][kda];
+            }
+
+            vk_pipeline pipeline = nullptr;
+            {
+                std::lock_guard<std::recursive_mutex> guard(ctx->device->mutex);
+                auto & slots = ctx->device->pipeline_gated_delta_net_slots[si][kda];
+                auto it = slots.find(K);
+                if (it != slots.end()) {
+                    pipeline = it->second;
+                } else {
+                    slots[K] = pipeline = std::make_shared<vk_pipeline_struct>();
+                }
+            }
+            return pipeline;
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
