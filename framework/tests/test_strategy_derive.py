@@ -39,6 +39,7 @@ from inferssd.strategy.derive import (
     offered,
     prefill_threads,
 )
+from inferssd.strategy.estimate import dense_decode_estimate
 from inferssd.strategy.inputs import GPUState, RuntimeFacts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
@@ -831,7 +832,8 @@ WINDOWS = "windows-x64-igpu.json"  # 4 + 4 Intel cores with an integrated GPU, o
 
 
 @pytest.mark.parametrize(
-    "total,available,status", [(128, range(128), "partial"), (64, range(64, 96), "failed")]
+    "total,available,status",
+    [(128, range(128), "partial"), (64, range(64, 96), "failed"), (64, range(64, 96), "partial")],
 )
 def test_saved_windows_multigroup_fallback_uses_live_cpus(models, total, available, status):
     c = machine(WINDOWS)
@@ -855,6 +857,11 @@ def test_saved_windows_multigroup_fallback_uses_live_cpus(models, total, availab
     s = derive(c, models["dsv"], runtime(available), "windows", model_drive_key=drive(c))
     assert s.threads == Threads(len(available) - 1, len(available) - 1)
     assert s.settings["cpu.io_cpus"].value_text == '""'
+    if status == "partial":
+        # The old probe could measure unpinned bandwidth despite the topology error.
+        c["memory"]["dram_read_Bps"] = [{"threads": len(available), "Bps": 1e9}]
+        estimate = dense_decode_estimate(c, 100_000_000, runtime(available))
+        assert estimate.tokens_per_second == pytest.approx(10)
 
 
 def test_windows_runs_the_one_derivation(models):

@@ -277,6 +277,24 @@ def io_cpu(allowed: Sequence[int], strict: Sequence[int], performance: set[int])
     return ((other or free)[-1],)
 
 
+def cpu_affinity(characteristics: Characteristics, runtime: RuntimeFacts) -> tuple[set[int], bool]:
+    """The process's usable CPU IDs and whether the profile supports explicit pinning."""
+    available = set(runtime.cpus)
+    # Old Windows profiles stored placeholder IDs 0..N-1 and advertised pinning
+    # when topology discovery refused multiple groups. Only the live IDs apply.
+    old_group_error = (
+        "topology unavailable: more than one processor group "
+        "(over 64 logical CPUs) is not supported"
+    )
+    if (
+        characteristics["identity"]["hard"]["platform"] == "windows"
+        and characteristics["sections"]["cpu"]["detail"].partition(";")[0] == old_group_error
+    ):
+        return available, False
+    available.intersection_update(row["id"] for row in characteristics["cpu"]["logical"])
+    return available, characteristics["cpu"]["affinity_supported"]
+
+
 def placement(
     characteristics: Characteristics, model: ModelFacts, runtime: RuntimeFacts, notes: list[str]
 ) -> tuple[Threads, tuple[int, ...], str]:
@@ -293,19 +311,7 @@ def placement(
     pinned measurement placed them. The engine runs decode on fewer of them while the machine's
     other work needs their CPUs.
     """
-    # Old Windows profiles stored placeholder IDs 0..N-1 and advertised pinning
-    # when topology discovery refused multiple groups. Only the live IDs apply.
-    old_group_error = (
-        "topology unavailable: more than one processor group "
-        "(over 64 logical CPUs) is not supported"
-    )
-    legacy_groups = (
-        characteristics["identity"]["hard"]["platform"] == "windows"
-        and characteristics["sections"]["cpu"]["detail"].partition(";")[0] == old_group_error
-    )
-    available = set(runtime.cpus)
-    if not legacy_groups:
-        available.intersection_update(row["id"] for row in characteristics["cpu"]["logical"])
+    available, can_pin = cpu_affinity(characteristics, runtime)
     allowed = sorted(available)
     if not allowed:
         raise ValueError("none of the CPUs this process may use is in the machine characteristics")
@@ -329,7 +335,7 @@ def placement(
     )
     notes.append(f"threads: decode {decode}, {decode_why}")
     notes.append(f"threads: prefill {batch}, {batch_why}")
-    if legacy_groups or not characteristics["cpu"]["affinity_supported"]:
+    if not can_pin:
         return (
             Threads(decode, batch, ()),
             (),
