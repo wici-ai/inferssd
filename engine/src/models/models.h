@@ -88,8 +88,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
                    int64_t   state_cols,
                    int64_t   channels) const;
 
-    // build_delta_net one token at a time, the states after the earlier tokens into planes 1 .. n - 1 of
-    // `states_all`. Each token runs the one-token recurrence, so its state is the one-token decode's.
+    // The states after the ubatch's tokens into planes n - 1 .. 0 of `states_all` (plane j: j tokens back from its
+    // end), written in place by one ggml_gated_delta_net_planes call, which runs each token as a one-token call of the
+    // op does: the output, and no new state (nullptr), as the planes hold it. Where the op cannot write the cache in
+    // place, build_delta_net one token at a time with the states after the earlier tokens copied into planes
+    // 1 .. n - 1, the new state returned for the caller to write into plane 0.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_planes(
         llm_graph_input_rs * inp,
                ggml_tensor * states_all,

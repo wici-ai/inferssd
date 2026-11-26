@@ -3836,6 +3836,130 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET writing the state after each token into rollback planes (ggml_gated_delta_net_planes): the
+// planes are a view of a cache of n_seqs + 1 cells, the sequences at cells 1 .. n_seqs. The output holds the attention
+// and the planes the op wrote; with `chain`, then the attention and the states of a chain of one-token calls of the
+// op, which they must equal on each backend; then the whole cache after the op (the planes after the written ones and
+// the other cell untouched). And the backend must match the CPU.
+struct test_gated_delta_net_planes : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    const int     v_repeat;
+    const bool    kda;
+    const int64_t n_planes;
+    const bool    chain;
+
+    int64_t n_self = 0; // the op's attention and planes in the output; with chain, as many of the chain's follow
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(head_count, head_size, n_seq_tokens, n_seqs, v_repeat, kda, n_planes, chain);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    // the backend against the CPU (nmse), and with chain the op against the chain on each (max |difference|)
+    double err(const float * a, const float * b, size_t n) override {
+        double e = nmse(a, b, n);
+        if (chain) {
+            for (const float * x : { a, b }) {
+                for (int64_t i = 0; i < n_self; i++) {
+                    e = std::max(e, (double) fabsf(x[i] - x[n_self + i]));
+                }
+            }
+        }
+        return e;
+    }
+
+    test_gated_delta_net_planes(int64_t head_count = 4, int64_t head_size = 32, int64_t n_seq_tokens = 4,
+            int64_t n_seqs = 1, int v_repeat = 1, bool kda = false, int64_t n_planes = 5, bool chain = true)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          v_repeat(v_repeat), kda(kda), n_planes(n_planes), chain(chain) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t S = head_size;
+        const int64_t H = head_count * v_repeat;
+        const int64_t D = S * S * H;
+        const int64_t n = n_seq_tokens;
+
+        ggml_tensor * q     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, head_count, n, n_seqs);
+        ggml_tensor * k     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, head_count, n, n_seqs);
+        ggml_tensor * v     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H, n, n_seqs);
+        ggml_tensor * g     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, kda ? S : 1, H, n, n_seqs);
+        ggml_tensor * beta  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H, n, n_seqs);
+        ggml_tensor * state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs);
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(g, "g");
+        ggml_set_name(beta, "beta");
+
+        const int64_t cells = n_seqs + 1;
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, cells * n_planes);
+        ggml_set_name(cache, "cache");
+        const size_t row = cache->nb[1];
+        ggml_tensor * planes = ggml_view_3d(ctx, cache, D, n_planes, n_seqs, cells * row, row, row);
+
+        ggml_tensor * attn = ggml_gated_delta_net_planes(ctx, q, k, v, g, beta, state, planes);
+
+        // planes 0 .. n - 1 of the sequences, read after the op: [D, n_seqs, n]
+        ggml_tensor * written = ggml_cont(ctx, ggml_view_3d(ctx, cache, D, n_seqs, n, row, cells * row, row));
+        ggml_tensor * out = ggml_concat(ctx, ggml_reshape_1d(ctx, attn, ggml_nelements(attn)),
+                ggml_reshape_1d(ctx, written, ggml_nelements(written)), 0);
+        n_self = ggml_nelements(out);
+
+        if (chain) {
+            ggml_tensor * st       = state;
+            ggml_tensor * c_attn   = nullptr; // [S*H, n_seqs, t]
+            ggml_tensor * c_states = nullptr; // [D, n_seqs, j], plane j the state after token n - 1 - j
+            for (int64_t t = 0; t < n; t++) {
+                const auto token = [&](ggml_tensor * x) {
+                    return ggml_view_4d(ctx, x, x->ne[0], x->ne[1], 1, x->ne[3], x->nb[1], x->nb[2], x->nb[3], t * x->nb[2]);
+                };
+                ggml_tensor * r = ggml_gated_delta_net(ctx, token(q), token(k), token(v), ggml_cont(ctx, token(g)),
+                        ggml_cont(ctx, token(beta)), st);
+                ggml_tensor * a = ggml_view_3d(ctx, r, S * H, n_seqs, 1, r->nb[1], r->nb[1] * n_seqs, 0);
+                st = ggml_view_2d(ctx, r, D, n_seqs, D * sizeof(float), S * H * n_seqs * sizeof(float));
+                ggml_tensor * s3 = ggml_reshape_3d(ctx, st, D, n_seqs, 1);
+                c_attn   = c_attn   ? ggml_concat(ctx, c_attn, a, 2)    : a;
+                c_states = c_states ? ggml_concat(ctx, s3, c_states, 2) : s3;
+            }
+            // as the op's attention: [S*H, n, n_seqs]
+            c_attn = ggml_cont(ctx, ggml_permute(ctx, c_attn, 0, 2, 1, 3));
+            ggml_tensor * other = ggml_concat(ctx, ggml_reshape_1d(ctx, c_attn, ggml_nelements(c_attn)),
+                    ggml_reshape_1d(ctx, c_states, ggml_nelements(c_states)), 0);
+            out = ggml_concat(ctx, out, other, 0);
+        }
+
+        ggml_tensor * after = ggml_cont(ctx, cache);
+        return ggml_concat(ctx, out, ggml_reshape_1d(ctx, after, ggml_nelements(after)), 0);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const float qk = sqrtf(3.0f / head_size);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.01f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+                init_tensor_uniform(t, -qk, qk);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -9481,6 +9605,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 8, 32, 4, 2, 2, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 2, 1, true,  true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 4, 2, 1, true,  true));
+    // The state after each token into rollback planes (a draft's verification), against one-token calls: more planes
+    // than tokens, as many, two sequences, the vector gate, Qwen3.6's linear attention (16 qk heads, 32 v heads of 128).
+    test_cases.emplace_back(new test_gated_delta_net_planes(4, 32, 2, 1, 1, false, 3));
+    test_cases.emplace_back(new test_gated_delta_net_planes(4, 32, 4, 1, 1, false, 5));
+    test_cases.emplace_back(new test_gated_delta_net_planes(8, 128, 4, 1, 1, false, 4));
+    test_cases.emplace_back(new test_gated_delta_net_planes(4, 64, 4, 2, 1, false, 5));
+    test_cases.emplace_back(new test_gated_delta_net_planes(4, 64, 4, 2, 1, true, 5));
+    test_cases.emplace_back(new test_gated_delta_net_planes(8, 32, 4, 2, 2, true, 5));
+    test_cases.emplace_back(new test_gated_delta_net_planes(16, 128, 2, 1, 2, false, 5));
+    test_cases.emplace_back(new test_gated_delta_net_planes(16, 128, 5, 1, 2, false, 5));
+    // across GPU dispatches (GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH), against the CPU: two dispatches, three with two
+    // sequences and the vector gate
+    test_cases.emplace_back(new test_gated_delta_net_planes(2, 32, 514, 1, 1, false, 515, false));
+    test_cases.emplace_back(new test_gated_delta_net_planes(2, 32, 1026, 2, 1, true, 1027, false));
 
 #if 0
     // these tests are disabled to save execution time, sbut they can be handy for debugging

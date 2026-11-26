@@ -6467,14 +6467,15 @@ struct ggml_tensor * ggml_solve_tri(
 
 // ggml_gated_delta_net
 
-struct ggml_tensor * ggml_gated_delta_net(
+static struct ggml_tensor * ggml_gated_delta_net_impl(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
         struct ggml_tensor  * g,
         struct ggml_tensor  * beta,
-        struct ggml_tensor  * state) {
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * planes) {
     GGML_ASSERT(ggml_is_contiguous_rows(q));
     GGML_ASSERT(ggml_is_contiguous_rows(k));
     GGML_ASSERT(ggml_is_contiguous_rows(v));
@@ -6500,9 +6501,16 @@ struct ggml_tensor * ggml_gated_delta_net(
 
     GGML_ASSERT(ggml_nelements(state) == S_v * S_v * H * n_seqs);
 
-    // concat output and new_state into a single tensor
+    if (planes) {
+        // the state after each token, written in place: a plane a token, rows of the state
+        GGML_ASSERT(planes->type == GGML_TYPE_F32);
+        GGML_ASSERT(planes->ne[0] == S_v * S_v * H && planes->ne[1] >= n_tokens && planes->ne[2] == n_seqs && planes->ne[3] == 1);
+        GGML_ASSERT(planes->nb[0] == sizeof(float) && planes->nb[1] % sizeof(float) == 0 && planes->nb[2] % sizeof(float) == 0);
+    }
+
+    // concat output and new_state into a single tensor (with planes, the output alone)
     // output: S_v * H * n_tokens * n_seqs, state: S_v * S_v * H * n_seqs
-    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + S_v * n_seqs, 1, 1 };
+    const int64_t ne[4] = { S_v * H, n_tokens * n_seqs + (planes ? 0 : S_v * n_seqs), 1, 1 };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
     result->op     = GGML_OP_GATED_DELTA_NET;
@@ -6512,8 +6520,33 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+    result->src[6] = planes;
 
     return result;
+}
+
+struct ggml_tensor * ggml_gated_delta_net(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state) {
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, NULL);
+}
+
+struct ggml_tensor * ggml_gated_delta_net_planes(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * planes) {
+    GGML_ASSERT(planes != NULL);
+    return ggml_gated_delta_net_impl(ctx, q, k, v, g, beta, state, planes);
 }
 
 // ggml_lightning_indexer

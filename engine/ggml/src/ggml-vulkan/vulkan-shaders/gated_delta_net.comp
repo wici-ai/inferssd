@@ -34,6 +34,10 @@ layout(push_constant) uniform Parameters {
     uint sb1, sb2, sb3;
     uint neq1, rq3;
     float scale;
+#ifdef PLANES
+    // ggml_gated_delta_net_planes: the planes' steps from a plane and from a sequence to the next, in floats
+    uint sp1, sp2;
+#endif
 };
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
@@ -43,6 +47,10 @@ layout(binding = 3) readonly  buffer GBuf     { FLOAT_TYPE data_g[];     };
 layout(binding = 4) readonly  buffer BetaBuf  { FLOAT_TYPE data_beta[];  };
 layout(binding = 5) readonly  buffer StateBuf { FLOAT_TYPE data_state[]; };
 layout(binding = 6)           buffer DstBuf   { FLOAT_TYPE data_dst[];   };
+#ifdef PLANES
+// the state after token t into plane n_tokens - 1 - t; dst holds the attention output alone
+layout(binding = 7)           buffer PlaneBuf { FLOAT_TYPE data_planes[]; };
+#endif
 
 #if !USE_SUBGROUP_ADD && !USE_SUBGROUP_CLUSTERED
 shared FLOAT_TYPE temp[SUBGROUP_SIZE];
@@ -109,7 +117,13 @@ void main() {
     FLOAT_TYPE s_shard[ROWS_PER_LANE];
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
         const uint is = state_base + col * S_V + r * LANES_PER_COLUMN + lane;
+#ifdef PLANES
+        // a dispatch after the first starts from the plane of the token before it
+        const uint ip = (n_tokens - t_begin) * sp1 + seq_id * sp2 + head_id * state_size + col * S_V + r * LANES_PER_COLUMN + lane;
+        s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_planes[ip]) : FLOAT_TYPE(data_state[is]);
+#else
         s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_dst[s_off + is]) : FLOAT_TYPE(data_state[is]);
+#endif
     }
 
     uint attn_off = (seq_id * n_tokens * H + head_id) * S_V + t_begin * S_V * H;
@@ -166,9 +180,18 @@ void main() {
         }
 
         attn_off += S_V * H;
+
+#ifdef PLANES
+        const uint plane_base = (n_tokens - 1 - t) * sp1 + seq_id * sp2 + head_id * state_size + col * S_V + lane;
+        [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
+            data_planes[plane_base + r * LANES_PER_COLUMN] = s_shard[r];
+        }
+#endif
     }
 
+#ifndef PLANES
     [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
         data_dst[s_off + state_base + col * S_V + r * LANES_PER_COLUMN + lane] = s_shard[r];
     }
+#endif
 }

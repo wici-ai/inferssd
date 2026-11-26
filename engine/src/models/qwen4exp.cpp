@@ -773,9 +773,12 @@ ggml_tensor * llm_build_qwen4exp::build_layer_attn_linear(
         build_delta_net_planes(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il) :
         build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
     ggml_tensor * output = attn_out.first;
-    ggml_build_forward_expand(gf, ggml_cpy(ctx0, attn_out.second,
-        ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                     inp->mctx->get_head() * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // the new state, unless the delta net wrote it into the rollback planes
+    if (attn_out.second) {
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, attn_out.second,
+            ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                         inp->mctx->get_head() * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);
 

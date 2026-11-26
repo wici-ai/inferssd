@@ -1652,12 +1652,18 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         /*.nb3  =*/ nb3,
         /*.t0   =*/ 0,
         /*.t1   =*/ 0,
+        /*.nbp1 =*/ op->src[6] ? op->src[6]->nb[1] : 0,
+        /*.nbp2 =*/ op->src[6] ? op->src[6]->nb[2] : 0,
     };
 
     const int nsg = pipeline.nsg;
 
+    // ggml_gated_delta_net_planes: the state after each token into the planes, src[6]
+    const ggml_tensor * planes = op->src[6];
+    const ggml_metal_buffer_id bid_planes = planes ? ggml_metal_get_buffer_id(planes) : ggml_metal_get_buffer_id(op);
+
     // at most GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH tokens a dispatch; a dispatch after the first starts from the
-    // state the one before wrote after dst's attention rows
+    // state the one before wrote after dst's attention rows (with planes, into the plane of its last token)
     ggml_metal_buffer_id bid_state = ggml_metal_get_buffer_id(op);
     bid_state.offs += (size_t) ne20*ne21*ne22*ne23*sizeof(float);
 
@@ -1667,6 +1673,11 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         }
         args.t0 = t0;
         args.t1 = std::min<int32_t>(t0 + GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH, ne22);
+
+        if (planes && t0 > 0) {
+            bid_state       = bid_planes;
+            bid_state.offs += (size_t) (ne22 - t0)*planes->nb[1];
+        }
 
         ida = 0;
         ggml_metal_encoder_set_pipeline(enc, pipeline);
@@ -1678,6 +1689,7 @@ int ggml_metal_op_gated_delta_net(ggml_metal_op_t ctx, int idx) {
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op->src[4]), ida++); // beta
         ggml_metal_encoder_set_buffer  (enc, t0 == 0 ? ggml_metal_get_buffer_id(op->src[5]) : bid_state, ida++); // state
         ggml_metal_encoder_set_buffer  (enc, ggml_metal_get_buffer_id(op),         ida++); // dst
+        ggml_metal_encoder_set_buffer  (enc, bid_planes,                           ida++); // planes (dst without)
 
         ggml_metal_encoder_dispatch_threadgroups(enc, op->src[2]->ne[0]/nsg, op->src[2]->ne[1], op->src[2]->ne[3], 32, nsg, 1);
     }

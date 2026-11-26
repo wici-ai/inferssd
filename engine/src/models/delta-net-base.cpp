@@ -491,6 +491,23 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     const size_t  row_size = states_all->nb[1];
     const auto    head     = inp->mctx->get_head();
     const auto    size     = inp->mctx->get_size();
+
+    // One op writes the state after each token straight into its plane, the final state into plane 0. It writes the
+    // planes in place, so it must run where they are: on the layer's device, which runs the op (fused_gdn_ch), with
+    // the cache there (offload_kqv).
+    if (cparams.fused_gdn_ch && cparams.offload_kqv && states_all->type == GGML_TYPE_F32) {
+        const int64_t S_v = v->ne[0];
+        const int64_t H_v = v->ne[1];
+        GGML_ASSERT(states_all->ne[0] == S_v * S_v * H_v);
+        // planes 0 .. n - 1 of the ubatch's cells: a plane steps size rows, a cell one row
+        ggml_tensor * planes = ggml_view_3d(ctx0, states_all, states_all->ne[0], n, n_seqs,
+                size * row_size, row_size, head * row_size);
+        ggml_tensor * output = ggml_gated_delta_net_planes(ctx0, q, k, v, g, b, s, planes);
+        cb(output, LLAMA_TENSOR_NAME_FGDN_CH, il);
+        return { ggml_reshape_4d(ctx0, output, S_v, H_v, n, n_seqs), nullptr };
+    }
+
+    // otherwise the one-token delta net a token, its states copied into the planes
     // token t of a [*, *, n_tokens, n_seqs] tensor
     const auto token = [&](ggml_tensor * x, int64_t t) {
         return ggml_cont(ctx0, ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], 1, x->ne[3], x->nb[1], x->nb[2], x->nb[3],
