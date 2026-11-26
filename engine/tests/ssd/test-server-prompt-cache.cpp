@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <initializer_list>
+#include <list>
 #include <string>
 #include <utility>
 #include <vector>
@@ -174,16 +175,25 @@ static void test_full_removal_only_removes_obsolete_shorter_with_checkpoint() {
     }
 }
 
+static server_prompt_points shared_at(int64_t n_shared, int64_t n_context = 0, std::vector<int64_t> branch = {}) {
+    server_prompt_points points;
+    points.n_shared  = n_shared;
+    points.n_context = n_context;
+    points.branch    = std::move(branch);
+    return points;
+}
+
 // The batches update_slots fills for a prompt of n_prompt tokens from n_start, for a memory that is checkpointed only
 // between batches.
-static std::vector<int64_t> prompt_batches(int64_t n_start, int64_t n_prompt, int64_t n_shared, int64_t n_batch) {
+static std::vector<int64_t> prompt_batches(int64_t n_start, int64_t n_prompt, const server_prompt_points & points,
+                                           int64_t n_batch) {
     std::vector<int64_t> batches;
     for (int64_t n_done = n_start; n_done < n_prompt;) {
         int64_t n = 0;
         while (n_done < n_prompt && n < n_batch) {
             ++n_done;
             ++n;
-            if (server_prompt_batch_stops(n_done, n_prompt, n_shared, n_batch)) {
+            if (server_prompt_batch_stops(n_done, n_prompt, points, n_batch)) {
                 break;
             }
         }
@@ -194,24 +204,100 @@ static std::vector<int64_t> prompt_batches(int64_t n_start, int64_t n_prompt, in
 
 static void test_prompt_batches_stop_at_shared_prefix_and_end() {
     // a new conversation behind a system prompt and tools of 8503 tokens: the prefix, the rest, the last 4 tokens
-    require(prompt_batches(0, 8673, 8503, 65536) == std::vector<int64_t>({ 8503, 166, 4 }),
+    require(prompt_batches(0, 8673, shared_at(8503), 65536) == std::vector<int64_t>({ 8503, 166, 4 }),
             "a new prompt stops after its shared prefix and 4 tokens before its end");
     // the next turn of a chat without a shared prefix, from the previous turn's checkpoint: no stop n_ubatch earlier
-    require(prompt_batches(987, 2068, 0, 65536) == std::vector<int64_t>({ 1077, 4 }),
+    require(prompt_batches(987, 2068, shared_at(0), 65536) == std::vector<int64_t>({ 1077, 4 }),
             "a later turn stops only 4 tokens before its end");
     // a prompt resumed at the shared prefix (from the prompt cache) or after it does not stop there again
-    require(prompt_batches(8503, 8675, 8503, 65536) == std::vector<int64_t>({ 168, 4 }),
+    require(prompt_batches(8503, 8675, shared_at(8503), 65536) == std::vector<int64_t>({ 168, 4 }),
             "a prompt resumed at its shared prefix does not stop there");
-    require(prompt_batches(8669, 8673, 8503, 65536) == std::vector<int64_t>({ 4 }),
+    require(prompt_batches(8669, 8673, shared_at(8503), 65536) == std::vector<int64_t>({ 4 }),
             "a prompt resumed after its shared prefix stops only at its end");
     // batches still end at n_batch
-    require(prompt_batches(0, 1200, 0, 512) == std::vector<int64_t>({ 512, 512, 172, 4 }),
+    require(prompt_batches(0, 1200, shared_at(0), 512) == std::vector<int64_t>({ 512, 512, 172, 4 }),
             "a long prompt is still split at n_batch");
     // a shared prefix that is too short, or ends inside the last 4 tokens, adds no stop
-    require(prompt_batches(0, 200, 40, 65536) == std::vector<int64_t>({ 196, 4 }),
+    require(prompt_batches(0, 200, shared_at(40), 65536) == std::vector<int64_t>({ 196, 4 }),
             "a shared prefix under 64 tokens adds no stop");
-    require(prompt_batches(0, 100, 98, 65536) == std::vector<int64_t>({ 96, 4 }),
+    require(prompt_batches(0, 100, shared_at(98), 65536) == std::vector<int64_t>({ 96, 4 }),
             "a shared prefix inside the last 4 tokens adds no stop");
+}
+
+// Codex with a user's own MCP server: its app tools end at 6000, the server's at 7000, the app text at 11000, the
+// user's context at 12500, where the approved commands start at 12400. A memory checkpointed only between batches
+// stops at the kept prefixes and the end, not at the branch points: each stop reads the weights once more.
+static void test_prompt_batches_stop_at_kept_prefixes_only() {
+    const server_prompt_points points = shared_at(11000, 12500, { 6000, 7000, 12400 });
+    require(prompt_batches(0, 12700, points, 65536) == std::vector<int64_t>({ 11000, 1500, 196, 4 }),
+            "a new prompt stops at its shared and context prefixes and before its end");
+    require(prompt_batches(11000, 12700, points, 65536) == std::vector<int64_t>({ 1500, 196, 4 }),
+            "a prompt resumed at the shared prefix stops only at the points after it");
+}
+
+// A sliding-window model's prompt resumed at 8192 tokens, with batches of 2048 and ubatches of 512: a batch that holds
+// a point ends with the ubatch that holds it, so that the state there can still be saved after the batch.
+static void test_batches_end_with_the_ubatch_of_a_point() {
+    const server_prompt_points points = shared_at(9786, 10730, { 7820, 9205, 9784, 10728 });
+    std::vector<int64_t> batches;
+    for (int64_t n_done = 8192; n_done < 10994;) {
+        int64_t n = 0;
+        bool past_point = false;
+        while (n_done < 10994 && n < 2048) {
+            ++n_done;
+            ++n;
+            past_point = past_point || points.has(n_done);
+            if (server_prompt_batch_ends_for_point(past_point, n, 512)) {
+                break;
+            }
+        }
+        batches.push_back(n);
+    }
+    require(batches == std::vector<int64_t>({ 1024, 1024, 512, 242 }), "each batch ends with the ubatch of its first point");
+}
+
+static void test_prompt_points() {
+    const server_prompt_points points = shared_at(11000, 12500, { 6000, 7000, 12400 });
+    require(points.all() == std::vector<int64_t>({ 6000, 7000, 11000, 12400, 12500 }), "every point, sorted");
+    require(points.has(7000) && points.has(12500) && !points.has(7001), "a point is one of them");
+    require(points.kept(11000) && points.kept(12500) && !points.kept(7000), "the prefixes are kept, branch points not");
+    require(points.has(6000 - 6000 % 128, 128) && points.kept(12500 - 12500 % 128, 128),
+            "rounded to a memory's alignment");
+
+    // the prompt's text from token 9000 to 9200 became 30 tokens fewer
+    server_prompt_points moved = points;
+    moved.replaced(9000, 9200, -30);
+    require(moved.n_shared == 10970 && moved.n_context == 12470 &&
+                moved.branch == std::vector<int64_t>({ 6000, 7000, 12370 }),
+            "points after the replaced tokens move with them");
+    server_prompt_points inside = points;
+    inside.replaced(6500, 11500, 10);
+    require(inside.n_shared == 0 && inside.n_context == 12510 && inside.branch == std::vector<int64_t>({ 6000, 12410 }),
+            "points inside the replaced tokens are lost");
+}
+
+static void test_checkpoints_at_points_are_kept_by_count() {
+    const server_prompt_points points = shared_at(11000, 12500, { 6000, 7000 });
+    std::list<server_prompt_checkpoint> checkpoints;
+    const auto add = [&](int64_t n) {
+        server_prompt_checkpoint cp = {};
+        cp.n_tokens = n;
+        cp.data     = { 1 };
+        checkpoints.push_back(cp);
+    };
+    add(6000);
+    add(7000);
+    add(11000);
+    // --ctx-checkpoints 1: the points' checkpoints stay, a new one at a point needs no room by count
+    require(server_prompt_checkpoint_over_count(checkpoints, points, 1, 12500, 1) == checkpoints.end(),
+            "a checkpoint at a point drops none by count");
+    require(server_prompt_checkpoint_over_count(checkpoints, points, 1, 12696, 1) == checkpoints.end(),
+            "no other checkpoint yet: the first ordinary one drops none");
+    add(12696);
+    const auto it = server_prompt_checkpoint_over_count(checkpoints, points, 1, 14000, 1);
+    require(it != checkpoints.end() && it->n_tokens == 12696, "the next ordinary one drops the ordinary one, not a point's");
+    require(server_prompt_checkpoint_over_count(checkpoints, shared_at(0), 1, 14000, 1) == checkpoints.begin(),
+            "without points, the oldest goes as before");
 }
 
 static void test_shared_prefix_serves_a_new_conversation() {
@@ -383,6 +469,10 @@ int main() {
     test_prefix_dir_is_read_again_when_it_changes();
     test_model_identity_ignores_path_and_time();
     test_prompt_batches_stop_at_shared_prefix_and_end();
+    test_prompt_batches_stop_at_kept_prefixes_only();
+    test_prompt_points();
+    test_batches_end_with_the_ubatch_of_a_point();
+    test_checkpoints_at_points_are_kept_by_count();
     test_shared_prefix_serves_a_new_conversation();
     test_find_checkpoint_before_tail_truncation_pos();
     test_oaicompat_chat_streams_reasoning_delta();

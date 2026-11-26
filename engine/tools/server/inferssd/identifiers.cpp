@@ -208,11 +208,12 @@ struct learned_identifier {
     int         kind;
 };
 
-// The folders the apps name in their system and developer messages that change with the project or the session.
-// Each one found, in the order found, becomes an identifier; the n-th one of a kind gets "-n" after its stand-in.
+// The folders the apps name in their system and developer messages that change with the project, the session or an
+// update. Each one found, in the order found, becomes an identifier; the n-th one of a kind gets "-n" after its
+// stand-in, unless its stand-in already names it alone.
 void learn_identifiers(const std::string & text, const server_identifier_env & env,
                        std::vector<learned_identifier> & out) {
-    const auto found = [&](int kind, std::string id, std::string stand_in) {
+    const auto found = [&](int kind, std::string id, std::string stand_in, bool numbered = true) {
         int n = 1;
         for (const auto & l : out) {
             if (l.id == id) {
@@ -220,7 +221,7 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
             }
             n += l.kind == kind;
         }
-        if (n > 1) {
+        if (numbered && n > 1) {
             stand_in += "-" + std::to_string(n);
         }
         out.push_back({std::move(id), std::move(stand_in), kind});
@@ -354,6 +355,35 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
             stand_in += text[j] == '-' ? '-' : '0';
         }
         found(6, text.substr(at, end - at), stand_in);
+    }
+
+    // the folder of a version of a plugin in an app's plugin cache: .../plugins/cache/<source>/<plugin>/<version>
+    // (Codex and the ChatGPT desktop app list the skills of their plugins there; Claude Code keeps its plugins the
+    // same way). Every update of a plugin changes it. The model sees the version 0.0.0 for each plugin, which names
+    // the plugin's folder alone, so that its stand-in does not depend on the other plugins installed.
+    static const std::string cache = "plugins/cache/";
+    for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
+        size_t i = literal_end(text, at, cache);
+        bool   ok = i != std::string::npos;
+        for (int k = 0; k < 2 && ok; ++k) {
+            const size_t end = run_end(text, i, is_folder_byte);
+            ok = end > i && sep_at(end);
+            i  = end + 1;
+        }
+        if (!ok || i >= text.size() || !std::isdigit((unsigned char) text[i])) {
+            continue;
+        }
+        const size_t end = run_end(text, i, [](unsigned char c) {
+            return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '+';
+        });
+        if (end < text.size() && !is_separator(text[end]) && is_folder_byte((unsigned char) text[end])) {
+            continue;
+        }
+        const std::string version = text.substr(i, end - i);
+        if (version == "0.0.0") {
+            continue;
+        }
+        found(7, text.substr(at, end - at), text.substr(at, i - at) + "0.0.0", /* numbered = */ false);
     }
 }
 
