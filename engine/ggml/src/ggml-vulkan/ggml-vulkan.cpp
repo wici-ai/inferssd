@@ -9497,8 +9497,8 @@ static void ggml_vk_flash_attn_rows(ggml_backend_vk_context * ctx, vk_context& s
 // the device has 64-bit indexing. A flash attention's mask holds keys times queries, so a long prompt's attention in
 // one ubatch outgrows a binding first: at about 23k tokens on 1 GiB. Such an attention runs as dispatches over ranges
 // of its query rows, each binding its rows of q, the mask and dst, and stays on the GPU
-// (ggml_backend_vk_device_supports_op); it would otherwise run on the CPU. The ranges are as few as the binding
-// allows: each dispatch ends with GPU cores idle while its last tiles finish.
+// (ggml_backend_vk_device_supports_op); it would otherwise run on the CPU. The ranges are as few as the binding and dispatch workload
+// limits allow: each dispatch ends with GPU cores idle while its last tiles finish.
 //
 // A range starts at a multiple of VK_FA_ROW_GRANULE, which every row tile (Br, at most 64) divides; the pipeline and
 // KV split are chosen for all the rows (ggml_vk_flash_attn_rows). So each range computes what its rows get in one
@@ -9550,13 +9550,32 @@ static void ggml_vk_flash_attn(ggml_backend_vk_context * ctx, vk_context& subctx
         if (mask) {
             fit = std::min(fit, ggml_vk_rows_in_binding(ctx->device, mask, 1) - mask_pad);
         }
+        // On a Windows iGPU a binding can fit while one attention dispatch occupies the device
+        // too long. Bound the Q*K and P*V work as the KV history grows, independently of ubatch.
+        bool split_submission = false;
+#ifdef _WIN32
+        if (ctx->device->uma) {
+            // Work for 1024 queries over 1024 keys with 16 heads of width 256 (K and V).
+            // Divide before multiplying large tensor dimensions. One row tile is indivisible.
+            constexpr int64_t fma_budget = int64_t{1} << 33;
+            const int64_t work_rows = std::max(VK_FA_ROW_GRANULE,
+                fma_budget / k->ne[1] / q->ne[2] / (q->ne[0] + v->ne[0]));
+            split_submission = work_rows < N;
+            fit = std::min(fit, work_rows);
+        }
+#endif
         if (fit < N) {
-            const int64_t max_rows = fit / VK_FA_ROW_GRANULE * VK_FA_ROW_GRANULE; // at least two granules (supports_op)
+            const int64_t max_rows = fit / VK_FA_ROW_GRANULE * VK_FA_ROW_GRANULE; // at least one granule
             const int64_t ranges = (N + max_rows - 1) / max_rows;
             const int64_t rows = ((N + ranges - 1) / ranges + VK_FA_ROW_GRANULE - 1) / VK_FA_ROW_GRANULE * VK_FA_ROW_GRANULE;
             for (int64_t r0 = 0; r0 < N; r0 += rows) {
                 const int64_t r1 = std::min(N, r0 + rows);
                 if (r0 > 0) {
+                    if (split_submission) {
+                        // A distinct command buffer / SubmitInfo on the same queue. Keep the
+                        // dependency below across submissions when the ranges reuse scratch.
+                        ggml_vk_ctx_begin(ctx->device, subctx);
+                    }
                     // the range before reads what this range's mask_opt pass rewrites
                     ggml_vk_sync_buffers(ctx, subctx);
                 }
