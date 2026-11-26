@@ -1398,6 +1398,20 @@ std::string common_get_model_endpoint() {
     return model_endpoint;
 }
 
+// The longest draft the configured speculative decoding verifies (each implementation's n_max): what a recurrent state
+// must be able to roll back by.
+uint32_t common_speculative_draft_bound(const common_params_speculative & params) {
+    switch (params.type) {
+        case COMMON_SPECULATIVE_TYPE_NONE:          return 0;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return params.ngram_simple.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return params.ngram_map_k.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return params.ngram_map_k4v.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return (uint32_t) std::max(0, params.ngram_mod.n_max);
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return 8;
+        default:                                    return (uint32_t) std::max(0, params.draft.n_max);
+    }
+}
+
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
@@ -1417,6 +1431,14 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     if (ret != 0) {
         LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
+    }
+
+    // A recurrent state with rollback planes removes a tail of up to llama_n_rs_seq tokens, after a decode step that
+    // verified them: the two tokens above may have been two steps (a context that splits outside a request's decode).
+    if (llama_n_rs_seq(ctx) > 0) {
+        LOG_INF("%s: the target context rolls back up to %u tokens\n", __func__, llama_n_rs_seq(ctx));
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         goto done;
     }
 
@@ -1517,6 +1539,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.ssd_options       = params.ssd_options.get();
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_rs_seq          = common_speculative_draft_bound(params.speculative);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

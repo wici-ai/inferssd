@@ -914,7 +914,11 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
     COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
     COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS   = 3, // can seq_rm the tail of a sequence up to llama_n_rs_seq tokens (a draft's rows)
 };
+
+// the longest draft the configured speculative decoding verifies
+uint32_t common_speculative_draft_bound(const struct common_params_speculative & params);
 
 // check if the llama_context can remove sequences
 // note: clears the memory of the context

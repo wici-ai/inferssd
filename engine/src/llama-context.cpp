@@ -61,6 +61,13 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    // the rollback planes of the recurrent state exist where the model's graph writes them
+    cparams.n_rs_seq = params.n_rs_seq;
+    if (cparams.n_rs_seq > 0 && model.arch != LLM_ARCH_QWEN35MOE && model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_INFO("%s: the recurrent state of %s does not roll back; n_rs_seq %u -> 0\n", __func__,
+            llm_arch_name(model.arch), cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -4551,6 +4558,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_rs_seq                    =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -4714,6 +4722,10 @@ bool llama_ssd_preload(llama_context * ctx) {
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD expert preload failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD expert preload failed\n"); }
     return false;
+}
+
+uint32_t llama_n_rs_seq(const llama_context * ctx) {
+    return ctx->get_cparams().n_rs_seq;
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {

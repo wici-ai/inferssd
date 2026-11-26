@@ -749,7 +749,9 @@ ggml_tensor * llm_build_qwen4exp::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    auto attn_out = keeps_planes() ?
+        build_delta_net_planes(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il) :
+        build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
     ggml_tensor * output = attn_out.first;
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, attn_out.second,
         ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
@@ -984,6 +986,8 @@ ggml_tensor * llm_build_qwen4exp::build_conv_state_at(
             kv_head * row_size);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+    // a draft's verification leaves its earlier tokens' histories as rollback planes
+    build_conv_planes(inp, conv_states_all, conv_input, state_cols, channels);
 
     return conv_input;
 }

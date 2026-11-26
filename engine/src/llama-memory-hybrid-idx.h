@@ -42,7 +42,9 @@ public:
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
                             /* the indexer cache exists only if this is given */
-    const layer_filter_cb & filter_idx);
+    const layer_filter_cb & filter_idx,
+                            /* the states a sequence can roll back by (llama_memory_recurrent) */
+                 uint32_t   n_rs_seq = 0);
 
     // defined out of line because kpool_layout is incomplete here
     ~llama_memory_hybrid_idx();

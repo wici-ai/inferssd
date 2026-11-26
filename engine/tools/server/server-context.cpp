@@ -372,6 +372,10 @@ struct server_slot {
         // note: slot.prompt is not yet expanded with the `id` token sampled above
         //       also, need to leave space for 1 extra token to allow context shifts
         n_draft_max = std::min(n_draft_max, n_ctx - prompt.n_tokens() - 2);
+        // a recurrent state rolls back by no more than its planes
+        if (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+            n_draft_max = std::min(n_draft_max, (int) llama_n_rs_seq(ctx));
+        }
 
         if (n_remaining > 0) {
             n_draft_max = std::min(n_draft_max, n_remaining - 1);
@@ -1107,8 +1111,9 @@ private:
             slot.n_ctx = n_ctx_slot;
 
             slot.ctx_seq_rm_type   = ctx_seq_rm_type;
-            slot.cache_seq_rm_type = ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0 ?
-                COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
+            // a state that rolls back only a draft's rows caches prompts as one that removes no tail does
+            slot.cache_seq_rm_type = (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) ||
+                ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
 
             slot.mctx                   = mctx;
             slot.prompt.tokens.has_mtmd = mctx != nullptr;
@@ -1152,7 +1157,8 @@ private:
         // rolled back at all, or a sliding-window cache that gives the window's cells to later positions, not one
         // with a full-size window (--swa-full, n_swa = 0 here).  The same condition as checkpoints that stop the
         // batch (do_checkpoint).
-        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && n_swa == 0) {
+        if (ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL && ctx_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS &&
+                n_swa == 0) {
             checkpoint_at_align = 0;
         }
         if (checkpoint_at_align > 0) {
@@ -2208,7 +2214,8 @@ private:
             if (params_base.n_ctx_checkpoints > 0) {
                 auto reservation = checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n));
                 if (reservation) {
-                    const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ? n - 1 :
+                    const llama_pos pos_min = slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                        slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? n - 1 :
                         llama_state_seq_pos_min_at(ctx, slot.id, n);
                     auto checkpoint = server_get_checkpoint_at(ctx, slot.id, n, pos_min);
                     reservation.commit();
@@ -3015,7 +3022,8 @@ private:
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             LOG_INF("slot %12.*s: id %2d | task %d | Checking checkpoint with [%d, %d] against %d...\n", 12,
                                                 func_name, (slot).id, ((slot).task ? (slot).task->id : -1), cur.pos_min, cur.pos_max, pos_min_thold);
-                                            if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                                            if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                                    slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
                                                 // a state that cannot be rolled back resumes exactly where it was saved, so the
                                                 // checkpoint has to lie inside the common prefix and leave a prompt token to process;
                                                 // the window margin below is for sliding-window states that are truncated after loading
@@ -3108,7 +3116,8 @@ private:
                     if (!llama_memory_seq_rm(llama_get_memory(ctx), slot.id, p0, -1)) {
                         bool restored = false;
 
-                        if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+                        if (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+                                slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
                             const server_prompt_checkpoint * checkpoint = server_prompt_find_checkpoint_before_pos(slot.prompt, p0);
 
                             if (checkpoint != nullptr) {
@@ -3178,6 +3187,7 @@ private:
                     // - the model uses SWA (and we are not using `swa_full`)
                     do_checkpoint = do_checkpoint && (
                             (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ||
+                            (slot.ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS) ||
                             (n_swa > 0));
 
                     // A memory that can save an earlier state is checkpointed after the batch is decoded

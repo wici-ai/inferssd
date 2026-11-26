@@ -9709,6 +9709,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.offload_kqv,
                             std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max,
+                            0, // no rollback planes: their graphs do not write them
                             nullptr);
                 } else if (llm_arch_is_hybrid(arch)) {
                     // The main difference between hybrid architectures is the
@@ -9733,7 +9734,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             cparams.n_ctx_seq, 1, hparams.n_swa, hparams.swa_type,
                             GGML_TYPE_F32, GGML_TYPE_F32, std::max((uint32_t) 1, cparams.n_seq_max),
                             cparams.n_seq_max, cparams.offload_kqv, cparams.kv_unified,
-                            filter_attn, filter_recr, idx);
+                            filter_attn, filter_recr, idx, cparams.n_rs_seq);
                     } else if (hparams.swa_type != LLAMA_SWA_TYPE_NONE) {
                         // Use hybrid-iswa for hybrid models with SWA
                         res = new llama_memory_hybrid_iswa(
@@ -9770,7 +9771,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* attn_n_grow       */ llama_kv_cache::n_grow_default,
+                            /* n_rs_seq          */ cparams.n_rs_seq);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;

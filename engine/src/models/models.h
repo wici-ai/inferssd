@@ -74,6 +74,32 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * b,
                 ggml_tensor * s,
                         int   il);
+
+    // Whether the ubatch leaves the rollback planes of its states behind: a decode step of 2 .. 1 + n_rs_seq tokens of
+    // a sequence (a draft's verification), as llama_memory_recurrent::keeps_planes counts them.
+    bool keeps_planes() const;
+
+    // The conv states after the ubatch's earlier tokens, into planes 1 .. n - 1 of `states_all` (plane j: j tokens
+    // back from its end); the caller writes plane 0. A row of `states_all` is state_cols x channels of conv_input.
+    void build_conv_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * conv_input,
+                   int64_t   state_cols,
+                   int64_t   channels) const;
+
+    // build_delta_net one token at a time, the states after the earlier tokens into planes 1 .. n - 1 of
+    // `states_all`. Each token runs the one-token recurrence, so its state is the one-token decode's.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * q,
+               ggml_tensor * k,
+               ggml_tensor * v,
+               ggml_tensor * g,
+               ggml_tensor * b,
+               ggml_tensor * s,
+                       int   il);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

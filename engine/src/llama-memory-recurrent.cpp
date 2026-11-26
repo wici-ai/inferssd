@@ -29,12 +29,17 @@ llama_memory_recurrent::llama_memory_recurrent(
                      bool   offload,
                  uint32_t   mem_size,
                  uint32_t   n_seq_max,
+                 uint32_t   n_rs_seq,
     const layer_filter_cb & filter) : hparams(model.hparams), n_seq_max(n_seq_max) {
     const int32_t n_layer = hparams.n_layer;
 
     head = 0;
     size = mem_size;
     used = 0;
+    this->n_rs_seq = n_rs_seq;
+    rs_idx.assign(mem_size, 0);
+    // every state tensor holds 1 + n_rs_seq planes of `size` rows
+    const int64_t n_rows = int64_t(mem_size) * (1 + n_rs_seq);
 
     cells.clear();
     cells.resize(mem_size);
@@ -99,14 +104,14 @@ llama_memory_recurrent::llama_memory_recurrent(
             throw std::runtime_error("failed to create ggml context for rs cache");
         }
 
-        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), mem_size);
-        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), mem_size);
+        ggml_tensor * r = ggml_new_tensor_2d(ctx, type_r, hparams.n_embd_r(), n_rows);
+        ggml_tensor * s = ggml_new_tensor_2d(ctx, type_s, hparams.n_embd_s(), n_rows);
         ggml_format_name(r, "cache_r_l%d", i);
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
         if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
-            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), mem_size);
+            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows);
             ggml_format_name(p, "cache_ple_r_l%d", i);
             p_l[i] = p;
         }
@@ -134,8 +139,8 @@ llama_memory_recurrent::llama_memory_recurrent(
         const size_t memory_size_r = size_r_bytes();
         const size_t memory_size_s = size_s_bytes();
 
-        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
-                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max,
+        LLAMA_LOG_INFO("%s: size = %7.2f MiB (%6u cells, %3d layers, %2u seqs, %u rollback planes), R (%s): %7.2f MiB, S (%s): %7.2f MiB\n", __func__,
+                (float)(memory_size_r + memory_size_s) / (1024.0f * 1024.0f), mem_size, n_layer, n_seq_max, n_rs_seq,
                 ggml_type_name(type_r), (float)memory_size_r / (1024.0f * 1024.0f),
                 ggml_type_name(type_s), (float)memory_size_s / (1024.0f * 1024.0f));
     }
@@ -147,7 +152,9 @@ void llama_memory_recurrent::clear(bool data) {
         cells[i].seq_id.clear();
         cells[i].src = -1;
         cells[i].tail = -1;
+        cells[i].rs_max = 0;
     }
+    std::fill(rs_idx.begin(), rs_idx.end(), 0);
 
     head = 0;
     used = 0;
@@ -180,10 +187,17 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (0 <= seq_id) {
         int32_t & tail_id = cells[seq_id].tail;
         if (tail_id >= 0) {
-            const auto & cell = cells[tail_id];
-            // partial intersection is invalid if it includes the final pos
+            auto & cell = cells[tail_id];
+            // partial intersection is invalid if it includes the final pos, unless the state's planes go back that far
+            // (the rows of a draft its verification rejected): the next ubatch reads the plane of the kept position
             if (0 < p0 && p0 <= cell.pos && p1 > cell.pos) {
-                //printf("[DEBUG] inside `llama_memory_recurrent::seq_rm`: partial intersection is invalid, so returning false, p0 = %d, cell.pos = %d, p1 = %d\n", p0, cell.pos, p1);
+                const llama_pos back = cell.pos - (p0 - 1);
+                if (cell.seq_id.size() == 1 && back >= 1 && (uint32_t) back <= cell.rs_max) {
+                    rs_idx[seq_id] += (uint32_t) back;
+                    cell.rs_max -= (uint32_t) back;
+                    cell.pos = p0 - 1;
+                    return true;
+                }
                 return false;
             }
             // invalidate tails which will be cleared
@@ -226,6 +240,15 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
     if (new_head != size && new_head < head) {
         head = new_head;
     }
+    // a sequence without a state has nothing to roll back
+    for (uint32_t s = 0; s < size; ++s) {
+        if ((seq_id < 0 || (llama_seq_id) s == seq_id) && cells[s].tail < 0) {
+            rs_idx[s] = 0;
+        }
+    }
+    for (auto & cell : cells) {
+        if (cell.is_empty()) { cell.rs_max = 0; }
+    }
 
     return true;
 }
@@ -264,6 +287,8 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
             cell_src.seq_id.insert(seq_id_dst);
             tail_dst.tail = tail_src.tail;
         }
+        // the copy reads the state the source does, a pending rollback's plane too
+        rs_idx[seq_id_dst] = tail_src.tail >= 0 ? rs_idx[seq_id_src] : 0;
     }
 }
 
@@ -453,6 +478,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     auto org_cells = cells;
     auto org_used = used;
     auto org_head = head;
+    auto org_rs_idx = rs_idx; // find_slot consumes a pending rollback
 
     bool success = true;
 
@@ -467,6 +493,7 @@ bool llama_memory_recurrent::prepare(const std::vector<llama_ubatch> & ubatches)
     cells = std::move(org_cells);
     used = org_used;
     head = org_head;
+    rs_idx = std::move(org_rs_idx);
 
     return success;
 }
@@ -574,6 +601,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 auto & orig_cell = cells[seq_meta.tail];
                 empty_cell.pos = orig_cell.pos;
                 empty_cell.src = orig_cell.src;
+                empty_cell.rs_max = orig_cell.rs_max;
                 orig_cell.seq_id.erase(seq_id);
                 empty_cell.seq_id.insert(seq_id); // will be overwritten
                 GGML_ASSERT(!orig_cell.is_empty()); // has at least one remaining seq_id
@@ -604,6 +632,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
             std::swap(dst_cell.pos, src_cell.pos);
             std::swap(dst_cell.src, src_cell.src);
+            std::swap(dst_cell.rs_max, src_cell.rs_max);
             std::swap(dst_cell.seq_id, src_cell.seq_id);
 
             // swap tails
@@ -632,6 +661,8 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
         }
         cell.pos = last_pos;
+        // the graph writes the planes of a short ubatch (a draft's verification): its rows can roll back
+        cell.rs_max = keeps_planes(n_seq_tokens) ? n_seq_tokens - 1 : 0;
         cell.seq_id.clear();
         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
             const llama_seq_id seq_id = ubatch.seq_id[i][j];
@@ -667,6 +698,14 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
                 // Stage the source ids for all used cells to allow correct seq_* behavior
                 // and still make these values available when setting the inputs
                 cells[i].src0 = cells[i].src;
+                // a rolled back sequence reads its state from the plane of the position it kept
+                if (n_rs_seq > 0 && cells[i].seq_id.size() == 1) {
+                    const llama_seq_id seq = *cells[i].seq_id.begin();
+                    if (seq >= 0 && (uint32_t) seq < rs_idx.size() && rs_idx[seq] > 0) {
+                        cells[i].src0 += int32_t(rs_idx[seq] * size);
+                        rs_idx[seq] = 0;
+                    }
+                }
             }
             cells[i].src = i; // avoid moving or clearing twice
         }
@@ -689,6 +728,7 @@ std::unique_ptr<llama_memory_recurrent::metadata_undo> llama_memory_recurrent::s
     saved->n     = n;
     saved->rs_z  = rs_z;
     saved->cells = cells;
+    saved->rs_idx = rs_idx;
     return saved;
 }
 
@@ -699,6 +739,7 @@ void llama_memory_recurrent::restore_metadata(metadata_undo & saved) noexcept {
     rs_z = saved.rs_z;
     // the cell count never changes, so the copy always has as many cells
     cells.swap(saved.cells);
+    rs_idx.swap(saved.rs_idx);
 }
 
 bool llama_memory_recurrent::get_can_shift() const {
@@ -776,8 +817,35 @@ void llama_memory_recurrent::state_write(llama_io_write_i & io, llama_seq_id seq
 
     io.write(&cell_count, sizeof(cell_count));
 
+    // The rows the states are in: a rolled back sequence's is in the plane of the position it kept.
+    std::vector<std::pair<uint32_t, uint32_t>> data_ranges;
+    for (const auto & range : cell_ranges) {
+        for (uint32_t i = range.first; i < range.second; ++i) {
+            uint32_t plane = 0;
+            if (n_rs_seq > 0) {
+                const auto & cell = cells[i];
+                bool first = true;
+                for (const llama_seq_id seq : cell.seq_id) {
+                    if (seq_id != -1 && seq != seq_id) { continue; }
+                    const uint32_t idx = seq >= 0 && (size_t) seq < rs_idx.size() ? rs_idx[seq] : 0;
+                    if (!first && idx != plane) {
+                        GGML_ABORT("a recurrent state shared by sequences with different rollbacks");
+                    }
+                    plane = idx;
+                    first = false;
+                }
+            }
+            const uint32_t row = plane * size + i;
+            if (!data_ranges.empty() && data_ranges.back().second == row) {
+                data_ranges.back().second++;
+            } else {
+                data_ranges.emplace_back(row, row + 1);
+            }
+        }
+    }
+
     state_write_meta(io, cell_ranges, seq_id);
-    state_write_data(io, cell_ranges);
+    state_write_data(io, data_ranges);
 }
 
 void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
@@ -798,6 +866,15 @@ void llama_memory_recurrent::state_read(llama_io_read_i & io, llama_seq_id seq_i
             seq_rm(seq_id, -1, -1);
         }
         throw std::runtime_error("failed to restore kv cache");
+    }
+    // a restored state is the state itself: nothing to roll back to
+    for (uint32_t s = 0; s < size; ++s) {
+        if (seq_id == -1 || (llama_seq_id) s == seq_id) {
+            rs_idx[s] = 0;
+        }
+    }
+    for (auto & cell : cells) {
+        if (seq_id == -1 || cell.has_seq_id(seq_id)) { cell.rs_max = 0; }
     }
 }
 

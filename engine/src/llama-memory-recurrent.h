@@ -24,6 +24,7 @@ public:
                          bool   offload,
                      uint32_t   mem_size,
                      uint32_t   n_seq_max,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter);
 
     ~llama_memory_recurrent() = default;
@@ -70,6 +71,18 @@ public:
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
 
+    // States a sequence can roll back by, for the rows of a draft its verification rejects: each state tensor holds
+    // 1 + n_rs_seq planes of `size` rows, plane j the state from j tokens before the last ubatch's end.
+    uint32_t n_rs_seq = 0;
+
+    // per sequence: the plane its next ubatch reads its state from (a rollback seq_rm made), 0 for the state itself
+    std::vector<uint32_t> rs_idx;
+
+    // whether a ubatch of this many tokens a sequence leaves the planes of its states behind (the graph writes them)
+    bool keeps_planes(uint32_t n_seq_tokens) const {
+        return n_rs_seq > 0 && n_seq_tokens >= 2 && n_seq_tokens <= 1 + n_rs_seq;
+    }
+
     // computed before each graph build
     uint32_t n = 0;
 
@@ -82,6 +95,9 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // tokens the state can still roll back by: the planes the last ubatch wrote, less the rollbacks since
+        uint32_t  rs_max = 0;
 
         std::set<llama_seq_id> seq_id;
 
@@ -109,6 +125,7 @@ public:
         uint32_t n    = 0;
         int32_t  rs_z = -1;
         std::vector<mem_cell> cells;
+        std::vector<uint32_t> rs_idx;
     };
 
     std::unique_ptr<metadata_undo> save_metadata() const;

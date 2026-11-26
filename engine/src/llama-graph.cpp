@@ -3249,7 +3249,10 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    // every plane of the cache (a rolled back sequence's state is in a later one): a copy source indexes them all
+    const int64_t n_rows = ggml_nelements(s) / state_size;
+    GGML_ASSERT(n_rows % rs_size == 0);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, n_rows);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Do not add a zero-sized SCALE root: although it computes nothing, the
