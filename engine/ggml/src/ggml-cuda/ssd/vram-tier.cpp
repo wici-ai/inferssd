@@ -893,9 +893,10 @@ struct tier {
         owed=owed_hold=false;
         ++grow_events;
         decode_growth_done=true;
-        std::fprintf(stderr,"[ssd_vram_elastic] event=decode_grow generation=%llu status=pass epoch=%llu token=%llu decode_token=%llu us=%.0f before_slots=%zu target_slots=%zu after_slots=%zu added_slots=%zu blocks=%zu free_before=%zu safety_blocks=%zu safety_mib=%zu safety_bytes=%llu\n",
+        std::fprintf(stderr,"[ssd_vram_elastic] event=decode_grow generation=%llu status=pass epoch=%llu token=%llu decode_token=%llu us=%.0f before_slots=%zu target_slots=%zu after_slots=%zu added_slots=%lld blocks=%zu free_before=%zu safety_blocks=%zu safety_mib=%zu safety_bytes=%llu\n",
             (unsigned long long)phase_generation,(unsigned long long)epoch,(unsigned long long)token,
-            (unsigned long long)phase_decode_tokens,micros(start),before,target,slot_locations.size(),slot_locations.size()-before,
+            (unsigned long long)phase_decode_tokens,micros(start),before,target,slot_locations.size(),
+            (long long)slot_locations.size()-(long long)before, // negative when the withheld pass gave blocks back
             blocks.size(),free_bytes,elastic_safety_blocks,elastic_safety_mib,(unsigned long long)safety);
     }
     // Decode growth leaves only the elastic safety margin free, and device memory keeps moving after it:
