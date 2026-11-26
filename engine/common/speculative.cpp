@@ -1395,6 +1395,84 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
     return n_min;
 }
 
+static void common_speculative_adapt_time(std::vector<double> & t, size_t i, double ms) {
+    if (t.size() <= i) {
+        t.resize(i + 1, 0.0);
+    }
+    t[i] = t[i] > 0.0 ? t[i] + common_speculative_adapt::rate * (ms - t[i]) : ms;
+}
+
+void common_speculative_adapt::on_plain(double ms) {
+    if (ms > 0.0) {
+        common_speculative_adapt_time(t_rows, 1, ms);
+    }
+}
+
+void common_speculative_adapt::on_block(int n_proposed, int n_accepted, int n_steps, double verify_ms, double draft_ms) {
+    if (n_proposed > 0 && verify_ms > 0.0) {
+        common_speculative_adapt_time(t_rows, size_t(n_proposed) + 1, verify_ms);
+    }
+    if (n_steps > 0 && draft_ms > 0.0) {
+        const double ms = draft_ms / n_steps;
+        t_step = t_step > 0.0 ? t_step + rate * (ms - t_step) : ms;
+    }
+    for (auto & x : acc)  { x *= decay; }
+    for (auto & x : seen) { x *= decay; }
+    if (acc.size() < size_t(std::max(n_proposed, 1))) {
+        acc.resize(std::max(n_proposed, 1), 0.0);
+        seen.resize(std::max(n_proposed, 1), 0.0);
+    }
+    // a head that proposed nothing (its first token was not sure enough) gave no draft token
+    if (n_proposed <= 0) {
+        seen[0] += 1.0;
+        return;
+    }
+    // the k-th draft token counts when every one before it was accepted
+    for (int k = 0; k < n_proposed && k <= n_accepted; ++k) {
+        seen[k] += 1.0;
+        acc[k]  += k < n_accepted ? 1.0 : 0.0;
+    }
+}
+
+double common_speculative_adapt::rate_of(int n) const {
+    const double t = size_t(n) + 1 < t_rows.size() ? t_rows[n + 1] : 0.0;
+    if (t <= 0.0) {
+        return 0.0;
+    }
+    // expected tokens: the sampled one, then each draft token while all before it are accepted (a draft the head
+    // did not propose counts as rejected)
+    double tokens = 1.0, p = 1.0;
+    for (int k = 0; k < n; ++k) {
+        const double a = k < (int) acc.size() ? (acc[k] + 1.0) / (seen[k] + 2.0) : 0.5;
+        p *= a;
+        tokens += p;
+    }
+    return tokens / (t + n * t_step);
+}
+
+int common_speculative_adapt::choose(int n_max) {
+    if (n_max <= 0) {
+        return 0;
+    }
+    const int pick = n_picks++;
+    if (pick < warmup * (n_max + 1)) {
+        return pick % (n_max + 1);
+    }
+    if (pick % probe_every == 0) {
+        return n_probe++ % (n_max + 1);
+    }
+    int best = 0;
+    double best_rate = rate_of(0);
+    for (int n = 1; n <= n_max; ++n) {
+        const double r = rate_of(n);
+        if (r > best_rate) {
+            best = n;
+            best_rate = r;
+        }
+    }
+    return best;
+}
+
 void common_speculative_print_stats(const common_speculative * spec) {
     if (spec == nullptr) {
         return;

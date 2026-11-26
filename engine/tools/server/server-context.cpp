@@ -406,6 +406,13 @@ struct server_slot {
     int64_t  t_spec_step_start_us = 0;
     double   t_spec_draft_ms = 0.0;
 
+    // A draft head's steps cost time (MTP): the slot drafts the length that pays, from what its steps measure. The
+    // estimates are the machine's, so they outlive a request.
+    bool                     spec_adaptive = false;
+    common_speculative_adapt spec_adapt;
+    int                      spec_draft_len   = 0; // the length the step drafts at most
+    int64_t                  t_plain_start_us = 0; // a step without drafts, from its batch to its token
+
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
@@ -557,7 +564,11 @@ struct server_slot {
     }
 
     void update_batch(llama_batch & batch) {
-        const int n_draft_max = get_n_draft_max();
+        int n_draft_max = get_n_draft_max();
+        if (n_draft_max > 0 && spec_adaptive && spec_draft.empty()) {
+            n_draft_max = spec_adapt.choose(n_draft_max);
+        }
+        spec_draft_len = n_draft_max;
         if (n_draft_max > 0) {
             GGML_ASSERT(can_speculate());
 
@@ -578,8 +589,18 @@ struct server_slot {
 
                 // generate a new draft
                 t_spec_step_start_us = ggml_time_us();
-                spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
+                if (spec_adaptive) {
+                    // the head drafts no more than the length chosen
+                    auto params_len = params_spec;
+                    params_len.draft.n_max = n_draft_max;
+                    spec_draft = common_speculative_draft(spec.get(), params_len, tokens, sampled);
+                } else {
+                    spec_draft = common_speculative_draft(spec.get(), params_spec, tokens, sampled);
+                }
                 t_spec_draft_ms = (ggml_time_us() - t_spec_step_start_us) / 1e3;
+                if (spec_adaptive && spec_draft.empty()) {
+                    spec_adapt.on_block(0, 0, 1, 0.0, t_spec_draft_ms);
+                }
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
                     SLT_WRN(*this, "draft size %d exceeds max %d, truncating\n", (int) spec_draft.size(), n_draft_max);
@@ -607,6 +628,9 @@ struct server_slot {
         if (spec_draft.empty()) {
             // no speculative decoding
             i_batch = batch.n_tokens;
+            if (spec_adaptive) {
+                t_plain_start_us = ggml_time_us();
+            }
 
             common_batch_add(batch, sampled, prompt.tokens.pos_next(), { this->id }, true);
 
@@ -1317,6 +1341,7 @@ private:
             slot.n_ctx = n_ctx_slot;
 
             slot.ctx_seq_rm_type   = ctx_seq_rm_type;
+            slot.spec_adaptive     = params_base.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
             // a state that rolls back only a draft's rows caches prompts as one that removes no tail does
             slot.cache_seq_rm_type = (ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART && n_swa > 0) ||
                 ctx_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS ? COMMON_CONTEXT_SEQ_RM_TYPE_FULL : ctx_seq_rm_type;
@@ -3836,6 +3861,11 @@ private:
                 // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
                 const int64_t t_current = ggml_time_us();
 
+                if (slot.t_plain_start_us > 0) {
+                    slot.spec_adapt.on_plain((t_current - slot.t_plain_start_us) / 1e3);
+                    slot.t_plain_start_us = 0;
+                }
+
                 slot.n_decoded += 1;
 
                 if (slot.n_decoded == 1) {
@@ -3947,17 +3977,23 @@ private:
                 slot.n_spec_blocks++;
                 const double spec_step_ms = slot.t_spec_step_start_us > 0 ?
                     (t_current - slot.t_spec_step_start_us) / 1e3 : 0.0;
+                if (slot.spec_adaptive) {
+                    // the head ran a step a token it proposed, and one more when it stopped short of the length
+                    const int n_steps = std::min(slot.spec_draft_len, (int) n_draft + 1);
+                    slot.spec_adapt.on_block((int) n_draft, (int) ids.size() - 1, n_steps,
+                        spec_step_ms - slot.t_spec_draft_ms - spec_recompute_ms, slot.t_spec_draft_ms);
+                }
                 SLT_INF(slot,
                         "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "
                         "sampled=%zu accepted_argmax_matched=%zu accepted_argmax_checked=%zu "
                         "sampled_argmax_matched=%zu sampled_argmax_checked=%zu partial=%d "
                         "recomputed=%d replay_rows=%zu draft_ms=%.3f recompute_ms=%.3f "
-                        "step_ms=%.3f semantics=batch-verifier\n",
+                        "step_ms=%.3f draft_len=%d semantics=batch-verifier\n",
                         slot.n_spec_blocks, n_draft, ids.size() - 1, ids.size(),
                         spec_accepted_argmax_matched, spec_accepted_argmax_checked,
                         spec_argmax_matched, spec_argmax_checked, spec_partial,
                         spec_recomputed, spec_recomputed ? ids.size() : 0,
-                        slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms);
+                        slot.t_spec_draft_ms, spec_recompute_ms, spec_step_ms, slot.spec_draft_len);
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
