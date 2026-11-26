@@ -18,6 +18,7 @@ from typing import Optional
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow
 from inferssd.strategy.derive import (
     IN_FLIGHT,
+    cpu_affinity,
     drive_rate,
     gpu_reserve_mib,
     host_headroom_mib,
@@ -695,7 +696,7 @@ def _dense_host_estimate(
     assumptions: list[str],
 ) -> Estimate:
     """Conditional CPU execution with a reusable page cache and mmap fault sensitivity."""
-    allowed = set(runtime.cpus) & {row["id"] for row in c["cpu"]["logical"]}
+    allowed, _ = cpu_affinity(c, runtime)
     dram = max(
         (row["Bps"] for row in c["memory"]["dram_read_Bps"] if row["threads"] <= len(allowed)),
         default=0.0,

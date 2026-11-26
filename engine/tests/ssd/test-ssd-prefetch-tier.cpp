@@ -162,7 +162,9 @@ int main(int argc, char ** argv) {
     // the test thread's when the sink starts (own), so the tier's threads take own less the coordinator's, or all of
     // own when that leaves none, as here.
     ssd::platform::cpu_list own;
-    require(ssd::platform::current_thread_cpus(own), "read the test thread's CPUs");
+    if (ssd::platform::thread_pinning() != ssd::platform::pin_policy::unsupported) {
+        require(ssd::platform::current_thread_cpus(own), "read the test thread's CPUs");
+    }
     auto beside = [&](const ssd::platform::cpu_list & coordinator) {
         ssd::platform::cpu_list rest;
         for (int cpu : own) {
@@ -170,8 +172,12 @@ int main(int argc, char ** argv) {
         }
         return rest.empty() ? own : rest;
     };
-    require(tier_placements.size() == 1 && tier_placements[0] == beside(own),
-            "the tier's threads were not placed once beside the coordinator");
+    if (own.empty()) {
+        require(tier_placements.empty(), "tier threads stay under OS scheduling when pinning is unavailable");
+    } else {
+        require(tier_placements.size() == 1 && tier_placements[0] == beside(own),
+                "the tier's threads were not placed once beside the coordinator");
+    }
     if (ssd::platform::affinity_supported() && own.size() > 1) {
         // A coordinator that moves is seen at the first layer after the next begin, as ggml moves its thread 0 only
         // between graphs; the tier is told each move and nothing else.

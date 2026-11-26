@@ -888,7 +888,8 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
             ready[index] = mode == 1 || mode == 7;
             inputs.set(names[0], ready[index] ? "1" : "0");
             inputs.set(names[1], mode == 6 ? weighted.c_str() : "");
-            inputs.set(names[2], mode >= 3 ? std::to_string(allowed.back()).c_str() : "");
+            const bool allow_pin = ssd::platform::thread_pinning() != ssd::platform::pin_policy::unsupported;
+            inputs.set(names[2], mode >= 3 && allow_pin ? std::to_string(allowed.back()).c_str() : "");
             // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};

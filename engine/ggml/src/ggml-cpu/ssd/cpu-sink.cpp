@@ -211,6 +211,9 @@ struct sink_configuration {
 // may run on. Where the OS cannot pin (macOS) they are still validated.
 static std::vector<int> sink_cpus(const std::vector<int> & cpus) {
     if (cpus.empty()) { return {}; }
+    if (ssd::platform::thread_pinning() == ssd::platform::pin_policy::unsupported) {
+        throw std::runtime_error("explicit CPU sink pinning is unsupported on this machine; leave cpu.io_cpus unset");
+    }
     ssd::platform::cpu_list allowed;
     std::string why;
     if (!ssd::platform::process_cpus(allowed, &why)) { throw std::runtime_error("get sink affinity: " + why); }

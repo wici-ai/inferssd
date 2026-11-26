@@ -157,13 +157,14 @@ order and split once at the largest relative drop above 10%; a CPU with
 neither value makes the whole machine one cluster. On macOS the
 `hw.perflevel0.logicalcpu` CPUs form the performance cluster and the rest the
 efficiency cluster. macOS has no thread affinity, so its CPU numbers only count
-CPUs. On Windows the CPUs are the logical processors of processor group 0,
-numbered as CPU masks number them; the CPUs of the highest CPU Set efficiency
-class form the performance cluster and the rest the efficiency cluster, and a
-machine without a CPU Set for every CPU is one cluster. There `capacity` is the
-efficiency class, `core` the CPU Set's core index, and package and maximum
-frequency are not recorded. Machines with more than one processor group (over
-64 logical CPUs) are not supported on Windows; their `cpu` section is partial.
+CPUs. On Windows, a CPU number is 64 times its processor group plus its index in
+that group. This also keeps core and SMT sibling records from different groups
+distinct. The highest CPU Set efficiency class forms the performance cluster.
+A machine without a CPU Set for every CPU has one cluster. `capacity` records
+the efficiency class. Package and maximum frequency are unknown. On machines
+with multiple processor groups, profiling and inference leave thread placement
+to Windows. The probe sizes its thread counts to the CPUs available to the
+process. Explicit CPU pinning requires a single-group machine.
 
 The knee of a request size is the smallest queue depth whose best run reaches
 the worst run of the fastest queue depth at that size. Each point's bandwidth is

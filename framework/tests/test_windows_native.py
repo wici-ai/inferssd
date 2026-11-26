@@ -23,9 +23,10 @@ if sys.platform == "win32":
 def test_profile_reads_this_host():
     layer = system.Win32()
     found = layer.processors()
-    assert found.logical >= found.group0 >= 1 and found.groups >= 1
-    assert all(row.index < found.group0 for row in found.sets)
-    assert set(layer.process_cpus()) <= set(range(found.group0))
+    assert found.logical == len(found.ids) and found.counts
+    assert {row.index for row in found.sets} <= set(found.ids)
+    allowed = layer.process_cpus()
+    assert allowed and set(allowed) <= set(found.ids)
     memory = layer.memory()
     assert 0 < memory.available_bytes <= memory.total_bytes
     assert Path(layer.volume(__file__).point).exists()

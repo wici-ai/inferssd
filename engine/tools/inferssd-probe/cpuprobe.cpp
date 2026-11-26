@@ -9,6 +9,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "platform/threads.h"
 #elif defined(__APPLE__)
 #include <sys/sysctl.h>
 #elif defined(__linux__)
@@ -163,12 +164,10 @@ int available_cpus() {
     CPU_ZERO(&set);
     if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0) { return CPU_COUNT(&set); }
 #elif defined(_WIN32)
-    DWORD_PTR process = 0, system = 0;
-    if (GetProcessAffinityMask(GetCurrentProcess(), &process, &system) && process != 0) {
-        int count = 0;
-        for (; process != 0; process &= process - 1) { ++count; }
-        return count;
-    }
+    ssd::platform::cpu_list allowed;
+    std::string why;
+    if (ssd::platform::process_cpus(allowed, &why)) { return int(allowed.size()); }
+    if (!ssd::platform::affinity_supported()) { throw std::runtime_error(why); }
 #endif
     return (int) std::max(1u, std::thread::hardware_concurrency());
 }
@@ -427,13 +426,16 @@ struct affinity_guard {
         if (valid) { sched_setaffinity(0, sizeof(saved), &saved); }
     }
 #elif defined(_WIN32)
-    DWORD_PTR saved = 0;
+    GROUP_AFFINITY saved = {};
     affinity_guard() {
-        DWORD_PTR system = 0;
-        if (!GetProcessAffinityMask(GetCurrentProcess(), &saved, &system)) { saved = 0; }
+        // Restoring a group-local mask would restrict an unpinned multi-group process.
+        if (!ssd::platform::affinity_supported()) { return; }
+        if (!GetThreadGroupAffinity(GetCurrentThread(), &saved)) {
+            throw std::runtime_error("cannot save the calling thread's affinity");
+        }
     }
     ~affinity_guard() {
-        if (saved != 0) { SetThreadAffinityMask(GetCurrentThread(), saved); }
+        if (saved.Mask) { SetThreadGroupAffinity(GetCurrentThread(), &saved, nullptr); }
     }
 #endif
 };
@@ -633,6 +635,9 @@ options parse_args(int argc, char ** argv) {
                 }
             }
 #elif defined(_WIN32)
+            if (!ssd::platform::affinity_supported()) {
+                throw usage_error("--cpus: strict CPU pinning is unsupported on Windows with multiple processor groups");
+            }
             o.cpus = parse_int_list(arg, value, 0, GGML_MAX_N_THREADS - 1);
             std::sort(o.cpus.begin(), o.cpus.end());
             // A thread cannot be pinned outside this process's CPUs; it would run unpinned unnoticed.
