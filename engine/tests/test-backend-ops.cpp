@@ -9410,6 +9410,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 4, 1, 1, true));
     // More tokens than a 16-bit index holds: Metal's kernel counted them in a short and never ended.
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 2, 64, 32769, 1));
+    // More tokens than a GPU dispatch takes (GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH): the state crosses dispatches.
+    // Qwen3.6's linear attention (16 qk heads, 32 v heads of 128), also non-contiguous; a last dispatch of one token;
+    // exactly two dispatches; two sequences; the vector gate.
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1300, 1, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 1300, 1, 2, true));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 513, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1024, 1));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 700, 2));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1300, 1, 1, false, true));
     // KDA (vector gate)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));

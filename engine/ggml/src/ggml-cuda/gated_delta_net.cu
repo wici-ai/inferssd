@@ -11,6 +11,8 @@ gated_delta_net_cuda(const float * q,
                                      float *       dst,
                                      int64_t       H,
                                      int64_t       n_tokens,
+                                     int64_t       t_begin,
+                                     int64_t       t_end,
                                      int64_t       n_seqs,
                                      int64_t       sq1,
                                      int64_t       sq2,
@@ -40,7 +42,7 @@ gated_delta_net_cuda(const float * q,
     const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
     state += state_offset;
     curr_state += state_offset + col * S_v;
-    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+    attn_data += (sequence * n_tokens * H + h_idx) * S_v + t_begin * S_v * H;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
     static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
@@ -54,7 +56,7 @@ gated_delta_net_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
-    for (int t = 0; t < n_tokens; t++) {
+    for (int t = (int) t_begin; t < (int) t_end; t++) {
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -167,36 +169,43 @@ static void launch_gated_delta_net(
 
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
-    switch (S_v) {
-        case 16:
-            gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 32:
-            gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        case 64: {
-            gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
+    // at most GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH tokens a launch; a launch after the first starts from the state
+    // the one before wrote to dst, which the stream orders before it
+    const int64_t chunk = GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH;
+    for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        const int64_t t1      = std::min(t0 + chunk, n_tokens);
+        const float * state_d = t0 == 0 ? s_d : dst_d + S_v * H * n_tokens * n_seqs;
+        switch (S_v) {
+            case 16:
+                gated_delta_net_cuda<16, KDA><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
+                    n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            case 32:
+                gated_delta_net_cuda<32, KDA><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
+                    n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            case 64: {
+                gated_delta_net_cuda<64, KDA><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
+                    n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            }
+            case 128: {
+                gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
+                    q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
+                    n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
+                break;
+            }
+            default:
+                GGML_ABORT("fatal error");
+                break;
         }
-        case 128: {
-            gated_delta_net_cuda<128, KDA><<<grid_dims, block_dims, 0, stream>>>(
-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, H,
-                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale);
-            break;
-        }
-        default:
-            GGML_ABORT("fatal error");
-            break;
     }
 }
 

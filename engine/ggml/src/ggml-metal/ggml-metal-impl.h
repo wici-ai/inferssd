@@ -889,6 +889,8 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  t0; // the tokens [t0, t1) of this dispatch (GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH)
+    int32_t  t1;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

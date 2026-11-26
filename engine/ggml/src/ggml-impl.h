@@ -108,6 +108,13 @@ static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
 //
+// GPU backends run GGML_OP_GATED_DELTA_NET as dispatches of at most this many tokens each, the state carried from
+// one dispatch to the next. Each workgroup of the op walks its tokens in order, so a workgroup runs as long as the
+// tokens it is given take: with a whole prompt in one ubatch, seconds on a slow GPU. A GPU that can switch work only
+// between workgroups then cannot yield, and the operating system resets it (Windows after 2 s, Linux's i915 after
+// 640 ms of a pending preemption). 512 is llama.cpp's default ubatch, the size this op has always run at there.
+#define GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH 512
+
 // logging
 //
 

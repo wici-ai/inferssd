@@ -1538,7 +1538,7 @@ struct vk_op_rwkv_wkv7_push_constants {
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
-    uint32_t n_seqs;
+    uint32_t t_begin;
     uint32_t s_off;
     uint32_t sq1, sq2, sq3;
     uint32_t sv1, sv2, sv3;
@@ -4957,7 +4957,7 @@ static void ggml_vk_load_shaders(vk_device& device) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
     }
@@ -10955,7 +10955,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t chunk = GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, (n_tokens + chunk - 1) / chunk);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
@@ -10977,8 +10978,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
+    vk_op_gated_delta_net_push_constants pc = {
+        H, n_tokens, 0, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
@@ -10986,9 +10987,16 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         scale
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+    for (uint32_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        if (t0 > 0) {
+            // this dispatch reads the state the one before wrote
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        pc.t_begin = t0;
+        ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+            {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+            pc, { H, n_seqs, S_v });
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
