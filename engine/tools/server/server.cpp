@@ -335,6 +335,7 @@ int main(int argc, char ** argv) {
         // this call blocks the main thread until queue_tasks.terminate() is called
         ctx_server.start_loop();
         ctx_server.finish_usage();
+        ctx_server.keep_states();
 
         clean_up();
         if (ctx_http.thread.joinable()) {

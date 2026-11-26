@@ -300,6 +300,21 @@ static void test_checkpoints_at_points_are_kept_by_count() {
             "without points, the oldest goes as before");
 }
 
+// Codex's next conversation behind the same 9207 tokens of instructions and tools, while the slot holds the 15,000
+// tokens of the conversation before: a sliding-window or hybrid model keeps none of the old conversation's tail, so the
+// old state is saved; a model that truncates keeps it as before (upstream's rule: less than half kept).
+static void test_a_state_that_cannot_roll_back_is_saved_when_left() {
+    const float f_keep = 9207.0f / 15000.0f;
+    require(server_prompt_save_before_switch(f_keep, COMMON_CONTEXT_SEQ_RM_TYPE_FULL, 9207, 15000),
+            "a state that cannot be rolled back is saved when a new prompt parts from it");
+    require(!server_prompt_save_before_switch(f_keep, COMMON_CONTEXT_SEQ_RM_TYPE_PART, 9207, 15000),
+            "a state that truncates keeps upstream's rule");
+    require(server_prompt_save_before_switch(4000.0f / 15000.0f, COMMON_CONTEXT_SEQ_RM_TYPE_PART, 4000, 15000),
+            "less than half kept: saved");
+    require(!server_prompt_save_before_switch(1.0f, COMMON_CONTEXT_SEQ_RM_TYPE_FULL, 15000, 15000),
+            "the next turn of the same conversation extends the state: not saved");
+}
+
 static void test_shared_prefix_serves_a_new_conversation() {
     // The previous conversation as the slot leaves it, with its one checkpoint 4 tokens before the end of its prompt,
     // and the shared prefix the prompt cache keeps; a new conversation shares only the prefix.
@@ -474,6 +489,7 @@ int main() {
     test_batches_end_with_the_ubatch_of_a_point();
     test_checkpoints_at_points_are_kept_by_count();
     test_shared_prefix_serves_a_new_conversation();
+    test_a_state_that_cannot_roll_back_is_saved_when_left();
     test_find_checkpoint_before_tail_truncation_pos();
     test_oaicompat_chat_streams_reasoning_delta();
     test_oaicompat_chat_final_contains_reasoning();

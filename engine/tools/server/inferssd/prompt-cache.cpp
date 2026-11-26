@@ -593,15 +593,13 @@ void server_prompt_cache::save(
     remove_superseded(prompt, &states.back());
 }
 
-bool server_prompt_cache::load(
-        server_prompt              & prompt,
-        const server_tokens        & tokens_new,
-        int64_t                      n_reuse_slot,
-        llama_context              * ctx,
-        int32_t                      id_slot,
-        common_context_seq_rm_type   seq_rm_type) {
-    server_ssd_memory_change budget_changes(ctx);
-    scan_prefix_dir();
+std::list<server_prompt>::iterator server_prompt_cache::best_to_load(
+        const server_prompt              & prompt,
+        const server_tokens              & tokens_new,
+        int64_t                            n_reuse_slot,
+        common_context_seq_rm_type         seq_rm_type,
+        const server_prompt_checkpoint  ** checkpoint,
+        int64_t                          * n_tokens) {
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
     int64_t n_tokens_best = -1;
@@ -651,15 +649,52 @@ bool server_prompt_cache::load(
         }
     }
 
-    if (it_best == states.end()) {
-        return true;
-    }
+    *checkpoint = checkpoint_best;
+    *n_tokens   = n_tokens_best;
+    return it_best;
+}
 
+bool server_prompt_cache::load(
+        server_prompt              & prompt,
+        const server_tokens        & tokens_new,
+        int64_t                      n_reuse_slot,
+        llama_context              * ctx,
+        int32_t                      id_slot,
+        common_context_seq_rm_type   seq_rm_type) {
+    server_ssd_memory_change budget_changes(ctx);
+    scan_prefix_dir();
+
+    // A cached prompt that fails to restore (a prefix cache of another state layout, a file that went) has already
+    // overwritten the slot's sequence: it goes, the slot starts empty and the next best one is taken.
+    for (;;) {
+        const server_prompt_checkpoint * checkpoint_best = nullptr;
+        int64_t n_tokens_best = -1;
+        const auto it_best = best_to_load(prompt, tokens_new, n_reuse_slot, seq_rm_type, &checkpoint_best, &n_tokens_best);
+        if (it_best == states.end()) {
+            return true;
+        }
+        if (take(it_best, checkpoint_best, n_tokens_best, prompt, ctx, id_slot)) {
+            return true;
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
+        prompt.tokens.clear();
+        prompt.checkpoints.clear();
+        n_reuse_slot = 0;
+    }
+}
+
+bool server_prompt_cache::take(
+        std::list<server_prompt>::iterator   it_best,
+        const server_prompt_checkpoint     * checkpoint_best,
+        int64_t                              n_tokens_best,
+        server_prompt                      & prompt,
+        llama_context                      * ctx,
+        int32_t                              id_slot) {
     SRV_WRN(" - found a better prompt%s%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "",
             it_best->read_only ? " (prefix cache)" : "", n_tokens_best);
 
     if (!server_prompt_restore(*it_best, checkpoint_best, ctx, id_slot)) {
-        SRV_WRN("%s", "failed to restore the cached prompt\n");
+        SRV_WRN("%s", "failed to restore the cached prompt, looking for another\n");
         remove(it_best);
         return false;
     }

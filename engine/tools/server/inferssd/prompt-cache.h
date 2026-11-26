@@ -154,6 +154,16 @@ struct server_prompt_points {
     }
 };
 
+// Whether the state a slot holds goes to the prompt cache before a new prompt that shares n_common of its n_state
+// tokens takes the slot, so that its conversation can go on from it later: when the new prompt keeps less than half of
+// it (f_keep, upstream's rule), and for a state that cannot be rolled back whenever the new prompt parts from it. Such
+// a state is kept only up to its end and its checkpoints, so the new prompt keeps none of its tail; another
+// conversation behind the same system prompt and tools keeps more than half and would let it go.
+inline bool server_prompt_save_before_switch(float f_keep, common_context_seq_rm_type seq_rm_type, int64_t n_common,
+                                             int64_t n_state) {
+    return f_keep < 0.5f || (seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL && n_common < n_state);
+}
+
 // For a memory that is checkpointed only between batches: whether a prompt batch stops after n_done of the prompt's
 // n_prompt tokens, so that a checkpoint can be taken there. It stops at the end of the shared and of the context prefix
 // and 4 tokens before the end of the prompt (the generation prompt may be rendered differently in the next turn). It
@@ -284,6 +294,15 @@ struct server_prompt_cache {
 
 private:
     friend struct server_prompt_cache_testing; // Explicit metadata-only unit fixture; no production admission shortcut.
+    // the cached prompt that lets the slot skip the most of tokens_new, if more than n_reuse_slot (end() if none),
+    // with the checkpoint it starts from (nullptr for its whole state) and the tokens it lets the slot skip
+    std::list<server_prompt>::iterator best_to_load(const server_prompt & prompt, const server_tokens & tokens_new,
+                                                    int64_t n_reuse_slot, common_context_seq_rm_type seq_rm_type,
+                                                    const server_prompt_checkpoint ** checkpoint, int64_t * n_tokens);
+    // restores the cached prompt into the slot and gives the slot its tokens and checkpoints; false (and the cached
+    // prompt removed) if it cannot be restored
+    bool take(std::list<server_prompt>::iterator it_best, const server_prompt_checkpoint * checkpoint_best,
+              int64_t n_tokens_best, server_prompt & prompt, llama_context * ctx, int32_t id_slot);
     void remove_obsolete(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     // removes the states `prompt` supersedes, except `saved`, the cache's own entry of it
     void remove_superseded(const server_prompt & prompt, const server_prompt * saved);

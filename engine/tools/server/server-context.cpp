@@ -965,10 +965,32 @@ private:
         prompt_cache->update();
     }
 
+    // Saves each slot's state in the prompt cache on disk, where a server started later finds it: the conversation a
+    // slot holds would otherwise go with the server, and the next request of it would read all of it again. A state
+    // the cache holds already is not written again.
+    void keep_states() {
+        if (!ctx || !prompt_cache || !prompt_cache->on_disk()) {
+            return;
+        }
+        bool saved = false;
+        for (server_slot & slot : slots) {
+            if (slot.prompt.n_tokens() == 0 || (slot.task && slot.task->is_child())) {
+                continue;
+            }
+            SLT_INF(slot, "keeping the slot's state of %d tokens in the prompt cache\n", slot.prompt.n_tokens());
+            slot.prompt_save(*prompt_cache);
+            saved = true;
+        }
+        if (saved) {
+            prompt_cache->update();
+        }
+    }
+
     void handle_sleeping_state(bool new_state) {
         GGML_ASSERT(sleeping != new_state);
         if (new_state) {
             SRV_INF("%s", "server is entering sleeping state\n");
+            keep_states();
             destroy();
         } else {
             SRV_INF("%s", "server is exiting sleeping state\n");
@@ -1438,8 +1460,9 @@ private:
                 SLT_INF(*ret, "selected slot by LCP similarity, sim_best = %.3f (> %.3f thold), f_keep = %.3f\n",
                         sim_best, slot_prompt_similarity, f_keep);
 
-                // if we are about to lose a large portion of the existing context - save it in the prompt cache
-                if (f_keep < 0.5f) {
+                // if we are about to lose the existing context, save it in the prompt cache
+                if (server_prompt_save_before_switch(f_keep, ret->cache_seq_rm_type,
+                        ret->prompt.tokens.get_common_prefix(task.tokens), ret->prompt.tokens.size())) {
                     update_cache = true;
                 }
             }
@@ -3807,6 +3830,10 @@ void server_context::terminate() {
 
 void server_context::finish_usage() {
     impl->finish_usage();
+}
+
+void server_context::keep_states() {
+    impl->keep_states();
 }
 
 llama_context * server_context::get_llama_context() const {
