@@ -1360,7 +1360,13 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         }
     }
     // A prompt's graphs, its later batches' too, hold the memory pools; the decode reserve below gives back the rest.
+    // From that reserve on the pools hold again: decode's steps differ in rows (a token, a draft's verification), and
+    // a pool given back to a one-row step is memory the VRAM tier grows into before the next longer step needs it.
     dense_pool_hold(active);
+    const auto decode_reserved = [&](bool ok) {
+        if (!active) { dense_pool_hold(true); }
+        return ok;
+    };
     // This is the explicit request prefill boundary, including single-token
     // prompts. Release before every early return or prefill workspace reserve.
     if (active && cpu_sink_runtime) {
@@ -1468,7 +1474,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         if (!cpu_prefill_actual_shape_active) {
             const bool reserved = !phase_changed || reserve_ubatch(1);
             const bool vram_complete = complete_vram_phase(reserved);
-            return reserved && vram_complete;
+            return decode_reserved(reserved && vram_complete);
         }
         const uint32_t released = cpu_prefill_selected_ubatch;
         const bool graph_restored = reserve_ubatch(1);
@@ -1481,12 +1487,12 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             "transition_ms=%.3f\n",
             released, graph_restored ? 1 : 0,
             (ggml_time_us() - transition_start_us) / 1000.0);
-        return graph_restored && vram_complete;
+        return decode_reserved(graph_restored && vram_complete);
     }
 
     const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
     const bool vram_complete = complete_vram_phase(reserved && !active);
-    return reserved && vram_complete;
+    return decode_reserved(reserved && vram_complete);
 }
 
 void llama_context::make_scheduler(size_t max_nodes) {
