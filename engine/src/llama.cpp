@@ -363,9 +363,30 @@ static struct llama_model * llama_model_load_from_file_impl(
         }
     }
 
+    if (params.check_tensor_split && params.tensor_split) {
+        // A tensor-parallel meta device represents all its component ordinals.
+        const size_t count = params.split_mode == LLAMA_SPLIT_MODE_TENSOR
+            ? model->get_split_state_ud.n_devices : model->devices.size();
+        for (size_t i = count; i < llama_max_devices(); ++i) {
+            if (params.tensor_split[i] > 0) {
+                LLAMA_LOG_ERROR("%s: tensor split assigns layers to an unavailable GPU\n", __func__);
+                llama_model_free(model);
+                return nullptr;
+            }
+        }
+    }
+
     for (const auto & dev : model->devices) {
         ggml_backend_dev_props props;
         ggml_backend_dev_get_props(dev.dev, &props);
+        // The CUDA-family backend reports zero capacity after a failed context or memory probe.
+        const char * reg_name = ggml_backend_reg_name(ggml_backend_dev_backend_reg(dev.dev));
+        if (props.memory_total == 0 && (strcmp(reg_name, "CUDA") == 0 || strcmp(reg_name, "ROCm") == 0 || strcmp(reg_name, "MUSA") == 0)) {
+            LLAMA_LOG_ERROR("%s: memory probe failed for selected device %s; free VRAM or exclude the device\n",
+                            __func__, props.name);
+            llama_model_free(model);
+            return nullptr;
+        }
         LLAMA_LOG_INFO("%s: using device %s (%s) (%s) - %zu MiB free\n", __func__,
                 ggml_backend_dev_name(dev.dev), ggml_backend_dev_description(dev.dev),
                 props.device_id ? props.device_id : "unknown id",

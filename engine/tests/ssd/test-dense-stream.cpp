@@ -142,7 +142,7 @@ void run() {
     backend_owner cpu_owned(ggml_backend_cpu_init(), ggml_backend_free);
     ggml_backend_t gpu = gpu_owned.get(), cpu = cpu_owned.get();
     require(gpu && cpu, "backend init failed");
-    runtime->attach_backend(gpu);
+    runtime->attach_backend(gpu, LLAMA_SPLIT_MODE_NONE);
     require(runtime->services.gpu && runtime->services.gpu_transport, "the context has no GPU transport");
     ssd::host::client_config budget;
     budget.unified = runtime->services.gpu->device_is_unified(runtime->services.gpu_device);

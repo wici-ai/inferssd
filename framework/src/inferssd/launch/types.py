@@ -6,6 +6,9 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Optional, cast
 
+# The typed server launch offloads this many positions, including the output.
+GPU_LAYERS = 99
+
 
 @dataclass(frozen=True)
 class LaunchInput:

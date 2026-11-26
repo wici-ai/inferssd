@@ -100,5 +100,7 @@ more than two backends differ, the file is kept and the new engine is added to i
 is published for it. A state computed twice on one GPU is not the same bytes either, so the comparison is by size of
 difference, not equality.
 
-The publisher can add engines to an already published legacy file when its size and SHA-256 match the existing list
-entry. It keeps the existing download and verifies the bytes it serves before writing the updated list.
+The publisher updates the entry for the requested system, model, app, app version, and file SHA-256. It can add an
+engine to an existing legacy entry when the size and SHA-256 match both that entry and the native import inventory
+in the named engine commit. Fetch the engine commits before publishing so the publisher can inspect their source.
+The publisher keeps the existing download and verifies the bytes it serves before writing the updated list.

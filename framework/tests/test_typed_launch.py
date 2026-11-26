@@ -545,6 +545,50 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     assert argv[argv.index("--prefix-cache") + 1] == str(Path(prefixes) / "model")
 
 
+def test_explicit_main_gpu_selects_one_visible_device(tmp_path):
+    inputs, spec, _, adapter, out = setup(tmp_path)
+    result = resolve(inputs, replace(spec, main_gpu=1), adapter, out)
+    assert result.code == 0
+    start = result.argv.index("--split-mode")
+    assert list(result.argv[start : start + 4]) == ["--split-mode", "none", "--main-gpu", "1"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+def test_explicit_ratios_select_layer_mode(tmp_path, platform):
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
+    template = str(Path(inputs.repo) / "engine/models/templates/muse-spark.jinja")
+    result = resolve(
+        inputs, replace(spec, template=template, tensor_split="0,2,1"), adapter, out, platform
+    )
+    start = result.argv.index("--split-mode")
+    assert list(result.argv[start : start + 4]) == [
+        "--split-mode",
+        "layer",
+        "--tensor-split",
+        "0,2,1",
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"tensor_split": "0,0"},
+        {"tensor_split": "NaN,1"},
+        {"tensor_split": "inf,0"},
+        {"tensor_split": "-1,1"},
+        {"tensor_split": "1,,2"},
+        {"tensor_split": "1,1", "main_gpu": 0},
+        {"tensor_split": "1", "split_mode": "none"},
+        {"main_gpu": -1},
+        {"main_gpu": 1, "split_mode": "layer"},
+    ],
+)
+def test_invalid_gpu_placement_is_refused(tmp_path, options):
+    inputs, spec, _, adapter, out = setup(tmp_path)
+    with pytest.raises(ValueError, match="--(main-gpu|tensor-split)"):
+        resolve(inputs, replace(spec, **options), adapter, out)
+
+
 def test_sizes_default_to_the_context_and_batch():
     assert (LaunchSpec("m", 1).context, LaunchSpec("m", 1).batch) == (None, None)
 

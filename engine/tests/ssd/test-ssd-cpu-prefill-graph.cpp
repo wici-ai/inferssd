@@ -52,8 +52,10 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     unread.resolve = [](void *, const char *, int expert, size_t bytes, int64_t, int * fd, uint64_t * offset,
             size_t * logical) noexcept { *fd = 0; *offset = uint64_t(expert) * bytes; *logical = bytes; return true; };
     const std::vector<ssd::store::expert_layout::routed_layer> routed = { { 0, { meta_roles[0], meta_roles[1], meta_roles[2] } } };
-    llama_ssd_cpu_sink_runtime runtime(1, routed, configured.value, services, unread);
-    llama_ssd_cpu_sink_runtime other_runtime(2, routed, configured.value, services, unread);
+    llama_ssd_executor_group runtime;
+    runtime.add(1, routed, configured.value, services, unread);
+    llama_ssd_executor_group other_runtime;
+    other_runtime.add(2, routed, configured.value, services, unread);
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -146,7 +148,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     if (use_sink) {
         require(output->op == GGML_OP_CUSTOM && result.cpu_sink_nodes.size() == 1, "missing CPU custom node");
         const auto & descriptor = *result.cpu_sink_nodes[0];
-        require(descriptor.runtime == &runtime && descriptor.prefill == prefill,
+        require(descriptor.runtime == &runtime.primary() && descriptor.prefill == prefill,
                 "custom node lost its context runtime or execution phase");
         require(qwen ? descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU :
                 descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
@@ -175,8 +177,18 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         require(dependencies.count(up) && dependencies.count(gate) && dependencies.count(down),
                 "legacy expert graph dependencies are missing");
     }
-    require(!runtime.sink && !runtime.prefill.context && !other_runtime.sink,
+    require(!runtime.primary().sink && !runtime.primary().prefill.context && !other_runtime.primary().sink,
             "graph construction unexpectedly initialized an executor");
+    const std::vector<ssd::store::expert_layout::routed_layer> remaining = {
+        { 1, { meta_roles[0], meta_roles[1], meta_roles[2] } },
+        { 2, { meta_roles[0], meta_roles[1], meta_roles[2] } },
+    };
+    runtime.add(1, remaining, configured.value, services, unread);
+    require(runtime.by_layer[0] != runtime.by_layer[1] && runtime.by_layer[1] == runtime.by_layer[2],
+            "a routed layer must borrow the executor that owns it");
+    require(!runtime.can_prefetch_after(0) && runtime.can_prefetch_after(1),
+            "read-ahead must stay on the owning device");
+
     std::printf("case=%s tokens=%d cpu_custom=%d nodes=%d status=PASS\n",
         label, ntokens, use_sink ? 1 : 0, ggml_graph_n_nodes(result.get_gf()));
 }

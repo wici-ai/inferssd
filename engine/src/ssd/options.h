@@ -11,6 +11,7 @@
 #include "ggml-ssd/stream/runtime.h"
 
 #include <memory>
+#include <map>
 
 struct llama_ssd_options {
     ssd::settings::snapshot settings;
@@ -21,7 +22,6 @@ struct llama_ssd_options {
     bool layer_events = true;
 };
 
-struct llama_model;
 struct llama_ssd_source_delete {
     void (*close)(void *) noexcept = nullptr;
     void operator()(void * source) const noexcept { if (source) { close(source); } }
@@ -44,7 +44,14 @@ struct llama_ssd_context {
     ssd::stream::runtime stream;
 
     explicit llama_ssd_context(const llama_ssd_options & options);
-    void attach_backend(ggml_backend_t backend);
+    struct device_binding {
+        std::unique_ptr<ssd::host::context_client> host;
+        ssd::runtime_services services;
+        std::unique_ptr<void, llama_ssd_source_delete> transport;
+    };
+    std::map<ggml_backend_dev_t, device_binding> additional_devices;
+    void attach_backend(ggml_backend_t backend, llama_split_mode mode);
+    const ssd::runtime_services & services_for(ggml_backend_dev_t device) const;
 };
 
 struct llama_ssd_host_reservation {

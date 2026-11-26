@@ -324,6 +324,7 @@ extern "C" {
                               // load into host memory, and the context moves into a discrete GPU those its memory
                               // holds (the rest streamed)
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool check_tensor_split; // reject positive split weights outside the load's selected devices
     };
 
     struct llama_sampler_seq_config {
