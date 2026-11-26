@@ -111,10 +111,19 @@ static bool ggml_mem_ranges_add_dst(ggml_mem_ranges_t mrs, const ggml_tensor * t
     return ggml_mem_ranges_add(mrs, mr);
 }
 
+// a source the op writes in place: the planes of ggml_gated_delta_net_planes
+static bool ggml_mem_ranges_src_written(const ggml_tensor * tensor, int i) {
+    return tensor->op == GGML_OP_GATED_DELTA_NET && i == 6;
+}
+
 bool ggml_mem_ranges_add(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i]) {
-            ggml_mem_ranges_add_src(mrs, tensor->src[i]);
+            if (ggml_mem_ranges_src_written(tensor, i)) {
+                ggml_mem_ranges_add_dst(mrs, tensor->src[i]);
+            } else {
+                ggml_mem_ranges_add_src(mrs, tensor->src[i]);
+            }
         }
     }
 
@@ -175,7 +184,9 @@ static bool ggml_mem_ranges_check_dst(ggml_mem_ranges_t mrs, const ggml_tensor *
 bool ggml_mem_ranges_check(ggml_mem_ranges_t mrs, const ggml_tensor * tensor) {
     for (int i = 0; i < GGML_MAX_SRC; i++) {
         if (tensor->src[i]) {
-            if (!ggml_mem_ranges_check_src(mrs, tensor->src[i])) {
+            const bool ok = ggml_mem_ranges_src_written(tensor, i) ?
+                ggml_mem_ranges_check_dst(mrs, tensor->src[i]) : ggml_mem_ranges_check_src(mrs, tensor->src[i]);
+            if (!ok) {
                 return false;
             }
         }
@@ -211,7 +222,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     const auto & h_add = [](ggml_mem_ranges_t mrs, const node_info & node) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (node.node->src[i]) {
-                if (!ggml_mem_ranges_add_src(mrs, node.node->src[i])) {
+                const bool ok = ggml_mem_ranges_src_written(node.node, i) ?
+                    ggml_mem_ranges_add_dst(mrs, node.node->src[i]) : ggml_mem_ranges_add_src(mrs, node.node->src[i]);
+                if (!ok) {
                     return false;
                 }
             }
@@ -235,7 +248,9 @@ static std::vector<int> ggml_metal_graph_optimize_reorder(const std::vector<node
     const auto & h_check = [](ggml_mem_ranges_t mrs, const node_info & node) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             if (node.node->src[i]) {
-                if (!ggml_mem_ranges_check_src(mrs, node.node->src[i])) {
+                const bool ok = ggml_mem_ranges_src_written(node.node, i) ?
+                    ggml_mem_ranges_check_dst(mrs, node.node->src[i]) : ggml_mem_ranges_check_src(mrs, node.node->src[i]);
+                if (!ok) {
                     return false;
                 }
             }

@@ -1,6 +1,8 @@
 #include "gated_delta_net.cuh"
 
-template <int S_v, bool KDA, bool keep_rs_t>
+// planes_t: the state after token t into plane n_tokens - 1 - t of `planes` (strides sp1 from a plane to the next, sp2
+// from a sequence to the next, in floats), and dst holds the attention output alone
+template <int S_v, bool KDA, bool planes_t>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -26,7 +28,9 @@ gated_delta_net_cuda(const float * q,
                                      const uint3   neqk1_magic,
                                      const uint3   rq3_magic,
                                      float         scale,
-                                     int           K) {
+                                     float *       planes,
+                                     int64_t       sp1,
+                                     int64_t       sp2) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -40,14 +44,10 @@ gated_delta_net_cuda(const float * q,
     float *       attn_data        = dst;
     float *       state            = dst + attn_score_elems;
 
-    // input state layout (D, K, n_seqs) — seq stride is K * D = K * H * S_v * S_v. A launch after the first starts
-    // from a slot of the output instead (per-slot D * n_seqs), whose seq stride is D.
-    // output state layout (per-slot D * n_seqs) — same per-(seq,head) offset as before.
-    const int64_t K_in                 = keep_rs_t && t_begin == 0 ? K : 1;
-    const int64_t state_in_offset      = (sequence * K_in * H + h_idx) * S_v * S_v;
-    const int64_t state_out_offset     = (sequence * H + h_idx) * S_v * S_v;
-    state += state_out_offset;
-    curr_state += state_in_offset + col * S_v;
+    const int64_t state_offset = (sequence * H + h_idx) * S_v * S_v;
+    state += state_offset;
+    // with planes, a launch after the first starts from the plane of the token before it
+    curr_state += (planes_t && t_begin > 0 ? sequence * sp2 + h_idx * S_v * S_v : state_offset) + col * S_v;
     attn_data += (sequence * n_tokens * H + h_idx) * S_v + t_begin * S_v * H;
 
     constexpr int warp_size = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
@@ -61,10 +61,6 @@ gated_delta_net_cuda(const float * q,
         const int i = r * warp_size + lane;
         s_shard[r]  = curr_state[i];
     }
-
-    // slot mapping: target_slot = t - shift. When n_tokens < K only the last n_tokens slots
-    // are written; earlier slots are left untouched (caller-owned).
-    const int shift = (int) n_tokens - K;
 
     for (int t = (int) t_begin; t < (int) t_end; t++) {
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
@@ -148,23 +144,18 @@ gated_delta_net_cuda(const float * q,
 
         attn_data += S_v * H;
 
-        if constexpr (keep_rs_t) {
-            const int target_slot = t - shift;
-            if (target_slot >= 0 && target_slot < K) {
-                const int64_t state_size_per_token = S_v * S_v * H * n_seqs; // per-slot stride in output
-                float * slot_state = (dst + attn_score_elems) + target_slot * state_size_per_token + state_out_offset;
+        if constexpr (planes_t) {
+            float * plane = planes + (n_tokens - 1 - t) * sp1 + sequence * sp2 + h_idx * S_v * S_v + col * S_v;
 #pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    slot_state[col * S_v + i] = s_shard[r];
-                }
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                plane[i]    = s_shard[r];
             }
         }
     }
 
-    // Write state back to global memory (transposed layout): K == 1 the final state; K > 1 a launch whose last token
-    // no slot keeps leaves its state in slot 0 for the next launch (a later token's snapshot overwrites it)
-    if (!keep_rs_t || (int) t_end - 1 < shift) {
+    if constexpr (!planes_t) {
+        // Write state back to global memory (transposed layout)
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i          = r * warp_size + lane;
@@ -173,7 +164,7 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
-template <bool KDA, bool keep_rs_t>
+template <bool KDA, bool planes_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
         const float * g_d, const float * b_d, const float * s_d,
@@ -183,7 +174,7 @@ static void launch_gated_delta_net(
         int64_t sv1,   int64_t sv2, int64_t sv3,
         int64_t sb1,   int64_t sb2, int64_t sb3,
         int64_t neqk1, int64_t rq3,
-        float scale, int K, cudaStream_t stream) {
+        float scale, float * planes_d, int64_t sp1, int64_t sp2, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
@@ -196,38 +187,36 @@ static void launch_gated_delta_net(
     int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
 
     // at most GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH tokens a launch; a launch after the first starts from the state
-    // the one before wrote to dst, which the stream orders before it: the slot of its last token (slot 0 when no slot
-    // keeps that token, and always with K == 1)
+    // the one before wrote to dst (with planes, to the plane of its last token), which the stream orders before it
     const int64_t chunk = GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH;
     for (int64_t t0 = 0; t0 < n_tokens; t0 += chunk) {
-        const int64_t t1        = std::min(t0 + chunk, n_tokens);
-        const int64_t slot_prev = keep_rs_t ? std::max<int64_t>(t0 - 1 - (n_tokens - K), 0) : 0;
-        const float * state_d   = t0 == 0 ? s_d : dst_d + S_v * H * n_tokens * n_seqs + slot_prev * S_v * S_v * H * n_seqs;
+        const int64_t t1      = std::min(t0 + chunk, n_tokens);
+        const float * state_d = t0 == 0 ? s_d : planes_t ? planes_d + (n_tokens - t0) * sp1 : dst_d + S_v * H * n_tokens * n_seqs;
         switch (S_v) {
             case 16:
-                gated_delta_net_cuda<16, KDA, keep_rs_t><<<grid_dims, block_dims, 0, stream>>>(
+                gated_delta_net_cuda<16, KDA, planes_t><<<grid_dims, block_dims, 0, stream>>>(
                     q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
                     n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, planes_d, sp1, sp2);
                 break;
             case 32:
-                gated_delta_net_cuda<32, KDA, keep_rs_t><<<grid_dims, block_dims, 0, stream>>>(
+                gated_delta_net_cuda<32, KDA, planes_t><<<grid_dims, block_dims, 0, stream>>>(
                     q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
                     n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, planes_d, sp1, sp2);
                 break;
             case 64: {
-                gated_delta_net_cuda<64, KDA, keep_rs_t><<<grid_dims, block_dims, 0, stream>>>(
+                gated_delta_net_cuda<64, KDA, planes_t><<<grid_dims, block_dims, 0, stream>>>(
                     q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
                     n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, planes_d, sp1, sp2);
                 break;
             }
             case 128: {
-                gated_delta_net_cuda<128, KDA, keep_rs_t><<<grid_dims, block_dims, 0, stream>>>(
+                gated_delta_net_cuda<128, KDA, planes_t><<<grid_dims, block_dims, 0, stream>>>(
                     q_d, k_d, v_d, g_d, b_d, state_d, dst_d, H,
                     n_tokens, t0, t1, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, K);
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, planes_d, sp1, sp2);
                 break;
             }
             default:
@@ -298,29 +287,31 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 
     cudaStream_t stream = ctx.stream();
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int  K       = (int) src_state->ne[1];
-    const bool keep_rs = K > 1;
+    // the state after each token into the planes, if given (ggml_gated_delta_net_planes)
+    ggml_tensor * planes   = dst->src[6];
+    float *       planes_d = planes ? (float *) planes->data : nullptr;
+    const int64_t sp1      = planes ? planes->nb[1] / sizeof(float) : 0;
+    const int64_t sp2      = planes ? planes->nb[2] / sizeof(float) : 0;
 
     if (kda) {
-        if (keep_rs) {
+        if (planes) {
             launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, planes_d, sp1, sp2, stream);
         } else {
             launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, planes_d, sp1, sp2, stream);
         }
     } else {
-        if (keep_rs) {
+        if (planes) {
             launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, planes_d, sp1, sp2, stream);
         } else {
             launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d,
                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
-                sb1, sb2, sb3, neqk1, rq3, scale, K, stream);
+                sb1, sb2, sb3, neqk1, rq3, scale, planes_d, sp1, sp2, stream);
         }
     }
 }

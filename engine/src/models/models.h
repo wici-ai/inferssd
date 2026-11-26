@@ -55,7 +55,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * s,
                 int           il);
 
-    // use the ggml_gated_delta_net fused operator (K=1; state has shape (D, 1, n_seqs))
+    // use the ggml_gated_delta_net fused operator
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_fused(
                 ggml_tensor * q,
                 ggml_tensor * k,
@@ -88,10 +88,11 @@ struct llm_build_delta_net_base : public llm_graph_context {
                    int64_t   state_cols,
                    int64_t   channels) const;
 
-    // One ggml_gated_delta_net call with a snapshot slot per token (K = n), the states after the earlier tokens into
-    // planes 1 .. n - 1 of `states_all`; the caller writes plane 0. The op runs each token as a one-token call of it
-    // does, so its outputs and states are those of the fused one-token decode, bit for bit. A verification takes the
-    // op even where multi-token ubatches take build_delta_net_chunking, which keeps no per-token states.
+    // The states after the ubatch's tokens into planes n - 1 .. 0 of `states_all` (plane j: j tokens back from its
+    // end), written in place by one ggml_gated_delta_net_planes call, which runs each token as a one-token call of the
+    // op does: the output, and no new state (nullptr), as the planes hold it. Where the op cannot write the cache in
+    // place, build_delta_net one token at a time with the states after the earlier tokens copied into planes
+    // 1 .. n - 1, the new state returned for the caller to write into plane 0.
     std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_planes(
         llm_graph_input_rs * inp,
                ggml_tensor * states_all,

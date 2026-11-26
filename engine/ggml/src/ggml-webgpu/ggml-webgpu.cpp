@@ -4050,8 +4050,8 @@ static bool ggml_backend_webgpu_device_supports_op(ggml_backend_dev_t dev, const
                               src2->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                               op->src[4]->type == GGML_TYPE_F32 && op->src[5]->type == GGML_TYPE_F32 &&
                               s_v <= ctx->webgpu_global_ctx->capabilities.limits.maxComputeInvocationsPerWorkgroup &&
-                              // the shader writes the final state only, no snapshot slots (state->ne[1] > 1)
-                              op->src[5]->ne[1] == 1;
+                              // the shader does not write the planes of ggml_gated_delta_net_planes
+                              op->src[6] == nullptr;
             }
             break;
         case GGML_OP_CLAMP:

@@ -2531,7 +2531,9 @@ kernel void kernel_rwkv_wkv7_f32(
 
 constant short FC_gated_delta_net_ne20 [[function_constant(FC_GATED_DELTA_NET + 0)]];
 constant short FC_gated_delta_net_ne30 [[function_constant(FC_GATED_DELTA_NET + 1)]];
-constant short FC_gated_delta_net_K    [[function_constant(FC_GATED_DELTA_NET + 2)]];
+// ggml_gated_delta_net_planes: the state after token t into plane ne22 - 1 - t of `planes`, and dst holds the attention
+// output alone
+constant bool  FC_gated_delta_net_planes [[function_constant(FC_GATED_DELTA_NET + 2)]];
 
 #if 1
 template<short NSG>
@@ -2544,31 +2546,31 @@ kernel void kernel_gated_delta_net_impl(
         device const char * b,
         device const char * s,
         device       char * dst,
+        device       char * planes,
         uint3 tgpig[[threadgroup_position_in_grid]],
         uint3 tpitg[[thread_position_in_threadgroup]],
         uint3   ntg[[threads_per_threadgroup]])  {
 #define S_v FC_gated_delta_net_ne20
 #define G   FC_gated_delta_net_ne30
-#define K   FC_gated_delta_net_K
+#define PLANES FC_gated_delta_net_planes
 
     const uint tx = tpitg.x;
     const uint ty = tpitg.y;
 
-    const uint i23 = tgpig.z; // B (n_seqs)
-    const uint i21 = tgpig.y; // H (head)
-    const uint i20 = tgpig.x*NSG + ty; // row within S_v
+    const uint i23 = tgpig.z; // B
+    const uint i21 = tgpig.y; // H
+    const uint i20 = tgpig.x*NSG + ty;
 
     const uint i01 = i21 % args.ne01;
     const uint i11 = i21 % args.ne11;
 
     const float scale = 1.0f / sqrt((float)S_v);
 
-    // input state layout (D, K, n_seqs): per-seq stride is K*H*D; we read slot 0. A dispatch after the first reads
-    // a slot of dst instead, whose per-seq stride is H*D.
-    const uint ks = args.t0 == 0 ? (uint) K : 1u;
-
     // state is stored transposed: M[i20][is] = S[is][i20], so row i20 is contiguous
-    device const float * s_ptr = (device const float *) (s) + (i23*ks*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    // (with planes, a dispatch after the first starts from the plane of the token before it, `s` here)
+    device const float * s_ptr = PLANES && args.t0 > 0 ?
+        (device const float *) (s + i23*args.nbp2) + i21*S_v*S_v + i20*S_v :
+        (device const float *) (s) + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
     float ls[NSG];
 
@@ -2591,10 +2593,6 @@ kernel void kernel_gated_delta_net_impl(
     v_ptr += args.t0*args.ns22;
     b_ptr += args.t0*args.ne21;
     g_ptr += args.t0*args.ne21*G;
-
-    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K, only the last
-    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
-    const int shift = (int)args.ne22 - (int)K;
 
     for (int t = args.t0; t < args.t1; t++) {
         float s_k = 0.0f;
@@ -2644,26 +2642,20 @@ kernel void kernel_gated_delta_net_impl(
         b_ptr += args.ne21;
         g_ptr += args.ne21*G;
 
-        if (K > 1) {
-            const int target_slot = t - shift;
-            if (target_slot >= 0 && target_slot < (int)K) {
-                // output state per-slot size: S_v * S_v * H * n_seqs
-                const uint state_size_per_snap = S_v*S_v*args.ne21*args.ne23;
-                device float * dst_slot = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v +
-                    (uint)target_slot*state_size_per_snap + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
-                FOR_UNROLL (short j = 0; j < NSG; j++) {
-                    const short is = tx*NSG + j;
-                    dst_slot[is] = ls[j];
-                }
+        if (PLANES) {
+            device float * dst_plane = (device float *) (planes + (uint64_t)(args.ne22 - 1 - t)*args.nbp1 + i23*args.nbp2) +
+                i21*S_v*S_v + i20*S_v;
+
+            FOR_UNROLL (short j = 0; j < NSG; j++) {
+                const short is = tx*NSG + j;
+                dst_plane[is] = ls[j];
             }
         }
     }
 
-    device float * dst_state = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
+    if (!PLANES) {
+        device float * dst_state = (device float *) (dst) + args.ne23*args.ne22*args.ne21*S_v + (i23*args.ne21 + i21)*S_v*S_v + i20*S_v;
 
-    // K == 1: the final state; K > 1: a dispatch whose last token no slot keeps leaves its state in slot 0 for the
-    // next dispatch (a later token's snapshot overwrites it)
-    if (K == 1 || args.t1 - 1 < shift) {
         FOR_UNROLL (short j = 0; j < NSG; j++) {
             const short is = tx*NSG + j;
             dst_state[is] = ls[j];
@@ -2672,7 +2664,7 @@ kernel void kernel_gated_delta_net_impl(
 
 #undef S_v
 #undef G
-#undef K
+#undef PLANES
 }
 
 typedef decltype(kernel_gated_delta_net_impl<4>) kernel_gated_delta_net_t;

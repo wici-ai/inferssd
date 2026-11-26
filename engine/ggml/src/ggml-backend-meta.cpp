@@ -753,19 +753,21 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
     };
 
     auto handle_gated_delta_net = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        // the planes of ggml_gated_delta_net_planes, written in place: each device writes its own copy, mirrored only
+        const bool planes = src_ss[6].axis != GGML_BACKEND_SPLIT_AXIS_NONE;
         if (src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
             src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
-            src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+            src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED && src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED &&
+            (!planes || src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED)) {
             return src_ss[0];
         }
+        GGML_ASSERT(!planes && "ggml_gated_delta_net_planes with split tensors is not supported");
         GGML_ASSERT(src_ss[0].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[1].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[2].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_1);
         GGML_ASSERT(src_ss[4].axis == GGML_BACKEND_SPLIT_AXIS_1);
-        // state shape is (S_v*S_v*H, K, n_seqs); the heads dim is nested inside axis 0,
-        // so a head-aligned split on the input cache reshapes to axis 0 here (not axis 2).
-        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1 || src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_0);
+        GGML_ASSERT(src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_2);
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, 1};
     };
 

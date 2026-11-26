@@ -5097,8 +5097,8 @@ static bool ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
             return true;
         case GGML_OP_GATED_DELTA_NET:
-            // the kernel writes the final state only, no snapshot slots (state->ne[1] > 1)
-            return op->src[5]->ne[1] == 1;
+            // the kernel does not write the planes of ggml_gated_delta_net_planes
+            return op->src[6] == nullptr;
         case GGML_OP_SSM_CONV:
             return op->type == GGML_TYPE_F32 &&
                    op->src[0]->type == GGML_TYPE_F32 &&

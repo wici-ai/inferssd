@@ -11017,6 +11017,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * planes    = dst->src[6]; // the state after token t into plane n_tokens - 1 - t, if given
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -11045,30 +11046,18 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
     const bool kda = (neg0 == S_v);
 
-    // state is 3D (S_v*S_v*H, K, n_seqs); K is the snapshot slot count.
-    const int64_t K = src_state->ne[1];
-    GGML_ASSERT(K >= 1);
-    // per-seq stride in floats (slot 0 of seq s lives at state + s * seq_stride)
-    const int64_t state_seq_stride = src_state->nb[2] / sizeof(float);
-
-    // scratch layout per thread: [delta(S_v) | state (S_v*S_v) when K > 1]
-    const int64_t scratch_per_thread = S_v + (K > 1 ? S_v * S_v : 0);
+    // scratch layout per thread: [delta(S_v)]
+    const int64_t scratch_per_thread = S_v;
     const int ith = params->ith;
 
-    float * delta      = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
-    float * state_work = K > 1 ? delta + S_v : nullptr;
+    float * delta = (float *)params->wdata + ith * scratch_per_thread + CACHE_LINE_SIZE_F32;
 
     // output layout: [attn_scores | new_states]
-    // attn_scores: S_v * H * n_tokens * n_seqs     floats
-    // new_states:  S_v * S_v * H * n_seqs * K      floats (K snapshot slots; the last min(n_tokens, K))
-    const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
-    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+    // attn_scores: S_v * H * n_tokens * n_seqs floats
+    // new_states:  S_v * S_v * H * n_seqs floats
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
     float * attn_out_base  = (float *)dst->data;
     float * state_out_base = (float *)dst->data + attn_score_elems;
-
-    // snapshot slot mapping: target_slot = t - shift. When n_tokens < K only the last
-    // n_tokens slots are written; earlier slots are left untouched (caller-owned).
-    const int64_t shift = n_tokens - K;
 
     const float * state_in_base = (const float *)src_state->data;
 
@@ -11089,15 +11078,16 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        // For K=1, write directly to the single output slot to avoid an extra memcpy at the end.
-        // For K>1, work in scratch and copy out per-token when the slot is in range.
-        float * s_out = K > 1
-            ? state_work
-            : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        // the state of head iv1 of sequence iv3 in plane p
+        const auto plane = [&](int64_t p) {
+            return (float *) ((char *) planes->data + p * planes->nb[1] + iv3 * planes->nb[2]) + iv1 * S_v * S_v;
+        };
 
-        // copy input state into the working buffer and operate in-place
-        // state layout (D, K, n_seqs): slot 0 of seq iv3 starts at iv3 * state_seq_stride.
-        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        // with planes, each token's plane, the first token's here
+        float * s_out = planes ? plane(n_tokens - 1) : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+
+        // copy input state into output buffer and operate in-place
+        const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
         memcpy(s_out, s_in, S_v * S_v * sizeof(float));
 
         // attn output pointer for first token of this (head, seq)
@@ -11110,6 +11100,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+
+            if (planes && t > 0) {
+                // the token updates the state in its own plane, from the state of the token before
+                float * s_t = plane(n_tokens - 1 - t);
+                memcpy(s_t, s_out, S_v * S_v * sizeof(float));
+                s_out = s_t;
+            }
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)
@@ -11147,15 +11144,6 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
             }
 
             attn_data += S_v * H; // advance to next token
-
-            if (K > 1) {
-                const int64_t target_slot = t - shift;
-                if (target_slot >= 0 && target_slot < K) {
-                    float * curr_state_o = state_out_base + target_slot * state_size_per_snap +
-                                           (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(curr_state_o, s_out, S_v * S_v * sizeof(float));
-                }
-            }
         }
     }
 }
