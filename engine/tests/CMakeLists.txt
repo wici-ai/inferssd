@@ -808,6 +808,12 @@ if (LLAMA_LLGUIDANCE)
 endif ()
 
 if (LLAMA_BUILD_TOOLS AND LLAMA_BUILD_SERVER AND NOT EMSCRIPTEN)
+    llama_build_and_test(ssd/test-server-prompt-cache-cancel.cpp)
+    target_include_directories(test-server-prompt-cache-cancel PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
+    target_link_libraries(test-server-prompt-cache-cancel PRIVATE server-context)
+    set_tests_properties(test-server-prompt-cache-cancel PROPERTIES TIMEOUT 60)
+    inferssd_ci_test(test-server-prompt-cache-cancel test-server-prompt-cache-cancel)
+
     llama_build_and_test(ssd/test-server-response-reader.cpp)
     target_include_directories(test-server-response-reader PRIVATE ${PROJECT_SOURCE_DIR}/tools/server)
     target_link_libraries(test-server-response-reader PRIVATE server-context)
