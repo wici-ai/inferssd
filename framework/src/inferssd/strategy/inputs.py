@@ -437,7 +437,8 @@ class RuntimeFacts:
     # on Windows the available physical memory. None when it cannot be read.
     # The engine sizes its caches from its own reading at run time.
     available_bytes: Optional[int]
-    memory_budget_bytes: Optional[int] = None  # the user's memory budget, when given
+    # The user's memory budget, when given: at most this much host memory is used or planned with.
+    memory_budget_bytes: Optional[int] = None
     # The GPU backends of the engine the launch starts, as its build names them; None when
     # unknown, and then taken to be the backends of the machine's GPUs (engine_gpu_backends).
     # Set by the launch, not recorded with the facts above.
@@ -680,6 +681,30 @@ def _nvidia(
     return tuple(GPUState(uuid, memory[uuid], busy[uuid]) for _, uuid in chosen), order
 
 
+def _cgroup_limits(host: identity.Host) -> list[tuple[str, int]]:
+    """This process's cgroup v2 directory and its ancestors that have a finite memory.max,
+    innermost first, with that limit."""
+    try:
+        line = next(
+            (row for row in host.text("/proc/self/cgroup").splitlines() if row.startswith("0::")),
+            None,
+        )
+    except OSError:
+        return []
+    if line is None:
+        return []
+    path = line[3:].strip().rstrip("/")
+    limits = []
+    while True:
+        base = "/sys/fs/cgroup" + path
+        limit = identity.read(host, base + "/memory.max")
+        if limit and limit.isdigit():
+            limits.append((base, int(limit)))
+        if not path:
+            return limits
+        path = path.rsplit("/", 1)[0]
+
+
 def _cgroup_room(host: Host) -> tuple[bool, Optional[int]]:
     """Whether the cgroup v2 limits could be read, and the room the tightest one leaves.
 
@@ -688,33 +713,27 @@ def _cgroup_room(host: Host) -> tuple[bool, Optional[int]]:
     memory.stat) counts as reclaimable, as the engine's host ledger counts it.
     A bounded level without memory.current or memory.stat gives no reading.
     """
-    try:
-        line = next(
-            (row for row in host.text("/proc/self/cgroup").splitlines() if row.startswith("0::")),
-            None,
-        )
-    except OSError:
-        return True, None
-    if line is None:
-        return True, None
-    path = line[3:].strip().rstrip("/")
     room: Optional[int] = None
-    while True:
-        base = "/sys/fs/cgroup" + path
-        limit = identity.read(host, base + "/memory.max")
-        if limit and limit.isdigit():
-            used = identity.read(host, base + "/memory.current")
-            stat = identity.read(host, base + "/memory.stat")
-            fields = dict(row.split(None, 1) for row in (stat or "").splitlines() if " " in row)
-            file = [fields.get(name, "").strip() for name in ("active_file", "inactive_file")]
-            if not used or not used.isdigit() or not all(value.isdigit() for value in file):
-                return False, None
-            anonymous = max(0, int(used) - sum(int(value) for value in file))
-            value = max(0, int(limit) - anonymous)
-            room = value if room is None else min(room, value)
-        if not path:
-            return True, room
-        path = path.rsplit("/", 1)[0]
+    for base, limit in _cgroup_limits(host):
+        used = identity.read(host, base + "/memory.current")
+        stat = identity.read(host, base + "/memory.stat")
+        fields = dict(row.split(None, 1) for row in (stat or "").splitlines() if " " in row)
+        file = [fields.get(name, "").strip() for name in ("active_file", "inactive_file")]
+        if not used or not used.isdigit() or not all(value.isdigit() for value in file):
+            return False, None
+        anonymous = max(0, int(used) - sum(int(value) for value in file))
+        value = max(0, limit - anonymous)
+        room = value if room is None else min(room, value)
+    return True, room
+
+
+def memory_limit_bytes(host: identity.Host) -> Optional[int]:
+    """The most host memory this process can be given whatever else runs: on Linux the tightest
+    cgroup v2 memory.max of its cgroup and every ancestor; None without a bounded level, and
+    elsewhere."""
+    if host.platform() != "linux":
+        return None
+    return min((limit for _, limit in _cgroup_limits(host)), default=None)
 
 
 def _available(host: Host, system: str) -> Optional[int]:

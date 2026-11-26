@@ -48,7 +48,13 @@ from inferssd.strategy.estimate import (
     dense_decode_estimate,
     host_memory_bytes,
 )
-from inferssd.strategy.inputs import ModelFacts, RuntimeFacts, facts_from_engine, read_runtime
+from inferssd.strategy.inputs import (
+    ModelFacts,
+    RuntimeFacts,
+    facts_from_engine,
+    memory_limit_bytes,
+    read_runtime,
+)
 from inferssd.strategy.kernels import expert_format_refusal
 from inferssd.strategy.weights import DenseWeights, dense_weights
 
@@ -346,13 +352,17 @@ def estimates(
 
 def memory_line(value: Characteristics, facts: RuntimeFacts) -> str:
     """The host memory the estimates plan with and where that amount comes from."""
-    if facts.memory_budget_bytes is not None:
+    memory = host_memory_bytes(value, facts)
+    asked = facts.memory_budget_bytes
+    if asked is not None and memory < asked:
+        source = f"--memory-gib asked for {_gib(asked)}, more than a process can have here"
+    elif asked is not None:
         source = "--memory-gib"
     elif facts.available_bytes is not None:
         source = "available now; --memory-gib sets another amount"
     else:
         source = "installed; --memory-gib sets another amount"
-    return f"estimate memory: {_gib(host_memory_bytes(value, facts))} ({source})"
+    return f"estimate memory: {_gib(memory)} ({source})"
 
 
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
@@ -447,13 +457,6 @@ def run(
         number = getattr(args, name)
         if number is not None and (not math.isfinite(number) or number < 0):
             raise ValueError(f"--{name.replace('_', '-')} must be finite and nonnegative")
-    original_runtime = runtime
-    if args.memory_gib is not None:
-
-        def budget_runtime() -> RuntimeFacts:
-            return replace(original_runtime(), memory_budget_bytes=int(args.memory_gib * GIB))
-
-        runtime = budget_runtime
     host = host or NativeHost()
     path = args.output or default_path(host.platform(), environ, home)
     paths = [str(model) for model in args.model]
@@ -506,10 +509,20 @@ def run(
                 facts.dense_bytes - read_bytes,
             )
 
+    # --memory-gib replaces the reading of the memory available now with the amount asked for and
+    # is the budget. A bounded cgroup never gives a launch more than its limit, so the amount stays
+    # within that limit, as it stays within the installed memory.
+    asked = planned = None if args.memory_gib is None else int(args.memory_gib * GIB)
+    limit = None if asked is None else memory_limit_bytes(host)
+    if asked is not None and limit is not None:
+        planned = min(asked, limit)
+
     # Placement uses the GPU backends of the engine the estimate is for, as a launch does, so a
     # CPU-only engine gets a host estimate even where the profile holds GPU measurements.
     def estimate_runtime() -> RuntimeFacts:
         facts = runtime()
+        if asked is not None:
+            facts = replace(facts, available_bytes=planned, memory_budget_bytes=asked)
         return facts if backends is None else replace(facts, gpu_backends=backends)
 
     def output(value: Characteristics, drive_key: Optional[str]) -> None:

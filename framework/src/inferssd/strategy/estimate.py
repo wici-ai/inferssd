@@ -85,18 +85,13 @@ def headroom_bytes(characteristics: Characteristics, runtime: RuntimeFacts, plat
 
 
 def host_memory_bytes(characteristics: Characteristics, runtime: RuntimeFacts) -> int:
-    """Host memory an estimate plans with, at most the installed memory.
-
-    A memory budget is the amount to estimate for and replaces the reading of what is
-    available now: the estimate then answers for that much memory, more or less than the
-    host has free at the moment. Without a budget it is the available memory, or the
-    installed memory when that is not known.
-    """
+    """Host memory an estimate plans with: the available memory, or the installed memory when
+    that is not known, within the memory budget and the installed memory."""
     total = characteristics["memory"]["total_bytes"]
-    memory = runtime.memory_budget_bytes
-    if memory is None:
-        memory = runtime.available_bytes
-    return total if memory is None else min(memory, total)
+    memory = total if runtime.available_bytes is None else min(runtime.available_bytes, total)
+    if runtime.memory_budget_bytes is not None:
+        memory = min(memory, runtime.memory_budget_bytes)
+    return memory
 
 
 def matvec_rate(

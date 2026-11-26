@@ -30,6 +30,7 @@ from inferssd.strategy.inputs import (
     Role,
     RuntimeFacts,
     facts_from_engine,
+    memory_limit_bytes,
     model_drive_key,
     model_facts_from,
     model_facts_json,
@@ -466,6 +467,17 @@ def test_cgroup_room_counts_file_cache_and_needs_memory_stat(tmp_path):
     # A bounded level without memory.stat gives no reading.
     (tmp_path / "sys/fs/cgroup/user.slice/run.scope/memory.stat").unlink()
     assert read_runtime(host=RuntimeHost(tmp_path, affinity=(0,))).available_bytes is None
+
+
+def test_memory_limit_is_the_tightest_cgroup_memory_max(tmp_path):
+    linux_runtime(tmp_path)
+    host = RuntimeHost(tmp_path, affinity=(0,))
+    assert memory_limit_bytes(host) == 40 << 30
+    write(tmp_path, "/sys/fs/cgroup/user.slice/run.scope/memory.max", f"{8 << 30}\n")
+    assert memory_limit_bytes(host) == 8 << 30
+    (tmp_path / "proc/self/cgroup").unlink()
+    assert memory_limit_bytes(host) is None
+    assert memory_limit_bytes(RuntimeHost(tmp_path, system="darwin")) is None
 
 
 def test_linux_runtime_respects_cuda_visible_devices(tmp_path):

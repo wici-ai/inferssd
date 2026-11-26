@@ -56,7 +56,8 @@ them, the estimator checks the build cache beside its binary. With no engine or 
 information, the saved machine GPU inventory and live availability determine placement.
 The command prints one progress line per step on stderr and one summary line per
 section on stdout, with `--model` the host memory the estimates plan with and
-one estimate line per supported model, then
+one estimate line per supported model (with `--estimate-gguf` or
+`--estimate-facts`, the memory line and one line for that target), then
 names the sections of this run that are partial or failed (on stderr with
 `--json`). It exits with status 1 when a section measured in this run failed
 (the file is still saved, with the reason recorded), and with status 2 on a
@@ -248,8 +249,10 @@ cache coverage. The reported range adds I/O overlap and the measured timing
 spread, without assigning probabilities. `--memory-gib`, `--host-work-mib` and
 `--gpu-work-mib` set available host memory and known working allocations.
 An estimate plans with the memory available when it is made. `--memory-gib`
-replaces that reading with the amount given, up to the installed memory. The
-`estimate memory` line names the amount used.
+replaces that reading with the amount given, up to the installed memory and, on
+Linux, the tightest cgroup `memory.max` above the process, since a launch never
+gets more. The `estimate memory` line names the amount used. GPU memory is
+still the free memory read when the estimate is made.
 An explicit target is estimated where a launch runs it as its header describes it: a
 decoder needs no model profile; separated routed experts need one, a layout the SSD
 path runs and expert formats its CPU executor computes. GPU placement follows the GPU

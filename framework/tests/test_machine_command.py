@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from test_decode_profiling import setup as gpu_machine
-from test_machine_identity import FakeHost, linux_tree, nvme_key
+from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
 from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts, moe
@@ -308,7 +308,10 @@ def test_memory_gib_sets_the_memory_the_estimates_plan_with(tmp_path):
     assert asked[1:] != now[1:]
     # A smaller amount still lowers it, and no amount exceeds the installed memory.
     assert shown(["--memory-gib", "1"], busy)[0] == "estimate memory: 1.0 GiB (--memory-gib)"
-    assert shown(["--memory-gib", "64"], busy)[0] == "estimate memory: 31.2 GiB (--memory-gib)"
+    assert shown(["--memory-gib", "64"], busy)[0] == (
+        "estimate memory: 31.2 GiB (--memory-gib asked for 64.0 GiB, more than a process can have "
+        "here)"
+    )
     code, out, _ = execute(
         [*show, "--json", "--memory-gib", "16"], host, FakeRunner({}), tmp_path, runtime=busy
     )
@@ -316,6 +319,29 @@ def test_memory_gib_sets_the_memory_the_estimates_plan_with(tmp_path):
         row["components"].get("memory_budget_bytes") for row in json.loads(out[0])["estimates"]
     }
     assert code == 0 and planned - {None} == {16.0 * GIB}
+
+
+def test_memory_gib_stays_within_the_cgroup_limit(tmp_path):
+    host, files, build = machine(tmp_path)
+    execute(["--model", files[0], "--build", str(build)], host, FakeRunner(replies()), tmp_path)
+    # The installed memory is 31.2 GiB, but no launch in this cgroup gets more than 8.
+    write(host.root, "/proc/self/cgroup", "0::/box.scope\n")
+    write(host.root, "/sys/fs/cgroup/memory.max", "max\n")
+    write(host.root, "/sys/fs/cgroup/box.scope/memory.max", f"{8 * GIB}\n")
+
+    def shown(argv, runtime):
+        argv = ["--show", "--model", files[0], *argv]
+        code, out, _ = execute(argv, host, FakeRunner({}), tmp_path, runtime=runtime)
+        assert code == 0
+        return [line for line in out if line.startswith("estimate")]
+
+    asked = shown(["--memory-gib", "16"], replace(RUNTIME, available_bytes=2 * GIB))
+    assert asked[0] == (
+        "estimate memory: 8.0 GiB (--memory-gib asked for 16.0 GiB, more than a process can have "
+        "here)"
+    )
+    assert asked[1:] == shown([], replace(RUNTIME, available_bytes=8 * GIB))[1:]
+    assert shown(["--memory-gib", "4"], RUNTIME)[0] == "estimate memory: 4.0 GiB (--memory-gib)"
 
 
 def test_show_measures_nothing(tmp_path):
