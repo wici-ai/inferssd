@@ -182,8 +182,8 @@ extern "C" {
     GGML_API const char *                  ggml_backend_dev_description(ggml_backend_dev_t device);
     GGML_API void                          ggml_backend_dev_memory(ggml_backend_dev_t device, size_t * free, size_t * total);
     GGML_API enum ggml_backend_dev_type    ggml_backend_dev_type(ggml_backend_dev_t device);
-    // Bound a physical prefill batch by the participating device(s).
-    GGML_API uint32_t                      ggml_backend_dev_prefill_ubatch(ggml_backend_dev_t device, uint32_t configured);
+    // Bound a prefill retry after graph reservation fails, using the participating devices.
+    GGML_API uint32_t                      ggml_backend_dev_prefill_retry_ubatch(ggml_backend_dev_t device, uint32_t configured);
     GGML_API void                          ggml_backend_dev_get_props(ggml_backend_dev_t device, struct ggml_backend_dev_props * props);
     GGML_API ggml_backend_reg_t            ggml_backend_dev_backend_reg(ggml_backend_dev_t device);
     GGML_API ggml_backend_t                ggml_backend_dev_init(ggml_backend_dev_t device, const char * params);
@@ -206,8 +206,8 @@ extern "C" {
 
     // Common functions that may be obtained using ggml_backend_reg_get_proc_address
 
-    // "ggml_backend_dev_max_prefill_ubatch": zero means no device limit.
-    typedef uint32_t (*ggml_backend_dev_max_prefill_ubatch_t)(ggml_backend_dev_t device);
+    // "ggml_backend_dev_max_prefill_retry_ubatch": zero means no device limit.
+    typedef uint32_t (*ggml_backend_dev_max_prefill_retry_ubatch_t)(ggml_backend_dev_t device);
 
     // Context management and operations for faster communication between backends, used for tensor parallelism (meta backend)
     typedef void * (*ggml_backend_comm_init_t)(ggml_backend_t * backends, size_t n_backends);

@@ -737,14 +737,14 @@ def derive(
                 "RAM cache do not hold"
             )
     # Request one pass: a pass reads every expert it routes to once, whatever computes it.
-    # The engine limits the physical batch to what the device can execute and the graph can
-    # reserve, and the expert caches give back what it needs. A model without routed experts reads
+    # If the prompt's graph cannot be reserved, the engine retries with a smaller physical batch.
+    # The expert caches give back what it needs. A model without routed experts reads
     # none of its weights a pass, and keeps the launch's batch sizes.
     if experts is not None:
         notes.append(
             "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
-            "expert it routes to once. The engine can split the prompt to meet device or memory "
-            "limits."
+            "expert it routes to once. If graph reservation fails, the engine retries with a "
+            "smaller batch."
         )
     else:
         notes.append(

@@ -16685,8 +16685,8 @@ static size_t ggml_backend_vk_buffer_get_committed(ggml_backend_buffer_t buffer)
 }
 
 #ifdef _WIN32
-static uint32_t ggml_backend_vk_max_prefill_ubatch(ggml_backend_dev_t) {
-    // Graph allocation can succeed even when a long dispatch would trip the Windows GPU watchdog.
+static uint32_t ggml_backend_vk_max_prefill_retry_ubatch(ggml_backend_dev_t) {
+    // On a retry, a graph just below the size that failed can still trip the Windows GPU watchdog.
     return 256;
 }
 #endif
@@ -16694,8 +16694,8 @@ static uint32_t ggml_backend_vk_max_prefill_ubatch(ggml_backend_dev_t) {
 static void * ggml_backend_vk_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
 #ifdef _WIN32
-    if (strcmp(name, "ggml_backend_dev_max_prefill_ubatch") == 0) {
-        return (void *) ggml_backend_vk_max_prefill_ubatch;
+    if (strcmp(name, "ggml_backend_dev_max_prefill_retry_ubatch") == 0) {
+        return (void *) ggml_backend_vk_max_prefill_retry_ubatch;
     }
 #endif
     if (strcmp(name, "ggml_backend_ssd_provider_v1") == 0) {

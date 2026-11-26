@@ -222,7 +222,7 @@ static void refit_search_holds_selected() {
                            search_case{48040, 25856, false, 0, "second reserve refused"}}) {
         uint32_t held = 0, last = 0;
         bool reserved_fits = false;
-        const uint32_t got = llama_prefill_ubatch_search(c.target, 1, [&](uint32_t n) {
+        const uint32_t got = llama_prefill_ubatch_search(c.target, 1, {}, [&](uint32_t n) {
             bool ok = n <= c.fits && !(n == c.fits && reserved_fits && !c.again);
             reserved_fits = reserved_fits || (ok && n == c.fits);
             held = ok ? n : 0;
@@ -238,21 +238,30 @@ static uint32_t device_limit(ggml_backend_dev_t dev) {
     return *static_cast<uint32_t *>(dev->context);
 }
 
-static void device_limited_prefill() {
+static void device_limited_prefill_retry() {
     ggml_backend_reg reg{};
     ggml_backend_device dev{};
     dev.reg = &reg;
     uint32_t advertised = 256;
     dev.context = &advertised;
-    require(ggml_backend_dev_prefill_ubatch(&dev, 37802) == 37802, "backend without a prefill limit");
+    require(ggml_backend_dev_prefill_retry_ubatch(&dev, 37802) == 37802, "backend without a prefill limit");
     reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
-        return std::strcmp(name, "ggml_backend_dev_max_prefill_ubatch") == 0 ? (void *) device_limit : nullptr;
+        return std::strcmp(name, "ggml_backend_dev_max_prefill_retry_ubatch") == 0 ? (void *) device_limit : nullptr;
     };
-    const uint32_t limit = ggml_backend_dev_prefill_ubatch(&dev, 262144);
-    require(limit == 256, "device must bound one-pass prefill");
-    require(ggml_backend_dev_prefill_ubatch(&dev, 64) == 64, "keep a smaller explicit ubatch");
+    std::vector<uint32_t> probes;
+    const auto limit = llama_prefill_ubatch_search(37802, 1, {{false, &dev}}, [&](uint32_t n) {
+        probes.push_back(n);
+        return true;
+    });
+    require(limit == 256 && probes == std::vector<uint32_t>{256}, "first retry must use the device limit");
+    const auto smaller = llama_prefill_ubatch_search(256, 1, {{false, &dev}}, [](uint32_t n) {
+        require(n < 256, "do not retry the failed graph size");
+        return true;
+    });
+    require(smaller > 0 && smaller < 256, "continue shrinking when the limited batch fails");
+    require(ggml_backend_dev_prefill_retry_ubatch(&dev, 64) == 64, "keep a smaller explicit ubatch");
     advertised = 0;
-    require(ggml_backend_dev_prefill_ubatch(&dev, 37802) == 37802, "zero means no device limit");
+    require(ggml_backend_dev_prefill_retry_ubatch(&dev, 37802) == 37802, "zero means no device limit");
 
     dev.iface.get_name = dev.iface.get_description = [](ggml_backend_dev_t) { return "test"; };
     auto limited = dev;
@@ -260,7 +269,7 @@ static void device_limited_prefill() {
     limited.context = &child_limit;
     ggml_backend_dev_t children[] = { &dev, &limited };
     auto meta = ggml_backend_meta_device(children, 2, nullptr, nullptr);
-    require(ggml_backend_dev_prefill_ubatch(meta, 37802) == 128, "a tensor split must respect its devices' limits");
+    require(ggml_backend_dev_prefill_retry_ubatch(meta, 37802) == 128, "a tensor split must respect its devices' limits");
 
     // Exercise the equal-sequence split used by the hybrid memory with the reported prompt length.
     llama_vocab vocab;
@@ -286,7 +295,7 @@ static void device_limited_prefill() {
 
 int main() {
     cells_partial_insert_oom();
-    device_limited_prefill();
+    device_limited_prefill_retry();
     refit_search_holds_selected();
     llama_model model(llama_model_default_params());
     model.hparams = {};

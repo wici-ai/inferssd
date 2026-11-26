@@ -18,6 +18,7 @@
 #include <vector>
 
 struct llama_model;
+struct llama_device;
 class llama_batch_allocr;
 
 class llama_io_read_i;
@@ -42,12 +43,13 @@ struct llama_dense_stream_meter {
     std::string end(const ggml_backend_sched_ssd_copy_stats & now);
 };
 
-// The ubatch of a request's prefill graph when a graph of the request's own size, target, does not fit (graphs sized
-// to the request).  Every pass of a smaller ubatch reads its layers' experts again, so the search takes the largest
-// size that fits: binary, in steps of the granularity, at least 256 tokens and at most half the target, and ending
+// Retry a refused prefill graph below its original size and within the devices' retry limits.
+// Each pass rereads its routed experts, so search for the largest size that fits, in steps of
+// the granularity, at least 256 tokens and at most half the search ceiling, and ending
 // with one token.  reserve(n): reserve the graph of n tokens.  Returns the selected ubatch, 0 if none fits.  Each
 // reserve replaces the graph the previous one left, so on return the graph reserved is the one of the size returned.
-uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::function<bool(uint32_t)> & reserve);
+uint32_t llama_prefill_ubatch_search(uint32_t original, uint32_t granularity, const std::vector<llama_device> & devices,
+        const std::function<bool(uint32_t)> & reserve);
 
 struct llama_context {
     // init scheduler and compute buffers, reserve worst-case graphs

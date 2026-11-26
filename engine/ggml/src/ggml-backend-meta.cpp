@@ -209,17 +209,17 @@ static ggml_backend_dev_t ggml_backend_meta_dev_simple_dev(ggml_backend_dev_t me
     return meta_dev_ctx->simple_devs[index];
 }
 
-uint32_t ggml_backend_dev_prefill_ubatch(ggml_backend_dev_t dev, uint32_t configured) {
+uint32_t ggml_backend_dev_prefill_retry_ubatch(ggml_backend_dev_t dev, uint32_t configured) {
     if (ggml_backend_dev_is_meta(dev)) {
         const auto * ctx = static_cast<const ggml_backend_meta_device_context *>(dev->context);
         for (auto child : ctx->simple_devs) {
-            configured = ggml_backend_dev_prefill_ubatch(child, configured);
+            configured = ggml_backend_dev_prefill_retry_ubatch(child, configured);
         }
         return configured;
     }
     const auto reg = ggml_backend_dev_backend_reg(dev);
-    const auto query = reg ? reinterpret_cast<ggml_backend_dev_max_prefill_ubatch_t>(
-            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_max_prefill_ubatch")) : nullptr;
+    const auto query = reg ? reinterpret_cast<ggml_backend_dev_max_prefill_retry_ubatch_t>(
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_dev_max_prefill_retry_ubatch")) : nullptr;
     const uint32_t limit = query ? query(dev) : 0;
     return limit ? std::min(configured, limit) : configured;
 }
