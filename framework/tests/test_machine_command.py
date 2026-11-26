@@ -358,12 +358,20 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
 
 
+@pytest.mark.parametrize(
+    "process_defaults,reserved_elsewhere,expected_max",
+    [((), False, 128), ((257,), True, 127), ((257, 321), True, 1)],
+)
 def test_desktop_profile_and_saved_report_on_two_windows_processor_groups(
-    tmp_path, monkeypatch, capsys
+    tmp_path, monkeypatch, capsys, process_defaults, reserved_elsewhere, expected_max
 ):
     models = tmp_path / "models"
     models.mkdir()
-    windows = Win32(MultiGroupKernel(), lambda key, name: REGISTRY.get((key, name)))
+    kernel = MultiGroupKernel()
+    kernel.default_sets = process_defaults
+    if reserved_elsewhere:
+        kernel.flags[1] = 0b010
+    windows = Win32(kernel, lambda key, name: REGISTRY.get((key, name)), last_error=lambda: 122)
     monkeypatch.setattr(windows, "volume", lambda path: Volume("C:\\", "NTFS", ()))
     host = WindowsHost(tmp_path, windows)
     host.devices[str(models)] = (0, 1)
@@ -374,7 +382,16 @@ def test_desktop_profile_and_saved_report_on_two_windows_processor_groups(
     descriptor = resource_descriptor(tmp_path, tmp_path / "build")
     monkeypatch.setenv("INFERSSD_RESOURCES", str(descriptor))
     simulated = replies()
-    monkeypatch.setattr(command, "run_process", lambda argv, *_: simulated[Path(argv[0]).name])
+    probe_maxima = []
+
+    def run_probe(argv, *_):
+        name = Path(argv[0]).name
+        if name == "inferssd-cpuprobe":
+            counts = argv[argv.index("--threads") + 1]
+            probe_maxima.append(max(map(int, counts.split(","))))
+        return simulated[name]
+
+    monkeypatch.setattr(command, "run_process", run_probe)
 
     # Measure and read back what the desktop setup shows with its actual CLI arguments.
     for flags in ([], ["--show"]):
@@ -386,6 +403,7 @@ def test_desktop_profile_and_saved_report_on_two_windows_processor_groups(
     saved = json.loads(Path(report["profile"]).read_text())
     assert saved["sections"]["cpu"]["status"] == "ok"
     assert len(saved["cpu"]["logical"]) == 128
+    assert probe_maxima == [expected_max]
 
 
 def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(

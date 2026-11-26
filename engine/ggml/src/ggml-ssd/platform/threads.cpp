@@ -19,6 +19,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include "windows-cpu-sets.h"
 #elif defined(__APPLE__)
 #include <mach/mach.h>
 #include <os/os_sync_wait_on_address.h>
@@ -218,41 +219,53 @@ void wake_all(const std::atomic<uint32_t> & word) noexcept {
 
 // A Windows processor number has a group and a local index in 0..63.
 constexpr int group_width = 64;
-struct cpu_set_table {
-    bool available = false;       // every active processor of a single-group machine has a CPU Set
-    std::vector<std::optional<ULONG>> id;
-};
+using windows_cpu_sets = detail::windows_cpu_sets<ULONG>;
 
-static cpu_set_table read_cpu_sets() {
-    cpu_set_table table;
-    const WORD groups = GetActiveProcessorGroupCount();
-    const DWORD slots = groups == 1 ? GetActiveProcessorCount(0) : DWORD(groups) * group_width;
-    if (!slots) { return table; }
-    table.id.resize(slots);
+static bool read_cpu_sets(HANDLE process, windows_cpu_sets & table, std::string * why) {
     ULONG bytes = 0;
-    GetSystemCpuSetInformation(nullptr, 0, &bytes, GetCurrentProcess(), 0);
-    if (bytes == 0) { return table; }
+    if (!GetSystemCpuSetInformation(nullptr, 0, &bytes, process, 0) &&
+            (GetLastError() != ERROR_INSUFFICIENT_BUFFER || !bytes)) {
+        set_why(why, "GetSystemCpuSetInformation failed: error " + std::to_string(GetLastError()));
+        return false;
+    }
+    if (!bytes) { return true; }
     std::vector<uint64_t> storage((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t)); // entries hold DWORD64
     auto * base = reinterpret_cast<unsigned char *>(storage.data());
-    if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(base), bytes, &bytes,
-            GetCurrentProcess(), 0)) {
-        return table;
+    if (!GetSystemCpuSetInformation(reinterpret_cast<PSYSTEM_CPU_SET_INFORMATION>(base), bytes, &bytes, process, 0)) {
+        set_why(why, "GetSystemCpuSetInformation failed: error " + std::to_string(GetLastError()));
+        return false;
     }
-    for (ULONG at = 0; at + sizeof(DWORD) * 2 <= bytes;) {
+    ULONG at = 0;
+    while (at < bytes) {
+        if (bytes - at < sizeof(DWORD) * 2) { break; }
         const auto * entry = reinterpret_cast<const SYSTEM_CPU_SET_INFORMATION *>(base + at);
-        if (entry->Size == 0 || at + entry->Size > bytes) { break; }
+        if (entry->Size < sizeof(DWORD) * 2 || entry->Size > bytes - at) { break; }
         if (entry->Type == CpuSetInformation) {
-            const DWORD cpu = DWORD(entry->CpuSet.Group) * group_width + entry->CpuSet.LogicalProcessorIndex;
-            if (cpu < slots) { table.id[cpu] = entry->CpuSet.Id; }
+            if (entry->Size <= offsetof(SYSTEM_CPU_SET_INFORMATION, CpuSet.AllFlags)) { break; }
+            const auto & set = entry->CpuSet;
+            table.record(DWORD(set.Group) * group_width + set.LogicalProcessorIndex,
+                         set.Id, set.Allocated, set.AllocatedToTargetProcess);
         }
         at += entry->Size;
     }
-    table.available = groups == 1 && std::all_of(table.id.begin(), table.id.end(), [](auto id) { return id.has_value(); });
-    return table;
+    if (at == bytes) { return true; }
+    set_why(why, "invalid GetSystemCpuSetInformation record");
+    return false;
 }
 
+// Only the stable group-0 IDs are cached for exact single-group pinning.
+struct cpu_set_table {
+    bool available;
+    std::vector<std::optional<ULONG>> id;
+};
+
 static const cpu_set_table & cpu_sets() {
-    static const cpu_set_table table = read_cpu_sets();
+    static const cpu_set_table table = [] {
+        windows_cpu_sets snapshot(GetActiveProcessorCount(0));
+        const bool complete = read_cpu_sets(GetCurrentProcess(), snapshot, nullptr) && !snapshot.ids.empty() &&
+            std::all_of(snapshot.ids.begin(), snapshot.ids.end(), [](auto id) { return id.has_value(); });
+        return cpu_set_table{complete, std::move(snapshot.ids)};
+    }();
     return table;
 }
 
@@ -269,8 +282,9 @@ static bool process_mask(DWORD_PTR & mask) {
 
 // Windows 10 can start this process in just one group, and Windows 11 can schedule
 // it across several. A process affinity mask describes CPUs only in the former case.
-static bool grouped_process_cpus(USHORT count, cpu_list & cpus, std::string * why) {
+static bool grouped_process_cpus(USHORT group_count, cpu_list & cpus, std::string * why) {
     const HANDLE process = GetCurrentProcess();
+    USHORT count = group_count;
     std::vector<USHORT> groups(count);
     if (!GetProcessGroupAffinity(process, &count, groups.data()) || !count) {
         set_why(why, "GetProcessGroupAffinity failed: error " + std::to_string(GetLastError()));
@@ -278,6 +292,11 @@ static bool grouped_process_cpus(USHORT count, cpu_list & cpus, std::string * wh
     }
     groups.resize(count);
     std::sort(groups.begin(), groups.end());
+    if (groups.back() >= group_count) {
+        set_why(why, "GetProcessGroupAffinity returned a group outside the active topology: " +
+                std::to_string(groups.back()));
+        return false;
+    }
     DWORD_PTR mask = ~DWORD_PTR(0);
     if (count == 1 && !process_mask(mask)) {
         set_why(why, "GetProcessAffinityMask failed: error " + std::to_string(GetLastError()));
@@ -299,36 +318,18 @@ static bool grouped_process_cpus(USHORT count, cpu_list & cpus, std::string * wh
         set_why(why, "GetProcessDefaultCpuSets failed: error " + std::to_string(GetLastError()));
         return false;
     }
+    std::vector<ULONG> defaults(n);
     if (n) {
-        std::vector<ULONG> defaults(n);
         if (!GetProcessDefaultCpuSets(process, defaults.data(), n, &n)) {
             set_why(why, "GetProcessDefaultCpuSets failed: error " + std::to_string(GetLastError()));
             return false;
         }
         defaults.resize(n);
-        const auto & ids = cpu_sets().id;
-        cpu_list selected;
-        for (ULONG id : defaults) {
-            const auto at = std::find(ids.begin(), ids.end(), id);
-            if (at == ids.end()) {
-                set_why(why, "unknown process-default CPU Set " + std::to_string(id));
-                return false;
-            }
-            const int cpu = int(at - ids.begin());
-            if (std::binary_search(hard.begin(), hard.end(), cpu)) { selected.push_back(cpu); }
-        }
-        // When no selected CPU Set is within the hard affinity, Windows ignores the selection.
-        if (!selected.empty()) {
-            std::sort(selected.begin(), selected.end());
-            hard.swap(selected);
-        }
     }
-    if (hard.empty()) {
-        set_why(why, "Windows reported no available CPUs in the process groups");
-        return false;
-    }
-    cpus.swap(hard);
-    return true;
+    // Reservations can change while the process runs. Query against its handle
+    // even without defaults so that foreign reservations are always excluded.
+    windows_cpu_sets sets(size_t(group_count) * group_width);
+    return read_cpu_sets(process, sets, why) && sets.process_cpus(hard, defaults, cpus, why);
 }
 
 bool process_cpus(cpu_list & cpus, std::string * why) {

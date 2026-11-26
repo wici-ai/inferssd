@@ -21,7 +21,8 @@ using cpu_list = std::vector<int>;
 
 // The CPUs this code may run on, ascending. Linux: the calling thread's
 // sched_getaffinity mask (inherited from the process). Windows: the process
-// affinity mask for a single group, or its groups and process-default CPU Sets.
+// affinity mask on a single-group machine. Across groups, process-default CPU
+// Sets narrow the allowed CPUs when eligible. CPUs reserved by others are excluded.
 // macOS: 0 .. hw.logicalcpu - 1.
 bool process_cpus(cpu_list & cpus, std::string * why = nullptr);
 

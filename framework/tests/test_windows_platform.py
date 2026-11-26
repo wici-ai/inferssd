@@ -88,10 +88,12 @@ class WindowsHost(FakeHost):
         return self.system_layer
 
 
-def set_row(index: int, core: int, efficiency: int, group: int = 0) -> bytes:
+def set_row(index: int, core: int, efficiency: int, group: int = 0, flags: int = 0) -> bytes:
     # Size, Type, then Id, Group, LogicalProcessorIndex, CoreIndex, LastLevelCacheIndex,
-    # NumaNodeIndex, EfficiencyClass, padded to the record's 32 bytes.
-    body = struct.pack("<IHBBBBB", 256 + 64 * group + index, group, index, core, 0, 0, efficiency)
+    # NumaNodeIndex, EfficiencyClass, AllFlags, padded to the record's 32 bytes.
+    body = struct.pack(
+        "<IHBBBBBB", 256 + 64 * group + index, group, index, core, 0, 0, efficiency, flags
+    )
     return struct.pack("<II", 32, 0) + body + b"\0" * (32 - 8 - len(body))
 
 
@@ -156,6 +158,9 @@ class MultiGroupKernel(FakeKernel):
     process_groups = (0, 1)
     default_sets: tuple[int, ...] = ()
 
+    def __init__(self):
+        self.flags: dict[int, int] = {}
+
     def GetActiveProcessorGroupCount(self) -> int:
         return len(self.counts)
 
@@ -168,9 +173,10 @@ class MultiGroupKernel(FakeKernel):
         numbers[: len(self.process_groups)] = self.process_groups
         return 1
 
-    def GetSystemCpuSetInformation(self, buffer, size, length, _process, _flags):
+    def GetSystemCpuSetInformation(self, buffer, size, length, process, _flags):
+        assert process.value == self.GetCurrentProcess()
         data = b"".join(
-            set_row(cpu, cpu // 2, 1, group)
+            set_row(cpu, cpu // 2, 1, group, self.flags.get(64 * group + cpu, 0))
             for group, count in enumerate(self.counts)
             for cpu in range(count)
         )
@@ -205,6 +211,31 @@ def test_multigroup_process_cpus_respect_groups_hard_mask_and_default_cpu_sets()
         layer.process_cpus()
 
 
+def test_process_cpus_refresh_reservations_and_keep_machine_topology():
+    kernel = MultiGroupKernel()
+    layer = system.Win32(kernel, last_error=lambda: 122)
+    # Bit 1 is Allocated and bit 2 is AllocatedToTargetProcess.
+    kernel.flags = {1: 0b010, 65: 0b110}
+    kernel.default_sets = (257, 321)
+    assert layer.process_cpus() == (65,)
+    assert layer.processors().ids == tuple(range(128))
+    assert len(layer.processors().sets) == 128
+    kernel.default_sets = (257,)
+    elsewhere = tuple(cpu for cpu in range(128) if cpu != 1)
+    assert layer.process_cpus() == elsewhere
+    kernel.default_sets = ()
+    assert layer.process_cpus() == elsewhere
+    # Same Win32 object. The reservation moves to another process between reads.
+    kernel.flags = {65: 0b010, 67: 0b110}
+    kernel.process_groups = (1,)
+    assert layer.process_cpus() == (67,)
+    kernel.default_sets = (321,)
+    assert layer.process_cpus() == (67,)
+    kernel.flags[67] = 0b010
+    with pytest.raises(OSError, match="no available CPUs"):
+        layer.process_cpus()
+
+
 def test_win32_reads_processors_affinity_and_memory():
     layer = system.Win32(FakeKernel(), lambda _key, _name: None, lambda: 0)
     found = layer.processors()
@@ -212,6 +243,18 @@ def test_win32_reads_processors_affinity_and_memory():
     assert [row.efficiency for row in found.sets] == [1, 1, 1, 1, 0, 0, 0, 0]
     assert layer.process_cpus() == (1, 3)
     assert layer.memory() == system.Memory(32 << 30, 24 << 30)
+
+
+def test_multigroup_availability_distinguishes_no_cpu_sets_from_a_query_error(monkeypatch):
+    kernel = MultiGroupKernel()
+    monkeypatch.setattr(kernel, "GetSystemCpuSetInformation", lambda *_: 1)
+    layer = system.Win32(kernel, last_error=lambda: 5)
+    assert layer.process_cpus() == tuple(range(128))  # a successful empty table
+    monkeypatch.setattr(kernel, "GetSystemCpuSetInformation", lambda *_: 0)
+    with pytest.raises(OSError, match="GetSystemCpuSetInformation.*error 5"):
+        layer.process_cpus()
+    # Machine topology still uses group counts when the optional CPU Sets are unavailable.
+    assert layer.processors() == system.Processors((64, 64), ())
 
 
 def test_win32_lists_the_display_adapters_it_finds():

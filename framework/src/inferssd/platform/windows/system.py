@@ -23,6 +23,9 @@ Value = Union[str, int, None]
 Registry = Callable[[str, str], Value]
 
 CPU_SET_INFORMATION = 0  # CPU_SET_INFORMATION_TYPE CpuSetInformation
+CPU_SET_ALLOCATED = 0x02
+CPU_SET_ALLOCATED_TO_TARGET_PROCESS = 0x04
+ERROR_INSUFFICIENT_BUFFER = 122
 DRIVE_REMOTE = 4
 FILE_SHARE_READ_WRITE = 0x1 | 0x2
 OPEN_EXISTING = 3
@@ -46,6 +49,7 @@ class CPUSet:
     core: int
     efficiency: int
     id: int  # opaque Win32 ID used by GetProcessDefaultCpuSets
+    reserved_elsewhere: bool = False
 
 
 @dataclass(frozen=True)
@@ -115,13 +119,18 @@ def cpu_sets(data: bytes) -> list[CPUSet]:
         size, kind = struct.unpack_from("<II", data, at)
         if size < 8 or at + size > len(data):
             break
-        if kind == CPU_SET_INFORMATION and size >= 19:
+        if kind == CPU_SET_INFORMATION and size >= 20:
             # Id, Group, LogicalProcessorIndex, CoreIndex, LastLevelCacheIndex,
-            # NumaNodeIndex, EfficiencyClass
-            set_id, group, index, core, _, _, efficiency = struct.unpack_from(
-                "<IHBBBBB", data, at + 8
+            # NumaNodeIndex, EfficiencyClass, AllFlags
+            set_id, group, index, core, _, _, efficiency, flags = struct.unpack_from(
+                "<IHBBBBBB", data, at + 8
             )
-            found.append(CPUSet(group * 64 + index, group * 64 + core, efficiency, set_id))
+            reserved = bool(
+                flags & CPU_SET_ALLOCATED and not flags & CPU_SET_ALLOCATED_TO_TARGET_PROCESS
+            )
+            found.append(
+                CPUSet(group * 64 + index, group * 64 + core, efficiency, set_id, reserved)
+            )
         at += size
     return found
 
@@ -212,15 +221,18 @@ class Win32:
                 found.append(Adapter(name, device, memory if isinstance(memory, int) else 0))
         return tuple(found)
 
-    def _cpu_sets(self) -> tuple[CPUSet, ...]:
+    def _cpu_sets(self, *, require_allocations: bool = False) -> tuple[CPUSet, ...]:
         kernel32 = self.kernel32
+        handle = ctypes.c_void_p(kernel32.GetCurrentProcess())
         length = ctypes.c_uint32(0)
-        kernel32.GetSystemCpuSetInformation(None, 0, ctypes.byref(length), None, 0)
+        sized = kernel32.GetSystemCpuSetInformation(None, 0, ctypes.byref(length), handle, 0)
+        if require_allocations and not sized and self.last_error() != ERROR_INSUFFICIENT_BUFFER:
+            raise self.error("GetSystemCpuSetInformation")
         if not length.value:
             return ()
         buffer = ctypes.create_string_buffer(length.value)
         if not kernel32.GetSystemCpuSetInformation(
-            buffer, length.value, ctypes.byref(length), None, 0
+            buffer, length.value, ctypes.byref(length), handle, 0
         ):
             raise self.error("GetSystemCpuSetInformation")
         return tuple(cpu_sets(buffer.raw[: length.value]))
@@ -268,10 +280,16 @@ class Win32:
             allowed = tuple(64 * g + cpu for g in groups for cpu in range(self._group_size(g)))
         if total == 1:
             return allowed
+        # Allocation changes while the process runs. Topology still includes every CPU.
+        sets = self._cpu_sets(require_allocations=True)
+        reserved = {row.index for row in sets if row.reserved_elsewhere}
+        allowed = tuple(cpu for cpu in allowed if cpu not in reserved)
+        if not allowed:
+            raise OSError("Windows reported no available CPUs in the process groups")
         # Process-default CPU Sets can further narrow the CPUs Windows will use.
         size = ctypes.c_uint32(0)
         if not kernel32.GetProcessDefaultCpuSets(handle, None, 0, ctypes.byref(size)):
-            if self.last_error() != 122:  # ERROR_INSUFFICIENT_BUFFER
+            if self.last_error() != ERROR_INSUFFICIENT_BUFFER:
                 raise self.error("GetProcessDefaultCpuSets")
         if not size.value:
             return allowed
@@ -280,7 +298,7 @@ class Win32:
             handle, selected, len(selected), ctypes.byref(size)
         ):
             raise self.error("GetProcessDefaultCpuSets")
-        by_id = {row.id: row.index for row in self._cpu_sets()}
+        by_id = {row.id: row.index for row in sets}
         try:
             preferred = {by_id[set_id] for set_id in selected[: size.value]}
         except KeyError as error:
