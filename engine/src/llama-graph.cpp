@@ -1651,7 +1651,8 @@ ggml_tensor * llm_graph_context::build_moe_prefetch_hint(
 llama_expert_gating_func_type gating_op,
              int64_t   n_expert,
                  int   il) {
-    if (!cpu_sink_runtime || !next_gate_inp || !cpu_sink_runtime->can_prefetch_after(il) || !(cpu_sink_prefill ? cpu_sink_prefill_hint : n_tokens == 1)) {
+    // a decode step's prediction is a row each (the sink's decode node gives the rows' to the next layer's prefetch)
+    if (!cpu_sink_runtime || !next_gate_inp || !cpu_sink_runtime->can_prefetch_after(il) || !(cpu_sink_prefill ? cpu_sink_prefill_hint : cpu_sink_decode)) {
         return nullptr;
     }
     // a router that reads the stream as it is has no norm of its own
