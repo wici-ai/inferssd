@@ -8,9 +8,11 @@
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 #include "llama-model.h"
+#include "ggml-backend-impl.h"
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <new>
@@ -232,8 +234,59 @@ static void refit_search_holds_selected() {
     }
 }
 
+static uint32_t device_limit(ggml_backend_dev_t dev) {
+    return *static_cast<uint32_t *>(dev->context);
+}
+
+static void device_limited_prefill() {
+    ggml_backend_reg reg{};
+    ggml_backend_device dev{};
+    dev.reg = &reg;
+    uint32_t advertised = 256;
+    dev.context = &advertised;
+    require(ggml_backend_dev_prefill_ubatch(&dev, 37802) == 37802, "backend without a prefill limit");
+    reg.iface.get_proc_address = [](ggml_backend_reg_t, const char * name) -> void * {
+        return std::strcmp(name, "ggml_backend_dev_max_prefill_ubatch") == 0 ? (void *) device_limit : nullptr;
+    };
+    const uint32_t limit = ggml_backend_dev_prefill_ubatch(&dev, 262144);
+    require(limit == 256, "device must bound one-pass prefill");
+    require(ggml_backend_dev_prefill_ubatch(&dev, 64) == 64, "keep a smaller explicit ubatch");
+    advertised = 0;
+    require(ggml_backend_dev_prefill_ubatch(&dev, 37802) == 37802, "zero means no device limit");
+
+    dev.iface.get_name = dev.iface.get_description = [](ggml_backend_dev_t) { return "test"; };
+    auto limited = dev;
+    uint32_t child_limit = 128;
+    limited.context = &child_limit;
+    ggml_backend_dev_t children[] = { &dev, &limited };
+    auto meta = ggml_backend_meta_device(children, 2, nullptr, nullptr);
+    require(ggml_backend_dev_prefill_ubatch(meta, 37802) == 128, "a tensor split must respect its devices' limits");
+
+    // Exercise the equal-sequence split used by the hybrid memory with the reported prompt length.
+    llama_vocab vocab;
+    llama_batch_allocr allocator(1);
+    std::vector<float> input(37802);
+    llama_batch prompt = {};
+    prompt.n_tokens = static_cast<int32_t>(input.size());
+    prompt.embd = input.data();
+    require(allocator.init(prompt, vocab, nullptr, 1, 1, false), "initialize the long prompt");
+    allocator.split_reset();
+    uint32_t consumed = 0;
+    while (consumed < allocator.get_n_tokens()) {
+        const uint32_t count = allocator.get_n_tokens() - consumed;
+        const auto piece = allocator.split_equal(limit, false);
+        require(piece.n_tokens == std::min(count, limit), "bounded prefill including the tail");
+        for (uint32_t i = 0; i < piece.n_tokens; ++i) {
+            require(piece.pos[i] == llama_pos(consumed + i), "prefill positions must stay contiguous");
+        }
+        consumed += piece.n_tokens;
+    }
+    require(allocator.get_n_used() == input.size(), "consume the complete prompt");
+}
+
 int main() {
     cells_partial_insert_oom();
+    device_limited_prefill();
     refit_search_holds_selected();
     llama_model model(llama_model_default_params());
     model.hparams = {};

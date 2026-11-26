@@ -208,6 +208,18 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    // Decoder-only causal prompts can be split without changing the logical batch or context.
+    if (cparams.causal_attn && !llama_model_has_encoder(&model) && (model.n_gpu_layers() > 0 || params.op_offload)) {
+        for (const auto & device : model.devices) {
+            const uint32_t limit = ggml_backend_dev_prefill_ubatch(device.dev, cparams.n_ubatch);
+            if (limit < cparams.n_ubatch) {
+                LLAMA_LOG_INFO("%s: limiting n_ubatch from %u to %u on %s (GPU execution timeout)\n",
+                        __func__, cparams.n_ubatch, limit, ggml_backend_dev_name(device.dev));
+                cparams.n_ubatch = limit;
+            }
+        }
+    }
+
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
@@ -428,7 +440,7 @@ llama_context::llama_context(
             if (fitted && fitted < cparams.n_ctx && (fit_requested || resident_cells)) {
                 cparams.n_ctx = cparams.n_ctx_seq = fitted;
                 cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
-                cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+                cparams.n_ubatch = std::min(cparams.n_batch, cparams.n_ubatch);
                 if (cpu_prefill_actual_shape_enabled) { cpu_prefill_configured_ubatch = cparams.n_ubatch; }
             }
             LLAMA_LOG_INFO("%s: n_ctx = %u, what memory holds of the trained %u (n_batch = %u, n_ubatch = %u)\n",

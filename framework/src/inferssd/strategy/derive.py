@@ -736,14 +736,14 @@ def derive(
                 "prefill: the SSD sink for every pass; it reads only what the VRAM tier and the "
                 "RAM cache do not hold"
             )
-    # A prompt in one pass, on every platform: a pass reads every expert it routes to once, whatever
-    # computes it. The engine reserves each prompt's own graph, a smaller one where that does not
-    # fit, and the expert caches give back what it needs. A model without routed experts reads
+    # Request one pass: a pass reads every expert it routes to once, whatever computes it.
+    # The engine limits the physical batch to what the device can execute and the graph can
+    # reserve, and the expert caches give back what it needs. A model without routed experts reads
     # none of its weights a pass, and keeps the launch's batch sizes.
     if experts is not None:
         notes.append(
             "prefill: one pass a prompt, -b and -ub as large as the context; a pass reads every "
-            "expert it routes to once"
+            "expert it routes to once. The engine can split the prompt to meet device or memory limits."
         )
     else:
         notes.append(

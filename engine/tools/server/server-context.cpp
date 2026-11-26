@@ -49,6 +49,8 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+static constexpr char prompt_workspace_error[] =
+    "Could not prepare memory for the prompt. Shorten the conversation or use a smaller model and retry.";
 
 // The number of tokens of a prompt prefix the chat template reported in `key` ("shared_prefix_chars",
 // "context_prefix_chars" or "conversation_prefix_chars", see oaicompat_chat_params_parse), if that prefix tokenizes
@@ -1606,7 +1608,7 @@ private:
             const bool defer_workspace = task.need_sampling();
             if (!server_moe_phase_report(slot.ctx, "request_begin", task.id,
                     static_cast<uint32_t>(task.n_tokens()), !defer_workspace)) {
-                send_error(task, "failed to prepare GPU memory for prompt processing", ERROR_TYPE_SERVER);
+                send_error(task, prompt_workspace_error, ERROR_TYPE_SERVER);
                 return false;
             }
             slot.request_open    = true;
@@ -2866,7 +2868,7 @@ private:
                             if (slot.task->n_tokens() >= slot.n_ctx) {
                                 send_error(slot,
                                            string_format("request (%d tokens) exceeds the available context size (%d "
-                                                         "tokens), try increasing it",
+                                                         "tokens). Shorten the conversation or increase the context size.",
                                                          slot.task->n_tokens(), slot.n_ctx),
                                            ERROR_TYPE_EXCEED_CONTEXT_SIZE);
                                 slot.release();
@@ -3146,7 +3148,7 @@ private:
                             static_cast<uint32_t>(slot.prompt.n_tokens());
                         if (!server_moe_workspace_transition(
                                 slot.ctx, "request_begin", slot.task->id, prompt_tokens, prefill_tokens)) {
-                            send_error(slot, "failed to prepare GPU memory for prompt processing", ERROR_TYPE_SERVER);
+                            send_error(slot, prompt_workspace_error, ERROR_TYPE_SERVER);
                             slot.release();
                             continue;
                         }
