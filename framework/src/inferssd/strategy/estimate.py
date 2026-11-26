@@ -84,6 +84,21 @@ def headroom_bytes(characteristics: Characteristics, runtime: RuntimeFacts, plat
     return ENGINE_RESERVE_BYTES if mib is None else mib << 20
 
 
+def host_memory_bytes(characteristics: Characteristics, runtime: RuntimeFacts) -> int:
+    """Host memory an estimate plans with, at most the installed memory.
+
+    A memory budget is the amount to estimate for and replaces the reading of what is
+    available now: the estimate then answers for that much memory, more or less than the
+    host has free at the moment. Without a budget it is the available memory, or the
+    installed memory when that is not known.
+    """
+    total = characteristics["memory"]["total_bytes"]
+    memory = runtime.memory_budget_bytes
+    if memory is None:
+        memory = runtime.available_bytes
+    return total if memory is None else min(memory, total)
+
+
 def matvec_rate(
     rows: list[ComputeRow],
     name: str,
@@ -331,12 +346,7 @@ def decode_estimate(
         return Estimate(None, str(error))
     drive_gbps, why = drive_rate(characteristics, experts, drive_key)
     drive_reason = why
-    available = runtime.available_bytes
-    if available is None:
-        available = characteristics["memory"]["total_bytes"]
-    if runtime.memory_budget_bytes is not None:
-        available = min(available, runtime.memory_budget_bytes)
-    available = min(available, characteristics["memory"]["total_bytes"])
+    available = host_memory_bytes(characteristics, runtime)
     room = max(
         0,
         available
@@ -814,10 +824,7 @@ def dense_decode_estimate(
     ]
     if weights:
         assumptions.extend(weights.graph_assumptions())
-    total = characteristics["memory"]["total_bytes"]
-    available = min(total, total if runtime.available_bytes is None else runtime.available_bytes)
-    if runtime.memory_budget_bytes is not None:
-        available = min(available, runtime.memory_budget_bytes)
+    available = host_memory_bytes(characteristics, runtime)
     platform = platform or characteristics["identity"]["hard"]["platform"]
     host_room = max(
         0,

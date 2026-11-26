@@ -37,7 +37,7 @@ inferssd profile --reprofile --model /models/model-00001-of-00004.gguf
 | `--resources FILE` | An [engine resource descriptor](engine-resources.md) whose `probes` map names the probe executables. |
 | `--build DIR` | An engine build directory; the probes are `DIR/bin/inferssd-*probe` (`inferssd-*probe.exe` on Windows). |
 | `--estimate-compute` | Measure single-token matrix throughput on idle CUDA/ROCm GPUs with synthetic weights. |
-| `--memory-gib`, `--host-work-mib`, `--gpu-work-mib` | Set the host budget and additional known working-memory reservations for estimation. |
+| `--memory-gib`, `--host-work-mib`, `--gpu-work-mib` | Set the host memory the estimates plan with, in place of the memory available now, and additional known working-memory reservations for estimation. |
 | `--estimate-gguf FILE` | Estimate a specific GGUF. The engine reads its headers and discovers standard shards. Pass extra tables or nonstandard shards with repeatable `--shard` or `--ple`. |
 | `--estimate-facts JSON` | Estimate exported native model facts against the current machine profile. Use `--model PATH` to select the target drive when the weights will spill. |
 | `--reprofile` | Ignore the saved file and measure every section. |
@@ -55,7 +55,8 @@ the selected or installed engine descriptor supplies its GPU backends. If an old
 them, the estimator checks the build cache beside its binary. With no engine or build
 information, the saved machine GPU inventory and live availability determine placement.
 The command prints one progress line per step on stderr and one summary line per
-section on stdout, with `--model` one estimate line per supported model, then
+section on stdout, with `--model` the host memory the estimates plan with and
+one estimate line per supported model, then
 names the sections of this run that are partial or failed (on stderr with
 `--json`). It exits with status 1 when a section measured in this run failed
 (the file is still saved, with the reason recorded), and with status 2 on a
@@ -246,6 +247,9 @@ times, `assumptions` records proxies, and `scenarios` compares the bounds on
 cache coverage. The reported range adds I/O overlap and the measured timing
 spread, without assigning probabilities. `--memory-gib`, `--host-work-mib` and
 `--gpu-work-mib` set available host memory and known working allocations.
+An estimate plans with the memory available when it is made. `--memory-gib`
+replaces that reading with the amount given, up to the installed memory. The
+`estimate memory` line names the amount used.
 An explicit target is estimated where a launch runs it as its header describes it: a
 decoder needs no model profile; separated routed experts need one, a layout the SSD
 path runs and expert formats its CPU executor computes. GPU placement follows the GPU

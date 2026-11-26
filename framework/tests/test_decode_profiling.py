@@ -78,6 +78,26 @@ def test_host_budget_and_gpu_placement_are_distinct():
     assert empty.components["host_cache_capacity_bytes"] == 0
 
 
+def test_a_host_budget_replaces_the_available_reading():
+    c, rt = setup()
+    busy = replace(rt, available_bytes=4 * GIB)
+    asked = estimate(c, replace(busy, memory_budget_bytes=32 * GIB))
+    # The budget is the memory to estimate for, whatever the host has free at the moment.
+    assert asked.components["memory_budget_bytes"] == 32 * GIB
+    assert asked == estimate(c, replace(rt, available_bytes=32 * GIB))
+    assert asked.tokens_per_second > estimate(c, busy).tokens_per_second
+    # It is still at most the installed memory.
+    total = c["memory"]["total_bytes"]
+    over = estimate(c, replace(busy, memory_budget_bytes=2 * total))
+    assert over.components["memory_budget_bytes"] == total
+    # A dense decoder plans with the same amount.
+    busy = replace(busy, gpus=())
+    dense = dense_decode_estimate(c, 4 * GIB, replace(busy, memory_budget_bytes=6 * GIB))
+    assert dense == dense_decode_estimate(c, 4 * GIB, replace(busy, available_bytes=6 * GIB))
+    assert dense.components["host_resident_bytes"] == 4 * GIB
+    assert dense_decode_estimate(c, 4 * GIB, busy).tokens_per_second is None
+
+
 def test_decode_pool_not_prefill_pool_prices_cpu_work():
     c, rt = setup()
     rt = replace(rt, gpus=())

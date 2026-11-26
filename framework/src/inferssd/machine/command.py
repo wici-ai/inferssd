@@ -42,7 +42,12 @@ from inferssd.machine.profile import (
     survey,
 )
 from inferssd.machine.store import default_path, exclusive, load_current, save
-from inferssd.strategy.estimate import Estimate, decode_estimate, dense_decode_estimate
+from inferssd.strategy.estimate import (
+    Estimate,
+    decode_estimate,
+    dense_decode_estimate,
+    host_memory_bytes,
+)
 from inferssd.strategy.inputs import ModelFacts, RuntimeFacts, facts_from_engine, read_runtime
 from inferssd.strategy.kernels import expert_format_refusal
 from inferssd.strategy.weights import DenseWeights, dense_weights
@@ -76,7 +81,12 @@ def add_command(commands: argparse._SubParsersAction[argparse.ArgumentParser]) -
     probes.add_argument(
         "--build", type=Path, help="engine build directory holding bin/inferssd-*probe"
     )
-    command.add_argument("--memory-gib", type=float, help="host memory budget for estimation only")
+    command.add_argument(
+        "--memory-gib",
+        type=float,
+        help="host memory the estimates plan with, in place of what is available now; "
+        "for estimation only",
+    )
     target = command.add_mutually_exclusive_group()
     target.add_argument(
         "--estimate-gguf",
@@ -334,6 +344,17 @@ def estimates(
     return [(model, Estimate(None, reason)) for model in models]
 
 
+def memory_line(value: Characteristics, facts: RuntimeFacts) -> str:
+    """The host memory the estimates plan with and where that amount comes from."""
+    if facts.memory_budget_bytes is not None:
+        source = "--memory-gib"
+    elif facts.available_bytes is not None:
+        source = "available now; --memory-gib sets another amount"
+    else:
+        source = "installed; --memory-gib sets another amount"
+    return f"estimate memory: {_gib(host_memory_bytes(value, facts))} ({source})"
+
+
 def estimate_lines(rows: list[tuple[catalog.Model, Estimate]]) -> list[str]:
     return [
         f"estimate: {model.repo}:{model.quantization} "
@@ -494,11 +515,17 @@ def run(
     def output(value: Characteristics, drive_key: Optional[str]) -> None:
         lines = summary(value, path)
         if args.json or args.model or target:
+            readings: list[RuntimeFacts] = []
+
+            def read() -> RuntimeFacts:
+                readings.append(estimate_runtime())
+                return readings[-1]
+
             rows = estimates(
                 value,
                 drive_key,
                 host.platform(),
-                estimate_runtime,
+                read,
                 host_work_bytes=int(args.host_work_mib * (1 << 20)),
                 gpu_work_bytes=int(args.gpu_work_mib * (1 << 20)),
                 target=target,
@@ -508,6 +535,8 @@ def run(
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
                 return
+            # The memory is read when the estimates are made, so it is named with them.
+            lines += [memory_line(value, facts) for facts in readings[-1:]]
             lines += estimate_lines(rows)
         for line in lines:
             emit(line)

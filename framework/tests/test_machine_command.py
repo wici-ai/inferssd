@@ -227,13 +227,14 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
         "GPUs: NVIDIA GeForce RTX 5090 (CUDA)"
     )
     names = [line.split(":", 1)[0] for line in out[2:]]
-    assert names == ["cpu", "memory", "compute", "gpus", "storage"] + ["estimate"] * len(
-        catalog.MODELS
-    )
+    assert names == ["cpu", "memory", "compute", "gpus", "storage", "estimate memory"] + [
+        "estimate"
+    ] * len(catalog.MODELS)
+    assert out[7] == "estimate memory: 24.0 GiB (available now; --memory-gib sets another amount)"
     # This machine measured Q4_K alone: every expert model is priced with its other formats taken
     # from Q4_K's rate, and the model without routed experts by its dense weights from RAM (its GPU
     # measured no matrix product).
-    for model, line in zip(catalog.MODELS, out[7:]):
+    for model, line in zip(catalog.MODELS, out[8:]):
         assert line.startswith(f"estimate: {model.repo}:{model.quantization} ")
         assert " tok/s" in line and "none:" not in line
         if model.facts.experts is None:
@@ -260,7 +261,7 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
     code, shown, _ = execute(["--show", "--model", files[0]], host, FakeRunner({}), tmp_path)
     assert code == 0 and shown == out
     code, shown, _ = execute(["--show"], host, FakeRunner({}), tmp_path)
-    assert code == 0 and shown == out[: -len(catalog.MODELS)]
+    assert code == 0 and shown == out[:7]
 
 
 def test_failed_sections_set_the_exit_status(tmp_path):
@@ -285,6 +286,36 @@ def test_unreadable_saved_profile_is_replaced(tmp_path):
         line.startswith("ignoring the unreadable saved profile") for line in progress
     )
     assert json.loads(output.read_text())["schema"] == "inferssd-machine/1"
+
+
+def test_memory_gib_sets_the_memory_the_estimates_plan_with(tmp_path):
+    host, files, build = machine(tmp_path)
+    execute(["--model", files[0], "--build", str(build)], host, FakeRunner(replies()), tmp_path)
+    show = ["--show", "--model", files[0]]
+    busy = replace(RUNTIME, available_bytes=2 * GIB)
+
+    def shown(argv, runtime):
+        code, out, _ = execute(show + argv, host, FakeRunner({}), tmp_path, runtime=runtime)
+        assert code == 0
+        return [line for line in out if line.startswith("estimate")]
+
+    now = shown([], busy)
+    assert now[0] == "estimate memory: 2.0 GiB (available now; --memory-gib sets another amount)"
+    asked = shown(["--memory-gib", "16"], busy)
+    assert asked[0] == "estimate memory: 16.0 GiB (--memory-gib)"
+    # The estimates are those of a host with that much available, not those of this moment.
+    assert asked[1:] == shown([], replace(RUNTIME, available_bytes=16 * GIB))[1:]
+    assert asked[1:] != now[1:]
+    # A smaller amount still lowers it, and no amount exceeds the installed memory.
+    assert shown(["--memory-gib", "1"], busy)[0] == "estimate memory: 1.0 GiB (--memory-gib)"
+    assert shown(["--memory-gib", "64"], busy)[0] == "estimate memory: 31.2 GiB (--memory-gib)"
+    code, out, _ = execute(
+        [*show, "--json", "--memory-gib", "16"], host, FakeRunner({}), tmp_path, runtime=busy
+    )
+    planned = {
+        row["components"].get("memory_budget_bytes") for row in json.loads(out[0])["estimates"]
+    }
+    assert code == 0 and planned - {None} == {16.0 * GIB}
 
 
 def test_show_measures_nothing(tmp_path):
