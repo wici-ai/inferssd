@@ -599,7 +599,7 @@ struct server_slot {
                 }
                 t_spec_draft_ms = (ggml_time_us() - t_spec_step_start_us) / 1e3;
                 if (spec_adaptive && spec_draft.empty()) {
-                    spec_adapt.on_block(0, 0, 1, 0.0, t_spec_draft_ms);
+                    spec_adapt.on_empty(n_draft_max, t_spec_draft_ms);
                 }
 
                 if (spec_draft.size() > (size_t) n_draft_max) {
@@ -3978,10 +3978,7 @@ private:
                 const double spec_step_ms = slot.t_spec_step_start_us > 0 ?
                     (t_current - slot.t_spec_step_start_us) / 1e3 : 0.0;
                 if (slot.spec_adaptive) {
-                    // the head ran a step a token it proposed, and one more when it stopped short of the length
-                    const int n_steps = std::min(slot.spec_draft_len, (int) n_draft + 1);
-                    slot.spec_adapt.on_block((int) n_draft, (int) ids.size() - 1, n_steps,
-                        spec_step_ms - slot.t_spec_draft_ms - spec_recompute_ms, slot.t_spec_draft_ms);
+                    slot.spec_adapt.on_block(slot.spec_draft_len, (int) ids.size() - 1, spec_step_ms - spec_recompute_ms);
                 }
                 SLT_INF(slot,
                         "speculative block audit: block=%" PRIu64 " proposed=%zu accepted=%zu "

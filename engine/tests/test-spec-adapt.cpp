@@ -11,18 +11,21 @@ static void require(bool ok, const char * what) {
     }
 }
 
-// a machine: a decode of r rows takes t1 + (r - 1) * row_ms, a draft step step_ms; the k-th draft token is accepted
-// with probability accept when every one before it was (deterministically: every block accepts its first `ok`)
-static int settle(double t1, double row_ms, double step_ms, int ok, int n_max) {
+// a machine: a decode of r rows takes t1 + (r - 1) * row_ms, a draft step step_ms; a block accepts its first `ok`
+// draft tokens; a head that is never sure enough (`propose` false) drafts nothing
+static int settle(double t1, double row_ms, double step_ms, int ok, int n_max, bool propose = true) {
     common_speculative_adapt a;
     int last = -1;
     for (int i = 0; i < 400; ++i) {
         const int n = a.choose(n_max);
         if (n == 0) {
             a.on_plain(t1);
+        } else if (!propose) {
+            a.on_empty(n, step_ms);
+            a.on_plain(t1);
         } else {
             const int accepted = ok < n ? ok : n;
-            a.on_block(n, accepted, n, t1 + n * row_ms, n * step_ms);
+            a.on_block(n, accepted, t1 + n * row_ms + n * step_ms);
         }
         if (i >= 300 && i % common_speculative_adapt::probe_every != 0) {
             last = n;
@@ -47,6 +50,8 @@ int main() {
     require(settle(100.0, 20.0, 2.0, 1, 3) == 1, "only the first accepted");
     // no draft is ever accepted: no draft
     require(settle(100.0, 10.0, 2.0, 0, 3) == 0, "nothing accepted");
+    // the head never proposes: its steps only cost time
+    require(settle(100.0, 10.0, 2.0, 3, 3, false) == 0, "never proposed");
     // nothing to draft
     {
         common_speculative_adapt a;
