@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "inferssd/app-versions.h"
+#include "inferssd/code-mode.h"
 #include "inferssd/identifiers.h"
 
 #include <algorithm>
@@ -376,6 +377,49 @@ static bool responses_collapse_system_messages(std::vector<json> & messages, siz
     return user_context;
 }
 
+// The code-mode exec of a Responses request (inferssd/code-mode.h) as the prompt would name it ("functions::exec" in
+// its namespace), and the tools it declares, which the prompt offers in its place; none without such an exec. The
+// first exec among the request's tools and those of its additional_tools items counts, with its description as the
+// tools of Codex versions render it (inferssd/app-versions.h).
+struct responses_code_mode {
+    std::string                        exec;
+    std::vector<server_code_mode_tool> tools;
+};
+
+static responses_code_mode responses_code_mode_of(const json & response_body) {
+    std::vector<json> tools;
+    if (response_body.contains("tools") && response_body.at("tools").is_array()) {
+        tools.insert(tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
+    }
+    const json input = json_value(response_body, "input", json());
+    if (input.is_array()) {
+        for (const json & item : input) {
+            if (item.is_object() && json_value(item, "type", std::string()) == "additional_tools" &&
+                !item.contains("content")) {
+                for (const json & tool : json_value(item, "tools", json::array())) {
+                    tools.push_back(tool);
+                }
+            }
+        }
+    }
+    for (json tool : tools) {
+        server_unify_codex_tool(tool, server_identifier_env::current().windows);
+        const std::string type = json_value(tool, "type", std::string());
+        if (type == "namespace") {
+            const std::string ns = json_value(tool, "name", std::string());
+            for (const json & sub_tool : json_value(tool, "tools", json::array())) {
+                if (json_value(sub_tool, "type", std::string()) == "custom" &&
+                    json_value(sub_tool, "name", std::string()) == "exec" && !ns.empty()) {
+                    return { ns + "::exec", server_code_mode_tools(sub_tool) };
+                }
+            }
+        } else if (type == "custom" && json_value(tool, "name", std::string()) == "exec") {
+            return { "exec", server_code_mode_tools(tool) };
+        }
+    }
+    return {};
+}
+
 json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     if (!response_body.contains("input")) {
         throw std::invalid_argument("'input' is required");
@@ -387,6 +431,7 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     const json input_value = response_body.at("input");
     json chatcmpl_body = response_body;
     chatcmpl_body.erase("input");
+    const responses_code_mode code_mode = responses_code_mode_of(response_body);
     std::vector<json> chatcmpl_messages;
     std::vector<json> input_tools; // tools that additional_tools input items declare
 
@@ -548,9 +593,19 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                 if (exists_and_is_string(item, "namespace") && !item.at("namespace").get<std::string>().empty()) {
                     name = item.at("namespace").get<std::string>() + "::" + name;
                 }
-                const json arguments = item.at("type") == "custom_tool_call"
+                json arguments = item.at("type") == "custom_tool_call"
                     ? json(json { {"input", item.at("input")} }.dump())
                     : item.at("arguments");
+                // A call of a code-mode exec that runs the script the server writes for a call of a tool exec
+                // declares is that tool's call, as the model wrote it (server_code_mode_call).
+                std::string called;
+                std::string called_arguments;
+                if (item.at("type") == "custom_tool_call" && name == code_mode.exec && !code_mode.tools.empty() &&
+                    server_code_mode_call(item.at("input").get<std::string>(), code_mode.tools, called,
+                                          called_arguments)) {
+                    name      = called;
+                    arguments = called_arguments;
+                }
                 json tool_call = {
                     {"function", json {
                         {"arguments", arguments},
@@ -724,6 +779,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                         LOG_WRN("Responses request: ignoring a tool in namespace '%s'\n", ns.c_str());
                         continue;
                     }
+                    if (sub_type == "custom" && !code_mode.tools.empty() &&
+                        ns + "::" + json_value(sub_tool, "name", std::string()) == code_mode.exec) {
+                        continue; // the tools it declares take its place, below
+                    }
                     if (sub_type == "custom") {
                         sub_tool = responses_custom_tool_function(std::move(sub_tool));
                     }
@@ -735,6 +794,10 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
                     add_tool(sub_tool, sub_type == "custom");
                 }
                 continue;
+            }
+            if (type == "custom" && !code_mode.tools.empty() &&
+                json_value(resp_tool, "name", std::string()) == code_mode.exec) {
+                continue; // the tools it declares take its place, below
             }
             if (type == "custom") {
                 add_tool(responses_custom_tool_function(std::move(resp_tool)), true);
@@ -748,6 +811,27 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             }
             resp_tool.erase("type");
             add_tool(resp_tool, false);
+        }
+        // The tools a code-mode exec declares, each as a function: a string tool (apply_patch) as a custom tool is.
+        // A tool of the same name the request offers otherwise keeps its own definition.
+        json code_mode_tools = json::object();
+        for (const server_code_mode_tool & tool : code_mode.tools) {
+            if (tool_names.count(tool.name) > 0) {
+                continue;
+            }
+            const json named = { { "name", tool.name }, { "description", tool.description } };
+            json function    = named;
+            if (tool.string_input) {
+                function = responses_custom_tool_function(named);
+            } else {
+                function["strict"]     = false;
+                function["parameters"] = tool.parameters;
+            }
+            add_tool(function, false);
+            code_mode_tools[tool.name] = tool.string_input;
+        }
+        if (!code_mode_tools.empty()) {
+            chatcmpl_body[SERVER_CODE_MODE] = { { "exec", code_mode.exec }, { "tools", code_mode_tools } };
         }
         if (!custom_tools.empty()) {
             chatcmpl_body[SERVER_CUSTOM_TOOLS] = custom_tools;

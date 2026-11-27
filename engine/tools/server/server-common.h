@@ -337,6 +337,13 @@ inline constexpr const char * SERVER_USER_CONTEXT_DATA_CHARS = "inferssd_user_co
 // keeps it (task_params::custom_tools), and the Responses output calls these tools with custom_tool_call items.
 inline constexpr const char * SERVER_CUSTOM_TOOLS = "inferssd_custom_tools";
 
+// A chat request field set by the conversion of a Responses request whose tools hold Codex's code-mode exec
+// (inferssd/code-mode.h): {"exec": <exec as the prompt would name it>, "tools": {<a tool exec declares, offered in
+// its place>: <whether it takes a string>, ...}}. oaicompat_chat_params_parse offers these tools after the other tools,
+// as it does custom tools (server_order_tools), and passes the field on; the task keeps it (task_params::code_mode),
+// and the Responses output makes each call of one an exec call (server_code_mode_input).
+inline constexpr const char * SERVER_CODE_MODE = "inferssd_code_mode";
+
 // A chat request field set by the conversion of an Anthropic Messages request (server_chat_convert_anthropic_to_oai):
 // the number of characters at the start of the first user message's text (its text parts in order) that are the
 // user's context, ahead of the user's own words: the system reminders that open the message and the environment block

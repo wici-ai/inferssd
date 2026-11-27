@@ -9,6 +9,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "server-common.h"
+#include "inferssd/code-mode.h"
 #include "server-ssd-reservation.h"
 
 #include <algorithm>
@@ -616,6 +617,12 @@ task_params server_task::params_from_json_cmpl(
         params.identifiers = server_identifier_map::from_json(json_value(data, "prompt_identifiers", json()));
         params.turn_context = json_value(data, "turn_context", std::string());
         params.custom_tools = json_value(data, SERVER_CUSTOM_TOOLS, std::vector<std::string>());
+        const json code_mode       = json_value(data, SERVER_CODE_MODE, json::object());
+        const json code_mode_tools = json_value(code_mode, "tools", json::object());
+        params.code_mode.exec = json_value(code_mode, "exec", std::string());
+        for (const auto & [name, string_input] : code_mode_tools.items()) {
+            params.code_mode.tools[name] = string_input.is_boolean() && string_input.get<bool>();
+        }
     }
 
     {
@@ -1133,8 +1140,19 @@ static bool oai_resp_custom_tool(const std::vector<std::string> & custom_tools, 
 }
 
 // A finished tool call as a Responses output item: a function_call, or for a custom tool (task_params::custom_tools)
-// a custom_tool_call with the tool's input.
-static json oai_resp_tool_call(const common_chat_tool_call & tool_call, const std::vector<std::string> & custom_tools) {
+// a custom_tool_call with the tool's input, or for a tool a code-mode exec declares (task_params::code_mode) a
+// custom_tool_call of exec with the script that calls the tool.
+static json oai_resp_tool_call(const common_chat_tool_call & tool_call, const std::vector<std::string> & custom_tools,
+                               const task_code_mode & code_mode) {
+    if (code_mode.has(tool_call.name)) {
+        return oai_resp_function_call(json {
+            {"type",    "custom_tool_call"},
+            {"status",  "completed"},
+            {"input",   server_code_mode_input(tool_call.name, tool_call.arguments,
+                                               code_mode.tools.at(tool_call.name))},
+            {"call_id", "fc_" + tool_call.id},
+        }, code_mode.exec);
+    }
     if (oai_resp_custom_tool(custom_tools, tool_call.name)) {
         return oai_resp_function_call(json {
             {"type",    "custom_tool_call"},
@@ -1192,7 +1210,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(oai_resp_tool_call(tool_call, oai_resp_custom_tools));
+        output.push_back(oai_resp_tool_call(tool_call, oai_resp_custom_tools, oai_resp_code_mode));
     }
 
     std::time_t t = std::time(0);
@@ -1285,7 +1303,18 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        const json output_item = oai_resp_tool_call(tool_call, oai_resp_custom_tools);
+        const json output_item = oai_resp_tool_call(tool_call, oai_resp_custom_tools, oai_resp_code_mode);
+        if (oai_resp_code_mode.has(tool_call.name)) {
+            // the exec call of a tool a code-mode exec declares: its input, which the stream has held back, whole
+            server_sent_events.push_back(json {
+                {"event", "response.custom_tool_call_input.delta"},
+                {"data", json {
+                    {"type",    "response.custom_tool_call_input.delta"},
+                    {"delta",   output_item.at("input")},
+                    {"item_id", "fc_" + tool_call.id},
+                }},
+            });
+        }
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1626,16 +1655,25 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
         }
     }
 
-    // A custom tool's input streams as its text, taken from the arguments it is written in as far as they go.
+    // A custom tool's input streams as its text, taken from the arguments it is written in as far as they go. A call
+    // of a tool a code-mode exec declares opens as an exec call, whose input comes whole with the final result.
     oai_resp_custom_inputs.clear();
-    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.custom_tools.empty()) {
+    oai_resp_custom_names.clear();
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && (!state.custom_tools.empty() || !state.code_mode.tools.empty())) {
         const std::vector<common_chat_tool_call> & calls = state.chat_msg_sent.tool_calls;
         for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
             const size_t i = diff.tool_call_index;
-            if (i >= calls.size() || !oai_resp_custom_tool(state.custom_tools, calls[i].name)) {
-                oai_resp_custom_inputs.emplace_back();
+            if (i < calls.size() && state.code_mode.has(calls[i].name)) {
+                oai_resp_custom_inputs.emplace_back(std::string());
+                oai_resp_custom_names.push_back(state.code_mode.exec);
                 continue;
             }
+            if (i >= calls.size() || !oai_resp_custom_tool(state.custom_tools, calls[i].name)) {
+                oai_resp_custom_inputs.emplace_back();
+                oai_resp_custom_names.emplace_back();
+                continue;
+            }
+            oai_resp_custom_names.push_back(calls[i].name);
             if (state.custom_input_sent.size() <= i) {
                 state.custom_input_sent.resize(i + 1, 0);
             }
@@ -1897,7 +1935,7 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
                         {"call_id", "fc_" + diff.tool_call_delta.id},
                         {"type",    "custom_tool_call"},
                         {"status",  "in_progress"},
-                    }, diff.tool_call_delta.name)},
+                    }, d < oai_resp_custom_names.size() ? oai_resp_custom_names[d] : diff.tool_call_delta.name)},
                 }},
             });
             oai_resp_fc_id = diff.tool_call_delta.id;

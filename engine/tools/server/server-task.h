@@ -50,6 +50,14 @@ enum stop_type {
     STOP_TYPE_LIMIT,
 };
 
+// See SERVER_CODE_MODE.
+struct task_code_mode {
+    std::string                 exec;  // as the prompt would name it, "functions::exec"
+    std::map<std::string, bool> tools; // each tool exec declares, offered in its place: whether it takes a string
+
+    bool has(const std::string & name) const { return tools.count(name) > 0; }
+};
+
 struct task_params {
     bool stream          = false;
     bool include_usage   = false;
@@ -99,6 +107,10 @@ struct task_params {
     // the custom tools of a Responses request as the prompt names them (SERVER_CUSTOM_TOOLS): its output calls them
     // with custom_tool_call items
     std::vector<std::string> custom_tools;
+
+    // the code-mode exec of a Responses request and the tools it declares (SERVER_CODE_MODE): its output makes each
+    // call of one an exec call
+    task_code_mode code_mode;
 
     // Embeddings
     int32_t embd_normalize = 2; // (-1=none, 0=max absolute int16, 1=taxicab, 2=Euclidean/L2, >2=p-norm)
@@ -150,15 +162,20 @@ struct task_result_state {
     const std::vector<std::string> custom_tools;
     std::vector<size_t> custom_input_sent;
 
+    // see task_params::code_mode
+    const task_code_mode code_mode;
+
     task_result_state(const common_chat_parser_params & chat_parser_params, server_identifier_map identifiers = {},
-                      std::string turn_context = {}, std::vector<std::string> custom_tools = {})
+                      std::string turn_context = {}, std::vector<std::string> custom_tools = {},
+                      task_code_mode code_mode = {})
         : chat_parser_params(chat_parser_params)
         , oai_resp_id("resp_" + random_string())
         , oai_resp_reasoning_id("rs_" + random_string())
         , oai_resp_message_id("msg_" + random_string())
         , identifiers(std::move(identifiers))
         , turn_context(std::move(turn_context))
-        , custom_tools(std::move(custom_tools)) {}
+        , custom_tools(std::move(custom_tools))
+        , code_mode(std::move(code_mode)) {}
 
     // parse partial tool calls and update the internal state
     common_chat_msg update_chat_msg(
@@ -305,7 +322,8 @@ struct server_task {
     // the task will be moved into queue, then onto slots
     // however, the state must be kept by caller (e.g., HTTP thread)
     task_result_state create_state() const {
-        return task_result_state(params.chat_parser_params, params.identifiers, params.turn_context, params.custom_tools);
+        return task_result_state(params.chat_parser_params, params.identifiers, params.turn_context,
+                                 params.custom_tools, params.code_mode);
     }
 
     bool is_parent() const {
@@ -432,6 +450,7 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
     std::vector<std::string> oai_resp_custom_tools; // see task_params::custom_tools
+    task_code_mode           oai_resp_code_mode;    // see task_params::code_mode
 
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
@@ -450,6 +469,7 @@ struct server_task_result_cmpl_final : server_task_result {
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
         oai_resp_message_id = state.oai_resp_message_id;
         oai_resp_custom_tools = state.custom_tools;
+        oai_resp_code_mode = state.code_mode;
     }
 
     json to_json_non_oaicompat();
@@ -507,8 +527,10 @@ struct server_task_result_cmpl_partial : server_task_result {
     std::string oai_resp_message_id;
     std::string oai_resp_fc_id;
     // for each of oaicompat_msg_diffs: for a tool call to a custom tool, the part of the tool's input it adds (the
-    // text, not the JSON of the arguments it is written in); nullopt for any other
+    // text, not the JSON of the arguments it is written in), and the tool the item calls; nullopt and empty for any
+    // other. A call of a tool a code-mode exec declares is an exec call, whose input comes whole with the final result.
     std::vector<std::optional<std::string>> oai_resp_custom_inputs;
+    std::vector<std::string>                oai_resp_custom_names;
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
