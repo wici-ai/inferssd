@@ -13,9 +13,9 @@ which refuse a build below it. There is one package for each GPU backend the lau
 on Windows:
 
 - `windows-x64-cuda`, for NVIDIA GPUs: the CUDA backend with the GPU expert tier and the GPU
-  memory probe, NVIDIA's CUDA runtime and cuBLAS libraries, built for Turing to Blackwell GPUs
-  (real code for Ampere, Ada and Blackwell, PTX for the others). A GPU it has real code for
-  (`native_compute_capabilities`) needs an NVIDIA driver no older than
+  memory probe, NVIDIA's CUDA runtime and cuBLAS libraries, built for Maxwell to Blackwell GPUs as
+  ggml-cuda builds by default (real code for Ampere, Ada and Blackwell, PTX for the others). A GPU
+  it has real code for (`native_compute_capabilities`) needs an NVIDIA driver no older than
   `minimum_nvidia_driver_native`, the oldest driver of the same CUDA major version (CUDA minor
   version compatibility); any other GPU needs `minimum_nvidia_driver`, the driver of the CUDA
   toolkit it is built with, which compiles the PTX. The installer reads each GPU's compute

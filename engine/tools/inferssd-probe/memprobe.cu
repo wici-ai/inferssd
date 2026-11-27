@@ -246,7 +246,7 @@ int run(int argc, char ** argv) {
     CK(cudaGetDeviceCount(&count));
     if (count <= 0) { throw std::runtime_error("no CUDA device"); }
     // One busy or failing device must not cost the measurements of the others.
-    std::string devices, skipped;
+    std::string devices, skipped, reasons;
     int measured = 0;
     for (int device = 0; device < count; ++device) {
         try {
@@ -257,10 +257,12 @@ int run(int argc, char ** argv) {
             std::fprintf(stderr, "inferssd-memprobe: device %d skipped: %s\n", device, e.what());
             skipped += std::string(skipped.empty() ? "" : ", ") + "{\"index\": " + std::to_string(device) +
                        ", \"reason\": " + quote(e.what()) + "}";
+            reasons += "; device " + std::to_string(device) + ": " + e.what();
         }
     }
     if (measured == 0) {
-        throw std::runtime_error("no CUDA device could be measured (" + std::to_string(count) + " found)");
+        // The last line is the one a caller reports: it carries each device's reason.
+        throw std::runtime_error("no CUDA device could be measured (" + std::to_string(count) + " found)" + reasons);
     }
     const std::string json = "{\"schema\": \"inferssd-memprobe/1\",\n \"devices\": [" + devices +
                              "],\n \"skipped\": [" + skipped + "]}\n";

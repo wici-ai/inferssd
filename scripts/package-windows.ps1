@@ -5,8 +5,10 @@ param(
   [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\dist'),
   [string]$BuildDirectory = '',
   [int]$Jobs = 2,
-  # Real code for the GPU generations people run; PTX for the rest, compiled by the driver on first use.
-  [string]$CudaArchitectures = '75-virtual;80-virtual;86-real;89-real;120a-real',
+  # ggml-cuda's default for a CUDA 12.8+ toolkit (engine/ggml/src/ggml-cuda/CMakeLists.txt): PTX for
+  # Maxwell, Pascal, Volta, Turing and Ampere, compiled by the driver on first use, and real code for
+  # Ampere, Ada and Blackwell. Its 121a-real is left out: only the GB10, which runs no x64 Windows, has it.
+  [string]$CudaArchitectures = '50-virtual;61-virtual;70-virtual;75-virtual;80-virtual;86-real;89-real;120a-real',
   # The driver of the CUDA toolkit this package is built with (12.9 Update 1): the oldest that runs its
   # runtime and compiles its PTX.
   [string]$MinimumNvidiaDriver = '576.57',
