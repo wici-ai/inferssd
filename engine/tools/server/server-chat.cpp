@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "inferssd/app-versions.h"
+#include "inferssd/identifiers.h"
 
 #include <algorithm>
 #include <cctype>
@@ -705,6 +706,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             });
         };
         for (json resp_tool : resp_tools) {
+            // the tools of Codex versions render as one (see inferssd/app-versions.h)
+            server_unify_codex_tool(resp_tool, server_identifier_env::current().windows);
             const std::string type = json_value(resp_tool, "type", std::string());
             if (type == "namespace") {
                 // A namespace groups function and custom tools (Codex: sub-agents, one per MCP server; the
@@ -830,8 +833,9 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     // Convert system prompt
     json oai_messages = json::array();
     auto system_param = json_value(body, "system", json());
-    if (server_is_claude_code(system_param)) {
-        // the variants of Claude Code's system prompt render as one (see inferssd/app-versions.h)
+    // the variants of Claude Code's system prompt and tools render as one (see inferssd/app-versions.h)
+    const bool claude_code = server_is_claude_code(system_param);
+    if (claude_code) {
         server_unify_claude_code_system(system_param);
     }
     if (!system_param.is_null()) {
@@ -985,7 +989,10 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         const json & tools = body.at("tools");
         if (tools.is_array()) {
             json oai_tools = json::array();
-            for (const auto & tool : tools) {
+            for (json tool : tools) {
+                if (claude_code) {
+                    server_unify_claude_code_tool(tool);
+                }
                 oai_tools.push_back({
                     {"type", "function"},
                     {"function", {

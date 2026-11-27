@@ -18,3 +18,14 @@ bool server_is_claude_code(const nlohmann::ordered_json & system);
 // lacks a passage gets it where the other variant has it: between the same two lines, when the block has those lines
 // next to each other and the passage nowhere.
 void server_unify_claude_code_system(nlohmann::ordered_json & system);
+
+// Claude Code's ToolSearch tool requires its parameters query and max_results in 2.1.328 and only query in 2.1.332.
+// A Claude Code request's ToolSearch (an Anthropic tool) that requires both requires only query, as 2.1.332 sends it:
+// 2.1.328 defines max_results as optional, with a default of 5, and takes a call without it as well.
+void server_unify_claude_code_tool(nlohmann::ordered_json & tool);
+
+// Codex's exec_command tool describes its parameter login one way in 0.160 to 0.170 (also in the ChatGPT desktop app)
+// and another in 0.172, which says it differently on macOS and on Windows. The earlier description becomes the 0.172
+// one of the system whose requests the server renders (server_identifier_env::current): Windows', or macOS' on the
+// others. tool is a Responses tool.
+void server_unify_codex_tool(nlohmann::ordered_json & tool, bool windows);

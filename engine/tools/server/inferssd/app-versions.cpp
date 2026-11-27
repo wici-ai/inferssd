@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "app-versions.h"
 
+#include <initializer_list>
 #include <string>
 
 using json = nlohmann::ordered_json;
@@ -48,6 +49,53 @@ const passage claude_code_passages[] = {
     },
 };
 
+// A list of the parameters a tool requires that one version of an app sends and another replaced; the one the server
+// renders names only the tool's parameters.
+struct required_list {
+    const char * tool;
+    const char * from; // JSON array
+    const char * to;   // JSON array
+};
+
+// From the requests of Claude Code 2.1.328 on macOS and on Windows (from) and of 2.1.332 on Windows (to).
+const required_list claude_code_required[] = {
+    { "ToolSearch", R"(["query", "max_results"])", R"(["query"])" },
+};
+
+// The description of a parameter of a tool that one version of an app sends, and the description a later version
+// sends on Windows and on macOS (no request from Linux was captured; it goes there as on macOS).
+struct parameter_description {
+    const char * tool;
+    const char * parameter;
+    const char * from;
+    const char * windows;
+    const char * others;
+};
+
+// From the requests of Codex 0.160 on macOS, of 0.170 and the ChatGPT desktop app's 0.169 on Windows (from), and of
+// 0.172 on Windows and on macOS.
+const parameter_description codex_descriptions[] = {
+    {
+        "exec_command", "login",
+        "True runs the shell with -l/-i semantics; false disables them. Defaults to true.",
+        "Login-shell startup. In PowerShell, false skips profiles. Keep them enabled for profile-defined commands, "
+        "even unattended. Omit to inherit.",
+        "Request login-shell startup. Omit to inherit.",
+    },
+};
+
+// The value at a path of keys in a JSON object, or nullptr.
+json * at_path(json & value, std::initializer_list<const char *> keys) {
+    json * at = &value;
+    for (const char * key : keys) {
+        if (!at->is_object() || !at->contains(key)) {
+            return nullptr;
+        }
+        at = &at->at(key);
+    }
+    return at;
+}
+
 // Puts the passage between its lines if the text has them next to each other, at the start of a line, and lacks it.
 void insert_passage(std::string & text, const passage & p) {
     if (text.find(p.text) != std::string::npos) {
@@ -80,6 +128,43 @@ void server_unify_claude_code_system(json & system) {
         std::string & text = block.at("text").get_ref<std::string &>();
         for (const passage & p : claude_code_passages) {
             insert_passage(text, p);
+        }
+    }
+}
+
+void server_unify_claude_code_tool(json & tool) {
+    for (const required_list & r : claude_code_required) {
+        if (!tool.is_object() || !tool.contains("name") || tool.at("name") != r.tool) {
+            continue;
+        }
+        json * required   = at_path(tool, { "input_schema", "required" });
+        json * properties = at_path(tool, { "input_schema", "properties" });
+        if (required == nullptr || properties == nullptr || !properties->is_object() ||
+            *required != json::parse(r.from)) {
+            continue;
+        }
+        const json to = json::parse(r.to);
+        bool       known = true;
+        for (const auto & name : to) {
+            known = known && properties->contains(name.get<std::string>());
+        }
+        if (known) {
+            *required = to;
+        }
+    }
+}
+
+void server_unify_codex_tool(json & tool, bool windows) {
+    if (!tool.is_object() || !tool.contains("type") || tool.at("type") != "function") {
+        return;
+    }
+    for (const parameter_description & d : codex_descriptions) {
+        if (!tool.contains("name") || tool.at("name") != d.tool) {
+            continue;
+        }
+        json * description = at_path(tool, { "parameters", "properties", d.parameter, "description" });
+        if (description != nullptr && *description == d.from) {
+            *description = windows ? d.windows : d.others;
         }
     }
 }
