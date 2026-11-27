@@ -100,6 +100,27 @@ class CompanyNameTests(unittest.TestCase):
                 self.assertIn("REPORT", output)
 
 
+class StandInHomeTests(unittest.TestCase):
+    # Blocked fixtures are split so that this file does not match its own patterns.
+    def findings(self, text):
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            result = scanner.inspect(text, "fixture:1", True)
+        return result, output.getvalue()
+
+    def test_stand_in_home_is_allowed(self):
+        for text in ("/Users/infer/project", "`/home/infer/project/notes.txt`", "(/Users/infer)", "/home/infer."):
+            with self.subTest(text=text):
+                self.assertEqual(self.findings(text), (0, ""))
+
+    def test_other_homes_are_blocked(self):
+        for text in ("/Us" + "ers/alice/code", "/ho" + "me/bob/", "/Us" + "ers/inferred/x", "/ho" + "me/infer-x/",
+                     "/Us" + "ers/infer.y/", "/ro" + "ot/x"):
+            with self.subTest(text=text):
+                result, output = self.findings(text)
+                self.assertEqual(result, 1)
+                self.assertIn("personal path", output)
+
+
 class PowerShellLineTests(unittest.TestCase):
     def findings(self, text):
         with contextlib.redirect_stdout(io.StringIO()):

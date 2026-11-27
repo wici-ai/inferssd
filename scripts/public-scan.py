@@ -9,7 +9,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-PATH = re.compile(r"(?<![\w$}])/(?:home|Users|var/tmp)/[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/|\b)|(?<![\w$}])/root/")
+# The server renders every user's home as the stand-in "infer" (engine/tools/server/inferssd/identifiers.h), a
+# folder of no one, so a path under it is not personal; any other name, "inferred" included, is.
+PATH = re.compile(r"(?<![\w$}])/(?:home|Users|var/tmp)/(?!infer(?:/|(?![\w-]|\.\w)))[A-Za-z0-9_-][A-Za-z0-9_.-]*(?:/|\b)"
+                  r"|(?<![\w$}])/root/")
 LOGIN = re.compile(r"(?<![\w./-])[A-Za-z_][A-Za-z0-9_.%+-]*@([A-Za-z_][A-Za-z0-9.-]*)")
 IP = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
 # The company is written "WiCi AI", its GitHub owner "wici-ai/" and its domain "wici.ai".
