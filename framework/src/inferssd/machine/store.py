@@ -122,22 +122,29 @@ def exclusive(
         os.close(fd)
 
 
+def replace_text(path: Path, content: str) -> None:
+    """Replace PATH with CONTENT atomically: a reader sees the old file or the new one, whole.
+
+    The caller holds PATH's lock (exclusive)."""
+    fd, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(temporary)
+        raise
+
+
 def save(value: Characteristics, path: Optional[Path] = None, *, wait_s: float = 10.0) -> None:
     """Validate, then replace PATH (default: the per-user file) atomically under the lock."""
     path = path or default_path()
     content = dumps(value)
     with exclusive(path, wait_s):
-        fd, temporary = tempfile.mkstemp(dir=path.parent, prefix="." + path.name + ".")
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        except BaseException:
-            with contextlib.suppress(OSError):
-                os.unlink(temporary)
-            raise
+        replace_text(path, content)
 
 
 @dataclass(frozen=True)

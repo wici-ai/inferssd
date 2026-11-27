@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import subprocess
 from collections.abc import Callable, Sequence
-from typing import Any, Protocol, cast
+from typing import Any, Optional, Protocol, cast
 
 from inferssd.contracts import ContractError
 from inferssd.machine.characteristics import (
@@ -89,7 +89,9 @@ MODEL: Check = record(
         "metadata": mapping(_anything),
         "tensors": array(TENSOR),
         "experts": nullable(EXPERTS),
-    }
+    },
+    # how many of experts.layers are the MTP head's, with which the facts were read (0 without)
+    {"draft_layers": COUNT},
 )
 
 
@@ -111,14 +113,20 @@ def validate(value: object) -> dict[str, Any]:
     return model
 
 
-def query(binary: str, path: str, run: Run, shards: Sequence[str] = ()) -> dict[str, Any]:
+def query(
+    binary: str, path: str, run: Run, shards: Sequence[str] = (), head: Optional[str] = None
+) -> dict[str, Any]:
     """The facts of the model PATH (a GGUF file or a split model's first shard) from BINARY.
 
     SHARDS are the model's --shard/--ple values, as the server takes them: the facts name
-    the files the engine loads the model from, theirs among them."""
+    the files the engine loads the model from, theirs among them. With HEAD, an MTP head
+    the model drafts with, they are the facts of the model with the head loaded: its
+    routed layer among the experts' and its tensors among the model's."""
     argv = [binary, "--ssd-model-facts", path]
     for shard in shards:
         argv += ["--shard", shard]
+    if head is not None:
+        argv += ["--spec-type", "draft-mtp", "--spec-draft-model", head]
     try:
         done = run(argv)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:

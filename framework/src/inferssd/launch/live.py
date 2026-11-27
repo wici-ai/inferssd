@@ -14,10 +14,11 @@ import platform
 import re
 import shutil
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional, Protocol
 
+from inferssd.engine import decode_steps
 from inferssd.engine import model as engine_model
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.resources import cmake_gpu_backends
@@ -25,6 +26,7 @@ from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine.identity import KFD_NODES
 from inferssd.platform.captured_command import run_captured
 from inferssd.strategy import inputs as strategy_inputs
+from inferssd.strategy.weights import dense_weights
 
 
 def cpu_count(value: str) -> str:
@@ -44,12 +46,20 @@ def cpu_count(value: str) -> str:
 
 
 def model_facts(
-    binary: str, path: str, run: engine_model.Run, shards: Sequence[str] = ()
+    binary: str,
+    path: str,
+    run: engine_model.Run,
+    shards: Sequence[str] = (),
+    head: Optional[str] = None,
 ) -> object:
     """The model_facts fact of the model PATH, with its --shard/--ple values SHARDS, as the
-    server BINARY would load it (inferssd.strategy.inputs)."""
-    model = engine_model.query(binary, path, run, shards)
-    return strategy_inputs.model_facts_json(strategy_inputs.facts_from_engine(model))
+    server BINARY would load it (inferssd.strategy.inputs); with the MTP head HEAD loaded too,
+    the draft_model_facts fact."""
+    model = engine_model.query(binary, path, run, shards, head)
+    facts = strategy_inputs.facts_from_engine(model)
+    # what a token reads whole, which the strategy's decode estimates take
+    read = dense_weights(model).active_bytes
+    return strategy_inputs.model_facts_json(replace(facts, dense_read_bytes=read))
 
 
 @dataclass(frozen=True)
@@ -111,7 +121,8 @@ HOST_FACTS = frozenset(
     "gpu_available ss_available systemd cgroup_v2 user_manager memory_controller euid "
     "memory_kib filesystem gpu_memory gpu_processes port_busy scope_suffix "
     "platform_system platform_machine default_threads physical_memory disk_free "
-    "runtime_facts model_drive_key engine_gpu_backends cpu_topology model_facts".split()
+    "runtime_facts model_drive_key engine_gpu_backends cpu_topology model_facts "
+    "draft_model_facts decode_steps decode_probe".split()
 )
 
 
@@ -123,15 +134,18 @@ class LiveArtifacts:
         host: Host,
         machine: Optional[str] = None,
         strategy_host: Optional[strategy_inputs.Host] = None,
+        measurements: Optional[Path] = None,
     ) -> None:
         """MACHINE: the characteristics text the launch strategy derives from, if any.
 
         STRATEGY_HOST reads the strategy's runtime facts; by default this host,
-        with the launch's environment.
+        with the launch's environment. MEASUREMENTS is the file of the decode
+        probe measurements this machine keeps; by default the per-user one.
         """
         self.inputs, self.host = inputs, host
         self.machine = machine
         self.strategy_host = strategy_host or strategy_inputs.NativeHost(dict(inputs.environment))
+        self.measurements = measurements
         self.artifacts = RecordedArtifacts(inputs, {})
 
     def __call__(self, fact: Fact) -> Reply:
@@ -238,6 +252,32 @@ class LiveArtifacts:
                 args[1],
                 lambda argv: host.command(argv, timeout=engine_model.TIMEOUT_S),
                 args[2:],
+            )
+        if name == "draft_model_facts":
+            # The engine's facts of the model ARGS[1] with its shards ARGS[3:] and the MTP head
+            # ARGS[2] loaded, as the server ARGS[0] would load them. Where the engine reads none,
+            # the launch leaves the head out, and the engine's error says why.
+            try:
+                return model_facts(
+                    args[0],
+                    args[1],
+                    lambda argv: host.command(argv, timeout=engine_model.TIMEOUT_S),
+                    args[3:],
+                    args[2],
+                )
+            except ValueError as error:
+                return str(error)
+        if name in ("decode_steps", "decode_probe"):
+            # A decode probe (inferssd.engine.decode_steps): the measurement kept for it, or None;
+            # or the probe run now, its measurement kept, or why it measured nothing.
+            request = decode_steps.Request.parse(args)
+            kept = self.measurements or decode_steps.store_path(
+                self.strategy_host.platform(), dict(self.inputs.environment)
+            )
+            if name == "decode_steps":
+                return decode_steps.cached(request, kept)
+            return decode_steps.probe(
+                request, kept, lambda argv: host.command(argv, timeout=decode_steps.TIMEOUT_S)
             )
         if name == "engine_gpu_backends":
             # The build the server executable came from: build/bin/inferssd-server lies beside

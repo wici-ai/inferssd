@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import math
@@ -11,7 +12,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from types import ModuleType
-from typing import Optional, cast
+from typing import Any, Optional, Union, cast
 
 from inferssd.configuration.settings import (
     PLATFORMS,
@@ -22,6 +23,7 @@ from inferssd.configuration.settings import (
     schema,
     uncomment,
 )
+from inferssd.engine import decode_steps
 from inferssd.launch.resources import EngineResources, server_binary
 from inferssd.launch.types import (
     GPU_LAYERS,
@@ -34,8 +36,8 @@ from inferssd.launch.types import (
     Threads,
 )
 from inferssd.machine.identity import TIER_BACKENDS
-from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
-from inferssd.strategy.launch import Planned, plan
+from inferssd.strategy.inputs import ModelFacts, model_facts_from, runtime_facts_from
+from inferssd.strategy.launch import DraftHead, Planned, plan
 
 # The architectures whose NextN block the engine drafts with (MTP), from a head file published
 # with the model.
@@ -512,11 +514,230 @@ def _resolve(
                 for item in value.entries
             ),
         )
+    given, given_threads = value, threads
+
+    def launched(planned: Optional[Planned]) -> tuple[Snapshot, Threads, Optional[Planned]]:
+        """The settings, thread pools and strategy a launch with PLANNED runs with."""
+        value, threads = given, given_threads
+        if planned is not None:
+            value, threads = planned.settings, threadpools(planned.threads, platform)
+            if any(
+                argument in protected - {"--split-mode", "--main-gpu", "--tensor-split"}
+                for argument in planned.server_args[::2]
+            ):
+                raise ValueError("the launch strategy names a protected server option")
+            # This newly supported CPU model has no measured thread/compute priors on
+            # many existing profiles. Avoid the unpriced all-core fallback on hybrid
+            # machines; priced strategies and explicit user thread choices still win.
+            costs = dict(cast(tuple[tuple[str, float], ...], value.at("place.costs").value))
+            if (
+                profile == "qwen4exp"
+                and gpu_backends == ()
+                and spec.threads == Threads()
+                and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
+                and value.at("cpu.decode_participants").value == 0
+            ):
+                runtime = runtime_facts_from(s.value("runtime_facts"))
+                io_cpus = set(cast(tuple[int, ...], value.at("cpu.io_cpus").value))
+                threads = threadpools(
+                    cpu_defaults(
+                        s.value("cpu_topology"),
+                        [cpu for cpu in runtime.cpus if cpu not in io_cpus],
+                        spec.threads,
+                    ),
+                    platform,
+                )
+                chosen = dict(cast(Mapping[str, object], planned.receipt.get("chosen", {})))
+                actual = {
+                    "decode": threads.decode,
+                    "batch": threads.batch,
+                    "cpus": list(threads.cpus),
+                    "decode_cpus": list(threads.decode_cpus),
+                }
+                strategy_receipt = dict(
+                    planned.receipt,
+                    model_defaults={
+                        "reason": "qwen4exp CPU compute priors unavailable; use the live fast "
+                        "cluster",
+                        "previous_threads": chosen.get("threads", {}),
+                        "threads": actual,
+                    },
+                )
+                chosen["threads"] = actual
+                strategy_receipt["chosen"] = chosen
+                planned = replace(planned, threads=threads, receipt=strategy_receipt)
+        if not experts and value.at("expert.source").value:
+            raise ValueError("expert.source names routed experts; the model has none")
+        if experts and not value.at("expert.source").value:
+            if value.at("expert.source").origin != "default":
+                raise ValueError("typed launch requires a nonempty explicit expert.source")
+            # The engine indexes the routed experts from the model's own GGUF headers.
+            selected = Setting(
+                "expert.source",
+                tuple(paths),
+                "file",
+                "the model's GGUF files",
+                " source=model; input=its GGUF shards",
+            )
+            value = replace(
+                value,
+                entries=tuple(selected if x.key == selected.key else x for x in value.entries),
+            )
+        # The draft head's routed experts are read as the model's are.
+        head = planned.draft_head if planned is not None else None
+        sources = cast(tuple[str, ...], value.at("expert.source").value)
+        if experts and head is not None and head not in sources:
+            source = value.at("expert.source")
+            added = replace(
+                source,
+                value=sources + (head,),
+                receipt=source.receipt + "; draft head=" + head,
+            )
+            value = replace(
+                value, entries=tuple(added if x.key == added.key else x for x in value.entries)
+            )
+        for path in cast(tuple[str, ...], value.at("expert.source").value):
+            if not isinstance(path, str) or not s.value("is_file", path):
+                raise ValueError("missing typed expert source: " + str(path))
+        return value, threads, planned
+
+    def pass_sizes(planned: Optional[Planned]) -> tuple[int, int, int]:
+        """The context, batch and micro-batch sizes of a launch with PLANNED."""
+        context = spec.context or AUTO_CONTEXT
+        one_pass = planned is not None and planned.one_pass
+        batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
+        ubatch = spec.ubatch or (batch if one_pass else BATCH)
+        return context, batch, ubatch
+
+    def server(
+        value: Snapshot, threads: Threads, planned: Optional[Planned], settings: str, telemetry: str
+    ) -> list[str]:
+        """The server command of a launch with VALUE, THREADS and PLANNED that reads its settings
+        from the file SETTINGS and writes its events to TELEMETRY."""
+        context, batch, ubatch = pass_sizes(planned)
+        command = [binary, "-m", model, *placement]
+        for shard in spec.shards:
+            command += ["--shard", shard]
+        command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
+        if not spec.layer_events:
+            command.append("--ssd-no-layer-events")
+        for item in value.entries:
+            if item.origin == "cli":
+                command += [
+                    "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
+                    literal(item, platform),
+                ]
+        command += [
+            "--mmap",
+            "--no-repack",
+            "--fit",
+            "on" if fit_layers else "off",
+            "--no-warmup",
+            "-ngl",
+            "auto" if fit_layers else str(GPU_LAYERS),
+            "-c",
+            str(context),
+            "-b",
+            str(batch),
+            "-ub",
+            str(ubatch),
+        ]
+        if threads.decode is not None:
+            command += ["-t", str(threads.decode)]
+        if threads.batch is not None:
+            command += ["-tb", str(threads.batch)]
+        if threads.cpus:
+            mask = hex(sum(1 << cpu for cpu in threads.cpus))
+            command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
+        elif threads.decode_cpus:
+            # The batch pool has its own count (-tb above), so it keeps no CPU mask.
+            command += [
+                "-C",
+                hex(sum(1 << cpu for cpu in threads.decode_cpus)),
+                "--cpu-strict",
+                "1",
+            ]
+        if template is not None:
+            command += ["--chat-template-file", template]
+        if profile == "dsv":
+            command += ["--chat-template-kwargs", DSV_TEMPLATE_KWARGS]
+        sampling = SAMPLING.get(profile or "", ())
+        named = {x.split("=", 1)[0] for x in s.inputs.extra}
+        for option, number in zip(sampling[::2], sampling[1::2]):
+            if option not in named:
+                command += [option, number]
+        if spec.prompt_cache is None:
+            command += ["--cache-ram", "0"]
+        else:
+            # One directory per model, named as its file is without the shard suffix.
+            match = re.fullmatch(r"(.+)-\d{5}-of-\d{5}\.gguf", os_path.basename(model))
+            name = match.group(1) if match else os_path.basename(model)
+            if name.endswith(".gguf"):
+                name = name[: -len(".gguf")]
+            if spec.prompt_cache_mib is not None and spec.prompt_cache_mib < 1:
+                raise ValueError("--prompt-cache-mib must be positive")
+            command += [
+                "--cache-disk",
+                os_path.join(spec.prompt_cache, name),
+                "--cache-disk-mib",
+                str(spec.prompt_cache_mib or PROMPT_CACHE_MIB),
+            ]
+            if spec.prefix_cache is not None:
+                command += ["--prefix-cache", os_path.join(spec.prefix_cache, name)]
+        command += [
+            "--host",
+            spec.host,
+            "--port",
+            str(spec.port),
+            "-np",
+            "1",
+        ]
+        if experts:
+            # The SSD executor reads the routed experts; their mapped pages stay unread.
+            command += ["--defer-experts"]
+        # Flash Attention stays the server's auto choice on every platform: on for each layer
+        # whose device runs it, which is every layer wherever the backends implement it.
+        if planned is not None:
+            command += list(planned.server_args)
+        return command + list(s.inputs.extra)
+
+    def head_facts(head: str) -> Union[ModelFacts, str]:
+        found = s.value("draft_model_facts", binary, model, head, *spec.shards)
+        return found if isinstance(found, str) else model_facts_from(found)
+
+    def measure(drafted: Planned) -> Union[Mapping[str, Any], str]:
+        """The engine's decode probe of the launch DRAFTED, which drafts with its head: the
+        measurement this machine keeps for the same server, model and launch, else a new one."""
+        value, threads, probed = launched(drafted)
+        text = materialized_settings(value)
+        settings = os_path.join(directory, "decode-probe.ssd")
+        argv = server(
+            value, threads, probed, settings, os_path.join(directory, "decode-probe-events.jsonl")
+        )
+        inputs = cast(Mapping[str, object], drafted.receipt["inputs"])
+        request = decode_steps.Request(
+            cast(str, inputs["characteristics_sha256"]),
+            hashlib.sha256(text.encode()).hexdigest(),
+            tuple(paths),
+            cast(str, drafted.draft_head),
+            (*argv, decode_steps.FLAG),
+        ).arguments()
+        found = s.value("decode_steps", *request)
+        if found is not None:
+            return cast(Mapping[str, Any], found)
+        s.ask("write_exclusive", settings, text)
+        s.emit(
+            "inferssd launch: measuring the model's decode steps with its draft head; later "
+            "launches reuse the measurement\n",
+            "stderr",
+        )
+        return cast(Union[Mapping[str, Any], str], s.value("decode_probe", *request))
+
     planned: Optional[Planned] = None
     if spec.strategy:
         # the MTP head published with the model, looked for once the strategy runs
-        find_head = (
-            (lambda: draft_head(s, model, os_path))
+        drafter = (
+            DraftHead(lambda: draft_head(s, model, os_path), head_facts, measure)
             if facts.architecture in DRAFT_ARCHITECTURES
             else None
         )
@@ -532,85 +753,9 @@ def _resolve(
             gpu_backends,
             placement,
             fit_layers=fit_layers,
-            draft_head=find_head,
+            draft_head=drafter,
         )
-        value, threads = planned.settings, threadpools(planned.threads, platform)
-        if any(
-            argument in protected - {"--split-mode", "--main-gpu", "--tensor-split"}
-            for argument in planned.server_args[::2]
-        ):
-            raise ValueError("the launch strategy names a protected server option")
-        # This newly supported CPU model has no measured thread/compute priors on
-        # many existing profiles. Avoid the unpriced all-core fallback on hybrid
-        # machines; priced strategies and explicit user thread choices still win.
-        costs = dict(cast(tuple[tuple[str, float], ...], value.at("place.costs").value))
-        if (
-            profile == "qwen4exp"
-            and gpu_backends == ()
-            and spec.threads == Threads()
-            and not {"cpu_fixed_us", "cpu_route_us"} <= costs.keys()
-            and value.at("cpu.decode_participants").value == 0
-        ):
-            runtime = runtime_facts_from(s.value("runtime_facts"))
-            io_cpus = set(cast(tuple[int, ...], value.at("cpu.io_cpus").value))
-            threads = threadpools(
-                cpu_defaults(
-                    s.value("cpu_topology"),
-                    [cpu for cpu in runtime.cpus if cpu not in io_cpus],
-                    spec.threads,
-                ),
-                platform,
-            )
-            chosen = dict(cast(Mapping[str, object], planned.receipt.get("chosen", {})))
-            actual = {
-                "decode": threads.decode,
-                "batch": threads.batch,
-                "cpus": list(threads.cpus),
-                "decode_cpus": list(threads.decode_cpus),
-            }
-            strategy_receipt = dict(
-                planned.receipt,
-                model_defaults={
-                    "reason": "qwen4exp CPU compute priors unavailable; use the live fast cluster",
-                    "previous_threads": chosen.get("threads", {}),
-                    "threads": actual,
-                },
-            )
-            chosen["threads"] = actual
-            strategy_receipt["chosen"] = chosen
-            planned = replace(planned, threads=threads, receipt=strategy_receipt)
-    if not experts and value.at("expert.source").value:
-        raise ValueError("expert.source names routed experts; the model has none")
-    if experts and not value.at("expert.source").value:
-        if value.at("expert.source").origin != "default":
-            raise ValueError("typed launch requires a nonempty explicit expert.source")
-        # The engine indexes the routed experts from the model's own GGUF headers.
-        selected = Setting(
-            "expert.source",
-            tuple(paths),
-            "file",
-            "the model's GGUF files",
-            " source=model; input=its GGUF shards",
-        )
-        value = replace(
-            value, entries=tuple(selected if x.key == selected.key else x for x in value.entries)
-        )
-    # The draft head's routed experts are read as the model's are.
-    head = planned.draft_head if planned is not None else None
-    sources = cast(tuple[str, ...], value.at("expert.source").value)
-    if experts and head is not None and head not in sources:
-        source = value.at("expert.source")
-        added = replace(
-            source,
-            value=sources + (head,),
-            receipt=source.receipt + "; draft head=" + head,
-        )
-        value = replace(
-            value, entries=tuple(added if x.key == added.key else x for x in value.entries)
-        )
-    for path in cast(tuple[str, ...], value.at("expert.source").value):
-        if not isinstance(path, str) or not s.value("is_file", path):
-            raise ValueError("missing typed expert source: " + str(path))
+    value, threads, planned = launched(planned)
     if platform == "linux":
         guide = "; see docs/quickstart.md#linux-requirements"
         if not s.value("systemd"):
@@ -669,90 +814,11 @@ def _resolve(
     if planned is not None:
         receipt = json.dumps(planned.receipt, ensure_ascii=False, indent=2) + "\n"
         s.ask("write_exclusive", os_path.join(directory, "strategy.json"), receipt)
-    context = spec.context or AUTO_CONTEXT
-    one_pass = planned is not None and planned.one_pass
-    batch = spec.batch or ((context or ONE_PASS_BATCH) if one_pass else BATCH)
-    ubatch = spec.ubatch or (batch if one_pass else BATCH)
-    if planned is not None and one_pass:
-        given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
-        cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
-    command = [binary, "-m", model, *placement]
-    for shard in spec.shards:
-        command += ["--shard", shard]
-    command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
-    if not spec.layer_events:
-        command.append("--ssd-no-layer-events")
-    for item in value.entries:
-        if item.origin == "cli":
-            command += [
-                "--ssd-" + item.key.replace(".", "-").replace("_", "-"),
-                literal(item, platform),
-            ]
-    command += [
-        "--mmap",
-        "--no-repack",
-        "--fit",
-        "on" if fit_layers else "off",
-        "--no-warmup",
-        "-ngl",
-        "auto" if fit_layers else str(GPU_LAYERS),
-        "-c",
-        str(context),
-        "-b",
-        str(batch),
-        "-ub",
-        str(ubatch),
-    ]
-    if threads.decode is not None:
-        command += ["-t", str(threads.decode)]
-    if threads.batch is not None:
-        command += ["-tb", str(threads.batch)]
-    if threads.cpus:
-        mask = hex(sum(1 << cpu for cpu in threads.cpus))
-        command += ["-C", mask, "-Cb", mask, "--cpu-strict", "1", "--cpu-strict-batch", "1"]
-    elif threads.decode_cpus:
-        # The batch pool has its own count (-tb above), so it keeps no CPU mask.
-        command += ["-C", hex(sum(1 << cpu for cpu in threads.decode_cpus)), "--cpu-strict", "1"]
-    if template is not None:
-        command += ["--chat-template-file", template]
-    if profile == "dsv":
-        command += ["--chat-template-kwargs", DSV_TEMPLATE_KWARGS]
-    sampling = SAMPLING.get(profile or "", ())
-    named = {x.split("=", 1)[0] for x in s.inputs.extra}
-    for option, number in zip(sampling[::2], sampling[1::2]):
-        if option not in named:
-            command += [option, number]
-    if spec.prompt_cache is None:
-        command += ["--cache-ram", "0"]
-    else:
-        # One directory per model, named as its file is without the shard suffix.
-        match = re.fullmatch(r"(.+)-\d{5}-of-\d{5}\.gguf", os_path.basename(model))
-        name = match.group(1) if match else os_path.basename(model)
-        if name.endswith(".gguf"):
-            name = name[: -len(".gguf")]
-        if spec.prompt_cache_mib is not None and spec.prompt_cache_mib < 1:
-            raise ValueError("--prompt-cache-mib must be positive")
-        command += [
-            "--cache-disk",
-            os_path.join(spec.prompt_cache, name),
-            "--cache-disk-mib",
-            str(spec.prompt_cache_mib or PROMPT_CACHE_MIB),
-        ]
-        if spec.prefix_cache is not None:
-            command += ["--prefix-cache", os_path.join(spec.prefix_cache, name)]
-    command += [
-        "--host",
-        spec.host,
-        "--port",
-        str(spec.port),
-        "-np",
-        "1",
-    ]
-    if experts:
-        # The SSD executor reads the routed experts; their mapped pages stay unread.
-        command += ["--defer-experts"]
-    # Flash Attention stays the server's auto choice on every platform: on for each layer whose
-    # device runs it, which is every layer wherever the backends implement it.
+    context, batch, ubatch = pass_sizes(planned)
+    if planned is not None and planned.one_pass:
+        given_sizes = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
+        cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given_sizes)
+    command = server(value, threads, planned, settings, telemetry)
     if platform == "linux":
         s.scope = (
             ["systemd-run"]
@@ -770,9 +836,6 @@ def _resolve(
     # Elsewhere Flash Attention keeps the server's auto choice, on for each layer
     # whose device runs it (every CPU layer), and the settings' host.budget_mib,
     # passed as given, bounds the process in place of a scope.
-    if planned is not None:
-        command += list(planned.server_args)
-    command += list(s.inputs.extra)
     s.argv = command
     output: dict[str, object] = {
         "settings": settings,

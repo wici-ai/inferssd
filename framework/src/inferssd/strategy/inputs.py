@@ -125,6 +125,11 @@ class ModelFacts:
     # CUDA weight allocation for each repeating layer, followed by the output layer.
     # Empty on older recordings that only retained aggregate weights.
     cuda_layer_bytes: tuple[int, ...] = ()
+    # The facts of a model read with its MTP head: how many of the routed layers are the head's.
+    draft_layers: int = 0
+    # The dense weights a token reads whole (strategy.weights.dense_weights): dense_bytes less the
+    # tables it reads a row of. None in facts recorded without it.
+    dense_read_bytes: Optional[int] = None
 
     @property
     def cpu_format(self) -> str:
@@ -261,6 +266,7 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
         layer_format_bytes=_ranked(per_type),
         experts=found,
         cuda_layer_bytes=_cuda_layer_bytes(model, dense) if found and has_block_layout else (),
+        draft_layers=model.get("draft_layers", 0),
     )
 
 
@@ -306,7 +312,11 @@ MODEL_RECORD = record(
         "layer_format_bytes": _type_bytes,
         "experts": nullable(EXPERTS_RECORD),
     },
-    optional={"cuda_layer_bytes": array(COUNT, minimum=1)},
+    optional={
+        "cuda_layer_bytes": array(COUNT, minimum=1),
+        "draft_layers": POSITIVE,
+        "dense_read_bytes": COUNT,
+    },
 )
 
 
@@ -319,6 +329,12 @@ def model_facts_json(facts: ModelFacts) -> dict[str, object]:
         "dense_bytes": facts.dense_bytes,
         "layer_format_bytes": [list(item) for item in facts.layer_format_bytes],
         **({"cuda_layer_bytes": list(facts.cuda_layer_bytes)} if facts.cuda_layer_bytes else {}),
+        **({"draft_layers": facts.draft_layers} if facts.draft_layers else {}),
+        **(
+            {"dense_read_bytes": facts.dense_read_bytes}
+            if facts.dense_read_bytes is not None
+            else {}
+        ),
         "experts": None
         if experts is None
         else {
@@ -392,6 +408,8 @@ def model_facts_from(value: object) -> ModelFacts:
         layer_format_bytes=tuple((name, size) for name, size in item["layer_format_bytes"]),
         experts=found,
         cuda_layer_bytes=tuple(item.get("cuda_layer_bytes", ())),
+        draft_layers=item.get("draft_layers", 0),
+        dense_read_bytes=item.get("dense_read_bytes"),
     )
 
 

@@ -49,6 +49,7 @@ from inferssd.launch.types import Fact, LaunchInput, Reply, Threads
 from inferssd.machine.characteristics import dumps, load
 from inferssd.machine.identity import Command
 from inferssd.machine.store import LockBusy, default_path
+from inferssd.strategy.weights import dense_weights
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
 X86_FILE = MACHINES / "linux-x86-rtx5090.json"
@@ -552,9 +553,11 @@ def test_live_model_facts_are_the_engines(tmp_path):
             return Command(0, printed["model"])
 
     adapter = LiveArtifacts(LaunchInput("", ()), host=EngineHost())
-    # The server the launch starts reads the model; the strategy takes its facts.
-    assert adapter(Fact("model_facts", ("/bin/server", model))).value == recorded_facts(
-        *deepseek_like(), path=model
+    # The server the launch starts reads the model; the strategy takes its facts, with what a
+    # token reads whole for its estimates.
+    read = dense_weights(engine_facts(*deepseek_like(), path=model)).active_bytes
+    assert adapter(Fact("model_facts", ("/bin/server", model))).value == dict(
+        recorded_facts(*deepseek_like(), path=model), dense_read_bytes=read
     )
     assert asked == [(["/bin/server", "--ssd-model-facts", model], 120.0)]
     # the model's --shard/--ple values reach the engine as the server takes them

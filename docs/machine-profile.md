@@ -110,7 +110,17 @@ memory, the available memory) to choose:
 - `vram.budget = 0` when the engine has CUDA and no CUDA GPU is usable, and on
   macOS and Windows the host memory budget from the runtime policy;
 - with an engine that has CUDA and one usable CUDA GPU, one prefill pass per prompt; on
-  a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`).
+  a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`);
+- for a model published with an MTP draft head (an `mtp-*.gguf` file beside the model's
+  files), whether to load it. The server measures the launch's decode steps with the head
+  once (`--ssd-decode-probe`, minutes, as loading the model takes): the dense time of a step
+  of one to four rows and of a draft. Drafts save only the dense work the rows of a step
+  share: each accepted token still pays its own routed experts, which the
+  [speed estimate](#speed-estimates) prices with and without the head, its tensors and its
+  routed layer taking expert cache. The head is loaded when drafting some length, every
+  draft accepted, costs less a token than decoding without it; the server then drafts the
+  length that pays as it runs, down to none. A `--spec-*` option of yours leaves speculative
+  decoding to you, and nothing is measured.
 
 Without a measurement of the model's weight format, both pools take every
 allowed CPU but one.
@@ -346,6 +356,12 @@ The file is JSON with schema `inferssd-machine/1`. It is replaced atomically,
 and a `machine.json.lock` file next to it keeps two profiles from running at
 once. Each section records when it was measured, how long it took, the method,
 its status (`ok`, `partial` or `failed`) and, when relevant, why.
+
+The decode steps a launch measured with a draft head are kept next to it in
+`decode-steps.json` (schema `inferssd-decode-steps/1`), each with what it holds for:
+the server build, the characteristics, the model's and the head's files and sizes, and
+the launch's arguments other than its port and run files. A launch with all of them the
+same reuses the measurement.
 
 ## When sections are measured again
 

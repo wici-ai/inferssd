@@ -6,6 +6,7 @@ import os
 from collections.abc import Mapping
 from pathlib import Path
 
+from inferssd.engine import decode_steps
 from inferssd.launch.resources import GPU_BACKENDS
 from inferssd.launch.types import Fact, LaunchInput, Reply
 from inferssd.machine import characteristics
@@ -70,6 +71,8 @@ class RecordedArtifacts:
         ):
             # Absent: no strategy, no drive term in it, or an engine whose GPU backends are unknown.
             return Reply(None)
+        if name == "decode_steps" and name not in self.host:
+            return Reply(None)  # no decode probe measurement kept on the recorded machine
         if name == "systemd" and name not in self.host:
             # Recordings made before this fact existed came from systemd hosts.
             return Reply(True)
@@ -104,10 +107,23 @@ class RecordedArtifacts:
                 return Reply(characteristics.dumps(characteristics.validate(value)))
             except ValueError as error:
                 raise ValueError(f"Recorded host fact {name}: {error}") from error
-        if name in ("model_facts", "runtime_facts"):
+        if name == "draft_model_facts" and isinstance(value, str):
+            return Reply(value)  # why the engine read no facts of the model with its head
+        if name in ("decode_steps", "decode_probe"):
+            # A decode probe's measurement (inferssd.engine.decode_steps); none kept, or why the
+            # probe measured nothing.
+            if (name == "decode_steps" and value is None) or (
+                name == "decode_probe" and isinstance(value, str)
+            ):
+                return Reply(value)
+            try:
+                return Reply(decode_steps.validate(value))
+            except ValueError as error:
+                raise ValueError(f"Recorded host fact {name}: {error}") from error
+        if name in ("model_facts", "draft_model_facts", "runtime_facts"):
             # Serialised strategy inputs, read back strictly and written out again.
             try:
-                if name == "model_facts":
+                if name != "runtime_facts":
                     facts = strategy_inputs.model_facts_from(value)
                     return Reply(strategy_inputs.model_facts_json(facts))
                 runtime = strategy_inputs.runtime_facts_from(value)
