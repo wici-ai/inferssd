@@ -380,6 +380,16 @@ struct llama_ssd_executor_group {
 
     bool has_cache() const { return primary().cache_budget || primary().vram_budget; }
 
+    // the wall time the executors' calls took, in microseconds, as each sums its calls' rows
+    double total_us() const {
+        double us = 0.0;
+        for (const auto & executor : executors) {
+            std::lock_guard<std::mutex> lock(executor->mutex);
+            us += executor->total_us;
+        }
+        return us;
+    }
+
     void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
         for (auto & executor : executors) { executor->begin(registry, token, decode, seq); }
     }

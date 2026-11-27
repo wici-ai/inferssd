@@ -85,6 +85,8 @@ struct llama_context {
     bool prefill_refit();
     // at load, after the load's passes: the expert caches filled from the drive (llama_ssd_preload)
     bool ssd_preload();
+    // the wall time the CPU expert sink's calls took, in microseconds (llama_ssd_sink_time_us)
+    double ssd_sink_time_us() const;
     // up, gate and down of every routed layer, in layer order
 
     // room in host memory for an allocation outside the RAM expert cache (llama_host_reserve)

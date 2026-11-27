@@ -50,6 +50,11 @@ LLAMA_API bool llama_ssd_prefill_phase(struct llama_context * ctx, bool active,
 // true and does nothing; false reports a failure, after which the caches fill as requests run.
 LLAMA_API bool llama_ssd_preload(struct llama_context * ctx);
 
+// The wall time in microseconds the context's CPU expert sink has spent in its calls since the context was created:
+// the routed experts its graphs ran on the CPU, the reads of those no cache held included. The time of a decode less
+// the sink's part of it is the time of its other work. 0 for a context without an SSD expert executor.
+LLAMA_API double llama_ssd_sink_time_us(const struct llama_context * ctx);
+
 // Keep this reservation alive until allocation and first touch finish. NULL
 // means refusal. A context without the Linux SSD executor returns a valid no-op
 // handle. Finish exactly once before destroying the context; false cancels an

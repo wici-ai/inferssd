@@ -3630,6 +3630,10 @@ bool llama_context::ssd_preload() {
     return true;
 }
 
+double llama_context::ssd_sink_time_us() const {
+    return cpu_sink_runtime ? cpu_sink_runtime->total_us() : 0.0;
+}
+
 uint32_t llama_prefill_ubatch_search(uint32_t target, uint32_t granularity, const std::function<bool(uint32_t)> & reserve) {
     if (reserve(target)) {
         return target;
@@ -4735,6 +4739,13 @@ bool llama_ssd_preload(llama_context * ctx) {
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD expert preload failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD expert preload failed\n"); }
     return false;
+}
+
+double llama_ssd_sink_time_us(const llama_context * ctx) {
+    try { return ctx ? ctx->ssd_sink_time_us() : 0.0; }
+    catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD sink time failed: %s\n", failure.what()); }
+    catch (...) { LLAMA_LOG_ERROR("SSD sink time failed\n"); }
+    return 0.0;
 }
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
