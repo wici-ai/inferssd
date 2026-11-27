@@ -545,6 +545,7 @@ void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, boo
         ssd_cpu_prefill_create(mixed.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
     require(gpu_prefill != nullptr, error);
     constexpr int nslots = 8;
+    bool start_values = true; // the planner still prices with the values above
     for (const int tokens : { 48, 1, 48 }) {
         std::normal_distribution<float> sample(0.0f, 1.0f);
         std::vector<float> input(size_t(tokens) * f.latent);
@@ -587,7 +588,11 @@ void run_tier_lane(fixture_inputs & inputs, size_t & checks, double & worst, boo
                 (unsigned long long) gs.ssd_experts, lanes);
             require(lanes <= 1.5e-3, "the tier's lane is more than 1.5e-3 from the CPU lane");
             require(gs.gpu_experts > 0, "the residents did not compute on the GPU");
-            if (tokens > 1) { require(moved > 0, "no transient moved at a cheap GPU"); }
+            // Only the start values make the GPU cheap: the first pass of several tokens prices with them and moves
+            // transients. The planner then prices with what it measured, and where the CPU computes them faster (the
+            // 32 cores beside an RTX 3090), the later passes leave them to it.
+            if (tokens > 1 && start_values) { require(moved > 0, "no transient moved at a cheap GPU"); }
+            if (tokens > 1) { start_values = false; }
             require(gs.stream.pending_reads == 0, "the lane returned with live reads");
             checks += 4;
         }
