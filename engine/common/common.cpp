@@ -1480,14 +1480,15 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
     mparams.check_tensor_split = llama_ssd_options_has_experts(params.ssd_options.get());
-    // A default SSD launch uses one visible CUDA device. Explicit layer placement is opt-in.
-    if (mparams.check_tensor_split && !params.split_mode_explicit &&
+    // A default SSD launch uses one visible CUDA device, with routed experts or without: a model without
+    // them homes its layers' matrices for one GPU (llama_dense_homes). Explicit layer placement is opt-in.
+    if (params.ssd_enabled && !params.split_mode_explicit &&
             params.devices.empty() && params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
             std::none_of(std::begin(params.tensor_split), std::end(params.tensor_split), [](float w) { return w != 0; })) {
         const auto cuda = ggml_backend_reg_by_name("CUDA");
         if (cuda && ggml_backend_reg_dev_count(cuda) > 1) {
             mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
-            LOG_INF("%s: SSD experts use visible GPU %d (single-device mode)\n", __func__, params.main_gpu);
+            LOG_INF("%s: the SSD launch uses visible GPU %d (single-device mode)\n", __func__, params.main_gpu);
         }
     }
     mparams.use_mmap        = params.use_mmap;
