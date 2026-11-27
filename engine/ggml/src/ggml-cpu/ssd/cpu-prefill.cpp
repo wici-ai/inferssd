@@ -127,6 +127,60 @@ struct ssd_cpu_prefill {
         if (!sink) { throw std::runtime_error("CPU prefill needs a sink"); }
     }
 
+    // The workspace of a pass of `ntokens` tokens through a layer of kernels `k`, with `nslots` routes a token and
+    // `columns` tokens for the expert that takes the most: activation, activation_up (SWIGLU's u beside g),
+    // post_exp_output and routed_output in floats, then quant_hidden and quant_input in bytes. Each CPU route's
+    // weighted output (routed_output) is kept for the graph's slot-order sum per token; a route the GPU tier serves
+    // is never written or read there.
+    struct workspace_sizes { size_t floats[4], bytes[2]; };
+    workspace_sizes sizes_of(size_t columns, size_t ntokens, size_t nslots, const ssd_cpu_expert_kernels & k,
+            bool swiglu, bool post_exp_norm) const {
+        return {
+            { columns * size_t(hidden), swiglu ? columns * size_t(hidden) : 0,
+              post_exp_norm ? columns * size_t(latent) : 0, ntokens * nslots * size_t(latent) },
+            { columns * k.hidden_row_bytes, ntokens * k.input_row_bytes },
+        };
+    }
+
+    // The workspace at `sizes`, as host memory outside the caches: the sink's host-memory ledger makes room for what
+    // it adds before any read and refuses only what the envelope cannot hold. A buffer that grows is replaced whole,
+    // the old one alive until the new one holds its values, so each is priced at its new size. `exact` gives back
+    // what a buffer holds beyond its size first.
+    void hold(const workspace_sizes & sizes, bool exact) {
+        std::vector<float> * floats[] = { &activation, &activation_up, &post_exp_output, &routed_output };
+        std::vector<uint8_t> * bytes[] = { &quant_hidden, &quant_input };
+        uint64_t growth = 0;
+        for (size_t i = 0; i < 4; ++i) {
+            if (exact && floats[i]->capacity() > sizes.floats[i]) { std::vector<float>().swap(*floats[i]); }
+            if (sizes.floats[i] > floats[i]->capacity()) { growth += uint64_t(sizes.floats[i]) * sizeof(float); }
+        }
+        for (size_t i = 0; i < 2; ++i) {
+            if (exact && bytes[i]->capacity() > sizes.bytes[i]) { std::vector<uint8_t>().swap(*bytes[i]); }
+            if (sizes.bytes[i] > bytes[i]->capacity()) { growth += uint64_t(sizes.bytes[i]); }
+        }
+        ssd_cpu_sink_host_grow(sink, growth, [&] {
+            // reserve allocates exactly the priced size; resize then writes every new element
+            for (size_t i = 0; i < 4; ++i) { floats[i]->reserve(sizes.floats[i]); floats[i]->resize(sizes.floats[i]); }
+            for (size_t i = 0; i < 2; ++i) { bytes[i]->reserve(sizes.bytes[i]); bytes[i]->resize(sizes.bytes[i]); }
+        });
+    }
+
+    // Before a prompt pass of `ntokens` tokens: the workspace the pass can need on any of the sink's routed layers,
+    // one expert taking every token, held at exactly that size. A run of the pass then grows nothing.
+    void reserve(int ntokens, int nslots, bool swiglu, bool post_exp_norm) {
+        const ssd_expert_layout & layout = ssd_cpu_sink_layout(sink);
+        latent = layout.latent; hidden = layout.hidden;
+        workspace_sizes most = {};
+        for (int i = 0; i < layout.n_layers; ++i) {
+            const ssd_cpu_expert_kernels * k = ssd_cpu_sink_kernels(sink, layout.layers[i].id);
+            if (!k) { continue; }
+            const auto sizes = sizes_of(size_t(ntokens), size_t(ntokens), size_t(nslots), *k, swiglu, post_exp_norm);
+            for (size_t j = 0; j < 4; ++j) { most.floats[j] = std::max(most.floats[j], sizes.floats[j]); }
+            for (size_t j = 0; j < 2; ++j) { most.bytes[j] = std::max(most.bytes[j], sizes.bytes[j]); }
+        }
+        hold(most, true);
+    }
+
     // A pass of routed layer `layer`: its format's kernels, which the sink chose when it was created.
     void prepare(int32_t layer, const int32_t * ids, const float * route_weights, int nslots, int ntokens) {
         const ssd_cpu_expert_kernels * k = ssd_cpu_sink_kernels(sink, layer);
@@ -181,33 +235,9 @@ struct ssd_cpu_prefill {
                         static_cast<uint64_t>(group->columns.size()));
             }
         }
-        const size_t columns = static_cast<size_t>(current.max_group_tokens);
-        const bool swiglu = activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU;
-        // Each CPU route's weighted output (routed_output), for the graph's slot-order sum per token; a route the
-        // GPU tier serves is never written or read there. The workspace grows with the pass, as host memory outside
-        // the caches: before any read, the sink's host-memory ledger makes room for what it adds and refuses only
-        // what the envelope cannot hold. A buffer that grows is replaced whole, the old one alive until the new one
-        // holds its values, so each is priced at its new size.
-        const size_t routes = static_cast<size_t>(ntokens) * size_t(nslots) * size_t(latent);
-        const size_t sizes[] = {
-            columns * size_t(hidden), swiglu ? columns * size_t(hidden) : 0,
-            activation_config.post_exp_norm ? columns * size_t(latent) : 0, routes,
-            columns * quant_bytes_hidden, static_cast<size_t>(ntokens) * quant_bytes_input,
-        };
-        std::vector<float> * floats[] = { &activation, &activation_up, &post_exp_output, &routed_output };
-        std::vector<uint8_t> * bytes[] = { &quant_hidden, &quant_input };
-        uint64_t growth = 0;
-        for (size_t i = 0; i < 4; ++i) {
-            if (sizes[i] > floats[i]->capacity()) { growth += uint64_t(sizes[i]) * sizeof(float); }
-        }
-        for (size_t i = 0; i < 2; ++i) {
-            if (sizes[4 + i] > bytes[i]->capacity()) { growth += uint64_t(sizes[4 + i]); }
-        }
-        ssd_cpu_sink_host_grow(sink, growth, [&] {
-            // reserve allocates exactly the priced size; resize then writes every new element
-            for (size_t i = 0; i < 4; ++i) { floats[i]->reserve(sizes[i]); floats[i]->resize(sizes[i]); }
-            for (size_t i = 0; i < 2; ++i) { bytes[i]->reserve(sizes[4 + i]); bytes[i]->resize(sizes[4 + i]); }
-        });
+        hold(sizes_of(size_t(current.max_group_tokens), size_t(ntokens), size_t(nslots), *k,
+                activation_config.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU, activation_config.post_exp_norm != nullptr),
+            false);
         consumed.assign(groups.size(), 0);
         size_t workspace = (activation.capacity() + activation_up.capacity()) * sizeof(float) +
                 quant_hidden.capacity() + quant_input.capacity() + routed_output.capacity() * sizeof(float) +
@@ -428,6 +458,30 @@ extern "C" struct ssd_cpu_prefill * ssd_cpu_prefill_create(
 }
 
 extern "C" void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill) { delete prefill; }
+
+extern "C" bool ssd_cpu_prefill_reserve(struct ssd_cpu_prefill * prefill, int ntokens, int nslots, bool swiglu,
+        bool post_exp_norm, uint64_t * held_bytes, char * error, size_t error_size) {
+    prefill_error(error, error_size, "");
+    if (held_bytes) { *held_bytes = 0; }
+    if (!prefill) { prefill_error(error, error_size, "null CPU prefill"); return false; }
+    if (ntokens < 1 || nslots < 0 || nslots > 16) {
+        prefill_error(error, error_size, "CPU prefill reserve requires a positive token count and 0..16 slots");
+        return false;
+    }
+    std::lock_guard<std::mutex> serial(prefill->mutex);
+    try {
+        prefill->reserve(ntokens, nslots, swiglu, post_exp_norm);
+        if (held_bytes) {
+            *held_bytes = (prefill->activation.capacity() + prefill->activation_up.capacity() +
+                prefill->post_exp_output.capacity() + prefill->routed_output.capacity()) * sizeof(float) +
+                prefill->quant_hidden.capacity() + prefill->quant_input.capacity();
+        }
+        return true;
+    } catch (const std::exception & e) {
+        prefill_error(error, error_size, e.what());
+        return false;
+    }
+}
 
 extern "C" bool ssd_cpu_prefill_run_activation(
         struct ssd_cpu_prefill * prefill, int32_t layer, const float * input, const int32_t * ids, const float * weights, int nslots, int ntokens,

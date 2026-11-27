@@ -35,9 +35,19 @@ struct llama_ssd_cpu_sink_node {
     // activation through ssd_cpu_sink_run_rows.
     ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SITU, 0.0f, 0.0f, 0.0f };
     int layer; // a routed layer of the runtime's expert layout
+    int slots = 0; // routes a token
     bool post_exp_norm = false;
     float post_exp_norm_eps = 0.0f;
     bool prefill = false;
+};
+
+// What a prompt graph's sink nodes on one executor ask of its CPU workspace: the most routes a token takes, and
+// whether a layer keeps SWIGLU's u row or the post-expert norm's output.
+struct llama_ssd_prefill_pass {
+    bool layers = false;
+    int slots = 0;
+    bool swiglu = false;
+    bool post_exp_norm = false;
 };
 
 struct llama_ssd_cpu_sink_runtime {
@@ -85,6 +95,8 @@ struct llama_ssd_cpu_sink_runtime {
     // The file pages the weight rows of the last prefill graph reserved gather (prefill_room): the load step leaves
     // them uncommitted for the first prefill.
     uint64_t prefill_pages = 0;
+    // The CPU workspace the last prompt graph reserved (reserve_workspace).
+    uint64_t prefill_workspace = 0;
 
     // routed: the model's routed layers in model order, each with its up, gate and down expert tensors.
     llama_ssd_cpu_sink_runtime(uint64_t context_epoch,
@@ -336,6 +348,27 @@ struct llama_ssd_cpu_sink_runtime {
         return true;
     }
 
+    // A prompt graph of `tokens` tokens that has its memory: the CPU workspace its routed layers need, held at that
+    // size (ssd_cpu_prefill_reserve), as the pass's first layer would take it. False refuses the graph.
+    bool reserve_workspace(uint32_t tokens, const llama_ssd_prefill_pass & pass) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!sink || !pass.layers) { return true; }
+        prefill.initialize(cpu_reg, sink);
+        char error[512] = {};
+        uint64_t held = 0;
+        if (!prefill.reserve(prefill.context, int(std::min<uint32_t>(tokens, uint32_t(std::numeric_limits<int>::max()))),
+                pass.slots, pass.swiglu, pass.post_exp_norm, &held, error, sizeof(error))) {
+            std::fprintf(stderr, "[ssd_cpu_prefill] a pass of %u tokens cannot have its workspace: %s\n", tokens, error);
+            return false;
+        }
+        if (held != prefill_workspace) {
+            std::fprintf(stderr, "[ssd_cpu_prefill] event=workspace tokens=%u slots=%d bytes=%" PRIu64 "\n",
+                tokens, pass.slots, held);
+            prefill_workspace = held;
+        }
+        return true;
+    }
+
     bool phase_complete(bool decode) {
         std::lock_guard<std::mutex> lock(mutex);
         if (decode) { prefill_open = false; }
@@ -410,6 +443,23 @@ struct llama_ssd_executor_group {
 
     bool reserve_pass(uint32_t tokens) {
         for (auto & executor : executors) { if (!executor->reserve_pass(tokens)) { return false; } }
+        return true;
+    }
+
+    // A prompt graph's CPU workspace (llama_ssd_cpu_sink_runtime::reserve_workspace): each executor's, for the sink
+    // nodes it runs.
+    bool reserve_workspace(uint32_t tokens, const std::vector<std::unique_ptr<llama_ssd_cpu_sink_node>> & nodes) {
+        for (auto & executor : executors) {
+            llama_ssd_prefill_pass pass;
+            for (const auto & node : nodes) {
+                if (!node->prefill || node->runtime != executor.get()) { continue; }
+                pass.layers = true;
+                pass.slots = std::max(pass.slots, node->slots);
+                pass.swiglu = pass.swiglu || node->activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU;
+                pass.post_exp_norm = pass.post_exp_norm || node->post_exp_norm;
+            }
+            if (!executor->reserve_workspace(tokens, pass)) { return false; }
+        }
         return true;
     }
 

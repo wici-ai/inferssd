@@ -289,9 +289,10 @@ public:
 
     // reserve a graph with a dummy ubatch of the specified size
     // `admitted`: what runs once the host ledger has given the graph its room, before its buffers are allocated.
-    // pass_tokens: the tokens of the prompt pass the graph is reserved for, whose executor memory is held with it (0: none)
+    // pass_tokens: the tokens of the prompt pass the graph is reserved for, whose executor memory is held with it (0: none);
+    // pass_graph: the graph's result, whose sink nodes the pass runs
     bool reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted = {},
-        uint32_t pass_tokens = 0);
+        uint32_t pass_tokens = 0, const llm_graph_result * pass_graph = nullptr);
 
     ggml_cgraph * graph_reserve(
         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only = false, size_t * sizes = nullptr);

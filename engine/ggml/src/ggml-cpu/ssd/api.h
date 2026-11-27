@@ -11,7 +11,7 @@
 // borrow it only while that backend stays loaded, just as for its other procs.
 namespace ssd { namespace cpu {
 struct api_v2 {
-    uint32_t version;   // 11: a decode ubatch's rows as one run (run_rows)
+    uint32_t version;   // 12: a prompt pass's CPU workspace with its graph (prefill_reserve)
     size_t size;
     decltype(&create_configured) create;
     decltype(&ssd_cpu_sink_run) run;
@@ -43,12 +43,13 @@ struct api_v2 {
     size_t runtime_services_size;
     decltype(&ssd_cpu_sink_vram_reserve_pass) vram_reserve_pass;
     decltype(&ssd_cpu_sink_run_rows) run_rows;
+    decltype(&ssd_cpu_prefill_reserve) prefill_reserve;
 };
 using get_api_v2 = const api_v2 * (*)();
 
 // Check the prefix before accessing members from a possibly different build.
 inline bool valid(const api_v2 * api) noexcept {
-    return api && api->version == 11 && api->size == sizeof(api_v2) &&
+    return api && api->version == 12 && api->size == sizeof(api_v2) &&
         api->runtime_services_size == sizeof(runtime_services) &&
         api->create &&
         api->run &&
@@ -69,6 +70,7 @@ inline bool valid(const api_v2 * api) noexcept {
         api->prefill_run &&
         api->prefill_run_activation &&
         api->prefill_destroy &&
-        api->take_room && api->attach_services && api->vram_reserve_pass && api->run_rows;
+        api->take_room && api->attach_services && api->vram_reserve_pass && api->run_rows &&
+        api->prefill_reserve;
 }
 } } // namespace ssd::cpu

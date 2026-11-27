@@ -2109,6 +2109,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->post_exp_norm = execution.post_norm;
         descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
+        descriptor->slots = int(ggml_nelements(selected_experts) / n_tokens);
         descriptor->prefill = cpu_sink_prefill;
         ggml_tensor * hint = cpu_sink_prefetch_hint;
         // slots: input, ids, weights, then the post-expert norm, then the hint

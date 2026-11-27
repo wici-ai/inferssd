@@ -524,6 +524,35 @@ static void synthetic_tests(fixture_inputs & inputs, int threads, int depth) {
     auto expected = reference_batch(small, 1, one);
     print_sample("decode_after_prefill", one, run_checked(inputs, "decode_after_prefill", small, e, 1, one, expected, false));
     compare_case(inputs, "prefill_after_decode", small, e, 2, synthetic_batch(small, 25));
+    {
+        // A prompt pass's workspace, reserved with its graph: the size a pass of that many tokens can need on any
+        // routed layer (one expert taking every token), held exactly. A smaller pass's reserve gives the rest back,
+        // and the pass's own runs then grow nothing.
+        executor r(inputs, small, threads, depth);
+        const ggml_type quantized = ggml_get_type_traits_cpu(GGML_TYPE_Q3_K)->vec_dot_type;
+        const auto workspace = [&](uint64_t tokens, uint64_t slots) {
+            return tokens * (uint64_t(small.hidden) + slots * small.latent) * sizeof(float) +
+                tokens * (ggml_row_size(quantized, small.hidden) + ggml_row_size(quantized, small.latent));
+        };
+        char error[512] = {};
+        uint64_t held = 0;
+        require(ssd_cpu_prefill_reserve(r.prefill.get(), 64, 16, false, false, &held, error, sizeof(error)), error);
+        require(held == workspace(64, 16), "reserve_64x16: workspace " + std::to_string(held) + ", expected " +
+            std::to_string(workspace(64, 16)));
+        require(ssd_cpu_prefill_reserve(r.prefill.get(), 25, 8, false, false, &held, error, sizeof(error)), error);
+        require(held == workspace(25, 8), "reserve_25x8: a smaller pass kept a larger workspace");
+        compare_case(inputs, "reserved_pass_ub25", small, r, 1, synthetic_batch(small, 25));
+        compare_case(inputs, "reserved_pass_ub25_layer2", small, r, 2, synthetic_batch(small, 25));
+        uint64_t after = 0;
+        require(ssd_cpu_prefill_reserve(r.prefill.get(), 25, 8, false, false, &after, error, sizeof(error)), error);
+        require(after == held, "reserved_pass: a run of the reserved pass grew its workspace");
+        require(!ssd_cpu_prefill_reserve(r.prefill.get(), 0, 8, false, false, &after, error, sizeof(error)) &&
+            !ssd_cpu_prefill_reserve(r.prefill.get(), 25, 17, false, false, &after, error, sizeof(error)) &&
+            !ssd_cpu_prefill_reserve(nullptr, 25, 8, false, false, &after, error, sizeof(error)),
+            "reserve accepted an empty pass, too many slots or no prefill");
+        std::printf("RESERVE case=pass_workspace held_64x16=%llu held_25x8=%llu status=PASS\n",
+            (unsigned long long) workspace(64, 16), (unsigned long long) held);
+    }
 
     auto bad = synthetic_batch(small, 2);
     bad.ids[0] = small.experts; fail_case(inputs, "out_of_range_id", small, e, bad);

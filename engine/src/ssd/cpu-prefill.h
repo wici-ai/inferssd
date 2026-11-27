@@ -9,6 +9,7 @@ struct llama_ssd_cpu_prefill_runtime {
     decltype(&ssd_cpu_prefill_run) run = nullptr;
     decltype(&ssd_cpu_prefill_run_activation) run_activation = nullptr;
     decltype(&ssd_cpu_prefill_destroy) destroy = nullptr;
+    decltype(&ssd_cpu_prefill_reserve) reserve = nullptr;
 
     void reset() {
         if (context) {
@@ -31,6 +32,7 @@ struct llama_ssd_cpu_prefill_runtime {
         run = api->prefill_run;
         run_activation = api->prefill_run_activation;
         destroy = api->prefill_destroy;
+        reserve = api->prefill_reserve;
         char error[512] = {};
         context = create(sink, error, sizeof(error));
         if (!context) {

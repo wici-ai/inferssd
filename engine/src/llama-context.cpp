@@ -2216,7 +2216,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         bool allocated = false;
         if (cpu_sink_runtime) {
             allocated = reserve_compute_graph(gf, prompt_pass, prefetch,
-                    prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0) &&
+                    prompt_pass && cpu_prefill_reserve_pending ? ubatch.n_tokens : 0, res) &&
                 ggml_backend_sched_alloc_prepared(sched.get(), gf);
         } else {
             prefetch();
@@ -3405,7 +3405,7 @@ static bool llama_sched_runs_on_host(ggml_backend_sched_t sched, ggml_tensor * n
 }
 
 bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, const std::function<void()> & admitted,
-        uint32_t pass_tokens) {
+        uint32_t pass_tokens, const llm_graph_result * pass_graph) {
     if (!cpu_sink_runtime) {
         if (admitted) { admitted(); }
         return ggml_backend_sched_reserve(sched.get(), graph);
@@ -3518,6 +3518,14 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     if (!ggml_backend_sched_reserve_prepared(sched.get(), graph)) { return false; }
     // New host COMPUTE chunks have already been touched by the allocator.
     room.value.commit();
+    // The pass's CPU workspace (each route's output and the quantized rows of its routed layers), taken where its
+    // first layer took it, after the graph, but before the pass starts: a pass that cannot have it refuses the
+    // graph, and the prompt takes a smaller ubatch (prefill_refit), where the sink used to abort the run there.
+    GGML_ASSERT(!prefill || pass_tokens <= 1 || pass_graph);
+    if (prefill && pass_tokens > 1 && !cpu_sink_runtime->reserve_workspace(pass_tokens, pass_graph->cpu_sink_nodes)) {
+        ggml_backend_sched_reset(sched.get());
+        return false;
+    }
     return true;
 }
 
@@ -3583,7 +3591,7 @@ ggml_cgraph * llama_context::graph_reserve(
             ggml_backend_sched_split_graph(sched.get(), gf);
         }
     } else if (!reserve_compute_graph(gf, n_tokens > n_seqs && !cpu_sink_decode_active, {},
-            cpu_prefill_reserve_pending && !cpu_sink_decode_active ? n_tokens : 0)) {
+            cpu_prefill_reserve_pending && !cpu_sink_decode_active ? n_tokens : 0, res)) {
         GGML_ASSERT(!sizes);
         LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
         return nullptr;

@@ -41,6 +41,15 @@ GGML_BACKEND_API struct ssd_cpu_prefill * ssd_cpu_prefill_create(
         struct ssd_cpu_sink * sink, char * error, size_t error_size);
 GGML_BACKEND_API void ssd_cpu_prefill_destroy(struct ssd_cpu_prefill * prefill);
 
+// Before a prompt pass of `ntokens` tokens, as its graph is reserved: the workspace a run of that pass can need on any
+// routed layer of the sink (nslots routes a token, one expert taking every token, SWIGLU's u row and the post-expert
+// norm's output where they are used), held at exactly that size: a larger one gives its rows back, and the growth is
+// priced to the sink's host-memory ledger, which refuses what the envelope cannot hold. The pass's runs then take no
+// host memory of their own. held_bytes, when not null, receives the workspace's bytes.
+GGML_BACKEND_API bool ssd_cpu_prefill_reserve(
+        struct ssd_cpu_prefill * prefill, int ntokens, int nslots, bool swiglu, bool post_exp_norm,
+        uint64_t * held_bytes, char * error, size_t error_size);
+
 // Token-major contiguous input/output [ntokens][latent] and routes
 // [ntokens][nslots] of routed layer `layer`. Token count follows the configured ubatch; 0..16 route slots. Layer
 // and activation requirements match ssd_cpu_sink_run_activation. Every distinct

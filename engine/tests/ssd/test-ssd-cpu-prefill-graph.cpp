@@ -155,6 +155,8 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
                 descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
                 "custom node carries another activation than the model's");
         require(descriptor.layer == 0, "custom node names another layer than its routed layer");
+        // a prompt pass's CPU workspace is reserved for this many routes a token (reserve_pass)
+        require(descriptor.slots == slots, "custom node carries another route count than its expert IDs");
         require(ggml_backend_sched_get_tensor_backend(scheduler.get(), output) == cpu, "custom node not assigned to CPU");
         require(bool(output->src[4]) == predicted, "the custom node must carry the prediction it was given");
         if (predicted) {
