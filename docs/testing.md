@@ -45,6 +45,14 @@ fetches the model that `test-thread-safety` and `test-state-restore-fragmented` 
 compares its recorded snapshots with the current Hugging Face files, and `test-jinja-py`
 needs `python3` with `jinja2`; exclude them with `ctest -E` where these are unavailable or have changed.
 
+## Vulkan runtime power management
+
+On Linux a discrete GPU whose PCI device has `power/control` set to `auto` (amdgpu's default for a GPU that
+drives no display) suspends after a few idle seconds, and the kernel first moves its VRAM contents to host
+memory. The Vulkan backend keeps such a GPU awake while it uses it. `test-vulkan-keep-awake` holds a buffer in
+VRAM, stays idle for twice the autosuspend delay and fails if the GPU suspended. Run it on an owned GPU that
+nothing else uses; it skips where runtime power management does not suspend the GPU.
+
 ## Q2_0 support
 
 `test-q2_0` checks the upstream type-42 group-64 layout (18 bytes per block),

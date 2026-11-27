@@ -78,6 +78,17 @@ DispatchLoaderDynamic & ggml_vk_default_dispatcher();
 #define YIELD()
 #endif
 
+#if defined(__linux__)
+#include <chrono>
+#include <dirent.h>
+#include <fcntl.h>
+#include <fstream>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
+#include <unistd.h>
+#endif
+
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
@@ -609,6 +620,90 @@ static constexpr std::initializer_list<std::array<int, 3>> rms_norm_mul_rope_vie
 };
 
 
+#if defined(__linux__)
+// A discrete GPU under Linux runtime power management (power/control "auto", amdgpu's default for a GPU that drives
+// no display) suspends after a few idle seconds (amdgpu: 5), and before it suspends the kernel moves what its VRAM
+// holds to host memory; the next use moves it back. Whenever the GPU has nothing to do (while the RAM expert cache
+// fills at load, between requests) the process then needs host memory for all it keeps in VRAM, which the expert
+// caches, sized from the free memory, have taken: the kernel kills the server. CUDA and ROCm keep their GPU awake
+// while a process uses it; Vulkan does not. Every ioctl on the device's render node restarts the autosuspend timer
+// (the DRM drivers take a runtime-PM reference around each one), so a DRM_IOCTL_VERSION every half delay, at most a
+// second apart, keeps the GPU awake for as long as the device is in use.
+struct vk_keep_awake {
+    struct drm_version_arg { // struct drm_version of <drm/drm.h>
+        int major, minor, patchlevel;
+        size_t name_len; char * name;
+        size_t date_len; char * date;
+        size_t desc_len; char * desc;
+    };
+
+    int fd = -1;
+    std::chrono::milliseconds period{1000};
+    std::mutex mutex;
+    std::condition_variable wake;
+    bool stop = false;
+    std::thread thread;
+
+    // The keeper of the GPU whose render node is major:minor; null when runtime power management does not suspend
+    // it (power/control "on", a negative autosuspend delay) or the node cannot be opened.
+    static std::unique_ptr<vk_keep_awake> start(uint32_t major, uint32_t minor) {
+        const std::string power = "/sys/dev/char/" + std::to_string(major) + ":" + std::to_string(minor) + "/device/power/";
+        std::string control;
+        long delay_ms = -1;
+        std::ifstream(power + "control") >> control;
+        std::ifstream(power + "autosuspend_delay_ms") >> delay_ms;
+        if (control != "auto" || delay_ms < 0) {
+            return nullptr;
+        }
+        std::unique_ptr<vk_keep_awake> keeper(new vk_keep_awake());
+        keeper->period = std::chrono::milliseconds(std::max(50L, std::min(1000L, delay_ms / 2)));
+        if (DIR * dir = opendir("/dev/dri")) {
+            while (const dirent * entry = readdir(dir)) {
+                const std::string node = std::string("/dev/dri/") + entry->d_name;
+                struct stat st;
+                if (stat(node.c_str(), &st) == 0 && S_ISCHR(st.st_mode) && st.st_rdev == makedev(major, minor)) {
+                    keeper->fd = open(node.c_str(), O_RDWR | O_CLOEXEC);
+                    break;
+                }
+            }
+            closedir(dir);
+        }
+        if (keeper->fd < 0) {
+            return nullptr;
+        }
+        try {
+            keeper->thread = std::thread([k = keeper.get()] { k->run(); });
+        } catch (const std::system_error &) {
+            return nullptr;
+        }
+        return keeper;
+    }
+
+    void run() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (!stop) {
+            drm_version_arg version = {};
+            ioctl(fd, _IOWR('d', 0x00, drm_version_arg), &version);
+            wake.wait_for(lock, period, [this] { return stop; });
+        }
+    }
+
+    ~vk_keep_awake() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stop = true;
+        }
+        wake.notify_all();
+        if (thread.joinable()) {
+            thread.join();
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+    }
+};
+#endif
+
 struct vk_device_struct {
     std::recursive_mutex mutex;
 
@@ -904,6 +999,10 @@ struct vk_device_struct {
     bool disable_graph_optimize;
 
     std::unique_ptr<vk_memory_logger> memory_logger;
+
+#if defined(__linux__)
+    std::unique_ptr<vk_keep_awake> keep_awake; // a discrete GPU runtime power management would suspend when idle
+#endif
 
     ~vk_device_struct() {
         VK_LOG_DEBUG("destroy device " << name);
@@ -5779,6 +5878,26 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
         device->device = device->physical_device.createDevice(device_create_info);
+
+#if defined(__linux__) && defined(VK_EXT_physical_device_drm)
+        if (device->properties.deviceType == vk::PhysicalDeviceType::eDiscreteGpu &&
+                std::any_of(ext_props.begin(), ext_props.end(), [](const vk::ExtensionProperties & e) {
+                    return strcmp(e.extensionName, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME) == 0;
+                })) {
+            vk::PhysicalDeviceProperties2 drm_props2;
+            vk::PhysicalDeviceDrmPropertiesEXT drm_props;
+            drm_props2.pNext = &drm_props;
+            device->physical_device.getProperties2(&drm_props2);
+            if (drm_props.hasRender) {
+                device->keep_awake = vk_keep_awake::start(uint32_t(drm_props.renderMajor), uint32_t(drm_props.renderMinor));
+            }
+            if (device->keep_awake) {
+                GGML_LOG_INFO("ggml_vulkan: %s: runtime power management would suspend the idle GPU and move its memory "
+                              "to the host: keeping it awake while in use (every %lld ms)\n", device->name.c_str(),
+                              (long long) device->keep_awake->period.count());
+            }
+        }
+#endif
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);

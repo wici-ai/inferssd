@@ -1199,6 +1199,13 @@ foreach(gpu_test dsv41_q2_pack_load ssd_dense_stream)
     endif()
 endforeach()
 
+# The Vulkan backend keeps a discrete GPU under Linux runtime power management awake while it uses it (an owned
+# GPU whose power/control is "auto"; not in ctest).
+if (GGML_VULKAN AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(test-vulkan-keep-awake test-vulkan-keep-awake.cpp)
+    target_link_libraries(test-vulkan-keep-awake PRIVATE ggml)
+endif()
+
 # The legacy fixtures keep their Linux scope: they model Linux CUDA provider
 # publication with dlopen, O_DIRECT and raw descriptors.
 if(TARGET ggml-ssd-c0-store AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
