@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <initializer_list>
 #include <string>
+#include <vector>
 
 using json = nlohmann::ordered_json;
 
@@ -126,6 +127,193 @@ const namespace_tool codex_namespace_tools[] = {
     },
 };
 
+// A namespace of tools that an MCP server or a plugin adds to the requests of an app, as the app sends it on Windows
+// and on the other systems (no request from Linux was captured; it goes there as on macOS).
+struct namespace_definition {
+    const char * name;
+    bool         desktop_app; // whether the ChatGPT desktop app's own requests get it as well as Codex's
+    const char * windows;     // JSON; nullptr: as on the others
+    const char * others;      // JSON
+};
+
+// The namespaces that Codex and the ChatGPT desktop app offer for the apps of the computer rather than of the request:
+// mcp__cua_repl from the requests of the ChatGPT desktop app 26.1120.50957 on macOS (26.1120.41243 sends the same)
+// and of Codex 0.172 on Windows with that app installed (the app 26.1120.41243 and Codex 0.170 there send the same);
+// mcp__node_repl from the requests of Codex 0.172 on macOS and on Windows with the app installed. The ChatGPT desktop
+// app lists mcp__node_repl among the deferred tool namespaces of the user's context in every request, never among its
+// tools, so its requests get only mcp__cua_repl.
+const namespace_definition codex_common_namespaces[] = {
+    {
+        "mcp__cua_repl", true,
+        R"({"type": "namespace", "name": "mcp__cua_repl", "description": "UI automation through cua_repl using the )"
+        R"(initialized cua API.", "tools": [{"type": "function", "name": "js", "description": "Control native apps )"
+        R"(or browsers on the user\u2019s computer by reading or operating UI. Prefer purpose-built skills, )"
+        R"(connectors, APIs, or CLIs when available.\r\n\r\nOn the first invocation of `cua_repl`, or after )"
+        R"(resetting it, execute exactly one of the API calls shown below, optionally assigning its result to a )"
+        R"(variable. Do not add other API calls, waits, or snapshots to that invocation.\r\nThe tool result will )"
+        R"(include documentation and, when creating or selecting a tab or selecting an app, its initial UI state. )"
+        R"(Selecting a browser does not open a tab. Read that result before continuing.\r\nUse only APIs described )"
+        R"(in the tool instructions or returned documentation.\r\n\r\nWhen you need an inventory of available )"
+        R"(apps, browsers, and tabs, get a snapshot of all enabled surfaces. Otherwise, use the relevant entry )"
+        R"(point below:\r\n\r\n```javascript\r\nawait cua.getState();\r\n```\n\nUse the first matching browser )"
+        R"(control option from the user's request:\r\n\r\nFor a tab @-mention (`mention=tab-v1`):\r\nPass the )"
+        R"(complete `plugin://...` URL to get the referenced tab.\r\n\r\n```javascript\r\nlet tab = await )"
+        R"(cua.getTab({ mention: tabMentionUrl });\r\n```\r\n\r\nFor an existing tab identified by URL in browser )"
+        R"(context (including the current IAB tab):\r\n\r\n```javascript\r\nlet tab = await cua.getTab({ url }, { )"
+        R"(browser: browserId });\r\n```\r\n\r\nKnown tab ID (`tabId` or `providerTabId`) and browser (name or )"
+        R"(browser @-mention):\r\n\r\n```javascript\r\nlet tab = await cua.getTab(tabId, { browser: browserId )"
+        R"(});\r\n```\r\n\r\nTo open a URL in the in-app browser (`@Browser`):\r\n\r\n```javascript\r\nlet tab = )"
+        R"(await cua.createBrowserTab(\"iab\", url, { visible: boolean });\r\n```\r\n\r\nTo open a URL in another )"
+        R"(named browser: pass its name directly; do not call `getBrowser` first.\r\n\r\n```javascript\r\nlet tab )"
+        R"(= await cua.createBrowserTab(browserName, url, browserOptions);\r\n```\r\n\r\nKnown URL, only when the )"
+        R"(user has not specified a browser by name or @-mention:\r\n\r\n```javascript\r\nlet browser = await )"
+        R"(cua.getBrowser({ url });\r\n```\r\n\r\nBrowser IDs and options:\r\n\r\n- `\"mcpapps\"`: use )"
+        R"(`cua.getBrowser({ id: \"mcpapps\" })` for existing full-screen MCP Apps in the task\u2019s side )"
+        R"(panel.\r\n- `\"iab\"` (in-app browser): in `createBrowserTab`, use `visible: true` to show the browser; )"
+        R"(`false` to keep it hidden.\r\n- `\"dot\"` (Dot): use only when present in browser inventory. It )"
+        R"(accesses tabs on Dot's active main thread. `cua.getTab(tabId, { browser: \"dot\" })` selects an )"
+        R"(existing tab. `cua.createBrowserTab(\"dot\", url, { visible: boolean })` creates one with the same )"
+        R"(visibility options as `\"iab\"`.\r\n- `\"chrome\"` (@Chrome), `\"edge\"` (@Edge): pass a short, )"
+        R"(emoji-prefixed `sessionName` (e.g. `\"\ud83d\udd0e Task\"`) to `createBrowserTab` when starting a )"
+        R"(task.\n\nOn Windows, choose the requested window by app and title from the inventory. Pass the selected )"
+        R"(window's ID as returned.\r\n\r\n```javascript\r\nlet app = await cua.getApp({ windowId: selected.id )"
+        R"(});\r\n```\n\nTo add other content to the tool result, use `nodeRepl.write(value)` for text or other )"
+        R"(values and `await nodeRepl.emitImage(image)` for images. The APIs listed above already display their )"
+        R"(documentation or UI state; do not wrap their results in `write` or `emitImage`.\r\n\r\nIf your context )"
+        R"(begins with a summary of an existing computer use task, call `await cua.rewriteDocumentation()` before )"
+        R"(continuing the computer use task to ensure you have a complete view of the necessary )"
+        R"(documentation.\n\nEach `cua_repl.js` call opens or continues a browser activity. Keep consecutive calls )"
+        R"(together. The activity stays open across messages until you emit completion commentary.\r\n\r\n**Manual )"
+        R"(takeover takes priority over the table below.** For a required manual browser step, call the documented )"
+        R"(takeover API before asking the user to act, unless takeover is already pending. Explain the required )"
+        R"(step in your final reply. Tab marking alone does not transfer control. While waiting for the user to )"
+        R"(finish and return control, emit no completion and make no CUA calls, even when answering side )"
+        R"(questions. The takeover API returning does not end this wait. When the user returns or unblocks you, )"
+        R"(resume browser work and apply the table. If they cancel, replace, or no longer need the browser work, )"
+        R"(close the activity before answering, even without another CUA call.\r\n\r\nCompletion is a standalone )"
+        R"(assistant commentary message containing only `::browser-complete{title=\"<headline>\"}`. Never put it )"
+        R"(in a tool call or final reply. Use 3\u20136 words starting with a past-tense verb to describe the )"
+        R"(observed outcome. Omit identifiers.\r\n\r\nAfter a user cancels pending browser work: commentary )"
+        R"(`::browser-complete{title=\"Stopped browser work\"}`, then the final acknowledgement. No browser call )"
+        R"(is needed.\r\n\r\nFor an open browser activity:\r\n\r\n| Next action                                   )"
+        R"(| Required output order                                                                     |\r\n| )"
+        R"(--------------------------------------------- | --------------------------------------------------------)"
+        R"(--------------------------------- |\r\n| Another CUA call                              | Continue )"
+        R"(without completion.                                                              |\r\n| A non-CUA tool, )"
+        R"(final reply, or chat question | Finish required tab marking, emit completion, then take that action in )"
+        R"(the same response. |\r\n\r\nWith no open activity, emit no completion. Later CUA use requires a fresh )"
+        R"(completion at the next table boundary.\r\n\r\nIf you need a one-time sign-in code, information, or )"
+        R"(confirmation from the user, follow the table and ask in chat. One-time code entry alone does not )"
+        R"(require takeover. This tool is part of plugin `unified-computer-use`.", "strict": false, "parameters": )"
+        R"({"type": "object", "properties": {"code": {"type": "string", "description": "JavaScript to execute )"
+        R"(using the initialized cua_repl runtime."}, "timeout_ms": {"type": "integer", "description": "Optional )"
+        R"(execution timeout in milliseconds. Defaults to 30000 (30 seconds) when omitted."}, "title": {"type": )"
+        R"("string", "description": "Short user-facing description of what this code block is doing. Prefer a few )"
+        R"(words in present-progressive form, such as 'Checking the mobile layout' or 'Comparing prices', over )"
+        R"(imperative or past-tense titles."}}, "required": ["code"], "additionalProperties": false}}, {"type": )"
+        R"("function", "name": "js_reset", "description": "Reset the persistent cua_repl JavaScript session. All )"
+        R"(JavaScript bindings are discarded. The next cua_repl.js call initializes a fresh runtime for the )"
+        R"(enabled surfaces. This does not close browser tabs or native apps, or erase their state. This tool is )"
+        R"(part of plugin `unified-computer-use`.", "strict": false, "parameters": {"type": "object", )"
+        R"("properties": {}, "additionalProperties": false}}]})",
+        R"({"type": "namespace", "name": "mcp__cua_repl", "description": "UI automation through cua_repl using the )"
+        R"(initialized cua API.", "tools": [{"type": "function", "name": "js", "description": "Control native apps )"
+        R"(or browsers on the user\u2019s computer by reading or operating UI. Prefer purpose-built skills, )"
+        R"(connectors, APIs, or CLIs when available.\n\nOn the first invocation of `cua_repl`, or after resetting )"
+        R"(it, execute exactly one of the API calls shown below, optionally assigning its result to a variable. Do )"
+        R"(not add other API calls, waits, or snapshots to that invocation.\nThe tool result will include )"
+        R"(documentation and, when creating or selecting a tab or selecting an app, its initial UI state. )"
+        R"(Selecting a browser does not open a tab. Read that result before continuing.\nUse only APIs described )"
+        R"(in the tool instructions or returned documentation.\n\nWhen you need an inventory of available apps, )"
+        R"(browsers, and tabs, get a snapshot of all enabled surfaces. Otherwise, use the relevant entry point )"
+        R"(below:\n\n```javascript\nawait cua.getState();\n```\n\nUse the first matching browser control option )"
+        R"(from the user's request:\n\nFor a tab @-mention (`mention=tab-v1`):\nPass the complete `plugin://...` )"
+        R"(URL to get the referenced tab.\n\n```javascript\nlet tab = await cua.getTab({ mention: tabMentionUrl )"
+        R"(});\n```\n\nFor an existing tab identified by URL in browser context (including the current IAB )"
+        R"(tab):\n\n```javascript\nlet tab = await cua.getTab({ url }, { browser: browserId });\n```\n\nKnown tab )"
+        R"(ID (`tabId` or `providerTabId`) and browser (name or browser @-mention):\n\n```javascript\nlet tab = )"
+        R"(await cua.getTab(tabId, { browser: browserId });\n```\n\nTo open a URL in the in-app browser )"
+        R"((`@Browser`):\n\n```javascript\nlet tab = await cua.createBrowserTab(\"iab\", url, { visible: boolean )"
+        R"(});\n```\n\nTo open a URL in another named browser: pass its name directly; do not call `getBrowser` )"
+        R"(first.\n\n```javascript\nlet tab = await cua.createBrowserTab(browserName, url, )"
+        R"(browserOptions);\n```\n\nKnown URL, only when the user has not specified a browser by name or )"
+        R"(@-mention:\n\n```javascript\nlet browser = await cua.getBrowser({ url });\n```\n\nBrowser IDs and )"
+        R"(options:\n\n- `\"mcpapps\"`: use `cua.getBrowser({ id: \"mcpapps\" })` for existing full-screen MCP )"
+        R"(Apps in the task\u2019s side panel.\n- `\"iab\"` (in-app browser): in `createBrowserTab`, use `visible: )"
+        R"(true` to show the browser; `false` to keep it hidden.\n- `\"dot\"` (Dot): use only when present in )"
+        R"(browser inventory. It accesses tabs on Dot's active main thread. `cua.getTab(tabId, { browser: \"dot\" )"
+        R"(})` selects an existing tab. `cua.createBrowserTab(\"dot\", url, { visible: boolean })` creates one )"
+        R"(with the same visibility options as `\"iab\"`.\n- `\"chrome\"` (@Chrome), `\"edge\"` (@Edge): pass a )"
+        R"(short, emoji-prefixed `sessionName` (e.g. `\"\ud83d\udd0e Task\"`) to `createBrowserTab` when starting )"
+        R"(a task.\n\nIf the user specifies an app to use, get the app by name, bundle ID, or )"
+        R"(path:\n\n```javascript\nlet app = await cua.getApp(\"Example App\");\n```\n\nTo add other content to )"
+        R"(the tool result, use `nodeRepl.write(value)` for text or other values and `await )"
+        R"(nodeRepl.emitImage(image)` for images. The APIs listed above already display their documentation or UI )"
+        R"(state; do not wrap their results in `write` or `emitImage`.\n\nIf your context begins with a summary of )"
+        R"(an existing computer use task, call `await cua.rewriteDocumentation()` before continuing the computer )"
+        R"(use task to ensure you have a complete view of the necessary documentation.\n\nEach `cua_repl.js` call )"
+        R"(opens or continues a browser activity. Keep consecutive calls together. The activity stays open across )"
+        R"(messages until you emit completion commentary.\n\n**Manual takeover takes priority over the table )"
+        R"(below.** For a required manual browser step, call the documented takeover API before asking the user to )"
+        R"(act, unless takeover is already pending. Explain the required step in your final reply. Tab marking )"
+        R"(alone does not transfer control. While waiting for the user to finish and return control, emit no )"
+        R"(completion and make no CUA calls, even when answering side questions. The takeover API returning does )"
+        R"(not end this wait. When the user returns or unblocks you, resume browser work and apply the table. If )"
+        R"(they cancel, replace, or no longer need the browser work, close the activity before answering, even )"
+        R"(without another CUA call.\n\nCompletion is a standalone assistant commentary message containing only )"
+        R"(`::browser-complete{title=\"<headline>\"}`. Never put it in a tool call or final reply. Use 3\u20136 )"
+        R"(words starting with a past-tense verb to describe the observed outcome. Omit identifiers.\n\nAfter a )"
+        R"(user cancels pending browser work: commentary `::browser-complete{title=\"Stopped browser work\"}`, )"
+        R"(then the final acknowledgement. No browser call is needed.\n\nFor an open browser activity:\n\n| Next )"
+        R"(action                                   | Required output order                                        )"
+        R"(                             |\n| --------------------------------------------- | )"
+        R"(----------------------------------------------------------------------------------------- |\n| Another )"
+        R"(CUA call                              | Continue without completion.                                    )"
+        R"(                          |\n| A non-CUA tool, final reply, or chat question | Finish required tab )"
+        R"(marking, emit completion, then take that action in the same response. |\n\nWith no open activity, emit )"
+        R"(no completion. Later CUA use requires a fresh completion at the next table boundary.\n\nIf you need a )"
+        R"(one-time sign-in code, information, or confirmation from the user, follow the table and ask in chat. )"
+        R"(One-time code entry alone does not require takeover. This tool is part of plugin )"
+        R"(`unified-computer-use`.", "strict": false, "parameters": {"type": "object", "properties": {"code": )"
+        R"({"type": "string", "description": "JavaScript to execute using the initialized cua_repl runtime."}, )"
+        R"("timeout_ms": {"type": "integer", "description": "Optional execution timeout in milliseconds. Defaults )"
+        R"(to 30000 (30 seconds) when omitted."}, "title": {"type": "string", "description": "Short user-facing )"
+        R"(description of what this code block is doing. Prefer a few words in present-progressive form, such as )"
+        R"('Checking the mobile layout' or 'Comparing prices', over imperative or past-tense titles."}}, )"
+        R"("required": ["code"], "additionalProperties": false}}, {"type": "function", "name": "js_reset", )"
+        R"("description": "Reset the persistent cua_repl JavaScript session. All JavaScript bindings are )"
+        R"(discarded. The next cua_repl.js call initializes a fresh runtime for the enabled surfaces. This does )"
+        R"(not close browser tabs or native apps, or erase their state. This tool is part of plugin )"
+        R"(`unified-computer-use`.", "strict": false, "parameters": {"type": "object", "properties": {}, )"
+        R"("additionalProperties": false}}]})",
+    },
+    {
+        "mcp__node_repl", false, nullptr,
+        R"({"type": "namespace", "name": "mcp__node_repl", "description": "Use `js` for `node_repl` execution with )"
+        R"(persistent, redeclarable top-level bindings, `js_reset` to clear bindings, and `js_add_node_module_dir` )"
+        R"(to add package directories.", "tools": [{"type": "function", "name": "js", "description": "Execute )"
+        R"(JavaScript in a persistent `node_repl` with top-level await. Top-level bindings persist until )"
+        R"(`js_reset` or an idle reset and can be redeclared. Use `const` for stable values and `let` for changing )"
+        R"(values. Use dynamic imports such as `await import(\"playwright\")`; top-level static imports and )"
+        R"(`node:process` are unavailable. Use `nodeRepl.write(value)` for output and `await )"
+        R"(nodeRepl.emitImage(image)` for images. Execution context is available through `nodeRepl.cwd`, )"
+        R"(`nodeRepl.homeDir`, `nodeRepl.tmpDir`, and `nodeRepl.requestMeta`. The default timeout is 30000 ms (30 )"
+        R"(seconds); increase `timeout_ms` for longer operations. Use `js_add_node_module_dir` when an additional )"
+        R"(package directory is required.", "strict": false, "parameters": {"type": "object", "properties": )"
+        R"({"code": {"type": "string", "description": "JavaScript code to execute with top-level await."}, )"
+        R"("timeout_ms": {"type": "integer", "description": "Optional execution timeout in milliseconds. Defaults )"
+        R"(to 30000 (30 seconds) when omitted."}, "title": {"type": "string", "description": "Short user-facing )"
+        R"(description of what the code does."}}, "required": ["code"], "additionalProperties": false}}, {"type": )"
+        R"("function", "name": "js_add_node_module_dir", "description": "Add an absolute `node_modules` directory )"
+        R"(for package imports. The directory remains available after `js_reset`.", "strict": false, "parameters": )"
+        R"({"type": "object", "properties": {"path": {"type": "string", "description": "Absolute path to a )"
+        R"(node_modules directory to add to Node package resolution."}}, "required": ["path"], )"
+        R"("additionalProperties": false}}, {"type": "function", "name": "js_reset", "description": "Reset the )"
+        R"(JavaScript kernel and clear all bindings.", "strict": false, "parameters": {"type": "object", )"
+        R"("properties": {}, "additionalProperties": false}}]})",
+    },
+};
+
 // The value at a path of keys in a JSON object, or nullptr.
 json * at_path(json & value, std::initializer_list<const char *> keys) {
     json * at = &value;
@@ -229,6 +417,41 @@ void server_unify_codex_tool(json & tool, bool windows) {
         json * description = at_path(tool, { "parameters", "properties", d.parameter, "description" });
         if (description != nullptr && *description == d.from) {
             *description = windows ? d.windows : d.others;
+        }
+    }
+}
+
+void server_add_codex_common_tools(std::vector<json> & tools, bool windows) {
+    const auto is = [](const json & tool, const char * type, const char * name) {
+        return tool.is_object() && tool.contains("type") && tool.at("type") == type && tool.contains("name") &&
+               tool.at("name") == name;
+    };
+    const auto has = [&](const char * type, const char * name) {
+        return std::any_of(tools.begin(), tools.end(), [&](const json & tool) { return is(tool, type, name); });
+    };
+    // Codex has the function exec_command. The ChatGPT desktop app, which runs Codex, has the namespace collaboration,
+    // and in a conversation the tool send_message_to_user_async in its namespace functions; the requests that title a
+    // conversation lack that tool and never offer mcp__cua_repl, and stay as sent.
+    const bool codex        = has("function", "exec_command");
+    const bool conversation = std::any_of(tools.begin(), tools.end(), [&](const json & tool) {
+        return is(tool, "namespace", "functions") && tool.contains("tools") && tool.at("tools").is_array() &&
+               std::any_of(tool.at("tools").begin(), tool.at("tools").end(), [&](const json & t) {
+                   return is(t, "function", "send_message_to_user_async");
+               });
+    });
+    const bool desktop_app  = !codex && has("namespace", "collaboration") && conversation;
+    if (!codex && !desktop_app) {
+        return;
+    }
+    for (const namespace_definition & d : codex_common_namespaces) {
+        if (desktop_app && !d.desktop_app) {
+            continue;
+        }
+        const bool sent = std::any_of(tools.begin(), tools.end(), [&](const json & tool) {
+            return tool.is_object() && tool.contains("name") && tool.at("name") == d.name;
+        });
+        if (!sent) {
+            tools.push_back(json::parse(windows && d.windows != nullptr ? d.windows : d.others));
         }
     }
 }

@@ -339,11 +339,122 @@ static void test_codex_namespace_has_the_worktree_tools() {
     require(tools.at(1).at("function").at("name") == "mcp__codex_tui::create_worktree", "as namespace tools");
 }
 
+// A namespace of function tools, trimmed.
+static json namespace_of(const std::string & name, const std::vector<std::string> & tools) {
+    json functions = json::array();
+    for (const auto & tool : tools) {
+        functions.push_back({{"type", "function"}, {"name", tool}, {"description", "A tool."}, {"strict", false},
+                             {"parameters", {{"type", "object"}, {"properties", json::object()}}}});
+    }
+    return {{"type", "namespace"}, {"name", name}, {"description", "Tools of " + name + "."}, {"tools", functions}};
+}
+
+static std::vector<std::string> names_of(const json & tools) {
+    std::vector<std::string> names;
+    for (const auto & tool : tools) {
+        names.push_back(tool.contains("function") ? tool.at("function").at("name").get<std::string>()
+                                                  : tool.at("name").get<std::string>());
+    }
+    return names;
+}
+
+static void test_codex_requests_offer_the_common_mcp_tools() {
+    const json exec = exec_command(LOGIN_0_172_MACOS);
+    const std::vector<std::string> cua  = { "js", "js_reset" };
+    const std::vector<std::string> node = { "js", "js_add_node_module_dir", "js_reset" };
+
+    // Codex without the apps that add them: both namespaces join at the end, as the table defines them
+    json node_definition;
+    for (const bool windows : {false, true}) {
+        std::vector<json> tools = { exec, codex_tui({ "create_thread" }) };
+        server_add_codex_common_tools(tools, windows);
+        require(names_of(tools) == std::vector<std::string>({ "exec_command", "mcp__codex_tui", "mcp__cua_repl",
+                                                              "mcp__node_repl" }),
+                "the namespaces are added: " + json(tools).dump());
+        require(names_of(tools[2].at("tools")) == cua && names_of(tools[3].at("tools")) == node,
+                "with their tools: " + json(tools).dump());
+        for (const json & ns : { tools[2], tools[3] }) {
+            for (const json & tool : ns.at("tools")) {
+                require(tool.at("type") == "function" && tool.at("strict") == false &&
+                            tool.at("parameters").at("additionalProperties") == false,
+                        "as the apps define them: " + tool.dump());
+            }
+        }
+        const std::string js = tools[2].at("tools").at(0).at("description").get<std::string>();
+        require((js.find("On Windows, choose the requested window") != std::string::npos) == windows &&
+                    (js.find("\r\n") != std::string::npos) == windows &&
+                    js.find("This tool is part of plugin `unified-computer-use`.") != std::string::npos &&
+                    js.find("the user\xe2\x80\x99s computer") != std::string::npos,
+                "the computer use tool as the app sends it on the system: " + js);
+        require(node_definition.is_null() || node_definition == tools[3], "the node tools are the same on both systems");
+        node_definition = tools[3];
+    }
+
+    // a namespace the request has stays as sent
+    const json own_cua = namespace_of("mcp__cua_repl", { "js" });
+    std::vector<json> with_cua = { exec, own_cua };
+    server_add_codex_common_tools(with_cua, false);
+    require(with_cua.size() == 3 && with_cua[1] == own_cua && with_cua[2] == node_definition,
+            "Codex's request keeps its namespace and gets the one it lacks: " + json(with_cua).dump());
+
+    // the ChatGPT desktop app's requests get only mcp__cua_repl: the app lists mcp__node_repl as a deferred tool
+    const std::vector<json> desktop_tools = {
+        namespace_of("functions", { "exec", "wait", "send_message_to_user_async" }),
+        namespace_of("collaboration", { "spawn_agent" }),
+    };
+    std::vector<json> desktop = desktop_tools;
+    server_add_codex_common_tools(desktop, false);
+    require(names_of(desktop) == std::vector<std::string>({ "functions", "collaboration", "mcp__cua_repl" }) &&
+                names_of(desktop[2].at("tools")) == cua,
+            "the desktop app's request gets the computer use tools: " + json(desktop).dump());
+    std::vector<json> desktop_with_cua = desktop_tools;
+    desktop_with_cua.push_back(own_cua);
+    const std::vector<json> desktop_before = desktop_with_cua;
+    server_add_codex_common_tools(desktop_with_cua, false);
+    require(desktop_with_cua == desktop_before, "and with them, stays as sent: " + json(desktop_with_cua).dump());
+    std::vector<json> title = { namespace_of("functions", { "exec", "wait" }),
+                                namespace_of("collaboration", { "spawn_agent" }) };
+    const std::vector<json> title_before = title;
+    server_add_codex_common_tools(title, false);
+    require(title == title_before, "a request that titles a conversation stays as sent: " + json(title).dump());
+    std::vector<json> old_desktop = { exec, namespace_of("collaboration", { "spawn_agent" }) };
+    server_add_codex_common_tools(old_desktop, false);
+    require(names_of(old_desktop) == std::vector<std::string>({ "exec_command", "collaboration", "mcp__cua_repl",
+                                                                "mcp__node_repl" }),
+            "a request with exec_command is Codex's: " + json(old_desktop).dump());
+
+    // other requests stay as sent
+    for (std::vector<json> other : { std::vector<json>{ namespace_of("functions", { "exec_command" }) },
+                                     std::vector<json>{ namespace_of("mcp__cua_repl", { "js" }) },
+                                     std::vector<json>{} }) {
+        const std::vector<json> before = other;
+        server_add_codex_common_tools(other, false);
+        require(other == before, "a request that is not Codex's stays: " + json(other).dump());
+    }
+
+    // a Responses request of Codex offers the tools as namespace tools, as a request with them as sent does
+    const auto tools_of = [](const json & tools) {
+        return server_chat_convert_responses_to_chatcmpl({{"model", "m"}, {"input", "hi"}, {"tools", tools}}).at("tools");
+    };
+    const json chat = tools_of(json::array({ exec }));
+    require(names_of(chat) == std::vector<std::string>({ "exec_command", "mcp__cua_repl::js", "mcp__cua_repl::js_reset",
+                                                         "mcp__node_repl::js", "mcp__node_repl::js_add_node_module_dir",
+                                                         "mcp__node_repl::js_reset" }),
+            "the request's tools: " + chat.dump());
+    std::vector<json> sent = { exec };
+    server_add_codex_common_tools(sent, server_identifier_env::current().windows);
+    require(chat == tools_of(sent), "the same as with the namespaces as sent");
+    require(names_of(tools_of(json::array({ namespace_of("mcp__docs", { "search" }) }))) ==
+                std::vector<std::string>({ "mcp__docs::search" }),
+            "another app's request offers its own tools");
+}
+
 int main() {
     test_claude_code_prompt_variants_render_as_one();
     test_other_prompts_stay();
     test_claude_code_tool_search_requires_only_the_query();
     test_codex_login_parameter_renders_as_in_0_172();
     test_codex_namespace_has_the_worktree_tools();
+    test_codex_requests_offer_the_common_mcp_tools();
     return 0;
 }

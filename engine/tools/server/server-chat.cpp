@@ -681,6 +681,8 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
             resp_tools.insert(resp_tools.end(), response_body.at("tools").begin(), response_body.at("tools").end());
         }
         resp_tools.insert(resp_tools.end(), input_tools.begin(), input_tools.end());
+        // every request of Codex offers the MCP tools the apps of a computer add (see inferssd/app-versions.h)
+        server_add_codex_common_tools(resp_tools, server_identifier_env::current().windows);
 
         // A tool keeps its first definition: Codex declares its additional_tools again in later turns.
         std::vector<json> chatcmpl_tools;

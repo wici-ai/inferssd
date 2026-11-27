@@ -3,6 +3,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include <vector>
+
 // Texts in which versions or variants of an agent app differ while they tell the model the same, and the one text the
 // server renders for all of them, so that their users share the cached prefix past them (as with the identifiers in
 // identifiers.h). Each known text comes from requests that a named version of the app sent (the tables in
@@ -31,3 +33,15 @@ void server_unify_claude_code_tool(nlohmann::ordered_json & tool);
 // (create_worktree, get_worktree_creation_status and list_worktrees): a namespace without one gets it, as 0.172 defines
 // it, after the tool it follows there. tool is a Responses tool.
 void server_unify_codex_tool(nlohmann::ordered_json & tool, bool windows);
+
+// Codex and the ChatGPT desktop app offer the tools of the MCP servers and plugins configured on the computer, which
+// the apps installed there add: the ChatGPT desktop app adds mcp__node_repl to Codex's configuration, and its computer
+// use plugin offers mcp__cua_repl, so the requests of two users of the same app version have them or not. A request
+// of Codex (it has the function exec_command) that lacks one of them gets it at its end, and a request of a ChatGPT
+// desktop app conversation (the namespace collaboration, send_message_to_user_async in the namespace functions, no
+// exec_command) mcp__cua_repl, as the app versions named in app-versions.cpp define them on the system whose requests
+// the server renders; the app lists mcp__node_repl among the deferred tools of its context instead, and the requests
+// that title its conversations never offer either. A definition the request has stays as sent. The server orders the
+// tools of MCP servers by server after the app's own (server_order_tools). The model may then call such a tool where
+// the user's app does not offer it, and the app answers the call with an error. tools are Responses tools.
+void server_add_codex_common_tools(std::vector<nlohmann::ordered_json> & tools, bool windows);
