@@ -330,6 +330,12 @@ inline constexpr const char * SERVER_USER_CONTEXT_SYSTEM_MESSAGE = "inferssd_use
 // state where they start. oaicompat_chat_params_parse reads and removes it.
 inline constexpr const char * SERVER_USER_CONTEXT_DATA_CHARS = "inferssd_user_context_data_chars";
 
+// A chat request field set by the conversion of a Responses request (server_chat_convert_responses_to_chatcmpl): the
+// names of its custom tools as the prompt offers them, each a function of the one string argument "input".
+// oaicompat_chat_params_parse passes it on like any field it does not know; the task keeps it (task_params::
+// custom_tools), and the Responses output calls these tools with custom_tool_call items.
+inline constexpr const char * SERVER_CUSTOM_TOOLS = "inferssd_custom_tools";
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,

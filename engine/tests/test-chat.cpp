@@ -1666,7 +1666,8 @@ static void test_convert_responses_to_chatcmpl() {
     }
 
     // Tools that additional_tools input items declare (Codex sends the tools of its Responses Lite models this
-    // way, again in later turns) join the request's tools once each; the items themselves are no messages.
+    // way, again in later turns) join the request's tools once each; the items themselves are no messages. A custom
+    // tool becomes a function of one string argument, "input" (see test-server-responses-custom-tools).
     {
         json input = json::parse(R"({
             "input": [
@@ -1695,11 +1696,15 @@ static void test_convert_responses_to_chatcmpl() {
 
         assert_equals((size_t)1, result.at("messages").size());
         const json & tools = result.at("tools");
-        assert_equals((size_t)2, tools.size());
+        assert_equals((size_t)3, tools.size());
         assert_equals(std::string("functions::exec_command"), tools[0].at("function").at("name").get<std::string>());
         assert_equals(std::string("Run a command."), tools[0].at("function").at("description").get<std::string>());
-        assert_equals(std::string("get_goal"), tools[1].at("function").at("name").get<std::string>());
+        assert_equals(std::string("functions::apply_patch"), tools[1].at("function").at("name").get<std::string>());
+        assert_equals(std::string("string"),
+                      tools[1].at("function").at("parameters").at("properties").at("input").at("type").get<std::string>());
+        assert_equals(std::string("get_goal"), tools[2].at("function").at("name").get<std::string>());
         assert_equals(std::string("auto"), result.at("tool_choice").get<std::string>());
+        assert_equals(json::array({"functions::apply_patch"}).dump(), result.at(SERVER_CUSTOM_TOOLS).dump());
     }
 }
 

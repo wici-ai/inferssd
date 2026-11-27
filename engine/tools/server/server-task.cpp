@@ -615,6 +615,7 @@ task_params server_task::params_from_json_cmpl(
         }
         params.identifiers = server_identifier_map::from_json(json_value(data, "prompt_identifiers", json()));
         params.turn_context = json_value(data, "turn_context", std::string());
+        params.custom_tools = json_value(data, SERVER_CUSTOM_TOOLS, std::vector<std::string>());
     }
 
     {
@@ -1127,6 +1128,29 @@ static json oai_resp_function_call(json item, const std::string & name) {
     return item;
 }
 
+static bool oai_resp_custom_tool(const std::vector<std::string> & custom_tools, const std::string & name) {
+    return std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end();
+}
+
+// A finished tool call as a Responses output item: a function_call, or for a custom tool (task_params::custom_tools)
+// a custom_tool_call with the tool's input.
+static json oai_resp_tool_call(const common_chat_tool_call & tool_call, const std::vector<std::string> & custom_tools) {
+    if (oai_resp_custom_tool(custom_tools, tool_call.name)) {
+        return oai_resp_function_call(json {
+            {"type",    "custom_tool_call"},
+            {"status",  "completed"},
+            {"input",   server_chat_custom_tool_input(tool_call.arguments, false)},
+            {"call_id", "fc_" + tool_call.id},
+        }, tool_call.name);
+    }
+    return oai_resp_function_call(json {
+        {"type",      "function_call"},
+        {"status",    "completed"},
+        {"arguments", tool_call.arguments},
+        {"call_id",   "fc_" + tool_call.id},
+    }, tool_call.name);
+}
+
 json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     common_chat_msg msg;
     if (!oaicompat_msg.empty()) {
@@ -1168,12 +1192,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        output.push_back(oai_resp_function_call(json {
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
-        }, tool_call.name));
+        output.push_back(oai_resp_tool_call(tool_call, oai_resp_custom_tools));
     }
 
     std::time_t t = std::time(0);
@@ -1266,12 +1285,7 @@ json server_task_result_cmpl_final::to_json_oaicompat_resp_stream() {
     }
 
     for (const common_chat_tool_call & tool_call : oaicompat_msg.tool_calls) {
-        const json output_item = oai_resp_function_call(json {
-            {"type",      "function_call"},
-            {"status",    "completed"},
-            {"arguments", tool_call.arguments},
-            {"call_id",   "fc_" + tool_call.id},
-        }, tool_call.name);
+        const json output_item = oai_resp_tool_call(tool_call, oai_resp_custom_tools);
         server_sent_events.push_back(json {
             {"event", "response.output_item.done"},
             {"data", json {
@@ -1611,6 +1625,26 @@ void server_task_result_cmpl_partial::update(task_result_state & state) {
             state.oai_resp_fc_id = diff.tool_call_delta.id;
         }
     }
+
+    // A custom tool's input streams as its text, taken from the arguments it is written in as far as they go.
+    oai_resp_custom_inputs.clear();
+    if (res_type == TASK_RESPONSE_TYPE_OAI_RESP && !state.custom_tools.empty()) {
+        const std::vector<common_chat_tool_call> & calls = state.chat_msg_sent.tool_calls;
+        for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
+            const size_t i = diff.tool_call_index;
+            if (i >= calls.size() || !oai_resp_custom_tool(state.custom_tools, calls[i].name)) {
+                oai_resp_custom_inputs.emplace_back();
+                continue;
+            }
+            if (state.custom_input_sent.size() <= i) {
+                state.custom_input_sent.resize(i + 1, 0);
+            }
+            size_t & sent = state.custom_input_sent[i];
+            const std::string input = server_chat_custom_tool_input(calls[i].arguments, true);
+            oai_resp_custom_inputs.emplace_back(input.size() > sent ? input.substr(sent) : std::string());
+            sent = std::max(sent, input.size());
+        }
+    }
 }
 
 json server_task_result_cmpl_partial::to_json() {
@@ -1781,7 +1815,12 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
         });
     }
 
-    for (const common_chat_msg_diff & diff : oaicompat_msg_diffs) {
+    for (size_t d = 0; d < oaicompat_msg_diffs.size(); ++d) {
+        const common_chat_msg_diff & diff = oaicompat_msg_diffs[d];
+        // the input of a custom tool streams as its text (see update)
+        const std::optional<std::string> custom_input =
+            d < oai_resp_custom_inputs.size() ? oai_resp_custom_inputs[d] : std::nullopt;
+
         if (!diff.reasoning_content_delta.empty()) {
             if (!thinking_block_started) {
                 events.push_back(json {
@@ -1848,7 +1887,21 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             });
         }
 
-        if (!diff.tool_call_delta.name.empty()) {
+        if (!diff.tool_call_delta.name.empty() && custom_input) {
+            events.push_back(json {
+                {"event", "response.output_item.added"},
+                {"data", json {
+                    {"type",  "response.output_item.added"},
+                    {"item", oai_resp_function_call(json {
+                        {"input",   ""},
+                        {"call_id", "fc_" + diff.tool_call_delta.id},
+                        {"type",    "custom_tool_call"},
+                        {"status",  "in_progress"},
+                    }, diff.tool_call_delta.name)},
+                }},
+            });
+            oai_resp_fc_id = diff.tool_call_delta.id;
+        } else if (!diff.tool_call_delta.name.empty()) {
             events.push_back(json {
                 {"event", "response.output_item.added"},
                 {"data", json {
@@ -1864,7 +1917,18 @@ json server_task_result_cmpl_partial::to_json_oaicompat_resp() {
             oai_resp_fc_id = diff.tool_call_delta.id;
         }
 
-        if (!diff.tool_call_delta.arguments.empty()) {
+        if (custom_input) {
+            if (!custom_input->empty()) {
+                events.push_back(json {
+                    {"event", "response.custom_tool_call_input.delta"},
+                    {"data", json {
+                        {"type",    "response.custom_tool_call_input.delta"},
+                        {"delta",   *custom_input},
+                        {"item_id", "fc_" + oai_resp_fc_id},
+                    }},
+                });
+            }
+        } else if (!diff.tool_call_delta.arguments.empty()) {
             events.push_back(json {
                 {"event", "response.function_call_arguments.delta"},
                 {"data", json {
