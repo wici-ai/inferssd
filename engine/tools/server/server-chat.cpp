@@ -827,6 +827,75 @@ static void anthropic_demote_mid_conversation_system_messages(json & messages) {
     messages = std::move(out);
 }
 
+// The text of a converted message that is Claude's environment block: it opens with "# Environment\n", inside a
+// <system-reminder> in the Claude desktop app. Empty for any other message.
+static std::string anthropic_environment_text(const json & message) {
+    const json content = json_value(message, "content", json());
+    std::string text;
+    if (content.is_string()) {
+        text = content.get<std::string>();
+    } else if (content.is_array()) {
+        for (const json & part : content) {
+            if (json_value(part, "type", std::string()) != "text") {
+                return std::string();
+            }
+            text += json_value(part, "text", std::string());
+        }
+    }
+    static const std::string reminder = "<system-reminder>\n";
+    const size_t heading = text.compare(0, reminder.size(), reminder) == 0 ? reminder.size() : 0;
+    return text.compare(heading, 14, "# Environment\n") == 0 ? text : std::string();
+}
+
+// Claude Code and the Claude desktop app send the environment (the working directories, the system, the deferred
+// tools, the agents, the skills, the date) as a system message right after the user's first words. Demoted where it
+// stands (below), it followed the words, so a new conversation of the same setup shared only the system prompt and
+// the tools. When it directly follows the conversation's first user message, its text goes into that message ahead
+// of the user's words, after the system reminders that open the message, with a blank line after it; a later system
+// message is demoted as before. Returns the number of characters of the message's text (its text parts in order)
+// that come before the user's words, where the server keeps a state (SERVER_FIRST_USER_CONTEXT_CHARS); 0 when the
+// request has no environment there.
+static size_t anthropic_join_environment(json & messages) {
+    const auto role_of = [](const json & message) { return json_value(message, "role", std::string()); };
+    size_t first = 0;
+    while (first < messages.size() && role_of(messages[first]) == "system") {
+        first++;
+    }
+    if (first + 1 >= messages.size() || role_of(messages[first]) != "user" ||
+        role_of(messages[first + 1]) != "system") {
+        return 0;
+    }
+    const std::string environment = anthropic_environment_text(messages[first + 1]);
+    if (environment.empty() || !messages[first].contains("content") ||
+        (!messages[first].at("content").is_string() && !messages[first].at("content").is_array())) {
+        return 0;
+    }
+    json & content = messages[first].at("content");
+    const std::string text = environment + "\n\n";
+    size_t chars = text.size();
+    if (content.is_string()) {
+        content = text + content.get<std::string>();
+    } else {
+        const auto is_text = [](const json & part) {
+            return json_value(part, "type", std::string()) == "text" && part.contains("text") &&
+                   part.at("text").is_string();
+        };
+        size_t words = 0;
+        while (words < content.size() && is_text(content[words]) &&
+               content[words].at("text").get<std::string>().rfind("<system-reminder>", 0) == 0) {
+            chars += content[words].at("text").get<std::string>().size();
+            words++;
+        }
+        if (words < content.size() && is_text(content[words])) {
+            content[words]["text"] = text + content[words].at("text").get<std::string>();
+        } else {
+            content.insert(content.begin() + words, json{ { "type", "text" }, { "text", text } });
+        }
+    }
+    messages.erase(messages.begin() + first + 1);
+    return chars;
+}
+
 json server_chat_convert_anthropic_to_oai(const json & body) {
     json oai_body;
 
@@ -981,8 +1050,13 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
         }
     }
 
+    const size_t first_user_context_chars = anthropic_join_environment(oai_messages);
     anthropic_demote_mid_conversation_system_messages(oai_messages);
     oai_body["messages"] = oai_messages;
+    if (first_user_context_chars > 0) {
+        // read and removed by oaicompat_chat_params_parse
+        oai_body[SERVER_FIRST_USER_CONTEXT_CHARS] = first_user_context_chars;
+    }
 
     // Convert tools
     if (body.contains("tools")) {

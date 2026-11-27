@@ -265,6 +265,121 @@ static void test_chat_request_reports_the_opening() {
             "the context prefix of a merged system turn ends with the turn");
 }
 
+// The environment block Claude Code and the Claude desktop app send as a system message after the user's first
+// words, trimmed from what they send: it goes into the first user message ahead of the words, after the system
+// reminders that open it, so a new conversation of the same setup shares everything up to the words, where the server
+// keeps a state.
+static void test_claude_environment_opens_the_conversation() {
+    const std::string reminder = "<system-reminder>\nAttribution for git commits.\n</system-reminder>\n";
+    const std::string code_env =
+        "# Environment\nYou have been invoked in the following environment: \n"
+        " - Primary working directory: /work/project\n - Plugins: /opt/.codex/plugins/cache/tools/run/26.1123.11515/bin\n"
+        " - Platform: linux\n\nToday's date is 2026-11-25.";
+    const std::string desktop_env =
+        "<system-reminder>\n# Environment\nYou have been invoked in the following environment: \n"
+        " - Primary working directory: /private/var/empty\n</system-reminder>\n\n"
+        "<system-reminder>\nToday's date is 2026-11-24.\n</system-reminder>";
+    const json system = json::array({{{"type", "text"}, {"text", "You are Claude Code, Anthropic's official CLI for Claude."}},
+                                      {{"type", "text"}, {"text", "Plugins are in /opt/.codex/plugins/cache/tools/run/26.1123.11515/bin."}}});
+    const auto text = [](const std::string & t) { return json{{"type", "text"}, {"text", t}}; };
+    const auto code_messages = [&](const std::string & words) {
+        return json::array({
+            {{"role", "user"}, {"content", json::array({text(reminder), text(words)})}},
+            {{"role", "system"}, {"content", json::array({{{"type", "text"}, {"text", code_env},
+                                                           {"cache_control", {{"type", "ephemeral"}}}}})}},
+        });
+    };
+    const auto convert = [&](const json & messages) {
+        return server_chat_convert_anthropic_to_oai({{"system", system}, {"messages", messages}, {"max_tokens", 16}});
+    };
+    const auto context_chars = [](const json & chat) { return json_value(chat, SERVER_FIRST_USER_CONTEXT_CHARS, (size_t) 0); };
+
+    // Claude Code: the block goes after the reminder, ahead of the words, with a blank line
+    const json code = convert(code_messages("hi"));
+    require(code.at("messages").size() == 2 &&
+                code.at("messages").at(1) == json({{"role", "user"},
+                                                   {"content", json::array({text(reminder), text(code_env + "\n\nhi")})}}),
+            "the environment opens the first user message: " + code.at("messages").dump());
+    require(context_chars(code) == reminder.size() + code_env.size() + 2, "the request says how long the context is");
+
+    // the Claude desktop app: a string in a reminder, a message without reminders; the words keep their fields
+    const json cache_control = {{"type", "ephemeral"}, {"ttl", "1h"}};
+    const json desktop = convert(json::array({
+        {{"role", "user"}, {"content", json::array({{{"type", "text"}, {"text", "hi"}, {"cache_control", cache_control}}})}},
+        {{"role", "system"}, {"content", desktop_env}},
+    }));
+    require(desktop.at("messages").at(1).at("content") ==
+                json::array({{{"type", "text"}, {"text", desktop_env + "\n\nhi"}, {"cache_control", cache_control}}}) &&
+                context_chars(desktop) == desktop_env.size() + 2,
+            "the desktop app's environment: " + desktop.dump());
+    const json words_string = convert(json::array({{{"role", "user"}, {"content", "hi"}},
+                                                   {{"role", "system"}, {"content", desktop_env}}}));
+    require(words_string.at("messages").at(1).at("content") == desktop_env + "\n\nhi", "words sent as a string");
+
+    // a later turn: the environment opens the conversation as in its first request; a later system message becomes a
+    // user message where it stands, as before
+    json later_messages = code_messages("hi");
+    later_messages.push_back({{"role", "assistant"}, {"content", "Hello."}});
+    later_messages.push_back({{"role", "user"}, {"content", "Thanks."}});
+    later_messages.push_back({{"role", "system"}, {"content", "<system-reminder>\nLater.\n</system-reminder>"}});
+    const json later = convert(later_messages);
+    require(later.at("messages").at(1) == code.at("messages").at(1) && later.at("messages").size() == 5 &&
+                later.at("messages").at(4) == json({{"role", "user"}, {"content", "<system-reminder>\nLater.\n</system-reminder>"}}),
+            "a later turn: " + later.at("messages").dump());
+
+    // requests without that shape convert as before: an environment after a reply, another system message there
+    const json after_reply = convert(json::array({{{"role", "user"}, {"content", "hi"}},
+                                                  {{"role", "assistant"}, {"content", "Hello."}},
+                                                  {{"role", "system"}, {"content", desktop_env}}}));
+    require(after_reply.at("messages").at(3) == json({{"role", "user"}, {"content", desktop_env}}) &&
+                context_chars(after_reply) == 0,
+            "an environment after a reply is demoted where it stands: " + after_reply.dump());
+    const json other = convert(json::array({{{"role", "user"}, {"content", "hi"}},
+                                            {{"role", "system"}, {"content", "<system-reminder>\nOther.\n</system-reminder>"}}}));
+    require(other.at("messages") == json::array({{{"role", "system"}, {"content", system[0].at("text").get<std::string>() +
+                                                                                   system[1].at("text").get<std::string>()}},
+                                                 {{"role", "user"}, {"content", "hi"}},
+                                                 {{"role", "user"}, {"content", "<system-reminder>\nOther.\n</system-reminder>"}}}) &&
+                context_chars(other) == 0,
+            "another system message after the words is demoted where it stands: " + other.dump());
+
+    // rendered, two conversations of the same setup share the prompt up to where the words start, where the server
+    // keeps the context prefix, though a plugin's version folder is shorter in the prompt (0.0.0) than as sent; also
+    // with a template that trims each text part
+    for (const char * tmpl : {
+             "{% for message in messages %}<|im_start|>{{ message.role }}\n{% if message.content is string %}"
+             "{{ message.content }}{% else %}{% for part in message.content %}{{ part.text }}{% endfor %}{% endif %}"
+             "<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}",
+             "{% for message in messages %}<|im_start|>{{ message.role }}\n{% if message.content is string %}"
+             "{{ message.content | trim }}{% else %}{% for part in message.content %}{{ part.text | trim }}{% endfor %}"
+             "{% endif %}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}" }) {
+        server_chat_params opt{};
+        opt.use_jinja          = true;
+        opt.prefill_assistant  = true;
+        opt.reasoning_format   = COMMON_REASONING_FORMAT_DEEPSEEK;
+        opt.tmpls = common_chat_templates_init(/* model= */ nullptr, tmpl);
+        const auto parse = [&](json chat) {
+            std::vector<raw_buffer> files;
+            const json params = oaicompat_chat_params_parse(chat, opt, files);
+            require(!params.contains(SERVER_FIRST_USER_CONTEXT_CHARS), "the request field is not passed on");
+            return params;
+        };
+        const json a = parse(code);
+        const json b = parse(convert(code_messages("What is in this folder?")));
+        const std::string pa = a.at("prompt").get<std::string>();
+        const std::string pb = b.at("prompt").get<std::string>();
+        const size_t at = json_value(a, "context_prefix_chars", (size_t) 0);
+        require(pa.find("/run/0.0.0/bin\n") != std::string::npos, "the stand-in: " + pa);
+        require(at > json_value(a, "shared_prefix_chars", (size_t) 0) && at == json_value(b, "context_prefix_chars", (size_t) 0) &&
+                    pa.compare(0, at, pb, 0, at) == 0,
+                std::string("both conversations share the context prefix: ") + tmpl + "\n" + a.dump());
+        require(pa.compare(at - 2, 4, "\n\nhi") == 0 && pb.compare(at, 4, "What") == 0,
+                "the context prefix ends where the words start: " + pa.substr(at - 20));
+        require(json_value(a, "conversation_prefix_chars", (size_t) 0) > at, "the opening holds the words");
+        require(!parse(other).contains("context_prefix_chars"), "a request without the environment has no context prefix");
+    }
+}
+
 // The layout of a request for reuse: the tools of MCP servers after the app's own tools, by server; a state kept
 // where each group of tools ends and where the data at the end of the user's context starts, or would start.
 static void test_chat_request_reports_branch_points() {
@@ -500,6 +615,7 @@ int main() {
         test_memory_cache();
         test_disk_cache();
         test_chat_request_reports_the_opening();
+        test_claude_environment_opens_the_conversation();
         test_chat_request_reports_branch_points();
         test_responses_request_layout();
         test_chatgpt_detail_modes_share_the_context();

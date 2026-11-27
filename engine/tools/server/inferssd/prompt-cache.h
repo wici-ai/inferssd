@@ -110,9 +110,10 @@ int64_t server_prompt_reuse_full(
 
 // The places of a prompt where the server keeps a state for later prompts (oaicompat_chat_params_parse): the end of
 // the shared prefix (the leading system messages and the tools, which every conversation with the app's setup starts
-// with) and of the context prefix (with the user's context too), whose states go to the prompt cache, and the branch
-// points inside them, where the prompt of another user or setup is likely to part from this one (where a group of
-// tools ends, where the data in the user's context starts), which the slot keeps checkpoints at when the memory can
+// with) and of the context prefix (with the user's context too: the second system message of a Responses request, or
+// the environment Claude's apps send, up to the user's first words), whose states go to the prompt cache, and the
+// branch points inside them, where the prompt of another user or setup is likely to part from this one (where a group
+// of tools ends, where the data in the user's context starts), which the slot keeps checkpoints at when the memory can
 // save an earlier state after a batch, and the states kept in the prompt cache carry. 0 for none.
 struct server_prompt_points {
     int64_t              n_shared  = 0;
