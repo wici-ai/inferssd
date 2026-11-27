@@ -331,6 +331,19 @@ static void test_chat_request_reports_branch_points() {
     require(points(data_params) == std::vector<std::string>({ context }), "a point where the data starts");
     require(!data_params.contains(SERVER_USER_CONTEXT_DATA_CHARS), "the request field is not passed on");
 
+    // data that names the folder of a plugin's version, which the model sees as 0.0.0 (inferssd/identifiers.h): the
+    // data is shorter in the prompt than as sent, and the point is still where it starts
+    const std::string plugin_data =
+        "\n\n## Approved command prefixes\n- [\"/opt/.codex/plugins/cache/tools/run/26.1123.11515/bin/run\"]";
+    json with_plugin = with_data;
+    with_plugin["messages"][1]["content"] = "<permissions instructions>\nAsk.\n</permissions instructions>" + plugin_data;
+    with_plugin[SERVER_USER_CONTEXT_DATA_CHARS] = plugin_data.size();
+    const json plugin_params = parse(with_plugin);
+    require(plugin_params.at("prompt").get<std::string>().find("/run/0.0.0/bin/run") != std::string::npos,
+            "the stand-in is in the prompt: " + plugin_params.at("prompt").get<std::string>());
+    require(points(plugin_params) == std::vector<std::string>({ context }),
+            "the point is where the data starts: " + (points(plugin_params).empty() ? "" : points(plugin_params)[0]));
+
     json no_data = with_data;
     no_data["messages"][1]["content"] = "<permissions instructions>\nAsk.\n</permissions instructions>";
     no_data.erase(SERVER_USER_CONTEXT_DATA_CHARS);

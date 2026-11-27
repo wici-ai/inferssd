@@ -1316,16 +1316,29 @@ json oaicompat_chat_params_parse(
     // prompt (see inferssd/identifiers.h).
     const bool user_context_system = json_value(body, SERVER_USER_CONTEXT_SYSTEM_MESSAGE, false);
     body.erase(SERVER_USER_CONTEXT_SYSTEM_MESSAGE);
-    const size_t user_context_data_chars = user_context_system ? json_value(body, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) : 0;
+    size_t user_context_data_chars = user_context_system ? json_value(body, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) : 0;
     body.erase(SERVER_USER_CONTEXT_DATA_CHARS);
     if (body.contains("messages")) {
         server_strip_anthropic_billing_header(body.at("messages"));
         server_strip_claude_env_user_lines(body.at("messages"));
         server_drop_codex_cwd_root(body.at("messages"));
     }
+    // the data at the end of the user's context as sent: the stand-ins may make it longer or shorter (a home folder,
+    // the version of a plugin in a skill's path), so its length is counted again in the text the model sees
+    std::string user_context_data;
+    if (user_context_data_chars > 0 && body.contains("messages") && body.at("messages").is_array() &&
+            body.at("messages").size() > 1 && body.at("messages")[1].is_object()) {
+        const std::string context = json_value(body.at("messages")[1], "content", std::string());
+        if (user_context_data_chars <= context.size()) {
+            user_context_data = context.substr(context.size() - user_context_data_chars);
+        }
+    }
     const server_identifier_map identifiers = server_identifiers_apply(body, server_identifier_env::current());
     if (!identifiers.empty()) {
         llama_params["prompt_identifiers"] = identifiers.to_json();
+        if (!user_context_data.empty()) {
+            user_context_data_chars = identifiers.to_stand_ins(user_context_data).size();
+        }
     }
 
     auto tools = json_value(body, "tools", json());
