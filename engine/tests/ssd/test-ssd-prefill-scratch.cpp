@@ -116,6 +116,16 @@ void run_case(fixture_inputs & inputs, ggml_type type, int tokens, int activatio
 // native: the sink names each role by its payload, as a GGUF source does, not by the pack's padded role.
 void run_seed_case(fixture_inputs & inputs, ggml_type type, int tokens, int activation_kind, bool retained = false,
         bool native = false) {
+    if (retained) {
+        // the retained RAM cache admits only under a finite, readable memory envelope
+        try {
+            test_resources::finite_envelope();
+        } catch (const test_resources::unavailable & e) {
+            std::printf("PREFILL_SEED type=%s tokens=%d retained=1 status=SKIP reason=%s\n", ggml_type_name(type), tokens,
+                e.what());
+            return;
+        }
+    }
     fixture f; f.type = f.down_type = type;
     f.latent = 512; f.hidden = 256; f.experts = 4;
     f.native_ranges = native; // native ranges name each role by its payload, as a GGUF source does
