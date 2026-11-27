@@ -953,25 +953,15 @@ struct expert_cache {
         for (const auto & r : requests) {
             if (r.cache_admit >= 0 && !entries[r.cache_admit].resident) { ++new_slots; }
         }
-        // The arena is page aligned; a non-page-aligned stride can straddle one
-        // additional page. No unused slot or whole-layer quota is charged here.
-        const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
-        const uint64_t payload_pages = multiply(slot_pages, page_size);
-        const uint64_t new_tables = multiply(new_slots, page_tables(payload_pages));
-        const uint64_t extra = add(add(multiply(new_slots, payload_pages), new_tables), arena ? 0 : 64 * 1024);
-        auto slot_ticket = take_guard(extra);
+        // No unused slot or whole-layer quota is charged here.
+        auto slot_ticket = take_guard(add(first_touch_bytes(new_slots), arena ? 0 : 64 * 1024));
         if (!slot_ticket) {
             reject_admission(requests, current, "cgroup_headroom"); return;
         }
         if (!arena && stats.capacity_bytes && !requests.empty()) {
             if (const char * failed = map_arena()) { pause(requests, current, failed); return; }
         }
-        // A discard may retain upper-level page tables. Keep a lifetime
-        // upper bound, while capping refaults so repeated phase churn cannot
-        // make the diagnostic grow beyond one per mapped slot.
-        const uint64_t maximum_tables = multiply(entries.size(), page_tables(payload_pages));
-        stats.page_table_bytes = std::min(stats.page_table_bytes, maximum_tables);
-        stats.page_table_bytes += std::min(new_tables, maximum_tables - stats.page_table_bytes);
+        count_page_tables(new_slots);
         for (const auto & r : requests) {
             if (r.cache_admit < 0 || entries[r.cache_admit].resident) { continue; }
             if (entries[r.cache_admit].was_released) {
@@ -980,8 +970,7 @@ struct expert_cache {
             }
             // Finish the admitted first touch before publishing resident slots
             // or asynchronous read targets. Only this new slot is written.
-            if (!commit_slots(size_t(r.cache_admit), 1)) { pause(requests, current, "commit_failed"); return; }
-            touch_pages(arena + size_t(r.cache_admit) * stride, stride, size_t(page_size));
+            if (!page_in(size_t(r.cache_admit))) { pause(requests, current, "commit_failed"); return; }
             entries[r.cache_admit].resident = true;
             stats.committed_bytes = add(stats.committed_bytes, stride);
             current.cache_new_slot_bytes = add(current.cache_new_slot_bytes, stride);
@@ -1006,6 +995,31 @@ struct expert_cache {
         const uint64_t begin = multiply(first, stride) / page_size * page_size;
         const uint64_t end = ceil_div(multiply(add(first, count), stride), page_size) * page_size;
         return ssd::platform::arena_commit(arena + begin, size_t(end - begin));
+    }
+    // A slot's first touch: its pages committed and paged in. It writes only that slot's bytes.
+    bool page_in(size_t index) const {
+        if (!commit_slots(index, 1)) { return false; }
+        touch_pages(arena + index * stride, stride, size_t(page_size));
+        return true;
+    }
+    // The pages a slot's first touch commits: the arena is page aligned, and a stride that is not a whole number of
+    // pages can straddle one more.
+    uint64_t slot_payload_bytes() const {
+        return multiply(add(ceil_div(stride, page_size), stride % page_size != 0), page_size);
+    }
+    // The room `slots` first touches take: their pages and page tables.
+    uint64_t first_touch_bytes(uint64_t slots) const {
+        const uint64_t payload = slot_payload_bytes();
+        return add(multiply(slots, payload), multiply(slots, page_tables(payload)));
+    }
+    // The page tables of `slots` slots paged in. A discard may retain upper-level page tables. Keep a lifetime
+    // upper bound, while capping refaults so repeated phase churn cannot make the diagnostic grow beyond one per
+    // mapped slot.
+    void count_page_tables(uint64_t slots) {
+        const uint64_t tables = page_tables(slot_payload_bytes());
+        const uint64_t maximum_tables = multiply(entries.size(), tables);
+        stats.page_table_bytes = std::min(stats.page_table_bytes, maximum_tables);
+        stats.page_table_bytes += std::min(multiply(slots, tables), maximum_tables - stats.page_table_bytes);
     }
     // A cache that can give room back to the ledger: partial reclaim, or elastic (its prefill shrinks to its prefill
     // slots).
