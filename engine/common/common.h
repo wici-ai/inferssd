@@ -438,6 +438,7 @@ struct ggml_opt_optimizer_params common_opt_lr_pars(void * userdata);
 struct common_params {
     bool ssd_enabled = false;
     std::string ssd_model_facts; // --ssd-model-facts: print this model's facts once the arguments are parsed, and exit
+    bool ssd_decode_probe = false; // --ssd-decode-probe: the server measures a decode step's dense time once loaded, and exits
     std::string ssd_settings_file;
     std::string ssd_telemetry_file;
     bool ssd_layer_events = true; // an event for each layer and each prompt graph in the telemetry file

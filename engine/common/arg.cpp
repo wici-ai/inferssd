@@ -1111,6 +1111,11 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
         "print the facts of the GGUF model FNAME, with its --shard/--ple files and, with --spec-type draft-mtp, the MTP head it drafts with (--spec-draft-model), as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
         [](common_params & p, const std::string & value) { p.ssd_model_facts = value; }));
+    add_opt(common_arg({"--ssd-decode-probe"},
+        "load the model and context as for serving, but with every routed expert run by the CPU expert sink (vram.budget=0, prefetch.depth=0), then measure and exit without serving: "
+        "after a 32-token prompt, 2 + 8 target decodes of each of 1 .. N+1 rows with logits for every row (N the longest draft the speculative decoding configured verifies, 0 without one) "
+        "and, with an MTP head, 2 + 8 of its draft steps; prints one JSON line with each one's median wall time, median sink time and median wall time less sink time (the dense time) over the 8",
+        [](common_params & p) { p.ssd_decode_probe = true; }).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));
     add_opt(common_arg({"--ssd-telemetry"}, "FILE", "exclusively create versioned SSD JSONL telemetry",

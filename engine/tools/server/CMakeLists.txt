@@ -12,6 +12,8 @@ add_library(${TARGET} STATIC
     inferssd/prompt-cache.cpp
     inferssd/prompt-cache.h
     inferssd/checkpoint.h
+    inferssd/decode-probe.cpp
+    inferssd/decode-probe.h
     inferssd/identifiers.cpp
     inferssd/identifiers.h
     inferssd/runtime.h

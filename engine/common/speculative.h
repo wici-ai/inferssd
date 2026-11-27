@@ -45,6 +45,12 @@ int32_t common_speculative_n_min(const common_speculative * spec, const common_p
 // print statistics about the speculative decoding
 void common_speculative_print_stats(const common_speculative * spec);
 
+// A step of the model's MTP draft head (draft-mtp) in the target's context: TOKEN at position POS of SEQ_ID, read with H,
+// the hidden state of the position before it. On success H holds the hidden state the step left, which the next step
+// reads, and BEST and P are the head's most likely next token and its probability; false when the step failed.
+bool common_speculative_mtp_step(llama_context * ctx, llama_batch & batch, std::vector<float> & h, llama_token token,
+        llama_pos pos, llama_seq_id seq_id, llama_token & best, double & p);
+
 // The draft length that pays on this machine, for a draft head whose steps cost time (MTP). Each length 0 .. n_max
 // keeps the tokens a step at that length gave and the time it took, draft steps included, as measured, and the
 // length that gives the most tokens a second runs. A length runs in steps of its own: every length first for a

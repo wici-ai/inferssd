@@ -3,6 +3,7 @@
 #include "server-models.h"
 #include "server-cors-proxy.h"
 #include "server-tools.h"
+#include "inferssd/decode-probe.h"
 
 #include "arg.h"
 #include "build-info.h"
@@ -112,6 +113,13 @@ int main(int argc, char ** argv) {
 
     LOG_INF("build_info: %s\n", llama_build_info());
     LOG_INF("%s\n", common_params_get_system_info(params).c_str());
+
+    // a decode step measured on the loaded model, without serving
+    if (params.ssd_decode_probe) {
+        const int status = server_decode_probe(ctx_server, params);
+        llama_backend_free();
+        return status;
+    }
 
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
