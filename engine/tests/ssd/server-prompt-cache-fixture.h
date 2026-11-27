@@ -61,4 +61,8 @@ struct server_prompt_cache_testing {
     static void scan_prefix_dir(server_prompt_cache & cache) {
         cache.scan_prefix_dir();
     }
+
+    static size_t unusable_prefixes(const server_prompt_cache & cache) {
+        return cache.prefix_unusable.size();
+    }
 };

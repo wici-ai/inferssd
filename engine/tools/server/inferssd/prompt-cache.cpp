@@ -436,6 +436,7 @@ void server_prompt_cache::scan_prefix_dir() {
         }
     }
 
+    decltype(prefix_unusable) still_unusable;
     size_t n_found = 0;
     const std::filesystem::directory_iterator end;
     for (auto it = ec ? end : std::filesystem::directory_iterator(directory, ec);
@@ -454,25 +455,28 @@ void server_prompt_cache::scan_prefix_dir() {
             continue;
         }
 
-        auto failed = prefix_unusable.find(path);
-        if (failed != prefix_unusable.end()) {
-            if (identified && failed->second == identity) {
-                continue;
-            }
-            prefix_unusable.erase(failed);
+        const auto failed = prefix_unusable.find(path);
+        if (identified && failed != prefix_unusable.end() && failed->second == identity) {
+            still_unusable.insert(prefix_unusable.extract(failed));
+            continue;
         }
         server_prompt prompt;
         server_prompt_file validated(file.release(), server_prompt_file_close);
-        if (!validated || !server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true)) {
-            SRV_WRN(" - skipping prefix cache %s: made for another model or format\\n", path.c_str());
-            continue;
-        }
+        const bool valid = validated && server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true);
         if (identified) {
             ssd::platform::file_identity after;
             if (!ssd::platform::identity(ssd::platform::stream_fd(validated.get()), after) || identity != after) {
                 continue;
             }
+            // Remember a rejected header or digest for this file version. Retry read errors on the next scan.
+            if (!valid && !std::ferror(validated.get())) {
+                still_unusable.emplace(path, identity);
+            }
             prompt.prefix_identity = identity;
+        }
+        if (!valid) {
+            SRV_WRN(" - skipping prefix cache %s: made for another model or format\n", path.c_str());
+            continue;
         }
         prompt.file = path;
         prompt.read_only = true;
@@ -487,8 +491,9 @@ void server_prompt_cache::scan_prefix_dir() {
     for (const auto & entry : indexed) {
         states.erase(entry.second);
     }
+    prefix_unusable.swap(still_unusable);
     prefix_dir_time = ec && ec != std::errc::no_such_file_or_directory ? -1 : t;
-    SRV_WRN("prefix caches in %s: %zu found\\n", prefix_dir.c_str(), n_found);
+    SRV_WRN("prefix caches in %s: %zu found\n", prefix_dir.c_str(), n_found);
 }
 
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {

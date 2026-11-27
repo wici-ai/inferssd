@@ -320,7 +320,7 @@ private:
     // reads the prefix cache directory again if it changed since the last read
     void scan_prefix_dir();
     int64_t prefix_dir_time = -1;
-    // The file versions that failed native restore. A replacement can be tried again.
+    // Present file versions that failed header validation or native restore. A replacement is tried again.
     std::unordered_map<std::string, ssd::platform::file_identity> prefix_unusable;
 };
 

@@ -507,6 +507,33 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     std::filesystem::remove_all(dir);
 }
 
+static void test_rejected_prefix_versions() {
+    const auto dir = fresh_dir("inferssd-test-prefix-dir-rejected");
+    const auto prefix = dir / "prefix.prompt";
+    const auto neighbor = dir / "neighbor.prompt";
+    write_prompt_file(prefix.string(), "fp|old", { 1, 2, 3 }, 16);
+    server_prompt_cache cache(1, 0);
+    cache.use_prefix_dir(dir.string(), "fp");
+    require(cache.states.empty() && server_prompt_cache_testing::unusable_prefixes(cache) == 1,
+            "an unpublished legacy header is rejected and its file version remembered");
+
+    write_prompt_file(neighbor.string(), "fp|old", { 4, 5, 6 }, 16);
+    touch_dir(dir, 2);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(cache.states.empty() && server_prompt_cache_testing::unusable_prefixes(cache) == 2,
+            "refresh keeps the earlier rejection and records the new one");
+
+    std::filesystem::remove(neighbor);
+    const auto replacement = dir / "replacement.tmp";
+    write_prompt_file(replacement.string(), "fp|build|adapter-cache=1", { 1, 2, 3 }, 16);
+    std::filesystem::rename(replacement, prefix);
+    touch_dir(dir, 4);
+    server_prompt_cache_testing::scan_prefix_dir(cache);
+    require(count_read_only(cache) == 1 && server_prompt_cache_testing::unusable_prefixes(cache) == 0,
+            "a valid replacement is admitted and the removed file's rejection is forgotten");
+    std::filesystem::remove_all(dir);
+}
+
 // a GGUF file with one value and one tensor
 static void write_gguf(const std::string & path, const char * value) {
     gguf_context * gguf = gguf_init_empty();
@@ -550,6 +577,7 @@ int main() {
     test_writable_adapter_fingerprint();
     test_prefix_cache_outlives_the_cache_limits_and_newer_states();
     test_prefix_dir_is_read_again_when_it_changes();
+    test_rejected_prefix_versions();
     test_model_identity_ignores_path_and_time();
     test_prompt_batches_stop_at_shared_prefix_and_end();
     test_prompt_batches_stop_at_kept_prefixes_only();
