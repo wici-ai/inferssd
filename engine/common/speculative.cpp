@@ -1467,6 +1467,10 @@ int common_speculative_adapt::choose(int n_max) {
         hold = 0;
         return held;
     }
+    // a burst of a length other than the best: its measurements start again, the burst's replacing the old ones
+    if (size_t(held) < c_len.size()) {
+        c_len[held] = 0;
+    }
     hold = burst - 1;
     return std::min(held, n_max);
 }

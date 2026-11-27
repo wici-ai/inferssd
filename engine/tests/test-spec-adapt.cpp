@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: Apache-2.0
 // The draft length common_speculative_adapt picks from the costs it measures.
 #include "speculative.h"
 
@@ -62,6 +63,22 @@ int main() {
     require(settle(100.0, 10.0, 2.0, 0, 3) == 0, "nothing accepted");
     // the head never proposes: its steps only cost time
     require(settle(100.0, 10.0, 2.0, 3, 3, false) == 0, "never proposed");
+    // a length slow in its first burst (a cold expert cache) and fast later: probed again, it is compared by that
+    // burst, not by a mean that reaches back to the cold start, and wins. Length 0 takes 200 ms a token in its warm-up
+    // and 60 ms after; length 1 gives 2 tokens in 130 ms, 65 ms a token.
+    {
+        common_speculative_adapt a;
+        const int burst = common_speculative_adapt::burst;
+        // both warm-up bursts, the best length until the probe, and the probe's burst of length 0
+        for (int i = 0; i < 2 * burst + common_speculative_adapt::probe_every + burst; ++i) {
+            if (a.choose(1) == 0) {
+                a.on_plain(i < burst ? 200.0 : 60.0);
+            } else {
+                a.on_block(1, 1, 130.0);
+            }
+        }
+        require(a.choose(1) == 0, "a length probed again after a cold start");
+    }
     // nothing to draft
     {
         common_speculative_adapt a;

@@ -50,7 +50,9 @@ void common_speculative_print_stats(const common_speculative * spec);
 // length that gives the most tokens a second runs. A length runs in steps of its own: every length first for a
 // burst, then the best one, and every probe_every steps the next other length for a burst again, so each stays
 // measured and the choice follows the machine and the text. The step after a change of length is not measured:
-// what a change costs once (another graph, other caches) is no measure of a length that keeps running.
+// what a change costs once (another graph, other caches) is no measure of a length that keeps running. A burst
+// measures its length anew, its steps replacing what the length had: a length probed again is compared by its latest
+// burst with the recent steps of the best one, not by a mean that reaches back to its first burst on a cold cache.
 struct common_speculative_adapt {
     static constexpr int    burst       = 4;
     static constexpr int    probe_every = 32;
@@ -58,7 +60,7 @@ struct common_speculative_adapt {
 
     std::vector<double> t_len; // ms a step at length n took, index n; 0 while unmeasured
     std::vector<double> n_len; // tokens it gave
-    std::vector<int>    c_len; // its measurements
+    std::vector<int>    c_len; // its measurements since its last burst began
     int    held    = -1;       // the length running, and its steps left before the next choice
     int    hold    = 0;
     int    n_warm  = 0;        // lengths run so far for their first burst
