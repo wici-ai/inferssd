@@ -148,6 +148,11 @@ def main() -> None:
                               check=False, capture_output=True, encoding="utf-8")
     if rejected.returncode != 2 or repr(argument) not in rejected.stderr:
         raise ValueError("the native launcher did not preserve Unicode/quoted arguments or exit status")
+    # The launcher passes UTF-16 arguments to the server, whose model and cache readers take UTF-8.
+    unknown = "--unknown-\u76ee\u5f55"
+    native = subprocess.run([str(package / resources["binary"]), unknown], capture_output=True)
+    if native.returncode == 0 or unknown.encode("utf-8") not in native.stderr:
+        raise ValueError("the native server lost Unicode command-line arguments")
     schema = json.loads(subprocess.check_output([str(package / resources["binary"]), "--ssd-schema"]))
     assert schema
     subprocess.run([str(package / resources["binary"]), "--list-devices"], check=True)
