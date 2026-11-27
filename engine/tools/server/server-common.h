@@ -347,9 +347,10 @@ inline constexpr const char * SERVER_CODE_MODE = "inferssd_code_mode";
 // A chat request field set by the conversion of an Anthropic Messages request (server_chat_convert_anthropic_to_oai):
 // the number of characters at the start of the first user message's text (its text parts in order) that are the
 // user's context, ahead of the user's own words: the system reminders that open the message and the environment block
-// that Claude Code and the Claude desktop app send after it, moved there. The server keeps a state where the words
-// start, the context prefix. oaicompat_chat_params_parse reads and removes it, and counts the characters again once
-// the identifiers' stand-ins are in them (inferssd/identifiers.h).
+// that Claude Code and the Claude desktop app send after it, moved there, up to the date that ends the block when it
+// ends with one, which changes each day. The server keeps a state there, the context prefix.
+// oaicompat_chat_params_parse reads and removes it, and counts the characters again once the identifiers' stand-ins
+// are in them (inferssd/identifiers.h).
 inline constexpr const char * SERVER_FIRST_USER_CONTEXT_CHARS = "inferssd_first_user_context_chars";
 
 json oaicompat_chat_params_parse(

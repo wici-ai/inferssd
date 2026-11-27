@@ -268,8 +268,8 @@ static void test_chat_request_reports_the_opening() {
 
 // The environment block Claude Code and the Claude desktop app send as a system message after the user's first
 // words, trimmed from what they send: it goes into the first user message ahead of the words, after the system
-// reminders that open it, so a new conversation of the same setup shares everything up to the words, where the server
-// keeps a state.
+// reminders that open it, so a new conversation of the same setup shares everything up to the date that ends the block,
+// where the server keeps a state, and on the same day up to the words.
 static void test_claude_environment_opens_the_conversation() {
     const std::string reminder = "<system-reminder>\nAttribution for git commits.\n</system-reminder>\n";
     const std::string code_env =
@@ -283,10 +283,10 @@ static void test_claude_environment_opens_the_conversation() {
     const json system = json::array({{{"type", "text"}, {"text", "You are Claude Code, Anthropic's official CLI for Claude."}},
                                       {{"type", "text"}, {"text", "Plugins are in /opt/.codex/plugins/cache/tools/run/26.1123.11515/bin."}}});
     const auto text = [](const std::string & t) { return json{{"type", "text"}, {"text", t}}; };
-    const auto code_messages = [&](const std::string & words) {
+    const auto code_messages = [&](const std::string & words, const std::string & env = "") {
         return json::array({
             {{"role", "user"}, {"content", json::array({text(reminder), text(words)})}},
-            {{"role", "system"}, {"content", json::array({{{"type", "text"}, {"text", code_env},
+            {{"role", "system"}, {"content", json::array({{{"type", "text"}, {"text", env.empty() ? code_env : env},
                                                            {"cache_control", {{"type", "ephemeral"}}}}})}},
         });
     };
@@ -301,7 +301,9 @@ static void test_claude_environment_opens_the_conversation() {
                 code.at("messages").at(1) == json({{"role", "user"},
                                                    {"content", json::array({text(reminder), text(code_env + "\n\nhi")})}}),
             "the environment opens the first user message: " + code.at("messages").dump());
-    require(context_chars(code) == reminder.size() + code_env.size() + 2, "the request says how long the context is");
+    const std::string date = "Today's date is ";
+    require(context_chars(code) == reminder.size() + code_env.find(date),
+            "the request says how long the context is, up to the date that ends the block");
 
     // the Claude desktop app: a string in a reminder, a message without reminders; the words keep their fields
     const json cache_control = {{"type", "ephemeral"}, {"ttl", "1h"}};
@@ -311,7 +313,7 @@ static void test_claude_environment_opens_the_conversation() {
     }));
     require(desktop.at("messages").at(1).at("content") ==
                 json::array({{{"type", "text"}, {"text", desktop_env + "\n\nhi"}, {"cache_control", cache_control}}}) &&
-                context_chars(desktop) == desktop_env.size() + 2,
+                context_chars(desktop) == desktop_env.find(date),
             "the desktop app's environment: " + desktop.dump());
     const json words_string = convert(json::array({{{"role", "user"}, {"content", "hi"}},
                                                    {{"role", "system"}, {"content", desktop_env}}}));
@@ -374,36 +376,57 @@ static void test_claude_environment_opens_the_conversation() {
         require(at > json_value(a, "shared_prefix_chars", (size_t) 0) && at == json_value(b, "context_prefix_chars", (size_t) 0) &&
                     pa.compare(0, at, pb, 0, at) == 0,
                 std::string("both conversations share the context prefix: ") + tmpl + "\n" + a.dump());
-        require(pa.compare(at - 2, 4, "\n\nhi") == 0 && pb.compare(at, 4, "What") == 0,
-                "the context prefix ends where the words start: " + pa.substr(at - 20));
+        require(pa.compare(at - 2, 2 + date.size(), "\n\n" + date) == 0,
+                "the context prefix ends where the date starts: " + pa.substr(at - 20));
         require(json_value(a, "conversation_prefix_chars", (size_t) 0) > at, "the opening holds the words");
+
+        // a conversation of another day shares the context prefix too
+        std::string later_env = code_env;
+        later_env.replace(later_env.find("2026-11-25"), 10, "2026-11-26");
+        const json c = parse(convert(code_messages("hi", later_env)));
+        require(json_value(c, "context_prefix_chars", (size_t) 0) == at &&
+                    c.at("prompt").get<std::string>().compare(0, at, pa, 0, at) == 0,
+                "another day shares the context prefix: " + c.dump());
+
+        // a block without the date keeps the context prefix where the words start
+        const std::string undated_env = code_env.substr(0, code_env.find("\n\n" + date));
+        const json undated_chat = convert(code_messages("hi", undated_env));
+        require(context_chars(undated_chat) == reminder.size() + undated_env.size() + 2,
+                "a block without the date: " + undated_chat.dump());
+        const json u = parse(undated_chat);
+        const std::string pu = u.at("prompt").get<std::string>();
+        const size_t u_at = json_value(u, "context_prefix_chars", (size_t) 0);
+        require(u_at > 0 && pu.compare(u_at - 2, 4, "\n\nhi") == 0,
+                "the context prefix of a block without the date ends where the words start: " + pu);
         require(!parse(other).contains("context_prefix_chars"), "a request without the environment has no context prefix");
     }
 }
 
-// The environment of two Claude Code users of one system with other project folders and other editions of the system
-// renders the same up to the user's words: the working directory has its stand-in, the OS Version line the system's
-// fixed text, and what the model writes in the stand-in folder goes back to the user's.
+// The environment of two Claude Code users of one system with other project folders and other editions of the system,
+// on other days, renders the same up to the date that ends it, where the server keeps the context prefix: the working
+// directory has its stand-in, the OS Version line the system's fixed text, and what the model writes in the stand-in
+// folder goes back to the user's.
 static void test_claude_environment_of_two_users() {
-    const auto convert = [](const std::string & cwd, const std::string & os, const std::string & words) {
+    const auto convert = [](const std::string & cwd, const std::string & os, const std::string & words,
+                            const std::string & day) {
         const std::string env = "# Environment\nYou have been invoked in the following environment: \n"
                                 " - Primary working directory: " + cwd + "\n - Is a git repository: false\n"
                                 " - Platform: win32\n - Shell: bash\n - OS Version: " + os +
-                                "\n\nToday's date is 2026-11-27.";
+                                "\n\nToday's date is 2026-11-" + day + ".";
         return server_chat_convert_anthropic_to_oai({
             {"system", json::array({{{"type", "text"},
                                      {"text", "You are Claude Code, Anthropic's official CLI for Claude."}}})},
             {"messages", json::array({{{"role", "user"}, {"content", words}}, {{"role", "system"}, {"content", env}}})},
             {"max_tokens", 16}});
     };
-    const json a = convert("/work/app", "Windows 11 Home China 10.0.26200", "hi");
-    const json b = convert("/srv/site", "Windows 11 Pro for Workstations 10.0.26100", "Create notes.txt.");
+    const json a = convert("/work/app", "Windows 11 Home China 10.0.26200", "hi", "27");
+    const json b = convert("/srv/site", "Windows 11 Pro for Workstations 10.0.26100", "Create notes.txt.", "28");
     const std::string a_text = a.at("messages").at(1).at("content").get<std::string>();
     const std::string fixed = " - OS Version: Windows 11 Pro 10.0.26200\n";
     require(a_text.find(fixed) != std::string::npos &&
                 b.at("messages").at(1).at("content").get<std::string>().find(fixed) != std::string::npos,
             "the system's fixed text: " + a_text);
-    require(json_value(a, SERVER_FIRST_USER_CONTEXT_CHARS, (size_t) 0) == a_text.size() - std::string("hi").size(),
+    require(json_value(a, SERVER_FIRST_USER_CONTEXT_CHARS, (size_t) 0) == a_text.find("Today's date is "),
             "the context's characters count the fixed text");
 
     server_chat_params opt{};
@@ -425,8 +448,8 @@ static void test_claude_environment_of_two_users() {
     require(prompt_a.find(" - Primary working directory: " + project + "\n") != std::string::npos,
             "the working directory's stand-in: " + prompt_a);
     require(at > 0 && at == json_value(pb, "context_prefix_chars", (size_t) 0) &&
-                prompt_a.compare(0, at, prompt_b, 0, at) == 0 && prompt_a.compare(at, 2, "hi") == 0,
-            "both users' prompts are the same up to the words: " + prompt_a + " | " + prompt_b);
+                prompt_a.compare(0, at, prompt_b, 0, at) == 0 && prompt_a.compare(at, 16, "Today's date is ") == 0,
+            "both users' prompts are the same up to the date: " + prompt_a + " | " + prompt_b);
     const server_identifier_map map = server_identifier_map::from_json(pa.at("prompt_identifiers"));
     require(map.to_identifiers("Wrote " + project + "/notes.txt", false) == "Wrote /work/app/notes.txt",
             "the model's path goes back to the user's folder");

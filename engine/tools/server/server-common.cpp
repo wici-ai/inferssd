@@ -1613,7 +1613,7 @@ json oaicompat_chat_params_parse(
     // app's own system message with the tools, which every user of the app starts with, and the context prefix is
     // all of them, which the users with the same context start with: the server keeps a state at both. When the first
     // user message opens with the user's context (SERVER_FIRST_USER_CONTEXT_CHARS), the context prefix runs to where
-    // the user's words start.
+    // the context ends: where the user's words start, or the date that ends Claude's environment.
     // The user messages that follow them, up to the first reply, open the conversation: every later state of it
     // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
@@ -1665,8 +1665,9 @@ json oaicompat_chat_params_parse(
         };
 
         // For a first user message (message n) that opens with n_text characters of the user's context: where the
-        // user's words start, which is where the prompt of another conversation of the same setup parts from this one:
-        // the length the prompt shares with the messages up to that one whose words are others. 0 if there is none.
+        // context ends (the user's words start, or the date that ends Claude's environment), which is where the prompt
+        // of another conversation of the same setup parts from this one: the length the prompt shares with the
+        // messages up to that one whose text after the context is other. 0 if there is none.
         const auto words_start_chars = [&](size_t n, size_t n_text) -> size_t {
             common_chat_templates_inputs probe_inputs = inputs;
             probe_inputs.messages.resize(n + 1);
