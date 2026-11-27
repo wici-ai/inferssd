@@ -116,7 +116,9 @@ struct tier {
     // routed layers in the layout's order; cur: the format of the layer being prepared, which its jobs on the worker
     // run with. payload: a role's bytes in the layout, which requests name it by and copies move; role_bytes: the role
     // as a slot lays it out, rounded up to 4 KiB.
-    struct expert_format { int type[3]={-1,-1,-1}; size_t role_bytes[3]={},payload[3]={},bytes=0; void * engine=nullptr; };
+    // rows: the engine's, the most experts its calls in flight at once take (launch_call): a one-row layer's 16, or a
+    // decode step's routes to hits (launch_rows).
+    struct expert_format { int type[3]={-1,-1,-1}; size_t role_bytes[3]={},payload[3]={},bytes=0; void * engine=nullptr; int rows=16; };
     std::vector<expert_format> formats;std::vector<int> layer_format,priority;size_t cur=0,stride=0;
     char * arena=nullptr;cudaStream_t upload_stream=nullptr;
     struct arena_block { char * data=nullptr;size_t first_slot=0,slot_count=0; };
@@ -155,6 +157,7 @@ struct tier {
     std::vector<uint8_t> input;
     std::vector<float> down;
     std::vector<size_t> output_rows;
+    std::vector<float> output_weights; // a decode layer's resident rows' weights, beside output_rows
     std::vector<size_t> pending_uploads;
     // Read-only grouped-prefill job. The full distinct-expert union is pinned
     // once; the worker reuses the existing <=16-route format engine per token.
@@ -1193,7 +1196,7 @@ struct tier {
         prefill_live=false;prefill_generation=0;prefill_queued=false;prefill_slots.clear();prefill_input.clear();
         {std::lock_guard<std::mutex> lock(mutex);prefill_launched=false;}
         prefill_routes.clear();prefill_weights.clear();prefill_output.clear();prefill_transient.clear();prefill_job_stats={};
-        work.clear();output_rows.clear();
+        work.clear();output_rows.clear();output_weights.clear();
         {std::lock_guard<std::mutex> lock(mutex);release_calls();layer_input_ready=false;}
         free_host_scratch();publish_storage();
         if(memory_trace)memory_sample("after_release",micros(release_start));
@@ -1751,7 +1754,7 @@ struct tier {
             for(auto & x:formats){
                 if(x.engine)continue;
                 char error[512]={};
-                x.engine=format_api->create(device,latent,hidden,16,x.type[0],x.type[1],x.type[2],error,sizeof(error));
+                x.engine=format_api->create(device,latent,hidden,x.rows,x.type[0],x.type[1],x.type[2],error,sizeof(error));
                 if(!x.engine)throw std::runtime_error(error);
             }
             format_mode=true;
@@ -1815,8 +1818,10 @@ struct tier {
         else if(elastic_active && active)phase_decode_tokens=1;
         report("allocated");
     }
-    void prepare_format(const ssd_vram_request * r,int count,int * slots){
-        if(count<0 || count>16 || (count && (!r || !slots)))throw std::runtime_error("VRAM request count");
+    // A decode layer's experts: a one-row layer's (at most 16), or with counted >= 0 a decode step of several rows' union
+    // of its rows' experts (format_prepare_rows: at most 256, the heat counting the first `counted`).
+    void prepare_format(const ssd_vram_request * r,int count,int * slots,int counted=-1){
+        if(count<0 || count>(counted<0?16:256) || counted>count || (count && (!r || !slots)))throw std::runtime_error("VRAM request count");
         if(count)std::fill(slots,slots+count,-1);
         if(!active || !count)return;
         initialize_format(r[0].layer);
@@ -1825,7 +1830,7 @@ struct tier {
             if(r[j].layer!=r[0].layer)throw std::runtime_error("VRAM requests of more than one layer");
             check_roles(cur,r[j].role,"VRAM role bytes are not the layout's");
         }
-        table->prepare(r,count);std::copy(table->hits.begin(),table->hits.end(),slots);
+        table->prepare(r,size_t(count),UINT32_MAX,counted<0?SIZE_MAX:size_t(counted));std::copy(table->hits.begin(),table->hits.end(),slots);
         for(int slot:table->hits){gpu_hits+=slot>=0;cpu_requests+=slot<0;}
     }
     void launch_activation(const void * q,size_t bytes,const ssd_vram_activation * a){
@@ -1836,10 +1841,10 @@ struct tier {
         if(a->kind!=SSD_VRAM_ACTIVATION_SITU && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU_CLAMP && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU)
             throw std::runtime_error("VRAM activation kind");
         {std::lock_guard<std::mutex> lock(mutex);if(!calls.empty())throw std::runtime_error("GPU job already outstanding");failure.clear();}
-        work.clear();output_rows.clear();
+        work.clear();output_rows.clear();output_weights.clear();
         for(size_t j=0;j<table->hits.size();++j){
             int slot=table->hits[j];if(slot<0)continue;
-            work.push_back(roles_at(slot_base(size_t(slot)),now()));output_rows.push_back(j);
+            work.push_back(roles_at(slot_base(size_t(slot)),now()));output_rows.push_back(j);output_weights.push_back(table->requests[j].weight);
         }
         // Host-memory jobs of this layer may follow (in place, or copied on a discrete GPU); they need the input even
         // when nothing is resident.
@@ -1848,6 +1853,51 @@ struct tier {
         if(work.empty())return;
         if(timing)++launches;
         launch_call(work,nullptr,false,{});
+    }
+    // A decode step of several rows (format_launch_rows): each row's routes to the prepared hits, in slot order, as one
+    // engine call on the row's input, as a one-row layer's residents run; route k's output row is k. The calls stay in
+    // flight together until finish, so the engine's rows grow to the step's routes to hits first: no call is in
+    // flight here, and the worker runs none in decode. A step's rows take no host jobs (launch_host): those follow a
+    // one-row layer's input.
+    void launch_rows(const void * q,size_t stride,const int32_t * request,const int32_t * row,const float * weight,int routes,
+            const ssd_vram_activation * a){
+        if(!active || !table || !table->in_flight)return;
+        if(!format_mode || !q || !a || routes<0 || (routes && (!request || !row || !weight)))
+            throw std::runtime_error("explicit-format VRAM row launch without its format");
+        if(stride<size_t(latent)*sizeof(float))throw std::runtime_error("VRAM input stride");
+        if(a->kind!=SSD_VRAM_ACTIVATION_SITU && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU_CLAMP && a->kind!=SSD_VRAM_ACTIVATION_SWIGLU)
+            throw std::runtime_error("VRAM activation kind");
+        {std::lock_guard<std::mutex> lock(mutex);if(!calls.empty())throw std::runtime_error("GPU job already outstanding");failure.clear();}
+        work.clear();output_rows.clear();output_weights.clear();
+        int resident=0;
+        for(int k=0;k<routes;++k){
+            if(request[k]<0 || size_t(request[k])>=table->hits.size() || row[k]<0 || (k && row[k]<row[k-1]) ||
+                    !std::isfinite(weight[k]) || weight[k]<0)
+                throw std::runtime_error("invalid VRAM decode route");
+            resident+=table->hits[size_t(request[k])]>=0;
+        }
+        if(resident>now().rows){
+            if(resident>256)throw std::runtime_error("VRAM decode step routes");
+            auto & x=formats.at(cur);
+            char error[512]={};
+            void * engine=format_api->create(device,latent,hidden,resident,x.type[0],x.type[1],x.type[2],error,sizeof(error));
+            if(!engine)throw std::runtime_error(error);
+            format_api->destroy(x.engine);x.engine=engine;x.rows=resident;
+        }
+        activation=*a;
+        for(int k=0;k<routes;){
+            const int t=row[k];
+            work.clear();
+            for(;k<routes && row[k]==t;++k){
+                const int slot=table->hits[size_t(request[k])];if(slot<0)continue;
+                work.push_back(roles_at(slot_base(size_t(slot)),now()));output_rows.push_back(size_t(k));output_weights.push_back(weight[k]);
+            }
+            if(work.empty())continue;
+            const auto * x=static_cast<const uint8_t *>(q)+size_t(t)*stride;
+            input.assign(x,x+size_t(latent)*sizeof(float));
+            if(timing)++launches;
+            launch_call(work,nullptr,false,{});
+        }
     }
     // Queues an engine call over the layer's next rows, after `ready` (null: at once), and returns. A refused launch
     // fails the layer at finish, which collects the calls launched before it.
@@ -1923,7 +1973,8 @@ struct tier {
                 {
                     std::lock_guard<std::mutex> lock(mutex);
                     if(!failure.empty())throw std::runtime_error(failure);
-                    if(pending_uploads.size()>=16)throw std::runtime_error("VRAM upload queue capacity");
+                    // an upload a request at most: a one-row layer's 16, a decode step's union of its rows' experts
+                    if(pending_uploads.size()>=table->requests.size())throw std::runtime_error("VRAM upload queue capacity");
                     upload_jobs.push_back(job);pending_uploads.push_back(j);done=false;
                 }
                 cv.notify_all();
@@ -2141,18 +2192,19 @@ struct tier {
         for(size_t j:pending_uploads)table->publish(j);
         pending_uploads.clear();
         if(!calls.empty() && (!output || row_stride<size_t(latent)))throw std::runtime_error("VRAM output geometry");
-        // A call's rows: the residents' in output_rows' order, a host batch's in its jobs' order.
+        // A call's rows: the residents' in output_rows' order (from the call's first engine row), a host batch's in its
+        // jobs' order.
         for(const auto & c:calls){
             const float * rows=format_api->host_rows(c.engine)+size_t(c.first)*size_t(latent);
             for(int i=0;i<c.count;++i){
-                const size_t row=c.host?size_t(c.tasks[size_t(i)].job.row):output_rows[size_t(i)];
-                const float weight=c.host?c.tasks[size_t(i)].job.weight:table->requests[row].weight;
+                const size_t row=c.host?size_t(c.tasks[size_t(i)].job.row):output_rows[size_t(c.first+i)];
+                const float weight=c.host?c.tasks[size_t(i)].job.weight:output_weights[size_t(c.first+i)];
                 for(int col=0;col<latent;++col){volatile float scaled=rows[size_t(i)*latent+col]*weight;output[row*row_stride+col]=scaled;}
             }
         }
         layer_input_ready=false;
         {std::lock_guard<std::mutex> lock(mutex);release_calls();std::fill(host_scratch_busy.begin(),host_scratch_busy.end(),0);}
-        table->finish();work.clear();output_rows.clear();
+        table->finish();work.clear();output_rows.clear();output_weights.clear();
     }
     void prepare_prefill(const ssd_vram_request * r,int count,int * slots){
         if(count<0 || (count && (!r || !slots)) || count>n_experts)
@@ -2466,6 +2518,12 @@ int format_prepare(void * p,const ssd_vram_request * r,int count,int * slots,cha
     auto * t=static_cast<tier *>(p);try{t->prepare_format(r,count,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int format_launch(void * p,const void * q,size_t bytes,const ssd_vram_activation * a,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->launch_activation(q,bytes,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int format_prepare_rows(void * p,const ssd_vram_request * r,int count,int counted,int * slots,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{if(counted<0)throw std::runtime_error("VRAM request count");
+        t->prepare_format(r,count,slots,counted);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
+int format_launch_rows(void * p,const void * q,size_t stride,const int32_t * request,const int32_t * row,const float * weight,
+        int routes,const ssd_vram_activation * a,char * e,size_t n){
+    auto * t=static_cast<tier *>(p);try{t->launch_rows(q,stride,request,row,weight,routes,a);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_prepare(void * p,const ssd_vram_request * r,int count,int * slots,char * e,size_t n){
     auto * t=static_cast<tier *>(p);try{t->prepare_prefill(r,count,slots);return 0;}catch(const std::exception & x){return fail(t,e,n,x);}}
 int prefill_transient_available(void * p){return p?static_cast<tier *>(p)->transient_prefill_available():0;}
@@ -2639,7 +2697,8 @@ extern "C" const ssd_vram_elastic_api * ssd_vram_elastic_get_api(){
         elastic_preload_slots,elastic_preload,elastic_reserve_pass};return &api;
 }
 extern "C" const ssd_vram_format_api * ssd_vram_format_get_api(){
-    static const ssd_vram_format_api api={4,sizeof(ssd_vram_format_api),format_prepare,format_launch};return &api;
+    static const ssd_vram_format_api api={5,sizeof(ssd_vram_format_api),format_prepare,format_launch,format_prepare_rows,
+        format_launch_rows};return &api;
 }
 extern "C" const ssd_vram_prefill_api * ssd_vram_prefill_get_api(){
     static const ssd_vram_prefill_api api={12,sizeof(ssd_vram_prefill_api),prefill_prepare,

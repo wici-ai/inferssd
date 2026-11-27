@@ -241,8 +241,12 @@ public:
         }
         return l.counts[e.key.expert]*l.score_factor;
     }
-    void prepare(const ssd_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX) {
-        if(in_flight || lease_generation || !step || n>16)throw std::runtime_error("invalid VRAM prepare phase");
+    // n requests of one layer: a one-row decode layer's (at most 16), or a decode step of several rows' union of its
+    // rows' experts (at most 256). demand_mask names which of the first 32 are demand (the later ones always are);
+    // the heat counts the demand among the first `counted`, a step's first row, as a step counts a layer once.
+    void prepare(const ssd_vram_request * input,size_t n,uint32_t demand_mask=UINT32_MAX,size_t counted=SIZE_MAX) {
+        if(in_flight || lease_generation || !step || n>256)throw std::runtime_error("invalid VRAM prepare phase");
+        const auto demand=[&](size_t j){return j>=32 || (demand_mask>>j&1u);};
         if(n)requests.assign(input,input+n);else requests.clear();
         hits.assign(n,-1);admissions.assign(n,-1);
         if(n==0){in_flight=true;return;}
@@ -254,7 +258,7 @@ public:
             const double factor=std::exp2(-double(step-l.observed)/half_life);
             for(auto & value:l.counts)value*=factor;
             std::vector<bool> seen(static_cast<size_t>(experts), false);
-            for(size_t j=0;j<n;++j){const auto & r=requests[j];if((demand_mask&(1u<<j))&&!seen[r.expert]){l.counts[r.expert]+=1;seen[r.expert]=true;}}
+            for(size_t j=0;j<n && j<counted;++j){const auto & r=requests[j];if(demand(j)&&!seen[r.expert]){l.counts[r.expert]+=1;seen[r.expert]=true;}}
             l.observed=step;
             l.score_step=step;l.score_factor=1;
         }
@@ -262,7 +266,7 @@ public:
         // that appears after a miss in the original router order. A seed's
         // or a preloaded entry's first hit makes it an ordinary entry.
         for(size_t j=0;j<n;++j) {
-            if(!(demand_mask&(1u<<j)))continue;
+            if(!demand(j))continue;
             const int i=find(requests[j],[](const entry & e){return e.valid;});
             if(i<0)continue;
             auto & e=slots[size_t(i)];
@@ -270,7 +274,7 @@ public:
             e.seed=e.preloaded=false;
         }
         std::vector<size_t> order;
-        for(size_t i=0;i<n;++i)if((demand_mask&(1u<<i))&&hits[i]<0)order.push_back(i);
+        for(size_t i=0;i<n;++i)if(demand(i)&&hits[i]<0)order.push_back(i);
         std::stable_sort(order.begin(),order.end(),[&](size_t a,size_t b){
             return count_decay && l.counts[requests[a].expert]>l.counts[requests[b].expert];
         });

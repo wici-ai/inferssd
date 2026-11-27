@@ -41,8 +41,12 @@ const ssd::gpu::provider_v1 * stand_in_provider() {
     static const ssd_vram_tier_api api = { 3, sizeof(ssd_vram_tier_api), tier_create, tier_destroy, tier_declare,
         tier_begin, tier_admit, tier_finish, tier_cancel };
     static const ssd_vram_residency_api residency = { 3, sizeof(ssd_vram_residency_api), tier_held };
-    static const ssd_vram_format_api format = { 4, sizeof(ssd_vram_format_api), no_slots,
-        [](void *, const void *, size_t, const ssd_vram_activation *, char *, size_t) { return 0; } };
+    static const ssd_vram_format_api format = { 5, sizeof(ssd_vram_format_api), no_slots,
+        [](void *, const void *, size_t, const ssd_vram_activation *, char *, size_t) { return 0; },
+        [](void * p, const ssd_vram_request * r, int count, int, int * slots, char * e, size_t n) {
+            return no_slots(p, r, count, slots, e, n); },
+        [](void *, const void *, size_t, const int32_t *, const int32_t *, const float *, int, const ssd_vram_activation *,
+           char *, size_t) { return 0; } };
     static const ssd_vram_prefill_api prefill = { 12, sizeof(ssd_vram_prefill_api), no_slots,
         [](void *) { return 0; },
         [](void *, const void *, size_t, const int32_t *, const float *, int, int, const ssd_vram_prefill_transient *,

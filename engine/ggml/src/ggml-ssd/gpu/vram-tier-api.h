@@ -83,13 +83,24 @@ struct ssd_vram_activation {
     float situ_beta, situ_linear_beta, swiglu_limit;
 };
 struct ssd_vram_format_api {
-    uint32_t version, size;   // 4
+    uint32_t version, size;   // 5
     // requests: at most 16 experts of one routed layer.
     int (*prepare)(void * context, const struct ssd_vram_request * requests, int count, int * slots,
                    char * error, size_t error_size);
     // input is the layer's f32 input row (latent floats).
     int (*launch)(void * context, const void * input, size_t input_bytes,
                   const struct ssd_vram_activation * activation, char * error, size_t error_size);
+    // Version 5: a decode step of several rows (a token and the draft rows it verifies) as one layer. prepare_rows is
+    // prepare over the union of the rows' experts, each once (at most 256); the heat counts the first `counted`, the
+    // step's first row's, as a step counts a layer once. launch_rows runs route k of `routes` (nondecreasing rows) on
+    // input row route_row[k] (f32 rows input_stride bytes apart) with prepared request route_request[k] and weight
+    // route_weight[k]: each row's routes to hits run as a one-row layer's residents do, on its input. finish then
+    // writes route k's weighted down row at row k of the contributions, for each route to a hit.
+    int (*prepare_rows)(void * context, const struct ssd_vram_request * requests, int count, int counted, int * slots,
+                        char * error, size_t error_size);
+    int (*launch_rows)(void * context, const void * input, size_t input_stride, const int32_t * route_request,
+                       const int32_t * route_row, const float * route_weight, int routes,
+                       const struct ssd_vram_activation * activation, char * error, size_t error_size);
 };
 // One host-resident expert selected for transient GPU prefill compute. The
 // request index addresses the distinct-expert union passed to prepare. RAM

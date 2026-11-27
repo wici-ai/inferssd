@@ -114,7 +114,8 @@ struct sink_vram {
         }
         if (configuration.gpu.format) {
             format = configuration.gpu.format;
-            if (!format || format->version != 4 || format->size != sizeof(*format) || !format->prepare || !format->launch) {
+            if (!format || format->version != 5 || format->size != sizeof(*format) || !format->prepare || !format->launch ||
+                    !format->prepare_rows || !format->launch_rows) {
                 throw std::runtime_error("GPU tier explicit-format ABI mismatch");
             }
         }

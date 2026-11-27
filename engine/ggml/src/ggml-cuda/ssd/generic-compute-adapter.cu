@@ -87,7 +87,8 @@ struct generic_engine {
         auto whole_blocks = [](int columns, int type) {
             return type >= 0 && type < GGML_TYPE_COUNT && columns % ggml_blck_size(ggml_type(type)) == 0;
         };
-        if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || max_hits < 1 || max_hits > 16 ||
+        // max_hits: a one-row decode layer's experts (16), or a decode step's routes to residents (16 rows of 16)
+        if (latent <= 0 || hidden <= 0 || latent > 16384 || hidden > 16384 || max_hits < 1 || max_hits > 256 ||
                 !whole_blocks(latent, up_type_) || !whole_blocks(latent, gate_type_) || !whole_blocks(hidden, down_type)) {
             throw std::runtime_error("unsupported generic VRAM expert geometry");
         }
