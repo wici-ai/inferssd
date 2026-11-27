@@ -69,7 +69,8 @@ struct server_identifier_env {
 
 // Puts stand-ins in place of the identifiers in the messages and tools of a chat request (OpenAI chat completions
 // form), and returns the map that takes them back; empty when the request has none or cannot be mapped exactly.
-server_identifier_map server_identifiers_apply(nlohmann::ordered_json & body, const server_identifier_env & env);
+server_identifier_map server_identifiers_apply(nlohmann::ordered_json & body, const server_identifier_env & env,
+                                             bool skill_alias_versions = false);
 
 // Codex names the project's folder in that context as well, as a writable root in its permission instructions
 // (" The writable roots are `<cwd>`, `/private/tmp`."), after it says that the sandbox permits "editing files in `cwd`

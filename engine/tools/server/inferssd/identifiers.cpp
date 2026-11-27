@@ -6,6 +6,8 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <sstream>
 #include <string_view>
 
 #if defined(__APPLE__)
@@ -202,6 +204,73 @@ bool is_folder_byte(unsigned char c) {
     return c > ' ' && !is_separator((char) c) && c != '"' && c != '\'' && c != '`' && c != '<' && c != '>' && c != '|';
 }
 
+// Read the version component at plugins/cache/<source>/<plugin>/<version>.
+bool plugin_version(const std::string & path, size_t at, size_t & begin, size_t & end) {
+    begin = literal_end(path, at, "plugins/cache/");
+    if (begin == std::string::npos) { return false; }
+    for (int k = 0; k < 2; ++k) {
+        end = run_end(path, begin, is_folder_byte);
+        if (end == begin || end >= path.size() || !is_separator(path[end])) { return false; }
+        begin = end + 1;
+    }
+    if (begin >= path.size() || !std::isdigit((unsigned char) path[begin])) { return false; }
+    end = run_end(path, begin, [](unsigned char c) {
+        return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '+';
+    });
+    return end == path.size() || is_separator(path[end]) || !is_folder_byte((unsigned char) path[end]);
+}
+
+// Read only file references in a Desktop skill catalog with a declared root. Learn both ways the
+// model can use a file: as listed, or after following Desktop's instructions to expand its root.
+void learn_skill_alias_versions(const std::string & text, pair_list & aliases) {
+    if (text.find("<skills_instructions>") == std::string::npos) { return; }
+    std::map<std::string, std::string> roots;
+    enum { outside, instructions, declarations, catalog } section = outside;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+        if (line == "<skills_instructions>") { roots.clear(); section = instructions; continue; }
+        if (line == "</skills_instructions>") { section = outside; continue; }
+        if (section == outside) { continue; }
+        if (line == "### Skill roots") { section = declarations; continue; }
+        if (line == "### Available skills") { section = catalog; continue; }
+        if (section == declarations && line.compare(0, 4, "- `r") == 0 && line.back() == '`') {
+            const size_t end = run_end(line, 4, [](unsigned char c) { return std::isdigit(c); });
+            if (end == 4 || line.compare(end, 5, "` = `") != 0 || end + 5 >= line.size() - 1) { continue; }
+            const std::string alias = line.substr(3, end - 3);
+            std::string root = line.substr(end + 5, line.size() - end - 6);
+            while (!root.empty() && is_separator(root.back())) { root.pop_back(); }
+            auto entry = roots.emplace(alias, root);
+            if (!entry.second && entry.first->second != root) { entry.first->second.clear(); }
+        }
+        const size_t marker = line.rfind(" (file: ");
+        if (section != catalog || line.compare(0, 2, "- ") != 0 || marker == std::string::npos || line.back() != ')') { continue; }
+        const std::string ref = line.substr(marker + 8, line.size() - marker - 9);
+        const size_t sep = ref.find_first_of("/\\");
+        if (sep == std::string::npos) { continue; }
+        const auto it = roots.find(ref.substr(0, sep));
+        if (it == roots.end() || it->second.empty()) { continue; }
+        const std::string & root = it->second;
+        const std::string path = root + ref.substr(sep);
+        size_t begin, end;
+        // A root can name the plugin source, the cache itself, or the plugin. Resolve before
+        // locating the version. Roots already containing the version need no alias mapping.
+        std::string normalized = path;
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        const size_t cache = normalized.rfind("/plugins/cache/", root.size());
+        if (cache == std::string::npos || normalized.find("/../") != std::string::npos ||
+                normalized.find("/./") != std::string::npos) { continue; }
+        const size_t at = cache + 1;
+        if (!plugin_version(path, at, begin, end) || begin <= root.size() ||
+                end == path.size() || !is_separator(path[end])) { continue; }
+        const size_t ref_begin = sep + begin - root.size();
+        const size_t ref_end = sep + end - root.size();
+        aliases.emplace_back(ref.substr(0, ref_end), ref.substr(0, ref_begin) + "0.0.0");
+        aliases.emplace_back(path.substr(at, end - at), path.substr(at, begin - at) + "0.0.0");
+    }
+}
+
 struct learned_identifier {
     std::string id;
     std::string stand_in;
@@ -382,24 +451,9 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
     // (Codex and the ChatGPT desktop app list the skills of their plugins there; Claude Code keeps its plugins the
     // same way). Every update of a plugin changes it. The model sees the version 0.0.0 for each plugin, which names
     // the plugin's folder alone, so that its stand-in does not depend on the other plugins installed.
-    static const std::string cache = "plugins/cache/";
     for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
-        size_t i = literal_end(text, at, cache);
-        bool   ok = i != std::string::npos;
-        for (int k = 0; k < 2 && ok; ++k) {
-            const size_t end = run_end(text, i, is_folder_byte);
-            ok = end > i && sep_at(end);
-            i  = end + 1;
-        }
-        if (!ok || i >= text.size() || !std::isdigit((unsigned char) text[i])) {
-            continue;
-        }
-        const size_t end = run_end(text, i, [](unsigned char c) {
-            return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '+';
-        });
-        if (end < text.size() && !is_separator(text[end]) && is_folder_byte((unsigned char) text[end])) {
-            continue;
-        }
+        size_t i, end;
+        if (!plugin_version(text, at, i, end)) { continue; }
         const std::string version = text.substr(i, end - i);
         if (version == "0.0.0") {
             continue;
@@ -632,7 +686,7 @@ const server_identifier_env & server_identifier_env::current() {
     return env;
 }
 
-server_identifier_map server_identifiers_apply(json & body, const server_identifier_env & env) {
+server_identifier_map server_identifiers_apply(json & body, const server_identifier_env & env, bool skill_alias_versions) {
     pair_list pairs;
     // a home directory of a few bytes ("/", "C:\") would match too much
     const bool home = env.home.size() >= 4 && !env.home_stand_in.empty();
@@ -650,12 +704,16 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
 
     json messages = body.contains("messages") ? body.at("messages") : json();
     std::vector<learned_identifier> learned;
+    pair_list aliases;
     if (messages.is_array()) {
         for (auto & msg : messages) {
             const std::string role = msg.is_object() && msg.contains("role") && msg.at("role").is_string() ?
                                          msg.at("role").get<std::string>() : std::string();
             const bool app_message = role == "system" || role == "developer";
-            auto learn = [&](std::string & text) { learn_identifiers(text, env, learned, app_message); };
+            auto learn = [&](std::string & text) {
+                learn_identifiers(text, env, learned, app_message);
+                if (skill_alias_versions && app_message) { learn_skill_alias_versions(text, aliases); }
+            };
             if (msg.contains("content")) {
                 for_each_text(msg.at("content"), learn);
             }
@@ -674,8 +732,16 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
 
+    for (const auto & alias : aliases) {
+        add_pair(pairs, alias.first, alias.second, env.windows);
+    }
     server_identifier_map map;
     map.pairs = std::move(pairs);
+    for (const auto & alias : aliases) {
+        // The expanded form may never occur in the input. It must still restore uniquely,
+        // including when two aliases expose different versions of the same plugin.
+        if (map.to_identifiers(alias.second, false) != alias.first) { return {}; }
+    }
     if (map.empty()) {
         return map;
     }

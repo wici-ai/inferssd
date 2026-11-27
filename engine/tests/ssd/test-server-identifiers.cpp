@@ -616,6 +616,37 @@ static void test_plugin_versions_share_their_context() {
             "Windows: " + text_of(w["messages"][0]));
 }
 
+static void test_desktop_skill_alias_versions() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    const std::string root = "D:/Apps/plugins/cache/team";
+    const auto request = [&](const std::string & version) {
+        const std::string catalog = "<skills_instructions>\r\n### Skill roots\r\n- `r3` = `" + root +
+            "`\r\n- `r4` = `D:/Other`\r\n### Available skills\r\n- doc (file: r3/doc/" + version +
+            "/skills/doc/SKILL.md)\r\n- unrelated (file: r4/doc/2.3.4/skills/SKILL.md)\r\n</skills_instructions>";
+        return json{{"messages", json::array({{{"role", "developer"}, {"content", catalog}}})}};
+    };
+    auto old = request("2.3.4"), current = request("2.4.1");
+    server_identifiers_apply(old, env, true);
+    const auto map = server_identifiers_apply(current, env, true);
+    require(!map.empty() && current == old && text_of(current["messages"][0]).find("r3/doc/0.0.0/") != std::string::npos,
+            "updating a plugin behind a source-root alias leaves identical prompt text");
+    require(text_of(current["messages"][0]).find("r4/doc/2.3.4/") != std::string::npos, "ordinary roots are literal");
+    require(map.to_identifiers("r3/doc/0.0.0/skills", false) == "r3/doc/2.4.1/skills" &&
+            map.to_identifiers(root + "/doc/0.0.0/skills", false) == root + "/doc/2.4.1/skills",
+            "both relative and expanded paths restore the current request's version");
+    require(map.to_identifiers("r3\\\\doc\\\\0.0.0\\\\skills", false) == "r3\\\\doc\\\\2.4.1\\\\skills" &&
+            map.to_identifiers("open r3/doc/0.", true) == "open ", "escaped and streaming path spellings restore");
+    auto regular = request("2.4.1");
+    server_identifiers_apply(regular, env);
+    require(regular == request("2.4.1"), "other clients keep catalog aliases as supplied");
+    auto ambiguous = request("2.4.1");
+    auto & text = ambiguous["messages"][0]["content"].get_ref<std::string &>();
+    text.insert(text.find("</skills_instructions>"), "- previous (file: r3/doc/2.3.4/skills/doc/SKILL.md)\n");
+    const auto original = ambiguous;
+    require(server_identifiers_apply(ambiguous, env, true).empty() && ambiguous == original,
+            "two versions that would restore to the same expanded path remain literal");
+}
+
 // a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
 // `roots`, and the environment
 static json codex_request(const std::string & roots, const std::string & cwd) {
@@ -832,6 +863,7 @@ int main() {
     test_chatgpt_conversations_share_their_context();
     test_chatgpt_visualizations_share_their_context();
     test_plugin_versions_share_their_context();
+    test_desktop_skill_alias_versions();
     test_codex_projects_share_their_context();
     test_identifiers_of_a_system();
     test_matches_stop_at_name_boundaries();
