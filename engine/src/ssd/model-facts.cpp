@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // The facts of a model as the engine would load it (llama_ssd_model_facts), from its files' headers alone: a planner
 // takes them before any weight is read or any backend starts. They come from the steps the load takes (the loader,
-// the architecture's hyperparameters, the NextN blocks dropped, the routed experts' layout over their source index),
-// so nothing outside the engine reads a GGUF again or keeps a copy of ggml's types.
+// the architecture's hyperparameters, the NextN blocks dropped or the MTP head's kept, the routed experts' layout over
+// their source index), so nothing outside the engine reads a GGUF again or keeps a copy of ggml's types.
 #include "llama-ssd.h"
 
 #include "llama-arch.h"
@@ -117,11 +117,12 @@ void role(std::string & out, const char * name, int32_t type, uint64_t bytes) {
 
 const char * const ROLE_NAMES[SSD_EXPERT_ROLES] = { "up", "gate", "down" };
 
-// The routed experts: every layer whose up, gate and down are routed expert tensors, laid out as the engine lays
-// them out at load (ssd::store::expert_layout), over the source index of the model's own files.
+// The routed experts: every layer whose up, gate and down are routed expert tensors, the MTP head's block among them,
+// laid out as the engine lays them out at load (ssd::store::expert_layout), over the source index of the model's own
+// files.
 void experts(std::string & out, llama_model_loader & ml, const llama_hparams & hparams) {
     std::vector<ssd::store::expert_layout::routed_layer> routed;
-    for (uint32_t il = 0; il < hparams.n_layer; ++il) {
+    for (uint32_t il = 0; il < hparams.n_layer_all(); ++il) {
         ssd::store::expert_layout::routed_layer layer = { int32_t(il), {} };
         for (int r = 0; r < SSD_EXPERT_ROLES; ++r) {
             const std::string name = "blk." + std::to_string(il) + ".ffn_" + ROLE_NAMES[r] + "_exps.weight";
@@ -197,7 +198,7 @@ void experts(std::string & out, llama_model_loader & ml, const llama_hparams & h
 #endif
 }
 
-std::string model_facts(const char * const * paths, size_t n_paths) {
+std::string model_facts(const char * const * paths, size_t n_paths, bool mtp) {
     // as llama_model_load_from_file takes one path and llama_model_load_from_splits several
     std::vector<std::string> splits;
     if (n_paths > 1) { splits.assign(paths, paths + n_paths); }
@@ -207,16 +208,24 @@ std::string model_facts(const char * const * paths, size_t n_paths) {
     llama_model_params params = llama_model_default_params();
     params.use_mmap = false;
     params.no_alloc = true;
+    params.mtp = mtp;
     llama_model model(params);
     model.load_arch(ml);
     model.load_hparams(ml);
-    model.drop_nextn_blocks(ml);
+    // as llama_model_load: the block of the MTP head a model drafts with stays, any other NextN block goes
+    if (mtp) {
+        model.keep_nextn_blocks(ml);
+    } else {
+        model.drop_nextn_blocks(ml);
+    }
 
     const std::string arch = llm_arch_name(model.arch);
     std::string out = "{\"version\":1,\"architecture\":";
     quote(out, arch.c_str());
     out += ",\"layers\":";
     number(out, int64_t(model.hparams.n_layer));
+    out += ",\"draft_layers\":";
+    number(out, int64_t(model.hparams.n_mtp));
     out += ",\"files\":[";
     for (size_t i = 0; i < ml.paths.size(); ++i) {
         out += i ? "," : "";
@@ -254,7 +263,7 @@ std::string model_facts(const char * const * paths, size_t n_paths) {
 }
 } // namespace
 
-bool llama_ssd_model_facts(const char * const * paths, size_t n_paths,
+bool llama_ssd_model_facts(const char * const * paths, size_t n_paths, bool mtp,
         void (*write)(const char * text, size_t size, void * user), void * user, char * error, size_t error_size) {
     if (error && error_size) { error[0] = '\0'; }
     const char * path = paths && n_paths ? paths[0] : nullptr;
@@ -262,7 +271,7 @@ bool llama_ssd_model_facts(const char * const * paths, size_t n_paths,
         if (!path || !write || std::find(paths, paths + n_paths, nullptr) != paths + n_paths) {
             throw std::invalid_argument("model facts need a model path and a writer");
         }
-        const std::string facts = model_facts(paths, n_paths);
+        const std::string facts = model_facts(paths, n_paths, mtp);
         write(facts.data(), facts.size(), user);
         return true;
     } catch (const std::exception & exception) {

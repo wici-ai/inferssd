@@ -547,9 +547,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     parse_cli_args();
 
     // the model's facts take its extra shards from the arguments and the environment, so they are answered once
-    // both are read, before anything is downloaded
+    // both are read, before anything is downloaded; with an MTP head, of the model as it loads to draft with it, the
+    // head's file one of its files as below
     if (!params.ssd_model_facts.empty()) {
-        exit(common_ssd_print_model_facts(params.ssd_model_facts, params.model.shards) ? 0 : 1);
+        const bool mtp = params.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
+        std::vector<std::string> shards = params.model.shards;
+        if (mtp && !params.speculative.draft.mparams.path.empty()) {
+            shards.push_back(params.speculative.draft.mparams.path);
+        }
+        exit(common_ssd_print_model_facts(params.ssd_model_facts, shards, mtp) ? 0 : 1);
     }
 
     // TODO: Remove later
@@ -1103,7 +1109,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         exit(0);
     }));
     add_opt(common_arg({"--ssd-model-facts"}, "FNAME",
-        "print the facts of the GGUF model FNAME, with its --shard/--ple files, as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
+        "print the facts of the GGUF model FNAME, with its --shard/--ple files and, with --spec-type draft-mtp, the MTP head it drafts with (--spec-draft-model), as the engine would load it, as JSON, and exit: no weight is read, and given alone no backend starts",
         [](common_params & p, const std::string & value) { p.ssd_model_facts = value; }));
     add_opt(common_arg({"--ssd-settings"}, "FILE", "load versioned SSD settings and source receipts",
         [](common_params & p, const std::string & value) { p.ssd_enabled = true; p.ssd_settings_file = value; }));

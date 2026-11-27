@@ -90,7 +90,8 @@ MODEL: Check = record(
         "tensors": array(TENSOR),
         "experts": nullable(EXPERTS),
     },
-    # how many of experts.layers are the MTP head's, with which the facts were read (0 without)
+    # how many of experts.layers are an MTP head's, loaded only to draft with (0 without; older
+    # engines leave it out)
     {"draft_layers": COUNT},
 )
 

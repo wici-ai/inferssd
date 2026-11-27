@@ -2,6 +2,7 @@
  "version": 1,
  "architecture": "qwen3moe",
  "layers": 2,
+ "draft_layers": 0,
  "files": [
   "<dir>/toy-00001-of-00002.gguf",
   "<dir>/toy-00002-of-00002.gguf"

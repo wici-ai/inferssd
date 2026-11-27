@@ -980,7 +980,10 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
         llama_test(test-llama-archs NAME test-kimi-k3-roundtrip ARGS -a kimi-k3 -s 42)
         inferssd_ci_test(test-llama-archs test-kimi-k3-roundtrip)
     endif()
-    # NextN blocks: every architecture, on the CPU alone
+    # NextN blocks: every architecture, on the CPU alone; with the expert store, the facts of a model with an MTP head
+    if (LLAMA_SSD_STORE)
+        target_compile_definitions(test-llama-archs PRIVATE LLAMA_SSD_STORE=1)
+    endif()
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)
     inferssd_ci_test(test-llama-archs test-llama-archs-nextn)
 endif()

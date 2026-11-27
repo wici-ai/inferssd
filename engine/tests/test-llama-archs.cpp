@@ -16,6 +16,8 @@
 #include "../src/llama-model-saver.h"
 #include "../src/models/deepseek41-engram.h"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <functional>
 #include <array>
@@ -799,6 +801,136 @@ static void save_model_file(const llama_model * model, const gguf_context * kv, 
     }
 }
 
+#if defined(LLAMA_SSD_STORE)
+// Writes the GGUF file PATH of the KV and TENSORS named, each fused gate and up expert tensor as its gate and its up
+// tensor, as the SSD expert store takes routed experts. Only the headers are read: the data is zero.
+static void save_headers_file(const std::string & path, const gguf_context * kv,
+        const std::vector<std::pair<std::string, const ggml_tensor *>> & tensors) {
+    const std::string fused = "ffn_gate_up_exps.weight";
+    size_t bytes = 0;
+    for (const auto & named : tensors) {
+        bytes += ggml_nbytes(named.second) + 2 * (ggml_tensor_overhead() + GGML_MEM_ALIGN);
+    }
+    const ggml_init_params params = { bytes, nullptr, false };
+    ggml_context_ptr ctx(ggml_init(params));
+    gguf_context_ptr out(gguf_init_empty());
+    gguf_set_kv(out.get(), kv);
+    const auto add = [&](const std::string & name, ggml_type type, int64_t ne0, int64_t ne1, int64_t ne2, int n_dims) {
+        const int64_t ne[3] = { ne0, ne1, ne2 };
+        ggml_tensor * t = ggml_new_tensor(ctx.get(), type, n_dims, ne);
+        ggml_set_name(t, name.c_str());
+        memset(t->data, 0, ggml_nbytes(t));
+        gguf_add_tensor(out.get(), t);
+    };
+    for (const auto & [name, t] : tensors) {
+        if (gguf_find_tensor(out.get(), name.c_str()) >= 0) {
+            continue;
+        }
+        if (name.size() > fused.size() && name.compare(name.size() - fused.size(), fused.size(), fused) == 0) {
+            const std::string block = name.substr(0, name.size() - fused.size());
+            add(block + "ffn_gate_exps.weight", t->type, t->ne[0], t->ne[1] / 2, t->ne[2], 3);
+            add(block + "ffn_up_exps.weight",   t->type, t->ne[0], t->ne[1] / 2, t->ne[2], 3);
+        } else {
+            add(name, t->type, t->ne[0], t->ne[1], t->ne[2], ggml_n_dims(t));
+        }
+    }
+    if (!gguf_write_to_file(out.get(), path.c_str(), false)) {
+        throw std::runtime_error("failed to write " + path);
+    }
+}
+
+// The facts of a model that drafts with an MTP head published as a file of its own, as --spec-type draft-mtp loads
+// it (llama_ssd_model_facts with mtp): the head's block follows the model's layers, its tensors and its routed layer
+// listed with the model's, and draft_layers counts it; the head file's copy of a tensor the model has is the model's.
+// Without mtp, or without the head's file, they are the model's own facts.
+static bool test_head_facts(const size_t seed) {
+    using json = nlohmann::ordered_json;
+    gguf_context_ptr kv = get_gguf_ctx(LLM_ARCH_QWEN4EXP, /* moe */ true);
+    auto base = get_model_and_ctx(kv.get(), nullptr, seed, {});
+    const llama_model * model = base.first.get();
+    const int32_t n_layer = llama_model_n_layer(model);
+    const std::string path_model = "test-llama-archs-mtp-model.gguf";
+    const std::string path_head  = "test-llama-archs-mtp-head.gguf";
+    struct remove_files {
+        std::vector<std::string> paths;
+        ~remove_files() {
+            for (const auto & path : paths) {
+                std::remove(path.c_str());
+            }
+        }
+    } written{ { path_model, path_head } };
+
+    // the head's file: the token table the model has too, then its block, the model's last (a full attention layer)
+    // after the model's blocks with the tensor only a NextN block has
+    std::vector<std::pair<std::string, const ggml_tensor *>> trunk, head;
+    const std::string last = "blk." + std::to_string(n_layer - 1) + ".";
+    const std::string next = "blk." + std::to_string(n_layer) + ".";
+    for (const auto & [name, t] : model->tensors_by_name) {
+        trunk.emplace_back(name, t);
+        if (name == "token_embd.weight") {
+            head.insert(head.begin(), { name, t });
+        } else if (name.rfind(last, 0) == 0) {
+            head.emplace_back(next + name.substr(last.size()), t);
+        }
+    }
+    const ggml_init_params params = { ggml_tensor_overhead() + 16 * sizeof(float) + GGML_MEM_ALIGN, nullptr, true };
+    ggml_context_ptr ctx(ggml_init(params));
+    head.emplace_back(next + "nextn.eh_proj.weight", ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, 16));
+    gguf_context_ptr head_kv(gguf_init_empty());
+    gguf_set_val_str(head_kv.get(), "general.architecture", llm_arch_name(LLM_ARCH_QWEN4EXP));
+    save_headers_file(path_model, kv.get(), trunk);
+    save_headers_file(path_head, head_kv.get(), head);
+
+    const auto facts = [](const std::vector<std::string> & files, bool mtp) {
+        std::vector<const char *> paths;
+        for (const auto & file : files) {
+            paths.push_back(file.c_str());
+        }
+        std::string text;
+        char error[512];
+        const auto append = [](const char * data, size_t size, void * user) { static_cast<std::string *>(user)->append(data, size); };
+        if (!llama_ssd_model_facts(paths.data(), paths.size(), mtp, append, &text, error, sizeof error)) {
+            throw std::runtime_error(std::string("model facts failed: ") + error);
+        }
+        return json::parse(text);
+    };
+    const json own      = facts({ path_model }, false);
+    const json headless = facts({ path_model }, true);
+    const json dropped  = facts({ path_model, path_head }, false);
+    const json drafting = facts({ path_model, path_head }, true);
+    if (!own["experts"].is_object()) {
+        throw std::runtime_error("the model has no routed experts");
+    }
+
+    bool ok = own["draft_layers"] == 0 && headless == own && dropped["draft_layers"] == 0 &&
+        dropped["tensors"] == own["tensors"] && dropped["experts"] == own["experts"];
+    // every tensor of the head's block from the head's file (those of the block it copies and eh_proj), the others as
+    // the model has them
+    size_t n_last = 0;
+    for (const auto & t : own["tensors"]) {
+        n_last += t["name"].get<std::string>().rfind(last, 0) == 0;
+    }
+    json model_tensors = json::array();
+    size_t n_head = 0;
+    for (const auto & t : drafting["tensors"]) {
+        if (t["name"].get<std::string>().rfind(next, 0) == 0) {
+            ok = ok && t["file"] == 1;
+            ++n_head;
+        } else {
+            model_tensors.push_back(t);
+        }
+    }
+    // its routed layer after the model's, in the format of the layer it copies
+    json layers = own["experts"]["layers"];
+    ok = ok && layers.back()[0] == n_layer - 1;
+    layers.push_back(json::array({ n_layer, layers.back()[1] }));
+    return ok && drafting["draft_layers"] == 1 && drafting["layers"] == n_layer &&
+        drafting["files"] == json::array({ path_model, path_head }) && n_head == n_last + 1 &&
+        model_tensors == own["tensors"] && drafting["experts"]["layers"] == layers &&
+        drafting["experts"]["formats"] == own["experts"]["formats"];
+}
+#endif
+
 // A file's NextN blocks are not part of the model. A model whose metadata counts one after its blocks
 // has the same blocks and logits, bit for bit, as the model without it; loaded from a file that also
 // holds the block's tensors, it has the same blocks, size and logits as loaded from the file without
@@ -902,6 +1034,19 @@ static int test_nextn(const llm_arch target_arch, const size_t seed, const ggml_
         printf("NextN blocks only: %s\n", (refused ? ok : fail).c_str());
         all_ok = all_ok && refused;
     }
+#if defined(LLAMA_SSD_STORE)
+    if (target_arch == LLM_ARCH_UNKNOWN || target_arch == LLM_ARCH_QWEN4EXP) {
+        bool head_ok = false;
+        std::string error;
+        try {
+            head_ok = test_head_facts(seed);
+        } catch (const std::exception & e) {
+            error = e.what();
+        }
+        printf("MTP head file facts: %s %s\n", (head_ok ? ok : fail).c_str(), error.c_str());
+        all_ok = all_ok && head_ok;
+    }
+#endif
 
     llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
     return all_ok ? 0 : 1;

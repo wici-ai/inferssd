@@ -39,7 +39,7 @@ void common_ssd_print_schema() {
     std::puts(output.data());
 }
 
-bool common_ssd_print_model_facts(const std::string & path, const std::vector<std::string> & shards) {
+bool common_ssd_print_model_facts(const std::string & path, const std::vector<std::string> & shards, bool mtp) {
     // the files the model loads from, as common_init_from_params takes them
     common_params_model model;
     model.path   = path;
@@ -50,7 +50,7 @@ bool common_ssd_print_model_facts(const std::string & path, const std::vector<st
     std::string facts;
     char error[1024];
     const auto append = [](const char * text, size_t size, void * user) { static_cast<std::string *>(user)->append(text, size); };
-    if (!llama_ssd_model_facts(c_paths.data(), c_paths.size(), append, &facts, error, sizeof error)) {
+    if (!llama_ssd_model_facts(c_paths.data(), c_paths.size(), mtp, append, &facts, error, sizeof error)) {
         std::fprintf(stderr, "error: %s\n", error);
         return false;
     }

@@ -85,7 +85,7 @@ static json facts(const std::string & path, std::string * error = nullptr, const
     std::string text;
     char message[1024];
     const auto append = [](const char * data, size_t size, void * user) { static_cast<std::string *>(user)->append(data, size); };
-    if (!llama_ssd_model_facts(paths.data(), paths.size(), append, &text, message, sizeof message)) {
+    if (!llama_ssd_model_facts(paths.data(), paths.size(), false, append, &text, message, sizeof message)) {
         require(error != nullptr, std::string("model facts failed: ") + message);
         *error = message;
         return nullptr;
@@ -132,7 +132,7 @@ static void split_model(const std::filesystem::path & directory, const std::stri
     const json model = facts(a);
 
     require(model["version"] == 1 && model["architecture"] == "qwen3moe", "version or architecture");
-    require(model["layers"] == 2, "the NextN block is part of the model");
+    require(model["layers"] == 2 && model["draft_layers"] == 0, "the NextN block is part of the model");
     require(model["files"] == json::array({ a, b }), "files: " + model["files"].dump());
     const json & kv = model["metadata"];
     require(kv["general.name"] == "toy \"quoted\"" && kv["qwen3moe.block_count"] == 3 &&
