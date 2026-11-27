@@ -386,11 +386,10 @@ def job_host(monkeypatch):
     monkeypatch.setattr(
         win32, "system_memory", lambda: {"physical_available_bytes": state["available"]}
     )
-    monkeypatch.setattr(win32, "find_process", lambda _name: 3)
     monkeypatch.setattr(
         win32, "process_memory", lambda _pid: {"working_set_bytes": state["compressor"]}
     )
-    monkeypatch.setattr(win32, "process_working_set", lambda _name, _pid: state["compressor"])
+    monkeypatch.setattr(win32, "process_working_set", lambda _name: state["compressor"])
     monkeypatch.setattr(win32, "pagefile_in_use", lambda: state["pagefile"])
     return state
 
@@ -417,63 +416,130 @@ def test_a_protected_compression_process_is_sampled_and_its_growth_is_enforced(
         runtime.sample(None)
 
 
-def test_an_unreadable_compression_counter_is_not_reported_as_zero(job_host, monkeypatch):
-    def unavailable(_name, _pid):
-        raise OSError("compression counter unavailable")
+def test_an_unreadable_compression_store_is_not_reported_as_zero(job_host, monkeypatch):
+    def unavailable(_name):
+        raise OSError("process list unavailable")
 
     monkeypatch.setattr(win32, "process_working_set", unavailable)
-    with pytest.raises(OSError, match="compression counter unavailable"):
+    with pytest.raises(OSError, match="process list unavailable"):
         windows_resources.Resources(policy()).prepare()
 
 
 def test_an_absent_compression_process_has_no_store(job_host, monkeypatch):
-    monkeypatch.setattr(win32, "find_process", lambda _name: None)
+    monkeypatch.setattr(win32, "process_working_set", lambda _name: None)
     assert windows_resources.Resources(policy()).prepare()["compressor_bytes"] == 0
 
 
-@pytest.mark.parametrize(
-    "counter_pid, status, message", [(3, 0, None), (4, 0, "another PID"), (3, 2, "unavailable")]
-)
-def test_process_working_set_uses_valid_raw_counters_for_the_exact_pid(
-    monkeypatch, counter_pid, status, message
-):
-    class Pdh:
-        def __init__(self):
-            self.paths, self.closed = [], False
+class Ntdll:
+    """NtQuerySystemInformation over lists built at the caller's buffer address."""
 
+    def __init__(self, lists: dict[int, Any], status: int = 0):
+        self.lists, self.status, self.sizes = lists, status, []
+
+    def NtQuerySystemInformation(self, information_class, buffer, size, written):
+        self.sizes.append(size)
+        if self.status:
+            return self.status
+        data = self.lists[information_class](ctypes.addressof(buffer))
+        written._obj.value = len(data)
+        if len(data) > size:
+            return 0xC0000004  # STATUS_INFO_LENGTH_MISMATCH
+        ctypes.memmove(buffer, data, len(data))
+        return 0
+
+
+def process_list(processes: list[tuple[Optional[str], int]]) -> Any:
+    """SYSTEM_PROCESS_INFORMATION entries, each followed by its image name as the kernel has it."""
+
+    def build(base: int) -> bytes:
+        data = bytearray()
+        for index, (name, working_set) in enumerate(processes):
+            entry = win32._SystemProcess()
+            encoded = (name or "").encode("utf-16-le")
+            start = len(data)
+            size = (ctypes.sizeof(entry) + len(encoded) + 7) // 8 * 8
+            entry.NextEntryOffset = size if index + 1 < len(processes) else 0
+            if name is not None:
+                entry.ImageName.Length = entry.ImageName.MaximumLength = len(encoded)
+                entry.ImageName.Buffer = base + start + ctypes.sizeof(entry)
+            entry.UniqueProcessId = 4 * index
+            entry.WorkingSetSize = working_set
+            data += bytes(entry) + encoded
+            data += bytes(start + size - len(data))
+        return bytes(data)
+
+    return build
+
+
+def pagefile_list(pages_in_use: list[int]) -> Any:
+    def build(_base: int) -> bytes:
+        data = bytearray()
+        for index, pages in enumerate(pages_in_use):
+            entry = win32._SystemPagefile(TotalSize=1 << 20, TotalInUse=pages, PeakUsage=pages)
+            entry.NextEntryOffset = ctypes.sizeof(entry) if index + 1 < len(pages_in_use) else 0
+            data += bytes(entry)
+        return bytes(data)
+
+    return build
+
+
+def test_process_working_set_reads_the_named_process_from_the_kernel_list(monkeypatch):
+    ntdll = Ntdll(
+        {5: process_list([(None, 8192), ("System", 1 << 20), ("Memory Compression", 123456)])}
+    )
+    monkeypatch.setattr(win32, "_dll", lambda _name: ntdll)
+    assert win32.process_working_set("Memory Compression") == 123456
+    assert win32.process_working_set("System") == 1 << 20
+    assert win32.process_working_set("Memory") is None
+
+
+def test_a_process_list_larger_than_the_first_buffer_is_read_whole(monkeypatch):
+    processes = [(f"worker-{index}.exe", index) for index in range(1000)]
+    ntdll = Ntdll({5: process_list(processes + [("Memory Compression", 7)])})
+    monkeypatch.setattr(win32, "_dll", lambda _name: ntdll)
+    assert win32.process_working_set("Memory Compression") == 7
+    assert ntdll.sizes[0] == 1 << 16 and len(ntdll.sizes) == 2 and ntdll.sizes[1] > 1 << 16
+
+
+def test_paging_file_use_sums_every_paging_file(monkeypatch):
+    lists = {18: pagefile_list([10, 5])}
+    monkeypatch.setattr(win32, "_dll", lambda _name: Ntdll(lists))
+    assert win32.pagefile_in_use() == 15 * win32.mmap.PAGESIZE
+    lists[18] = pagefile_list([])
+    assert win32.pagefile_in_use() == 0
+
+
+@pytest.mark.parametrize(
+    "read, name",
+    [
+        (lambda: win32.process_working_set("Memory Compression"), "SystemProcessInformation"),
+        (win32.pagefile_in_use, "SystemPageFileInformation"),
+    ],
+)
+def test_a_failed_system_query_names_its_class_and_status(monkeypatch, read, name):
+    monkeypatch.setattr(win32, "_dll", lambda _name: Ntdll({}, status=0xC0000022))
+    with pytest.raises(OSError, match=rf"{name}\) failed with NTSTATUS 0xC0000022"):
+        read()
+
+
+def test_memory_samples_need_no_performance_counters(monkeypatch):
+    # On a machine whose performance counters are disabled or damaged, PDH refuses every counter
+    # path (PDH_CSTATUS_NO_OBJECT) and a launch used to fail at its first sample.
+    class NoCounters:
         def PdhOpenQueryW(self, _source, _data, query):
             query._obj.value = 1
             return 0
 
-        def PdhAddEnglishCounterW(self, _query, path, _data, counter):
-            self.paths.append(path)
-            counter._obj.value = len(self.paths)
-            return 0
-
-        def PdhCollectQueryData(self, _query):
-            return 0
-
-        def PdhGetRawCounterValue(self, counter, _kind, raw):
-            raw._obj.CStatus = status
-            raw._obj.FirstValue = counter_pid if counter.value == 1 else 123456
-            return 0
+        def PdhAddEnglishCounterW(self, *_arguments):
+            return 0xC0000BB8
 
         def PdhCloseQuery(self, _query):
-            self.closed = True
             return 0
 
-    pdh = Pdh()
-    monkeypatch.setattr(win32, "_dll", lambda _name: pdh)
-    if message:
-        with pytest.raises(OSError, match=message):
-            win32.process_working_set("Memory Compression", 3)
-    else:
-        assert win32.process_working_set("Memory Compression", 3) == 123456
-    assert pdh.closed
-    assert pdh.paths == [
-        "\\Process(Memory Compression)\\ID Process",
-        "\\Process(Memory Compression)\\Working Set",
-    ]
+    ntdll = Ntdll({5: process_list([("Memory Compression", 4096)]), 18: pagefile_list([3])})
+    monkeypatch.setattr(win32, "_dll", {"pdh": NoCounters(), "ntdll": ntdll}.__getitem__)
+    assert win32.pagefile_in_use() == 3 * win32.mmap.PAGESIZE
+    assert windows_resources.Resources(policy()).compressor_bytes() == 4096
 
 
 @pytest.mark.parametrize(

@@ -120,7 +120,7 @@ def test_system_memory_and_paging_file_counters():
     memory = win32.system_memory()
     assert 0 < memory["physical_available_bytes"] <= memory["physical_total_bytes"]
     assert win32.pagefile_in_use() >= 0
-    # The compression store can be protected from OpenProcess; PDH still samples it.
-    pid = win32.find_process("Memory Compression")
-    if pid is not None:
-        assert win32.process_working_set("Memory Compression", pid) >= 0
+    # The kernel's process list has every process, protected ones such as the compression store too.
+    assert win32.process_working_set("System") > 0
+    compression = win32.process_working_set("Memory Compression")
+    assert compression is None or compression >= 0

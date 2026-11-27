@@ -2,9 +2,9 @@
 """The Win32 calls of the Windows ownership mechanisms, through ctypes.
 
 This is the only module that reaches the Win32 API. Each function makes one
-documented call or a short fixed sequence of them and raises OSError when one
-fails. Nothing is loaded until a function is called, so the modules built on
-these functions import on any platform; their tests replace these functions.
+call or a short fixed sequence of them and raises OSError when one fails.
+Nothing is loaded until a function is called, so the modules built on these
+functions import on any platform; their tests replace these functions.
 """
 
 from __future__ import annotations
@@ -16,14 +16,17 @@ import socket
 import struct
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from ctypes import (
     POINTER,
     Structure,
     byref,
     c_int,
+    c_int32,
     c_int64,
     c_size_t,
+    c_uint8,
+    c_uint16,
     c_uint32,
     c_uint64,
     c_void_p,
@@ -168,13 +171,39 @@ class _ProcessEntry(Structure):
     ]
 
 
-class _RawCounter(Structure):
+class _UnicodeString(Structure):
+    _fields_ = [("Length", c_uint16), ("MaximumLength", c_uint16), ("Buffer", c_void_p)]
+
+
+class _SystemProcess(Structure):
+    # SYSTEM_PROCESS_INFORMATION as winternl.h documents it, up to the fields read here.
     _fields_ = [
-        ("CStatus", c_uint32),
-        ("TimeStamp", c_uint32 * 2),
-        ("FirstValue", c_int64),
-        ("SecondValue", c_int64),
-        ("MultiCount", c_uint32),
+        ("NextEntryOffset", c_uint32),
+        ("NumberOfThreads", c_uint32),
+        ("Reserved1", c_uint8 * 48),
+        ("ImageName", _UnicodeString),
+        ("BasePriority", c_int32),
+        ("UniqueProcessId", c_void_p),
+        ("Reserved2", c_void_p),
+        ("HandleCount", c_uint32),
+        ("SessionId", c_uint32),
+        ("Reserved3", c_void_p),
+        ("PeakVirtualSize", c_size_t),
+        ("VirtualSize", c_size_t),
+        ("Reserved4", c_uint32),
+        ("PeakWorkingSetSize", c_size_t),
+        ("WorkingSetSize", c_size_t),
+    ]
+
+
+class _SystemPagefile(Structure):
+    # SYSTEM_PAGEFILE_INFORMATION: one entry a paging file, sizes in pages.
+    _fields_ = [
+        ("NextEntryOffset", c_uint32),
+        ("TotalSize", c_uint32),
+        ("TotalInUse", c_uint32),
+        ("PeakUsage", c_uint32),
+        ("PageFileName", _UnicodeString),
     ]
 
 
@@ -255,14 +284,14 @@ _PROTOTYPES: Mapping[str, Mapping[str, tuple[Any, list[Any]]]] = {
         "D3DKMTQueryVideoMemoryInfo": (c_int, [POINTER(_KmtVideoMemoryInfo)]),
     },
     "iphlpapi": {"GetExtendedTcpTable": (_D, [_P, POINTER(_D), _B, _D, c_int, _D])},
-    "pdh": {
-        "PdhAddEnglishCounterW": (_D, [_H, c_wchar_p, c_size_t, POINTER(_H)]),
-        "PdhCloseQuery": (_D, [_H]),
-        "PdhCollectQueryData": (_D, [_H]),
-        "PdhGetRawCounterValue": (_D, [_H, POINTER(_D), POINTER(_RawCounter)]),
-        "PdhOpenQueryW": (_D, [c_wchar_p, c_size_t, POINTER(_H)]),
-    },
+    # The NTSTATUS result is read unsigned, as it is printed.
+    "ntdll": {"NtQuerySystemInformation": (_D, [c_int, _P, _D, POINTER(_D)])},
 }
+
+# System information classes, and the status that asks for a larger buffer.
+_SYSTEM_PROCESS_INFORMATION = 5
+_SYSTEM_PAGEFILE_INFORMATION = 18
+_STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
 
 
 @cache
@@ -423,20 +452,51 @@ def interrupt_console() -> None:
     _check(_dll("kernel32").GenerateConsoleCtrlEvent(0, 0), "GenerateConsoleCtrlEvent")
 
 
-def find_process(name: str) -> Optional[int]:
-    """The first process whose image name is name."""
-    kernel = _dll("kernel32")
-    snapshot = _handle(kernel.CreateToolhelp32Snapshot(0x2, 0), "CreateToolhelp32Snapshot")
-    try:
-        entry = _ProcessEntry(dwSize=sizeof(_ProcessEntry))
-        found = kernel.Process32FirstW(snapshot, byref(entry))
-        while found:
-            if entry.szExeFile == name:
-                return int(entry.th32ProcessID)
-            found = kernel.Process32NextW(snapshot, byref(entry))
-        return None
-    finally:
-        close(snapshot)
+def _system_information(information_class: int, name: str) -> tuple[Any, int]:
+    """NtQuerySystemInformation's data for information_class: its buffer and the bytes written."""
+    ntdll = _dll("ntdll")
+    size = 1 << 16
+    while True:
+        buffer = ctypes.create_string_buffer(size)
+        written = c_uint32()
+        status = ntdll.NtQuerySystemInformation(information_class, buffer, size, byref(written))
+        if status == _STATUS_INFO_LENGTH_MISMATCH:
+            # The data can grow before the next call (a process starts): leave it room.
+            size = max(2 * size, written.value + (1 << 14))
+            continue
+        if status & 0x80000000:
+            raise OSError(f"NtQuerySystemInformation({name}) failed with NTSTATUS 0x{status:08X}")
+        return buffer, written.value
+
+
+def _entries(kind: Any, buffer: Any, length: int) -> Iterator[Any]:
+    """The entries of a system information list, each NextEntryOffset bytes after the one before."""
+    offset = 0
+    while length:
+        if offset + sizeof(kind) > length:
+            raise OSError(f"NtQuerySystemInformation returned a truncated {kind.__name__} entry")
+        entry = kind.from_buffer(buffer, offset)
+        yield entry
+        if not entry.NextEntryOffset:
+            return
+        offset += entry.NextEntryOffset
+
+
+def process_working_set(name: str) -> Optional[int]:
+    """Working-set bytes of the first process whose image name is name, or None without one.
+
+    The kernel's process list holds every process's working set, so this needs no access to the
+    process, which a protected one such as the memory compression store refuses, and no
+    performance counters, which a machine can have disabled or damaged.
+    """
+    encoded = name.encode("utf-16-le")
+    buffer, length = _system_information(_SYSTEM_PROCESS_INFORMATION, "SystemProcessInformation")
+    for entry in _entries(_SystemProcess, buffer, length):
+        image = entry.ImageName
+        # A counted UTF-16 string; the idle process has none.
+        if image.Buffer and ctypes.string_at(image.Buffer, image.Length) == encoded:
+            return int(entry.WorkingSetSize)
+    return None
 
 
 def process_memory(pid: int) -> dict[str, int]:
@@ -474,34 +534,6 @@ def process_running(pid: int) -> bool:
         return False
     finally:
         close(snapshot)
-
-
-def process_working_set(name: str, pid: int) -> int:
-    """Working-set bytes from PDH, including protected processes, with a PID check."""
-    pdh = _dll("pdh")
-    query = c_void_p()
-    if pdh.PdhOpenQueryW(None, 0, byref(query)):
-        raise OSError("PdhOpenQueryW failed")
-    try:
-        counters = []
-        for field in ("ID Process", "Working Set"):
-            counter = c_void_p()
-            if pdh.PdhAddEnglishCounterW(query, f"\\Process({name})\\{field}", 0, byref(counter)):
-                raise OSError("PdhAddEnglishCounterW failed")
-            counters.append(counter)
-        if pdh.PdhCollectQueryData(query):
-            raise OSError("PdhCollectQueryData failed")
-        values = []
-        for counter in counters:
-            raw, kind = _RawCounter(), c_uint32()
-            if pdh.PdhGetRawCounterValue(counter, byref(kind), byref(raw)) or raw.CStatus > 1:
-                raise OSError("process working-set counter unavailable")
-            values.append(int(raw.FirstValue))
-        if values[0] != pid:
-            raise OSError("process working-set counter belongs to another PID")
-        return values[1]
-    finally:
-        pdh.PdhCloseQuery(query)
 
 
 # Job objects
@@ -696,24 +728,15 @@ def discrete_video_memory() -> int:
 
 
 def pagefile_in_use() -> int:
-    """Bytes in use across the paging files, from their % Usage performance counter."""
-    pdh = _dll("pdh")
-    query, counter = c_void_p(), c_void_p()
-    if pdh.PdhOpenQueryW(None, 0, byref(query)):
-        raise OSError("PdhOpenQueryW failed")
-    try:
-        if pdh.PdhAddEnglishCounterW(query, "\\Paging File(_Total)\\% Usage", 0, byref(counter)):
-            raise OSError("PdhAddEnglishCounterW failed")
-        if pdh.PdhCollectQueryData(query):
-            raise OSError("PdhCollectQueryData failed")
-        raw, kind = _RawCounter(), c_uint32()
-        # PDH_CSTATUS_VALID_DATA or PDH_CSTATUS_NEW_DATA
-        if pdh.PdhGetRawCounterValue(counter, byref(kind), byref(raw)) or raw.CStatus > 1:
-            raise OSError("paging file usage counter unavailable")
-        # A raw fraction: pages in use over the pages of all paging files.
-        return int(raw.FirstValue) * mmap.PAGESIZE
-    finally:
-        pdh.PdhCloseQuery(query)
+    """Bytes in use across the paging files, 0 without one.
+
+    SystemPageFileInformation is not declared in winternl.h; its entry is
+    SYSTEM_PAGEFILE_INFORMATION as System Informer's phnt headers (ntexapi.h) give it. It is the
+    count the paging files' % Usage performance counter reports, read without the counters.
+    """
+    buffer, length = _system_information(_SYSTEM_PAGEFILE_INFORMATION, "SystemPageFileInformation")
+    pages = sum(int(entry.TotalInUse) for entry in _entries(_SystemPagefile, buffer, length))
+    return pages * mmap.PAGESIZE
 
 
 def tcp_listeners() -> list[tuple[str, int, int]]:

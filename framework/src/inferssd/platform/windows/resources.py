@@ -51,8 +51,8 @@ class Resources:
         return first
 
     def compressor_bytes(self) -> int:
-        pid = win32.find_process(COMPRESSION)
-        return win32.process_working_set(COMPRESSION, pid) if pid is not None else 0
+        working_set = win32.process_working_set(COMPRESSION)
+        return 0 if working_set is None else working_set
 
     def sample(self, pid: Optional[int]) -> dict[str, Any]:
         job = win32.job_memory(None)
