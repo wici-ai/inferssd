@@ -325,9 +325,10 @@ void server_turn_memory_record(const common_chat_msg & msg, const std::string & 
 inline constexpr const char * SERVER_USER_CONTEXT_SYSTEM_MESSAGE = "inferssd_user_context_system_message";
 
 // A chat request field set with SERVER_USER_CONTEXT_SYSTEM_MESSAGE: the number of characters at the end of the
-// user's context that are data the user adds to over time (the commands approved, the tools deferred), moved there
-// so that the context before them stays the same (server_chat_convert_responses_to_chatcmpl). The server keeps a
-// state where they start. oaicompat_chat_params_parse reads and removes it.
+// user's context that are data the user adds to over time or chooses (the commands approved, the tools deferred, the
+// sections of a detail mode), moved there so that the context before them stays the same
+// (server_chat_convert_responses_to_chatcmpl). The server keeps a state where they start. oaicompat_chat_params_parse
+// reads and removes it.
 inline constexpr const char * SERVER_USER_CONTEXT_DATA_CHARS = "inferssd_user_context_data_chars";
 
 // A chat request field set by the conversion of a Responses request (server_chat_convert_responses_to_chatcmpl): the

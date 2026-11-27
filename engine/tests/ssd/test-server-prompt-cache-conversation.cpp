@@ -376,6 +376,111 @@ static void test_responses_request_layout() {
             "the model list becomes one sentence: " + chat.at("tools").at(0).at("function").at("description").get<std::string>());
 }
 
+// The ChatGPT desktop app's app context in its detail modes, trimmed from what the app sends: Prose adds the sections
+// Non-technical UI and Writing blocks to what Commands sends. They go to the end of the user's context, so a request
+// of either mode renders the same up to where the data starts, and the server keeps a state there.
+static void test_chatgpt_detail_modes_share_the_context() {
+    const std::string head =
+        "<app-context>\n# Codex desktop context\n"
+        "- You are running inside the Codex (desktop) app, which allows some additional features not available in the "
+        "CLI alone:\n\n"
+        "### Thread Coordination\n"
+        "- Only use `create_thread` when the user explicitly asks to create a new thread.\n";
+    const std::string non_technical =
+        "### Non-technical UI\n"
+        "- The user has requested a non-technical UI.\n"
+        "- However, if the user asks for detail or it would help the user debug, you can still decide to dive into "
+        "technical details.";
+    const std::string comments =
+        "### Inline Code Comments\n"
+        "- Keep line ranges tight; end defaults to start.\n"
+        "</app-context>";
+    const std::string writing =
+        "### Writing blocks\n\n"
+        "- A writing block contains a finished, reusable writing artifact that the user can copy, edit, or use outside "
+        "this conversation.\n"
+        "- Use this syntax for non-email drafts:\n\n"
+        ":::writing{variant=\"<variant>\" id=\"<id>\" title=\"<title>\"}\n<content>\n:::\n\n"
+        "- If distinct tone or style choices would materially help the user, put two or three alternatives in one "
+        "writing block and start every alternative with a line in this exact form:\n\n"
+        "---tone <label>\n<alternative content>\n\n"
+        "- Keep any explanation outside the writing block and do not mention this formatting contract to the user.";
+    const std::string projectless =
+        "### Projectless Chat\n"
+        "Do not write directly in the home directory unless the user explicitly asks.";
+    const std::string commands = head + "\n" + comments + "\n\n" + projectless;
+    const std::string prose    = head + "\n" + non_technical + "\n\n" + comments + "\n\n" + writing + "\n\n" + projectless;
+    const std::string permissions = "<permissions instructions>\nApproval policy is `never`.\n</permissions instructions>";
+    const std::string deferred    = "<tools>\nDeferred tool namespaces:\n- mcp__node_repl\n</tools>";
+
+    const auto convert = [&](const std::string & app_context, const std::string & last) {
+        json parts = json::array({{{"type", "input_text"}, {"text", app_context}},
+                                  {{"type", "input_text"}, {"text", permissions}}});
+        if (!last.empty()) {
+            parts.push_back({{"type", "input_text"}, {"text", last}});
+        }
+        return server_chat_convert_responses_to_chatcmpl({
+            {"model", "m"},
+            {"input", json::array({
+                {{"role", "developer"}, {"content", json::array({{{"type", "input_text"}, {"text", "You are Codex."}}})}},
+                {{"role", "developer"}, {"content", parts}},
+                {{"role", "user"}, {"content", "hi"}},
+            })},
+        });
+    };
+    const auto context_of = [](const json & chat) { return chat.at("messages").at(1).at("content").get<std::string>(); };
+    const auto data_of    = [](const json & chat) { return json_value(chat, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0); };
+
+    const json chat_commands = convert(commands, deferred);
+    const json chat_prose    = convert(prose, deferred);
+    const std::string rest   = commands + "\n\n" + permissions;
+    require(context_of(chat_commands) == rest + "\n\n" + deferred,
+            "a context without the sections stays as sent: " + context_of(chat_commands));
+    const std::string moved = non_technical + "\n\n" + writing + "\n\n" + deferred;
+    require(context_of(chat_prose) == rest + "\n\n" + moved,
+            "the sections go to the end of the context, before the deferred tools: " + context_of(chat_prose));
+    require(data_of(chat_prose) == moved.size() + 2, "the sections are data");
+
+    // either section alone, and no other data
+    const json only_non_technical = convert(head + "\n" + non_technical + "\n\n" + comments + "\n\n" + projectless, "");
+    require(context_of(only_non_technical) == rest + "\n\n" + non_technical && data_of(only_non_technical) == non_technical.size() + 2,
+            "Non-technical UI alone: " + context_of(only_non_technical));
+    const json last_section = convert(head + "\n" + comments + "\n\n" + writing, "");
+    require(context_of(last_section) == head + "\n" + comments + "\n\n" + permissions + "\n\n" + writing,
+            "a section that ends the text: " + context_of(last_section));
+
+    // the headings in another part stay
+    const json elsewhere = convert(commands, "<skills_instructions>\n\n### Writing blocks\nA skill.\n</skills_instructions>");
+    require(context_of(elsewhere) == rest + "\n\n<skills_instructions>\n\n### Writing blocks\nA skill.\n</skills_instructions>" &&
+                data_of(elsewhere) == 0,
+            "a heading outside the app context stays: " + context_of(elsewhere));
+
+    // rendered, both modes share the prompt up to the state the server keeps where the data starts
+    server_chat_params opt{};
+    opt.use_jinja          = true;
+    opt.prefill_assistant  = true;
+    opt.reasoning_format   = COMMON_REASONING_FORMAT_DEEPSEEK;
+    opt.force_pure_content = true;
+    opt.tmpls = common_chat_templates_init(/* model= */ nullptr,
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}");
+    const auto render = [&](json chat) {
+        std::vector<raw_buffer> files;
+        const json params = oaicompat_chat_params_parse(chat, opt, files);
+        const std::string prompt = params.at("prompt").get<std::string>();
+        const json points = json_value(params, "branch_points_chars", json::array());
+        require(points.size() == 1, "a point where the data starts: " + params.dump());
+        return std::make_pair(prompt, points.at(0).get<size_t>());
+    };
+    const auto [prompt_commands, at_commands] = render(chat_commands);
+    const auto [prompt_prose, at_prose]       = render(chat_prose);
+    require(at_commands == at_prose && prompt_commands.compare(0, at_commands, prompt_prose, 0, at_prose) == 0,
+            "both modes render the same up to the data: " + prompt_commands.substr(0, at_commands) + " | " +
+                prompt_prose.substr(0, at_prose));
+    require(prompt_prose.compare(at_prose, 2 + non_technical.size(), "\n\n" + non_technical) == 0,
+            "and part where the data starts: " + prompt_prose.substr(at_prose));
+}
+
 int main() {
     try {
         test_supersedes();
@@ -384,6 +489,7 @@ int main() {
         test_chat_request_reports_the_opening();
         test_chat_request_reports_branch_points();
         test_responses_request_layout();
+        test_chatgpt_detail_modes_share_the_context();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

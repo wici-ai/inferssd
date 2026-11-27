@@ -1,6 +1,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <optional>
@@ -233,11 +234,34 @@ std::string server_chat_custom_tool_input(const std::string & arguments, bool pa
 
 // Takes out of the user's context the data that grows as the user works and returns it, to go at the context's end:
 // the command prefixes the user approved (a list at the end of the permission instructions, one more each time the
-// user allows a command for good) and the tools the account defers (a part of its own). The rest of the context then
-// stays the same from one conversation to the next, and the server keeps a state where the data starts. Only data
-// moves, each with the line that says what it is; the instructions keep their order.
+// user allows a command for good) and the tools the account defers (a part of its own). The sections the ChatGPT
+// desktop app adds to its app context when the user picks the detail mode Prose rather than Commands go there too,
+// first: Non-technical UI and Writing blocks, which say how to talk to the user and refer to nothing around them. The
+// rest of the context then stays the same from one conversation and one mode to the next, and the server keeps a
+// state where the data starts. Only these move, each with the line that says what it is; the rest keeps its order.
 static std::vector<std::string> responses_move_context_data(std::vector<std::string> & context_texts) {
     std::vector<std::string> data;
+    static const char * const prose_sections[] = { "\n\n### Non-technical UI\n", "\n\n### Writing blocks\n" };
+    for (auto & text : context_texts) {
+        const size_t start = text.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos || text.compare(start, 13, "<app-context>") != 0) {
+            continue;
+        }
+        for (const char * heading : prose_sections) {
+            const size_t begin = text.find(heading);
+            if (begin == std::string::npos) {
+                continue;
+            }
+            // the section runs to the next heading after a blank line, to the line that closes the app context or to
+            // the end of the text (Writing blocks comes after the closing line)
+            size_t end = std::min(text.find("\n\n#", begin + 2), text.find("\n</app-context>", begin + 2));
+            if (end == std::string::npos) {
+                end = text.size();
+            }
+            data.push_back(text.substr(begin + 2, end - begin - 2));
+            text.erase(begin, end - begin);
+        }
+    }
     static const std::string approved = "\n\n## Approved command prefixes\n";
     for (auto & text : context_texts) {
         const size_t start = text.find_first_not_of(" \t\r\n");
