@@ -5125,6 +5125,34 @@ static bool ggml_vk_has_rebar(const vk::PhysicalDevice & physical_device) {
     return false;
 }
 
+// A device its driver refused to create: the driver, the extensions asked of it that it does not advertise, and the
+// instance layers the loader knows (an implicit one takes part in every device's creation), so that a report of the
+// failure names which it was.
+static void ggml_vk_log_device_refused(size_t idx, const vk::PhysicalDeviceProperties & props,
+        const vk::PhysicalDeviceDriverProperties & driver, const std::vector<vk::ExtensionProperties> & advertised,
+        const std::vector<const char *> & requested, const char * error) {
+    std::string asked, missing, layers;
+    for (const char * name : requested) {
+        asked += (asked.empty() ? "" : ",") + std::string(name);
+        const bool found = std::any_of(advertised.begin(), advertised.end(),
+            [&](const vk::ExtensionProperties & e) { return std::string(e.extensionName.data()) == name; });
+        if (!found) { missing += (missing.empty() ? "" : ",") + std::string(name); }
+    }
+    try {
+        for (const auto & layer : vk::enumerateInstanceLayerProperties()) {
+            layers += (layers.empty() ? "" : ",") + std::string(layer.layerName.data());
+        }
+    } catch (const vk::SystemError & e) {
+        layers = std::string("unknown (") + e.what() + ")";
+    }
+    GGML_LOG_ERROR("ggml_vulkan: device %zu (%s, vendor 0x%04x, device 0x%04x, Vulkan %u.%u.%u) refused its creation: %s; "
+        "driver %s (%s), version 0x%08x; extensions requested: %s; requested but not advertised: %s; instance layers: %s\n",
+        idx, props.deviceName.data(), props.vendorID, props.deviceID, VK_API_VERSION_MAJOR(props.apiVersion),
+        VK_API_VERSION_MINOR(props.apiVersion), VK_API_VERSION_PATCH(props.apiVersion), error, driver.driverName.data(),
+        driver.driverInfo.data(), props.driverVersion, asked.empty() ? "none" : asked.c_str(),
+        missing.empty() ? "none" : missing.c_str(), layers.empty() ? "none" : layers.c_str());
+}
+
 static vk_device ggml_vk_get_device(size_t idx) {
     VK_LOG_DEBUG("ggml_vk_get_device(" << idx << ")");
 
@@ -5778,7 +5806,12 @@ static vk_device ggml_vk_get_device(size_t idx) {
             .setQueueCreateInfos(device_queue_create_infos)
             .setPEnabledExtensionNames(device_extensions);
         device_create_info.setPNext(&device_features2);
-        device->device = device->physical_device.createDevice(device_create_info);
+        try {
+            device->device = device->physical_device.createDevice(device_create_info);
+        } catch (const vk::SystemError & e) {
+            ggml_vk_log_device_refused(idx, device->properties, driver_props, ext_props, device_extensions, e.what());
+            throw;
+        }
 
         // Queues
         ggml_vk_create_queue(device, device->compute_queue, compute_queue_family_index, 0, { vk::PipelineStageFlagBits::eComputeShader | vk::PipelineStageFlagBits::eTransfer }, false);
