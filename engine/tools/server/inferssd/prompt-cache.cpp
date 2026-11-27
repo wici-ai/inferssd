@@ -409,6 +409,8 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
 }
 
 void server_prompt_cache::use_prefix_dir(const std::string & dir, const std::string & fingerprint) {
+    states.remove_if([](const server_prompt & prompt) { return prompt.read_only; });
+    prefix_unusable.clear();
     prefix_dir         = dir;
     prefix_fingerprint = fingerprint;
     prefix_dir_time    = -1;
@@ -420,37 +422,73 @@ void server_prompt_cache::scan_prefix_dir() {
         return;
     }
     std::error_code ec;
-    const auto    time = std::filesystem::last_write_time(prefix_dir, ec);
+    const auto directory = std::filesystem::u8path(prefix_dir);
+    const auto    time = std::filesystem::last_write_time(directory, ec);
     const int64_t t    = ec ? 0 : (int64_t) time.time_since_epoch().count();
     if (t == prefix_dir_time) {
         return;
     }
-    prefix_dir_time = t;
-
-    // Reindex unchanged names too: a completed download can replace an older file.
-    states.remove_if([](const server_prompt & prompt) { return prompt.read_only; });
-    if (ec) {
-        return;
+    // Keep validated metadata for unchanged files. Only the selected prefix is verified again at restore.
+    std::unordered_map<std::string, std::list<server_prompt>::iterator> indexed;
+    for (auto it = states.begin(); it != states.end(); ++it) {
+        if (it->read_only) {
+            indexed.emplace(it->file, it);
+        }
     }
 
     size_t n_found = 0;
-    for (const auto & entry : std::filesystem::directory_iterator(prefix_dir, ec)) {
-        if (entry.path().extension() != ".prompt") {
+    const std::filesystem::directory_iterator end;
+    for (auto it = ec ? end : std::filesystem::directory_iterator(directory, ec);
+         !ec && it != end; it.increment(ec)) {
+        if (it->path().extension() != ".prompt") {
             continue;
         }
-        const std::string path = entry.path().string();
+        const std::string path = it->path().u8string();
+        std::unique_ptr<FILE, decltype(&std::fclose)> file(ssd::platform::open_stream(path.c_str()), std::fclose);
+        ssd::platform::file_identity identity;
+        const bool identified = file && ssd::platform::identity(ssd::platform::stream_fd(file.get()), identity);
+        auto old = indexed.find(path);
+        if (old != indexed.end() && identified && old->second->prefix_identity == identity) {
+            indexed.erase(old);
+            ++n_found;
+            continue;
+        }
+
+        auto failed = prefix_unusable.find(path);
+        if (failed != prefix_unusable.end()) {
+            if (identified && failed->second == identity) {
+                continue;
+            }
+            prefix_unusable.erase(failed);
+        }
         server_prompt prompt;
-        server_prompt_file file(std::fopen(path.c_str(), "rb"), server_prompt_file_close);
-        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, prompt, true)) {
-            SRV_WRN(" - skipping prefix cache %s: made for another model or format\n", path.c_str());
+        server_prompt_file validated(file.release(), server_prompt_file_close);
+        if (!validated || !server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true)) {
+            SRV_WRN(" - skipping prefix cache %s: made for another model or format\\n", path.c_str());
             continue;
         }
-        prompt.file      = path;
+        if (identified) {
+            ssd::platform::file_identity after;
+            if (!ssd::platform::identity(ssd::platform::stream_fd(validated.get()), after) || identity != after) {
+                continue;
+            }
+            prompt.prefix_identity = identity;
+        }
+        prompt.file = path;
         prompt.read_only = true;
-        states.push_front(std::move(prompt));
+        if (old != indexed.end()) {
+            *old->second = std::move(prompt);
+            indexed.erase(old);
+        } else {
+            states.push_front(std::move(prompt));
+        }
         ++n_found;
     }
-    SRV_WRN("prefix caches in %s: %zu found\n", prefix_dir.c_str(), n_found);
+    for (const auto & entry : indexed) {
+        states.erase(entry.second);
+    }
+    prefix_dir_time = ec && ec != std::errc::no_such_file_or_directory ? -1 : t;
+    SRV_WRN("prefix caches in %s: %zu found\\n", prefix_dir.c_str(), n_found);
 }
 
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
@@ -471,7 +509,9 @@ bool server_prompt_cache::contains(const server_prompt & prompt, common_context_
 }
 
 void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
-    if (!it->read_only && !it->file.empty()) {
+    if (it->read_only && it->prefix_identity) {
+        prefix_unusable.insert_or_assign(it->file, *it->prefix_identity);
+    } else if (!it->read_only && !it->file.empty()) {
         std::error_code ec;
         std::filesystem::remove(it->file, ec);
     }
@@ -690,18 +730,13 @@ void server_prompt_cache::save(
     remove_superseded(prompt, &states.back());
 }
 
-bool server_prompt_cache::load(
-        server_prompt              & prompt,
-        const server_tokens        & tokens_new,
-        int64_t                      n_reuse_slot,
-        llama_context              * ctx,
-        int32_t                      id_slot,
-        common_context_seq_rm_type   seq_rm_type) {
-    if (!prompt.adapter_key) {
-        return true;
-    }
-    server_ssd_memory_change budget_changes(ctx);
-    scan_prefix_dir();
+std::list<server_prompt>::iterator server_prompt_cache::best_to_load(
+        const server_prompt              & prompt,
+        const server_tokens              & tokens_new,
+        int64_t                            n_reuse_slot,
+        common_context_seq_rm_type         seq_rm_type,
+        const server_prompt_checkpoint  ** checkpoint,
+        int64_t                          * n_tokens) {
     auto it_best = states.end();
     const server_prompt_checkpoint * checkpoint_best = nullptr;
     int64_t n_tokens_best = -1;
@@ -757,12 +792,59 @@ bool server_prompt_cache::load(
         }
     }
 
-    if (it_best == states.end()) {
+    *checkpoint = checkpoint_best;
+    *n_tokens   = n_tokens_best;
+    return it_best;
+}
+
+bool server_prompt_cache::load(
+        server_prompt              & prompt,
+        const server_tokens        & tokens_new,
+        int64_t                      n_reuse_slot,
+        llama_context              * ctx,
+        int32_t                      id_slot,
+        common_context_seq_rm_type   seq_rm_type) {
+    if (!prompt.adapter_key) {
         return true;
     }
+    server_ssd_memory_change budget_changes(ctx);
+    scan_prefix_dir();
 
-    server_prompt_file file(it_best->file.empty() ? nullptr : std::fopen(it_best->file.c_str(), "rb"),
-                            server_prompt_file_close);
+    // Discard stale candidates before touching the slot. If a native restore fails after starting to replace
+    // the sequence, clear the slot before trying the next candidate.
+    for (;;) {
+        const server_prompt_checkpoint * checkpoint_best = nullptr;
+        int64_t n_tokens_best = -1;
+        const auto it_best = best_to_load(prompt, tokens_new, n_reuse_slot, seq_rm_type, &checkpoint_best, &n_tokens_best);
+        if (it_best == states.end()) {
+            return true;
+        }
+        const auto result = take(it_best, checkpoint_best, n_tokens_best, prompt, ctx, id_slot);
+        if (result == take_result::restored) {
+            return true;
+        }
+        if (result == take_result::stale_index) {
+            continue;
+        }
+        llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
+        prompt.tokens.clear();
+        prompt.checkpoints.clear();
+        n_reuse_slot = 0;
+    }
+}
+
+server_prompt_cache::take_result server_prompt_cache::take(
+        std::list<server_prompt>::iterator   it_best,
+        const server_prompt_checkpoint     * checkpoint_best,
+        int64_t                              n_tokens_best,
+        server_prompt                      & prompt,
+        llama_context                      * ctx,
+        int32_t                              id_slot) {
+    server_prompt_file file(nullptr, server_prompt_file_close);
+    if (!it_best->file.empty()) {
+        file.reset(it_best->read_only ? ssd::platform::open_stream(it_best->file.c_str())
+                                      : std::fopen(it_best->file.c_str(), "rb"));
+    }
     server_prompt opened;
     if (it_best->read_only) {
         // Bind validation and every read to this handle. The directory index can
@@ -772,12 +854,9 @@ bool server_prompt_cache::load(
             SRV_WRN(" - prefix cache changed since indexing: %s\n", it_best->file.c_str());
             states.erase(it_best);
             prefix_dir_time = -1;
-            return true;
+            return take_result::stale_index;
         }
         opened.file = it_best->file;
-        if (checkpoint_best) {
-            server_prompt_reuse_full(opened, tokens_new, &checkpoint_best);
-        }
     }
     const server_prompt & entry = it_best->read_only ? opened : *it_best;
 
@@ -786,9 +865,14 @@ bool server_prompt_cache::load(
 
     if (!server_prompt_restore(entry, checkpoint_best, file.get(), ctx, id_slot)) {
         SRV_WRN("%s", "failed to restore the cached prompt\n");
+        if (it_best->read_only) {
+            ssd::platform::file_identity identity;
+            it_best->prefix_identity = ssd::platform::identity(ssd::platform::stream_fd(file.get()), identity)
+                ? std::optional{identity} : std::nullopt;
+        }
         file.reset();
         remove(it_best);
-        return false;
+        return take_result::restore_failed;
     }
 
     // the slot takes over the cached prompt, cut back to the checkpoint it starts from; its checkpoints move to memory
@@ -826,7 +910,7 @@ bool server_prompt_cache::load(
         states.erase(it_best);
     }
 
-    return true;
+    return take_result::restored;
 }
 
 void server_prompt_cache::update() {

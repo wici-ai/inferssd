@@ -231,8 +231,9 @@ expert matrix orientations. Run profiling on an idle GPU. Saved measurements are
 reused; `--reprofile` replaces them.
 
 Estimation uses the decode thread pool, each expert quantization type, and measured
-GPU matvec rates rather than charging GPU work to the CPU. `--memory-gib 32` limits
-the **estimated host budget** (it does not set a process limit). Optional
+GPU matvec rates rather than charging GPU work to the CPU. `--memory-gib 32` sets
+the **estimated host budget** in place of the memory available now (it does not
+set a process limit). Optional
 `--host-work-mib` and `--gpu-work-mib` reserve known KV/graph working memory. Without
 these, cache capacity is an upper estimate; these options do not alter launches.
 

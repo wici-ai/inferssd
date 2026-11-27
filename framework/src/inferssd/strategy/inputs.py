@@ -777,7 +777,7 @@ def read_runtime(
         cpus = cpu_list(f"0-{identity.sysctl_int(live, 'hw.logicalcpu') - 1}")
         gpus = ()
     elif system == "windows":
-        # Group 0 logical processor indices, as the engine and its CPU masks number them.
+        # Group-qualified logical processor indices, as the Windows topology numbers them.
         cpus = live.windows().process_cpus()
         gpus, cuda_uuids = _gpus(live, native_cuda)
     else:

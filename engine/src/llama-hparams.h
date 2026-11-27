@@ -97,7 +97,8 @@ struct llama_hparams {
     uint32_t expert_gating_func   = LLAMA_EXPERT_GATING_FUNC_TYPE_NONE;
     uint32_t moe_every_n_layers   = 0;
     uint32_t moe_latent_size      = 0;
-    uint32_t nextn_predict_layers = 0; // NextN blocks after the model's in the file; this engine never loads them
+    uint32_t nextn_predict_layers = 0; // NextN blocks after the model's in the file
+    uint32_t n_mtp = 0; // the NextN blocks loaded (layers n_layer .. n_layer + n_mtp - 1), the MTP draft head; 0 without
 
     float f_norm_eps;
     float f_norm_rms_eps;
@@ -362,6 +363,12 @@ struct llama_hparams {
 
     // the blocks of the file, which per-block metadata covers: the model's and its NextN blocks
     uint32_t n_block() const;
+
+    // the layers loaded: the model's and the MTP head's
+    uint32_t n_layer_all() const { return n_layer + n_mtp; }
+
+    // the hidden state of a token an MTP head reads: the residual before the final norm, all hc streams of qwen4exp
+    uint32_t n_embd_h() const { return n_embd * (dsv4_hc_mult > 1 ? dsv4_hc_mult : 1); }
 
     // whether or not the given layer is recurrent (for hybrid models)
     bool is_recurrent(uint32_t il) const;

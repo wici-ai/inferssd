@@ -3298,6 +3298,12 @@ static struct ggml_threadpool * ggml_threadpool_new_impl(
 }
 
 struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp) {
+#if defined(_WIN32)
+    if (ggml_thread_cpumask_is_valid(tpp->cpumask) && GetActiveProcessorGroupCount() > 1) {
+        GGML_LOG_ERROR("Explicit CPU pinning is unsupported on Windows with multiple processor groups. Use an unpinned threadpool.\n");
+        return NULL;
+    }
+#endif
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 

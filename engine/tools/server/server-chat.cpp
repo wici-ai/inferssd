@@ -77,6 +77,74 @@ static bool responses_user_context(const std::string & text) {
     return false;
 }
 
+// Codex's sub-agent tool lists the OpenAI models a sub-agent may run on, with their reasoning efforts and service
+// tiers. With this server the sub-agent runs on the same model whatever it names, and the list changes with the
+// models Codex knows of (Codex 0.160 listed gpt-6.1-sol first, 0.172 gpt-6.2-sol), changing the tools every user of
+// the app shares. It is replaced by a sentence that says so; the rest of the description stays.
+static std::string responses_tool_without_model_list(const std::string & description) {
+    static const std::string header = "Available model overrides (optional; inherited parent model is preferred):\n";
+    const size_t begin = description.find(header);
+    if (begin == std::string::npos) {
+        return description;
+    }
+    // the list: one line "- `<model>`: ..." for each model
+    size_t end = begin + header.size();
+    while (description.compare(end, 3, "- `") == 0) {
+        const size_t line_end = description.find('\n', end);
+        end = line_end == std::string::npos ? description.size() : line_end + 1;
+    }
+    if (end == begin + header.size()) {
+        return description;
+    }
+    std::string out = description.substr(0, begin);
+    out += "Model overrides: none; the new agent runs on the parent's model.";
+    if (description[end - 1] == '\n') {
+        out += '\n';
+    }
+    out += description.substr(end);
+    return out;
+}
+
+// Takes out of the user's context the data that grows as the user works and returns it, to go at the context's end:
+// the command prefixes the user approved (a list at the end of the permission instructions, one more each time the
+// user allows a command for good) and the tools the account defers (a part of its own). The rest of the context then
+// stays the same from one conversation to the next, and the server keeps a state where the data starts. Only data
+// moves, each with the line that says what it is; the instructions keep their order.
+static std::vector<std::string> responses_move_context_data(std::vector<std::string> & context_texts) {
+    std::vector<std::string> data;
+    static const std::string approved = "\n\n## Approved command prefixes\n";
+    for (auto & text : context_texts) {
+        const size_t start = text.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos || text.compare(start, 26, "<permissions instructions>") != 0) {
+            continue;
+        }
+        const size_t begin = text.find(approved);
+        if (begin == std::string::npos) {
+            continue;
+        }
+        // the list runs to the writable roots, which Codex writes after it, or to the end of the instructions
+        size_t end = text.find("\n The writable root", begin + approved.size());
+        if (end == std::string::npos) {
+            end = text.find("\n</permissions instructions>", begin + approved.size());
+        }
+        if (end == std::string::npos) {
+            end = text.size();
+        }
+        data.push_back(text.substr(begin + 2, end - begin - 2));
+        text.erase(begin, end - begin);
+    }
+    for (auto it = context_texts.begin(); it != context_texts.end();) {
+        const size_t start = it->find_first_not_of(" \t\r\n");
+        if (start != std::string::npos && it->compare(start, 33, "<tools>\nDeferred tool namespaces:") == 0) {
+            data.push_back(*it);
+            it = context_texts.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return data;
+}
+
 // Codex sends its instructions and several developer messages at the start, another developer message at the start
 // of a later turn, and now and then one inside a tool-call loop. Chat templates often take one system message at
 // the start and raise on the others or drop them. As CC Switch's Codex proxy converts them for Chat Completions,
@@ -94,8 +162,8 @@ static bool responses_user_context(const std::string & text) {
 //   stands, so the request sent before stays a prefix of this one;
 // - any other later one joins the user's context, so a tool-call loop stays one turn and the app's part is the same.
 // Texts are joined by a blank line; an empty one is dropped. Returns whether the second system message is the user's
-// context.
-static bool responses_collapse_system_messages(std::vector<json> & messages) {
+// context; *data_chars is then the length of the data at its end (responses_move_context_data).
+static bool responses_collapse_system_messages(std::vector<json> & messages, size_t * data_chars) {
     std::vector<bool> followed_by_user(messages.size(), false);
     bool next_is_user = false;
     for (size_t i = messages.size(); i-- > 0;) {
@@ -139,8 +207,16 @@ static bool responses_collapse_system_messages(std::vector<json> & messages) {
     if (!app_texts.empty()) {
         out.push_back({ { "role", "system" }, { "content", join_texts(app_texts) } });
     }
+    *data_chars = 0;
     if (!context_texts.empty()) {
-        out.push_back({ { "role", "system" }, { "content", join_texts(context_texts) } });
+        const std::vector<std::string> data = responses_move_context_data(context_texts);
+        std::string context = join_texts(context_texts);
+        if (!data.empty()) {
+            const std::string tail = join_texts(data);
+            *data_chars = (context.empty() ? 0 : 2) + tail.size();
+            context += (context.empty() ? "" : "\n\n") + tail;
+        }
+        out.push_back({ { "role", "system" }, { "content", context } });
     }
     const bool user_context = !app_texts.empty() && !context_texts.empty();
     out.insert(out.end(), std::make_move_iterator(rest.begin()), std::make_move_iterator(rest.end()));
@@ -428,9 +504,13 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         throw std::invalid_argument("'input' must be a string or array of objects");
     }
 
-    if (responses_collapse_system_messages(chatcmpl_messages)) {
+    size_t context_data_chars = 0;
+    if (responses_collapse_system_messages(chatcmpl_messages, &context_data_chars)) {
         // read and removed by oaicompat_chat_params_parse: the shared prefix ends with the first system message
         chatcmpl_body[SERVER_USER_CONTEXT_SYSTEM_MESSAGE] = true;
+        if (context_data_chars > 0) {
+            chatcmpl_body[SERVER_USER_CONTEXT_DATA_CHARS] = context_data_chars;
+        }
     }
     chatcmpl_body["messages"] = std::move(chatcmpl_messages);
 
@@ -450,6 +530,9 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
         const auto add_tool = [&](json function) {
             if (!tool_names.insert(json_value(function, "name", std::string())).second) {
                 return;
+            }
+            if (function.contains("description") && function.at("description").is_string()) {
+                function["description"] = responses_tool_without_model_list(function.at("description").get<std::string>());
             }
             if (!function.contains("strict")) {
                 function["strict"] = true;

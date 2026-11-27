@@ -118,6 +118,16 @@ bool llm_graph_input_embd::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_mtp_h::set_input(const llama_ubatch * ubatch) {
+    const size_t bytes = size_t(ubatch->n_tokens) * h->ne[0] * sizeof(float);
+    GGML_ASSERT(src != nullptr && src->size() * sizeof(float) >= bytes && "an MTP draft step needs its hidden states");
+    ggml_backend_tensor_set(h, src->data(), 0, bytes);
+}
+
+bool llm_graph_input_mtp_h::can_reuse(const llm_graph_params & params) {
+    return h && h->ne[1] == params.ubatch.n_tokens && src == params.mtp_h;
+}
+
 void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {
     if (ubatch->pos && pos) {
         const int64_t n_tokens = ubatch->n_tokens;
@@ -1273,6 +1283,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cpu_sink_prefill (params.cpu_sink_prefill),
     cpu_sink_prefill_hint (params.cpu_sink_prefill_hint),
     cpu_sink_runtime (params.cpu_sink_runtime),
+    mtp_h            (params.mtp_h),
     n_ctx_orig       (cparams.n_ctx_orig_yarn),
     pooling_type     (cparams.pooling_type),
     rope_type        (hparams.rope_type),
@@ -1651,7 +1662,8 @@ ggml_tensor * llm_graph_context::build_moe_prefetch_hint(
 llama_expert_gating_func_type gating_op,
              int64_t   n_expert,
                  int   il) {
-    if (!cpu_sink_runtime || !next_gate_inp || !cpu_sink_runtime->can_prefetch_after(il) || !(cpu_sink_prefill ? cpu_sink_prefill_hint : n_tokens == 1)) {
+    // a decode step's prediction is a row each (the sink's decode node gives the rows' to the next layer's prefetch)
+    if (!cpu_sink_runtime || !next_gate_inp || !cpu_sink_runtime->can_prefetch_after(il) || !(cpu_sink_prefill ? cpu_sink_prefill_hint : cpu_sink_decode)) {
         return nullptr;
     }
     // a router that reads the stream as it is has no norm of its own
@@ -2056,7 +2068,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_build_forward_expand(gf, weights);
 
     // The context's typed runtime selects CPU decode and grouped prefill.
-    if ((cpu_sink_decode && n_tokens == 1) || cpu_sink_prefill) {
+    if (cpu_sink_decode || cpu_sink_prefill) {
         GGML_ASSERT(n_tokens >= 1);
 
         const auto requirements = llama_ssd::describe_experts(arch, hparams, il);
@@ -2098,7 +2110,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         descriptor->post_exp_norm_eps = execution.post_norm_eps;
         descriptor->layer = il;
         descriptor->prefill = cpu_sink_prefill;
-        ggml_tensor * hint = cpu_sink_prefill || n_tokens == 1 ? cpu_sink_prefetch_hint : nullptr;
+        ggml_tensor * hint = cpu_sink_prefetch_hint;
         // slots: input, ids, weights, then the post-expert norm, then the hint
         ggml_tensor * args[] = {
             ggml_cont(ctx0, cur), ggml_cont(ctx0, selected_experts), ggml_cont(ctx0, weights),
@@ -2459,6 +2471,20 @@ ggml_tensor * llm_graph_context::build_inp_pos() const {
 
     cur = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t)n_tokens*hparams.n_pos_per_embd());
     ggml_set_input(cur);
+
+    res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_inp_mtp_h() const {
+    auto inp = std::make_unique<llm_graph_input_mtp_h>(mtp_h);
+
+    auto & cur = inp->h;
+
+    cur = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.n_embd_h(), n_tokens);
+    ggml_set_input(cur);
+    cb(cur, "inp_mtp_h", -1);
 
     res->add_input(std::move(inp));
 
@@ -3248,7 +3274,10 @@ ggml_tensor * llm_graph_context::build_rs(
             int32_t   rs_zero,
         const llm_graph_get_rows_fn & get_state_rows) const {
 
-    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, rs_size);
+    // every plane of the cache (a rolled back sequence's state is in a later one): a copy source indexes them all
+    const int64_t n_rows = ggml_nelements(s) / state_size;
+    GGML_ASSERT(n_rows % rs_size == 0);
+    ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, n_rows);
 
     // Clear a single state which will then be copied to the other cleared states.
     // Do not add a zero-sized SCALE root: although it computes nothing, the

@@ -715,6 +715,9 @@ llama_model_loader::llama_model_loader(
             }
 
             bool allow_override_tensor = false;
+            // A draft head published with the model (an MTP head) may carry the model's embedding and output
+            // matrices too: the model's are kept, the head's copies are not loaded.
+            bool keep_model_tensors = false;
             if (idx < n_backbone) {
                 const int kid = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str());
                 if (kid < 0) {
@@ -736,6 +739,9 @@ llama_model_loader::llama_model_loader(
             } else {
                 // an external PLE table replaces the one in the model, if any
                 allow_override_tensor = is_ple_only(ctx_gguf.get());
+                for (int64_t i = 0; i < gguf_get_n_tensors(ctx_gguf.get()); ++i) {
+                    keep_model_tensors |= std::strstr(gguf_get_tensor_name(ctx_gguf.get(), i), ".nextn.") != nullptr;
+                }
                 const bool numbered = gguf_find_key(ctx_gguf.get(), kv_split_no.c_str()) >= 0 ||
                     gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_SPLIT_COUNT).c_str()) >= 0 ||
                     gguf_find_key(ctx_gguf.get(), llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str()) >= 0;
@@ -756,6 +762,11 @@ llama_model_loader::llama_model_loader(
                 const std::string tensor_name = cur->name;
                 auto it = weights_map.find(tensor_name);
                 if (it != weights_map.end()) {
+                    if (keep_model_tensors && it->second.idx < n_backbone_files) {
+                        LLAMA_LOG_INFO("%s: tensor '%s' of %s is the model's own, using the model's\n", __func__,
+                            tensor_name.c_str(), fname_split);
+                        continue;
+                    }
                     // only override tensors of the model, not of another extra shard
                     if (!allow_override_tensor || it->second.idx >= n_backbone_files) {
                         throw std::runtime_error(format("invalid model: tensor '%s' is duplicated", ggml_get_name(cur)));

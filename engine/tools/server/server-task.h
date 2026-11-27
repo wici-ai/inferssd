@@ -11,6 +11,7 @@
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
 #include "inferssd/identifiers.h"
+#include "inferssd/prompt-cache.h"
 #include "inferssd/usage.h"
 
 using json = nlohmann::ordered_json;
@@ -181,12 +182,12 @@ struct server_task {
     task_params   params;
     server_tokens tokens;
 
-    // tokens of the prompt that other conversations with the same setup share: the leading system messages with
-    // the tools (0 if unknown); the server keeps a state there that later conversations start from. When the last
-    // leading system message holds the user's context, it is the app's system message with the tools, and
-    // n_context_prefix is the end of all of them, which the users with the same context share: a second state
-    int64_t n_shared_prefix  = 0;
-    int64_t n_context_prefix = 0;
+    // where the server keeps states of the prompt that later conversations start from (server_prompt_points): the
+    // end of the leading system messages with the tools, which other conversations with the same setup share; when
+    // the last leading system message holds the user's context, the end of the app's system message with the tools,
+    // which every user of the app shares, and the end of all of them, which the users with the same context share;
+    // and the places inside them where a prompt of another user or setup is likely to part from this one
+    server_prompt_points points;
 
     // tokens of the prompt that every state of its conversation starts with: the shared prefix and the user
     // messages before the first reply (0 if unknown); the prompt cache keeps one state per conversation by them
@@ -617,5 +618,3 @@ struct server_task_result_get_lora : server_task_result {
 struct server_task_result_apply_lora : server_task_result {
     virtual json to_json() override;
 };
-
-#include "inferssd/prompt-cache.h"

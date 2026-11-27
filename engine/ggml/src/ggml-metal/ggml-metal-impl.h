@@ -101,6 +101,7 @@
 #define FC_SUM_ROWS                    1400
 #define FC_UPSCALE                     1500
 #define FC_GATED_DELTA_NET             1600
+#define FC_MUL_MV_MMA                  2300
 
 // op-specific constants
 #define OP_FLASH_ATTN_EXT_NQPSG 8
@@ -889,6 +890,10 @@ typedef struct {
     uint64_t nb1;
     uint64_t nb2;
     uint64_t nb3;
+    int32_t  t0; // the tokens [t0, t1) of this dispatch (GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH)
+    int32_t  t1;
+    uint64_t nbp1; // ggml_gated_delta_net_planes: the planes' steps from a plane and from a sequence to the next
+    uint64_t nbp2;
 } ggml_metal_kargs_gated_delta_net;
 
 typedef struct {

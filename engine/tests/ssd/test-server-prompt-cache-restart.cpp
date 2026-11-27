@@ -185,7 +185,7 @@ static completion first_token(server_context & server, const llama_tokens & prom
     task.id = reader.get_new_id();
     task.id_slot = id_slot;
     task.tokens = server_tokens(prompt, false);
-    task.n_shared_prefix = n_shared;
+    task.points.n_shared = n_shared;
     task.params.n_predict = 1;
     task.params.n_cache_reuse = n_cache_reuse;
     task.params.stream = false;

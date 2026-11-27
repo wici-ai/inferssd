@@ -39,6 +39,8 @@ enum llm_graph_type {
     LLM_GRAPH_TYPE_DEFAULT,
     LLM_GRAPH_TYPE_ENCODER,
     LLM_GRAPH_TYPE_DECODER,
+    // a draft step of the model's MTP head: its NextN block alone, over the hidden states the step is given
+    LLM_GRAPH_TYPE_DECODER_MTP,
 };
 
 enum llm_ffn_op_type {
@@ -145,6 +147,21 @@ public:
     const ggml_tensor * table = nullptr;
 
     const int64_t n_embd = 0;
+};
+
+// the hidden states an MTP draft step reads, one row a token in batch order (llama_context::mtp_h)
+class llm_graph_input_mtp_h : public llm_graph_input_i {
+public:
+    llm_graph_input_mtp_h(const std::vector<float> * src) : src(src) {}
+    virtual ~llm_graph_input_mtp_h() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * h = nullptr; // F32 [n_embd_h, n_batch]
+
+    const std::vector<float> * src;
 };
 
 class llm_graph_input_pos : public llm_graph_input_i {
@@ -682,6 +699,9 @@ struct llm_graph_params {
     // Maximum context position covered by the current scheduler reserve.
     uint32_t n_ctx_reserve = 0;
 
+    // an MTP draft step's hidden states (LLM_GRAPH_TYPE_DECODER_MTP)
+    const std::vector<float> * mtp_h = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -796,7 +816,7 @@ public:
     ggml_tensor * t_logits      = nullptr;
     ggml_tensor * t_embd        = nullptr;
     ggml_tensor * t_embd_pooled = nullptr;
-    ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs], hidden state before final norm
+    ggml_tensor * t_h_nextn     = nullptr; // [n_embd_h, n_outputs], hidden state before final norm, an MTP head's input
 
     std::vector<ggml_tensor *> t_layer_inp;
 
@@ -879,6 +899,7 @@ struct llm_graph_context {
     const bool cpu_sink_prefill;
     const bool cpu_sink_prefill_hint;
     llama_ssd_executor_group * const cpu_sink_runtime;
+    const std::vector<float> * const mtp_h;
     // Set by a model around its build_moe_ffn call: the next layer's predicted experts for the CPU sink, a decode
     // token's for its prefetch, every token's of a sink prefill for its read-ahead.
     ggml_tensor * cpu_sink_prefetch_hint = nullptr;
@@ -1038,6 +1059,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
+    ggml_tensor * build_inp_mtp_h() const; // [n_embd_h, n_tokens]: an MTP draft step's hidden states
     ggml_tensor * build_inp_pos() const;
     ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;

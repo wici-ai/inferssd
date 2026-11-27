@@ -98,11 +98,12 @@ static std::vector<uint32_t> cells_of(const std::vector<llama_pos> & positions) 
 }
 static bool same_recurrent(const llama_memory_recurrent & mem, const llama_memory_recurrent::metadata_undo & saved) {
     if (mem.head != saved.head || mem.used != saved.used || mem.n != saved.n || mem.rs_z != saved.rs_z ||
-            mem.cells.size() != saved.cells.size()) { return false; }
+            mem.cells.size() != saved.cells.size() || mem.rs_idx != saved.rs_idx) { return false; }
     for (size_t i = 0; i < mem.cells.size(); ++i) {
         const auto & a = mem.cells[i];
         const auto & b = saved.cells[i];
-        if (a.pos != b.pos || a.src != b.src || a.src0 != b.src0 || a.tail != b.tail || a.seq_id != b.seq_id) {
+        if (a.pos != b.pos || a.src != b.src || a.src0 != b.src0 || a.tail != b.tail || a.rs_max != b.rs_max ||
+                a.seq_id != b.seq_id) {
             return false;
         }
     }
@@ -144,7 +145,7 @@ static void recurrent_and_hybrid_undo(llama_model & model) {
         const auto prompt = prefix ? span(11, 10) : span(0, 10);
         const llama_pos last = prefix ? 10 : -1;
 
-        llama_memory_recurrent recr(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 1, 1, {});
+        llama_memory_recurrent recr(model, GGML_TYPE_F32, GGML_TYPE_F32, false, 1, 1, 0, {});
         if (prefix) { require(recr.find_slot(batch(first)), "recurrent prefix"); }
         const auto recr_saved = recr.save_metadata();
         undo_every_failure("recurrent",

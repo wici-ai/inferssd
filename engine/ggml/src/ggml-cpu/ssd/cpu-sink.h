@@ -45,6 +45,11 @@ GGML_BACKEND_API int ssd_cpu_sink_decode_threads(struct ssd_cpu_sink * sink, int
 // Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void ssd_cpu_sink_prefetch_hint(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);
+// The rows of a decode ubatch (a token and the draft rows it verifies): the next `count` decode runs of `layer` are its
+// rows, `slots` experts each (`experts` row-major, -1 for none). A row's run keeps the prefetches of the experts its
+// later rows select queued for them. Given before the first row's run; one row (count 1) clears it.
+GGML_BACKEND_API void ssd_cpu_sink_decode_rows(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts,
+        int slots, int count);
 // A grouped prefill's prediction of the next routed layer: the experts of `layer` that each of `ntokens` tokens is
 // predicted to select, `k` a token best first (token-major), given before the prefill call of the layer before it.
 // The read-ahead (prefill.lookahead) reads the experts it makes likely; ignored when that is off.

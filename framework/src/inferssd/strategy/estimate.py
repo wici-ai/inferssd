@@ -18,6 +18,7 @@ from typing import Optional
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow
 from inferssd.strategy.derive import (
     IN_FLIGHT,
+    cpu_affinity,
     drive_rate,
     gpu_reserve_mib,
     host_headroom_mib,
@@ -81,6 +82,21 @@ def drive_iqr(
 def headroom_bytes(characteristics: Characteristics, runtime: RuntimeFacts, platform: str) -> int:
     mib = host_headroom_mib(characteristics, runtime, platform)
     return ENGINE_RESERVE_BYTES if mib is None else mib << 20
+
+
+def host_memory_bytes(characteristics: Characteristics, runtime: RuntimeFacts) -> int:
+    """Host memory an estimate plans with, at most the installed memory.
+
+    A memory budget is the amount to estimate for and replaces the reading of what is
+    available now: the estimate then answers for that much memory, more or less than the
+    host has free at the moment. Without a budget it is the available memory, or the
+    installed memory when that is not known.
+    """
+    total = characteristics["memory"]["total_bytes"]
+    memory = runtime.memory_budget_bytes
+    if memory is None:
+        memory = runtime.available_bytes
+    return total if memory is None else min(memory, total)
 
 
 def matvec_rate(
@@ -330,12 +346,7 @@ def decode_estimate(
         return Estimate(None, str(error))
     drive_gbps, why = drive_rate(characteristics, experts, drive_key)
     drive_reason = why
-    available = runtime.available_bytes
-    if available is None:
-        available = characteristics["memory"]["total_bytes"]
-    if runtime.memory_budget_bytes is not None:
-        available = min(available, runtime.memory_budget_bytes)
-    available = min(available, characteristics["memory"]["total_bytes"])
+    available = host_memory_bytes(characteristics, runtime)
     room = max(
         0,
         available
@@ -695,7 +706,7 @@ def _dense_host_estimate(
     assumptions: list[str],
 ) -> Estimate:
     """Conditional CPU execution with a reusable page cache and mmap fault sensitivity."""
-    allowed = set(runtime.cpus) & {row["id"] for row in c["cpu"]["logical"]}
+    allowed, _ = cpu_affinity(c, runtime)
     dram = max(
         (row["Bps"] for row in c["memory"]["dram_read_Bps"] if row["threads"] <= len(allowed)),
         default=0.0,
@@ -813,10 +824,7 @@ def dense_decode_estimate(
     ]
     if weights:
         assumptions.extend(weights.graph_assumptions())
-    total = characteristics["memory"]["total_bytes"]
-    available = min(total, total if runtime.available_bytes is None else runtime.available_bytes)
-    if runtime.memory_budget_bytes is not None:
-        available = min(available, runtime.memory_budget_bytes)
+    available = host_memory_bytes(characteristics, runtime)
     platform = platform or characteristics["identity"]["hard"]["platform"]
     host_room = max(
         0,
