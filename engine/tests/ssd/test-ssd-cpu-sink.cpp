@@ -4450,6 +4450,9 @@ static std::vector<int32_t> same_residents(fixture_inputs & inputs, const fixtur
 // expert only later rows select is the first to go); no cache, SwiGLU and a per-expert post norm; a run of one row as
 // ssd_cpu_sink_run_activation; the next-layer prefetch; the layer's event; and the refusals.
 static void rows_tests(fixture_inputs & inputs, int threads, int depth) {
+    // The CPU backend's tables before the first run: x86 converts the experts' FP16 scales through one. The other
+    // tests build a reference graph first, which initializes the backend; these run the sink first.
+    ggml_cpu_init();
     for (const auto & kv : { std::pair<const char *, const char *>{ "ready_first", "1" }, { "early_up_gate", "1" },
             { "role_major", "1" }, { "nonblocking_down_sched", "1" }, { "dynamic_rows", "1" },
             { "dynamic_chunk_rows", "64" }, { "cache_allocation", "uniform" } }) {
