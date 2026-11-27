@@ -408,6 +408,90 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
     }
 }
 
+// The environment Claude Code and the Claude desktop app send after the user's first words: this heading, then a list
+// of lines " - name: value", an item of a nested list "  - value".
+const std::string claude_environment = "# Environment\nYou have been invoked in the following environment: \n";
+
+// The lines of the list of each environment block in text, as (begin, end) without the line break.
+std::vector<std::pair<size_t, size_t>> claude_environment_lines(const std::string & text) {
+    std::vector<std::pair<size_t, size_t>> lines;
+    const std::string & heading = claude_environment;
+    for (size_t at = text.find(heading); at != std::string::npos; at = text.find(heading, at + 1)) {
+        size_t line = at + heading.size();
+        while (line < text.size() && (text.compare(line, 3, " - ") == 0 || text.compare(line, 4, "  - ") == 0)) {
+            const size_t eol = std::min(text.find('\n', line), text.size());
+            lines.emplace_back(line, eol);
+            line = eol + 1;
+        }
+    }
+    return lines;
+}
+
+std::string with_slashes(std::string path) {
+    std::replace(path.begin(), path.end(), '\\', '/');
+    return path;
+}
+
+// The working directories named in the environment blocks of text: " - Primary working directory: <dir>" and the
+// items under " - Additional working directories:". Each one becomes an identifier whose stand-in is the folder
+// project in the stand-in home, the n-th one project-n, consistent with the stand-in of Claude Code's memory folder for
+// the project (above). A directory stays as it is when it is the home directory or a folder that holds it, which the
+// home's stand-in already makes the same for every user. The Claude desktop app's agent works in the folders of its
+// session (local-agent-mode-sessions, and /private/var/empty on macOS beside it) and its title job in the job's folder,
+// which have stand-ins of their own: a block that names a folder with a learned stand-in is left to those.
+void learn_working_directories(const std::string & text, const server_identifier_env & env,
+                               std::vector<learned_identifier> & out) {
+    static const std::string primary = " - Primary working directory: ";
+    static const std::string additional = " - Additional working directories:";
+    if (env.home_stand_in.empty() || text.find(claude_environment) == std::string::npos) {
+        return;
+    }
+    std::vector<std::string> dirs;
+    bool in_additional = false;
+    for (const auto & [begin, end] : claude_environment_lines(text)) {
+        const std::string line = text.substr(begin, end - begin);
+        std::string dir;
+        if (line.compare(0, primary.size(), primary) == 0) {
+            dir = line.substr(primary.size());
+        } else if (in_additional && line.compare(0, 4, "  - ") == 0) {
+            dir = line.substr(4);
+        }
+        in_additional = line == additional || (in_additional && line.compare(0, 4, "  - ") == 0);
+        while (dir.size() > 1 && is_separator(dir.back())) {
+            dir.pop_back();
+        }
+        if (!dir.empty()) {
+            dirs.push_back(dir);
+        }
+    }
+    for (const std::string & dir : dirs) {
+        for (const auto & l : out) {
+            if (l.kind != 9 && with_slashes(dir).find(with_slashes(l.id)) != std::string::npos) {
+                return;
+            }
+        }
+    }
+    const std::string home = with_slashes(env.home);
+    for (const std::string & dir : dirs) {
+        const std::string d = with_slashes(dir);
+        const bool holds_home = home.size() >= d.size() && home.compare(0, d.size(), d) == 0 &&
+                                (home.size() == d.size() || d.back() == '/' || home[d.size()] == '/');
+        if (dir.size() < 4 || holds_home) {
+            continue;
+        }
+        int n = 1;
+        bool known = false;
+        for (const auto & l : out) {
+            known = known || l.id == dir;
+            n += l.kind == 9;
+        }
+        if (!known) {
+            std::string stand_in = env.home_stand_in + (env.windows ? "\\" : "/") + "project";
+            out.push_back({dir, n > 1 ? stand_in + "-" + std::to_string(n) : stand_in, 9});
+        }
+    }
+}
+
 // Takes the root that is the cwd out of Codex's sentences " The writable root is `<root>`." and " The writable
 // roots are `<root>`, `<root>`.", and writes the sentence again as Codex writes it for the roots left; with none left
 // the sentence goes with the line break before it, as Codex writes its instructions without writable roots.
@@ -577,6 +661,15 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
             }
         }
     }
+    // then the working directories of Claude's environment, in any message, once the folders they may lie in are known
+    if (messages.is_array()) {
+        for (auto & msg : messages) {
+            auto learn = [&](std::string & text) { learn_working_directories(text, env, learned); };
+            if (msg.is_object() && msg.contains("content")) {
+                for_each_text(msg.at("content"), learn);
+            }
+        }
+    }
     for (const auto & l : learned) {
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
@@ -693,6 +786,37 @@ bool server_strip_claude_env_user_lines(std::string & text) {
                 changed = true;
             } else {
                 line = eol + 1;
+            }
+        }
+    }
+    return changed;
+}
+
+bool server_unify_claude_os_version(std::string & text) {
+    static const std::string platform = " - Platform: ";
+    static const std::string os = " - OS Version: ";
+    bool changed = false;
+    // from the last line to the first, so that the positions of the lines before stay
+    const auto lines = claude_environment_lines(text);
+    for (size_t k = lines.size(); k-- > 0;) {
+        const auto [begin, end] = lines[k];
+        if (text.compare(begin, os.size(), os) == 0) {
+            // the Platform line of the same block, which comes before
+            std::string fixed;
+            for (size_t j = k; j-- > 0 && lines[j].second + 1 == lines[j + 1].first;) {
+                if (text.compare(lines[j].first, platform.size(), platform) == 0) {
+                    const std::string name = text.substr(lines[j].first + platform.size(),
+                                                         lines[j].second - lines[j].first - platform.size());
+                    fixed = name == "win32"  ? "Windows 11 Pro 10.0.26200" :
+                            name == "darwin" ? "Darwin 25.4.0" :
+                            name == "linux"  ? "Linux 6.8.0" : "";
+                    break;
+                }
+            }
+            const size_t value = begin + os.size();
+            if (!fixed.empty() && text.compare(value, end - value, fixed) != 0) {
+                text.replace(value, end - value, fixed);
+                changed = true;
             }
         }
     }

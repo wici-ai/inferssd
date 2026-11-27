@@ -8,6 +8,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-task.h"
+#include "inferssd/identifiers.h"
 #include "server-prompt-cache-fixture.h"
 #include "chat.h"
 
@@ -380,6 +381,57 @@ static void test_claude_environment_opens_the_conversation() {
     }
 }
 
+// The environment of two Claude Code users of one system with other project folders and other editions of the system
+// renders the same up to the user's words: the working directory has its stand-in, the OS Version line the system's
+// fixed text, and what the model writes in the stand-in folder goes back to the user's.
+static void test_claude_environment_of_two_users() {
+    const auto convert = [](const std::string & cwd, const std::string & os, const std::string & words) {
+        const std::string env = "# Environment\nYou have been invoked in the following environment: \n"
+                                " - Primary working directory: " + cwd + "\n - Is a git repository: false\n"
+                                " - Platform: win32\n - Shell: bash\n - OS Version: " + os +
+                                "\n\nToday's date is 2026-11-27.";
+        return server_chat_convert_anthropic_to_oai({
+            {"system", json::array({{{"type", "text"},
+                                     {"text", "You are Claude Code, Anthropic's official CLI for Claude."}}})},
+            {"messages", json::array({{{"role", "user"}, {"content", words}}, {{"role", "system"}, {"content", env}}})},
+            {"max_tokens", 16}});
+    };
+    const json a = convert("/work/app", "Windows 11 Home China 10.0.26200", "hi");
+    const json b = convert("/srv/site", "Windows 11 Pro for Workstations 10.0.26100", "Create notes.txt.");
+    const std::string a_text = a.at("messages").at(1).at("content").get<std::string>();
+    const std::string fixed = " - OS Version: Windows 11 Pro 10.0.26200\n";
+    require(a_text.find(fixed) != std::string::npos &&
+                b.at("messages").at(1).at("content").get<std::string>().find(fixed) != std::string::npos,
+            "the system's fixed text: " + a_text);
+    require(json_value(a, SERVER_FIRST_USER_CONTEXT_CHARS, (size_t) 0) == a_text.size() - std::string("hi").size(),
+            "the context's characters count the fixed text");
+
+    server_chat_params opt{};
+    opt.use_jinja          = true;
+    opt.prefill_assistant  = true;
+    opt.reasoning_format   = COMMON_REASONING_FORMAT_DEEPSEEK;
+    opt.tmpls = common_chat_templates_init(/* model= */ nullptr,
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}"
+            "{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}");
+    const auto parse = [&](json chat) {
+        std::vector<raw_buffer> files;
+        return oaicompat_chat_params_parse(chat, opt, files);
+    };
+    const json pa = parse(a), pb = parse(b);
+    const std::string prompt_a = pa.at("prompt").get<std::string>(), prompt_b = pb.at("prompt").get<std::string>();
+    const server_identifier_env & env = server_identifier_env::current();
+    const std::string project = env.home_stand_in + (env.windows ? "\\" : "/") + "project";
+    const size_t at = json_value(pa, "context_prefix_chars", (size_t) 0);
+    require(prompt_a.find(" - Primary working directory: " + project + "\n") != std::string::npos,
+            "the working directory's stand-in: " + prompt_a);
+    require(at > 0 && at == json_value(pb, "context_prefix_chars", (size_t) 0) &&
+                prompt_a.compare(0, at, prompt_b, 0, at) == 0 && prompt_a.compare(at, 2, "hi") == 0,
+            "both users' prompts are the same up to the words: " + prompt_a + " | " + prompt_b);
+    const server_identifier_map map = server_identifier_map::from_json(pa.at("prompt_identifiers"));
+    require(map.to_identifiers("Wrote " + project + "/notes.txt", false) == "Wrote /work/app/notes.txt",
+            "the model's path goes back to the user's folder");
+}
+
 // The layout of a request for reuse: the tools of MCP servers after the app's own tools, by server; a state kept
 // where each group of tools ends and where the data at the end of the user's context starts, or would start.
 static void test_chat_request_reports_branch_points() {
@@ -634,6 +686,7 @@ int main() {
         test_disk_cache();
         test_chat_request_reports_the_opening();
         test_claude_environment_opens_the_conversation();
+        test_claude_environment_of_two_users();
         test_chat_request_reports_branch_points();
         test_responses_request_layout();
         test_chatgpt_detail_modes_share_the_context();

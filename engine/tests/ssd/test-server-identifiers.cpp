@@ -5,6 +5,7 @@
 #include "server-task.h"
 #include "inferssd/identifiers.h"
 
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -225,11 +226,12 @@ static void test_claude_desktop_sessions_share_their_context() {
 // it sends as a system message; the server renders that as the user's text (server_chat_convert_anthropic_to_oai).
 static void test_claude_desktop_title_jobs_share_their_context() {
     const server_identifier_env env = mac_env(users("alice"), "");
-    const auto request = [&](const std::string & folder) {
+    const auto request = [&](const std::string & folder,
+                             const std::string & words = "You are coming up with a title.") {
         const std::string text = "<system-reminder>\n# Environment\nYou have been invoked in the following "
                                  "environment: \n - Primary working directory: " + folder +
                                  "\n - Is a git repository: false\n"
-                                 "</system-reminder>\n\nYou are coming up with a title.";
+                                 "</system-reminder>\n\n" + words;
         return json{{"messages", json::array({{{"role", "system"}, {"content", "You write short session titles."}},
                                               {{"role", "user"}, {"content", text}}})}};
     };
@@ -257,14 +259,260 @@ static void test_claude_desktop_title_jobs_share_their_context() {
                                            "00000000-0000-0000-0000-000000000000\n") != std::string::npos,
             "Windows: " + text_of(w["messages"][1]));
 
-    // a folder of another shape stays, and the other folders are learned from the apps' system messages only
+    // a folder of another shape stays, and the other folders are learned from the apps' system messages only; the
+    // job's folder, which has its stand-in, keeps it as the working directory
     for (const std::string & other : { secrets + "a87d132d", secrets + "a87d132d-619f-4c94-9d22-5c0497c0e2bdx",
                                        std::string("/Documents/Codex/2026-11-19/q") }) {
-        json o = request(env.home + other);
+        json o = request(env.home + secrets + "a87d132d-619f-4c94-9d22-5c0497c0e2bd", "Name " + env.home + other + ".");
         server_identifiers_apply(o, env);
-        require(text_of(o["messages"][1]).find(" - Primary working directory: " + STAND_IN + other + "\n") !=
-                    std::string::npos,
+        require(text_of(o["messages"][1]).find(" - Primary working directory: " + STAND_IN + secrets +
+                                               "00000000-0000-0000-0000-000000000000\n") != std::string::npos &&
+                    text_of(o["messages"][1]).find("\n\nName " + STAND_IN + other + ".") != std::string::npos,
                 "another folder in a user message stays: " + text_of(o["messages"][1]));
+    }
+}
+
+// Claude's environment block, trimmed from what Claude Code 2.1.332 sends after the user's first words; extra lines go
+// after the git line, as the additional working directories do
+static std::string claude_environment(const std::string & cwd, const std::string & extra = "",
+                                      const std::string & platform = "darwin",
+                                      const std::string & os = "Darwin 25.4.0") {
+    return "# Environment\nYou have been invoked in the following environment: \n - Primary working directory: " + cwd +
+           "\n - Is a git repository: false\n" + extra + " - Platform: " + platform +
+           "\n - Shell: zsh\n - OS Version: " + os +
+           "\n - In `curl`, send untrusted values with `--form-string`, not `-F`.\n\nToday's date is 2026-11-27.";
+}
+
+// A Claude Code request as server_chat_convert_anthropic_to_oai leaves it: the memory folder in the system prompt, the
+// environment ahead of the user's words, a Write call in the working directory (sep: the separator of the client's
+// paths) and its result
+static json claude_code_env_request(const std::string & home, const std::string & cwd, const std::string & sep = "/",
+                                    const std::string & extra = "") {
+    const std::string memory =
+        home + sep + ".claude" + sep + "projects" + sep + claude_name(cwd) + sep + "memory" + sep;
+    const std::string file   = cwd + sep + "notes.txt";
+    return {{"messages", json::array({
+        {{"role", "system"},
+         {"content", "You are Claude Code.\n# Memory\nYou have a persistent memory at `" + memory + "`."}},
+        {{"role", "user"}, {"content", json::array({
+            {{"type", "text"}, {"text", "<system-reminder>\nAttribution.\n</system-reminder>\n"}},
+            {{"type", "text"}, {"text", claude_environment(cwd, extra) + "\n\nCreate notes.txt here."}}})}},
+        {{"role", "assistant"}, {"content", ""},
+         {"tool_calls", json::array({tool_call("t1", "Write", {{"file_path", file}, {"content", "hi"}})})}},
+        {{"role", "tool"}, {"tool_call_id", "t1"}, {"content", "File created successfully at: " + file}},
+    })}};
+}
+
+static std::string env_text_of(const json & request) {
+    return request["messages"][1]["content"][1]["text"].get<std::string>();
+}
+
+static std::string args_of(const json & request) {
+    return request["messages"][2]["tool_calls"][0]["function"]["arguments"].get<std::string>();
+}
+
+// The working directory that Claude Code names in its environment gets a stand-in: two users with other project
+// folders get the same request, and the model's paths, as it writes them, go back to the user's folder.
+static void test_claude_working_directories_share_their_context() {
+    const server_identifier_env alice = mac_env(users("alice"), "/var/folders/ab/abc123/T");
+    const server_identifier_env bob   = mac_env(users("bob"), "/var/folders/cd/def456/T");
+    const std::string cwd = alice.home + "/code/app";
+    json a = claude_code_env_request(alice.home, cwd);
+    json b = claude_code_env_request(bob.home, bob.home + "/work/site");
+    const json original = a;
+    const server_identifier_map map = server_identifiers_apply(a, alice);
+    server_identifiers_apply(b, bob);
+    require(a == b, "two users with other project folders get the same request: " + a.dump() + " | " + b.dump());
+
+    const std::string project = STAND_IN + "/project";
+    require(env_text_of(a).find(" - Primary working directory: " + project + "\n") != std::string::npos,
+            "the working directory's stand-in: " + env_text_of(a));
+    require(text_of(a["messages"][0]).find(STAND_IN + "/.claude/projects/-Users-infer-project/memory/") !=
+                std::string::npos,
+            "the memory folder's stand-in names the same project: " + text_of(a["messages"][0]));
+    require(args_of(a) == json({{"file_path", project + "/notes.txt"}, {"content", "hi"}}).dump(),
+            "tool-call arguments: " + args_of(a));
+    require(text_of(a["messages"][3]) == "File created successfully at: " + project + "/notes.txt",
+            "a tool result names the stand-in: " + text_of(a["messages"][3]));
+    require(map.to_identifiers(env_text_of(a), false) == env_text_of(original) &&
+                map.to_identifiers(args_of(a), false) == args_of(original) &&
+                map.to_identifiers(text_of(a["messages"][3]), false) == text_of(original["messages"][3]),
+            "the stand-ins come back out of the request exactly");
+
+    // the model's text and arguments go back to the project; a folder beside it to its own place in the home
+    require(map.to_identifiers("Wrote " + project + "/notes.txt; " + STAND_IN + "/code/lib and " + project +
+                                   "s are elsewhere.", false) ==
+                "Wrote " + cwd + "/notes.txt; " + alice.home + "/code/lib and " + alice.home +
+                    "/projects are elsewhere.",
+            "the model's text: " + map.to_identifiers("Wrote " + project + "/notes.txt", false));
+    const std::string written = json({{"file_path", project + "/src/main.py"}, {"content", project}}).dump();
+    const std::string real    = json({{"file_path", cwd + "/src/main.py"}, {"content", cwd}}).dump();
+    std::string last;
+    for (size_t n = 0; n <= written.size(); ++n) {
+        const std::string sent = map.to_identifiers(written.substr(0, n), true);
+        require(sent.compare(0, last.size(), last) == 0, "streamed arguments only grow, at " + std::to_string(n));
+        last = sent;
+    }
+    require(map.to_identifiers(written, false) == real && real.compare(0, last.size(), last) == 0,
+            "the arguments when the call is done: " + map.to_identifiers(written, false));
+
+    // streamed and whole, through the state of a task's results
+    common_chat_parser_params parser; // content only
+    for (const size_t piece : { size_t(1), size_t(5), size_t(1000) }) {
+        task_result_state state(parser, server_identifier_map::from_json(map.to_json()));
+        const std::string text = "Created " + project + "/notes.txt in " + project + ".";
+        std::string streamed;
+        std::vector<common_chat_msg_diff> diffs;
+        for (size_t i = 0; i < text.size(); i += piece) {
+            state.update_chat_msg(text.substr(i, piece), true, diffs);
+            for (const auto & d : diffs) {
+                streamed += d.content_delta;
+            }
+        }
+        const common_chat_msg final_msg = state.update_chat_msg("", false, diffs);
+        for (const auto & d : diffs) {
+            streamed += d.content_delta;
+        }
+        const std::string expected = "Created " + cwd + "/notes.txt in " + cwd + ".";
+        require(streamed == expected && final_msg.content == expected,
+                "in pieces of " + std::to_string(piece) + ": " + streamed + " | " + final_msg.content);
+    }
+
+    // additional working directories: project-2 and on, after the primary one
+    json c = claude_code_env_request(alice.home, cwd, "/", " - Additional working directories:\n  - " + alice.home +
+                                                               "/code/lib\n  - /opt/shared\n");
+    const server_identifier_map map_c = server_identifiers_apply(c, alice);
+    require(env_text_of(c).find(" - Primary working directory: " + project + "\n - Is a git repository: false\n"
+                                " - Additional working directories:\n  - " + project + "-2\n  - " + project + "-3\n") !=
+                std::string::npos,
+            "the additional working directories: " + env_text_of(c));
+    require(map_c.to_identifiers(project + "-2/a " + project + "-3/b", false) ==
+                alice.home + "/code/lib/a /opt/shared/b",
+            "they come back");
+
+    // a request that names a folder project in the home that is not the working directory stays as it is
+    json d = claude_code_env_request(alice.home, cwd);
+    d["messages"][3]["content"] = "See " + alice.home + "/project.";
+    const json d_before = d;
+    require(server_identifiers_apply(d, alice).empty() && d == d_before,
+            "a request whose stand-ins would not come back exactly stays");
+}
+
+// A working directory outside the home gets the same stand-in, on Windows in every spelling of it.
+static void test_claude_working_directories_outside_the_home() {
+    const server_identifier_env alice = mac_env(users("alice"), "");
+    const server_identifier_env bob   = mac_env(users("bob"), "");
+    json a = claude_code_env_request(alice.home, "/Volumes/data/site");
+    json b = claude_code_env_request(bob.home, "/opt/src/app");
+    const server_identifier_map map = server_identifiers_apply(a, alice);
+    server_identifiers_apply(b, bob);
+    require(a == b, "outside the home: " + a.dump() + " | " + b.dump());
+    require(map.to_identifiers(STAND_IN + "/project/notes.txt", false) == "/Volumes/data/site/notes.txt",
+            "a path comes back outside the home");
+
+    server_identifier_env win;
+    win.home          = "C:\\Users\\bob";
+    win.home_stand_in = "C:\\Users\\infer";
+    win.windows       = true;
+    const std::string cwd = "D:\\src\\site";
+    json w = claude_code_env_request(win.home, cwd, "\\");
+    const json before = w;
+    const server_identifier_map map_w = server_identifiers_apply(w, win);
+    require(env_text_of(w).find(" - Primary working directory: C:\\Users\\infer\\project\n") != std::string::npos,
+            "Windows: " + env_text_of(w));
+    require(text_of(w["messages"][0]).find("C:\\Users\\infer\\.claude\\projects\\C--Users-infer-project\\memory\\") !=
+                std::string::npos,
+            "the Windows memory folder: " + text_of(w["messages"][0]));
+    require(args_of(w) == json({{"file_path", "C:\\Users\\infer\\project\\notes.txt"}, {"content", "hi"}}).dump() &&
+                map_w.to_identifiers(args_of(w), false) == args_of(before),
+            "JSON-escaped arguments: " + args_of(w));
+    // C:/Users/... and /c/Users/... are built from parts, as above
+    const std::string others =
+        "cd /c" + STAND_IN + "/project && ls C:" + STAND_IN + "/project/src c:\\Users\\infer\\project";
+    require(map_w.to_identifiers(others, false) == "cd /d/src/site && ls D:/src/site/src d:\\src\\site",
+            "the other spellings: " + map_w.to_identifiers(others, false));
+}
+
+// A working directory that is the home, or a folder that holds it, is the same for every user with the home's stand-in.
+static void test_claude_working_directories_that_hold_the_home() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    json home = claude_code_env_request(env.home, env.home);
+    const server_identifier_map map = server_identifiers_apply(home, env);
+    require(env_text_of(home).find(" - Primary working directory: " + STAND_IN + "\n") != std::string::npos &&
+                text_of(home["messages"][0]).find(STAND_IN + "/.claude/projects/-Users-infer/memory/") !=
+                    std::string::npos,
+            "the home: " + env_text_of(home) + " | " + text_of(home["messages"][0]));
+    require(map.to_identifiers(STAND_IN + "/project/x", false) == env.home + "/project/x", "and no project stand-in");
+
+    json users_dir = claude_code_env_request(env.home, "/Users");
+    server_identifiers_apply(users_dir, env);
+    require(env_text_of(users_dir).find(" - Primary working directory: /Users\n") != std::string::npos,
+            "a folder that holds the home stays: " + env_text_of(users_dir));
+
+    json more = claude_code_env_request(env.home, env.home, "/", " - Additional working directories:\n  - " + env.home +
+                                                                    "/code/lib\n");
+    server_identifiers_apply(more, env);
+    require(env_text_of(more).find(" - Primary working directory: " + STAND_IN + "\n - Is a git repository: false\n"
+                                   " - Additional working directories:\n  - " + STAND_IN + "/project\n") !=
+                std::string::npos,
+            "an additional directory beside the home: " + env_text_of(more));
+}
+
+// The Claude desktop app's agent works in the folders of its session, which have stand-ins of their own; its block
+// stays as those leave it.
+static void test_claude_desktop_working_directories_stay() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    const std::string session = env.home + "/Library/Application Support/Claude-3p/local-agent-mode-sessions/"
+                                           "a8dda2a7/00000000/bae96d99";
+    const std::string block = "<system-reminder>\n" +
+                              claude_environment("/private/var/empty", " - Additional working directories:\n  - " +
+                                                                           session + "/outputs\n") +
+                              "\n</system-reminder>";
+    json r = {{"messages", json::array({
+        {{"role", "system"}, {"content", "You are a Claude agent.\nSave files to `" + session + "/outputs`."}},
+        {{"role", "user"}, {"content", block + "\n\nhi"}}})}};
+    server_identifiers_apply(r, env);
+    require(text_of(r["messages"][1]).find(" - Primary working directory: /private/var/empty\n") != std::string::npos &&
+                text_of(r["messages"][1]).find("\n  - " + STAND_IN + "/Library/Application Support/Claude-3p/"
+                                               "local-agent-mode-sessions/00000000/00000000/00000000/outputs\n") !=
+                    std::string::npos &&
+                text_of(r["messages"][1]).find("/project") == std::string::npos,
+            "the desktop app's block: " + text_of(r["messages"][1]));
+}
+
+// Only the working directories of an environment block are learned, and a request without one stays as before.
+static void test_requests_without_claude_environment_stay() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    const std::string words = "Primary working directory: /opt/app\n - Primary working directory: /opt/app\n";
+    json r = {{"messages", json::array({{{"role", "system"}, {"content", "You are Claude Code."}},
+                                        {{"role", "user"}, {"content", words}}})}};
+    const json before = r;
+    require(server_identifiers_apply(r, env).empty() && r == before, "lines outside a block stay");
+    const std::string heading = "# Environment\nSomething else: \n - Primary working directory: /opt/app\n";
+    json other = {{"messages", json::array({{{"role", "user"}, {"content", heading}}})}};
+    const json other_before = other;
+    require(server_identifiers_apply(other, env).empty() && other == other_before, "another heading stays");
+}
+
+static void test_claude_os_version() {
+    for (const auto & [platform, os, fixed] : std::vector<std::array<std::string, 3>>{
+             {"win32", "Windows 11 Home China 10.0.26200", "Windows 11 Pro 10.0.26200"},
+             {"darwin", "Darwin 24.6.0", "Darwin 25.4.0"},
+             {"linux", "Linux 6.17.0-1021-azure", "Linux 6.8.0"}}) {
+        std::string text =
+            "<system-reminder>\n" + claude_environment("/opt/app", "", platform, os) + "\n</system-reminder>";
+        require(server_unify_claude_os_version(text) &&
+                    text == "<system-reminder>\n" + claude_environment("/opt/app", "", platform, fixed) +
+                                "\n</system-reminder>",
+                platform + ": " + text);
+        require(!server_unify_claude_os_version(text), platform + ": a fixed line stays");
+    }
+    for (const std::string & kept : {claude_environment("/opt/app", "", "freebsd", "FreeBSD 14.1"),
+                                     std::string(" - Platform: win32\n - OS Version: Windows 10 Home 10.0.19045\n"),
+                                     std::string("# Environment\nYou have been invoked in the following environment: \n"
+                                                 " - OS Version: Windows 10 Home 10.0.19045\n")}) {
+        std::string text = kept;
+        require(!server_unify_claude_os_version(text) && text == kept, "stays: " + kept);
     }
 }
 
@@ -575,6 +823,12 @@ int main() {
     test_claude_code_shares_its_context();
     test_claude_desktop_sessions_share_their_context();
     test_claude_desktop_title_jobs_share_their_context();
+    test_claude_working_directories_share_their_context();
+    test_claude_working_directories_outside_the_home();
+    test_claude_working_directories_that_hold_the_home();
+    test_claude_desktop_working_directories_stay();
+    test_requests_without_claude_environment_stay();
+    test_claude_os_version();
     test_chatgpt_conversations_share_their_context();
     test_chatgpt_visualizations_share_their_context();
     test_plugin_versions_share_their_context();

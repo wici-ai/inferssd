@@ -15,18 +15,23 @@
 // directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop app the
 // skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the folder of its
 // visualizations, both dated; Codex and the ChatGPT desktop app name the folder of each version of a plugin they list
-// skills of; the Claude desktop app names the folder of the job that titles a session as its working directory. A new
-// project, session, user or plugin update would process all of the context after them again. The server gives the model
-// stand-ins for these identifiers wherever they occur in a request, and puts the request's identifiers back in place of
-// the stand-ins in what the model writes. The model only copies such strings into paths, so it does the same work, and
-// the client sees its own paths. The user name in the stand-ins is infer: with inferssd, three tokens to Qwen3.6,
-// Qwen3.6-35B-A3B left out the .claude after it in 3 of 4 copies of Claude Code's memory folder, with infer in none of
-// 6.
+// skills of; the Claude desktop app names the folder of the job that titles a session as its working directory; the
+// environment Claude Code sends after the user's first words, which the server puts ahead of them, opens with the
+// working directory. A new project, session, user or plugin update would process all of the context after them again.
+// The server gives the model stand-ins for these identifiers wherever they occur in a request, and puts the request's
+// identifiers back in place of the stand-ins in what the model writes. The model only copies such strings into paths,
+// so it does the same work, and the client sees its own paths. The user name in the stand-ins is infer: with inferssd,
+// three tokens to Qwen3.6, Qwen3.6-35B-A3B left out the .claude after it in 3 of 4 copies of Claude Code's memory
+// folder, with infer in none of 6.
 //
 // The identifiers are the home directory, the user's temporary directory, and the folders the apps name in their system
-// and developer messages (see identifiers.cpp), and the title job's folder in any message: the app names it in a system
-// message that the server renders as the user's. A match must start and end at a name boundary. A request whose text
-// the stand-ins cannot be taken back out of exactly (one that has a stand-in in it already, say) is left as it is.
+// and developer messages (see identifiers.cpp), and in any message the title job's folder and the working directories
+// of Claude's environment: the apps send them in system messages that the server renders as the user's. A working
+// directory's stand-in is the folder project in the stand-in home (C:\Users\infer\project on Windows), wherever the
+// directory is: a folder beside it keeps its place under the stand-in home, so the model sees it elsewhere. A match
+// must start and end at a name boundary. A request whose text the stand-ins cannot be taken back out of exactly (one
+// that has a stand-in in it already, or names a folder project in the home that is not the working directory) is left
+// as it is.
 struct server_identifier_map {
     // (identifier, stand-in), every spelling; empty: the request is left as it is
     std::vector<std::pair<std::string, std::string>> pairs;
@@ -100,3 +105,19 @@ void server_strip_claude_env_user_lines(nlohmann::ordered_json & messages);
 
 // The same for one text; returns whether a line went.
 bool server_strip_claude_env_user_lines(std::string & text);
+
+// Claude Code and the Claude desktop app name the system in the environment they send after the user's first words
+// (server_chat_convert_anthropic_to_oai):
+//   # Environment
+//   You have been invoked in the following environment:
+//    - Primary working directory: C:\Users\name\app
+//    - Is a git repository: false
+//    - Platform: win32
+//    - Shell: bash
+//    - OS Version: Windows 11 Home China 10.0.26200
+// The OS Version line differs with the edition, the language and each update of the system, so users of one system
+// share no cached state past it. It becomes a fixed text of the system that the Platform line names: Windows 11 Pro
+// 10.0.26200 (win32), Darwin 25.4.0 (darwin), Linux 6.8.0 (linux); another platform's line stays. The model learns the
+// system from the Platform and Shell lines, which stay, and asks the shell for the exact version. Returns whether the
+// line changed. (The working directories get stand-ins: server_identifiers_apply.)
+bool server_unify_claude_os_version(std::string & text);

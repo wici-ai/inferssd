@@ -938,7 +938,8 @@ static std::string anthropic_environment_text(const json & message) {
 // stands (below), it followed the words, so a new conversation of the same setup shared only the system prompt and
 // the tools. When it directly follows the conversation's first user message, its text goes into that message ahead
 // of the user's words, after the system reminders that open the message, with a blank line after it; a later system
-// message is demoted as before. Returns the number of characters of the message's text (its text parts in order)
+// message is demoted as before. The block's OS Version line gets the fixed text of its platform
+// (server_unify_claude_os_version). Returns the number of characters of the message's text (its text parts in order)
 // that come before the user's words, where the server keeps a state (SERVER_FIRST_USER_CONTEXT_CHARS); 0 when the
 // request has no environment there.
 static size_t anthropic_join_environment(json & messages) {
@@ -951,11 +952,12 @@ static size_t anthropic_join_environment(json & messages) {
         role_of(messages[first + 1]) != "system") {
         return 0;
     }
-    const std::string environment = anthropic_environment_text(messages[first + 1]);
+    std::string environment = anthropic_environment_text(messages[first + 1]);
     if (environment.empty() || !messages[first].contains("content") ||
         (!messages[first].at("content").is_string() && !messages[first].at("content").is_array())) {
         return 0;
     }
+    server_unify_claude_os_version(environment);
     json & content = messages[first].at("content");
     const std::string text = environment + "\n\n";
     size_t chars = text.size();
