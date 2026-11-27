@@ -27,5 +27,7 @@ void server_unify_claude_code_tool(nlohmann::ordered_json & tool);
 // Codex's exec_command tool describes its parameter login one way in 0.160 to 0.170 (also in the ChatGPT desktop app)
 // and another in 0.172, which says it differently on macOS and on Windows. The earlier description becomes the 0.172
 // one of the system whose requests the server renders (server_identifier_env::current): Windows', or macOS' on the
-// others. tool is a Responses tool.
+// others. Codex 0.170 and 0.172 have three worktree tools in the namespace mcp__codex_tui that 0.160 lacks
+// (create_worktree, get_worktree_creation_status and list_worktrees): a namespace without one gets it, as 0.172 defines
+// it, after the tool it follows there. tool is a Responses tool.
 void server_unify_codex_tool(nlohmann::ordered_json & tool, bool windows);
