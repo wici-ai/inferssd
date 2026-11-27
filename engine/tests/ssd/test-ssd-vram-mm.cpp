@@ -144,6 +144,13 @@ size_t device_free() {
     return free;
 }
 
+// Whether the free memory the driver reports is the device's own. On an integrated GPU (unified memory, as on DGX
+// Spark) it is the system's available memory, which other processes and the page cache change at any moment, so a
+// product's allocation cannot be told from them there; the context's own byte count is checked on every GPU.
+bool free_is_the_devices = true;
+
+bool device_memory_unchanged(size_t free_before) { return !free_is_the_devices || device_free() == free_before; }
+
 double nmse(const std::vector<float> & got, const std::vector<float> & expected) {
     double error = 0.0, norm = 0.0;
     for (size_t i = 0; i < got.size(); ++i) {
@@ -259,7 +266,7 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
                 stride, ncols, n, d_operand.p, stream), "quantize");
             require(ggml_cuda_moe_stream_mm(mm, type, d_w.p, nrows, ncols, d_operand.p, n, d_dst.as<float>(), stream), "mm");
             cuda(cudaStreamSynchronize(stream), "product");
-            require(device_free() == free_before, std::string("a product took device memory after reserve: ") +
+            require(device_memory_unchanged(free_before), std::string("a product took device memory after reserve: ") +
                 ggml_type_name(type) + " n=" + std::to_string(n));
             std::vector<float> got(size_t(n) * nrows);
             cuda(cudaMemcpy(got.data(), d_dst.p, got.size() * sizeof(float), cudaMemcpyDeviceToHost), "dst D2H");
@@ -298,7 +305,7 @@ void run_type(void * mm, ggml_backend_t backend, ggml_type type, int64_t nrows, 
     if (timing) {
         const size_t free_before = device_free();
         time_products(mm, type, nrows, ncols, d_w.p, d_x.as<float>(), d_ids.as<int32_t>(), stride, d_operand.p, d_dst.as<float>(), stream);
-        require(device_free() == free_before, std::string("a timed product took device memory: ") + ggml_type_name(type));
+        require(device_memory_unchanged(free_before), std::string("a timed product took device memory: ") + ggml_type_name(type));
     }
 
     const size_t after = ggml_cuda_moe_stream_mm_device_bytes(mm);
@@ -317,6 +324,7 @@ int main(int argc, char ** argv) {
         cuda(cudaSetDevice(device), "cudaSetDevice");
         cudaDeviceProp prop = {};
         cuda(cudaGetDeviceProperties(&prop, device), "properties");
+        free_is_the_devices = prop.integrated == 0;
         cudaStream_t stream = nullptr;
         cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
         // the grouped products serve exactly the types the decode engine serves
@@ -370,8 +378,8 @@ int main(int argc, char ** argv) {
         ggml_cuda_moe_stream_mm_destroy(mm);
         ggml_backend_free(backend);
         cuda(cudaStreamDestroy(stream), "stream destroy");
-        std::printf("SSD_VRAM_MM_PASS device=%s cc=%d.%d types=%zu checks=%zu worst_nmse=%.3g\n", prop.name, prop.major,
-            prop.minor, covered, t.checks, t.worst);
+        std::printf("SSD_VRAM_MM_PASS device=%s cc=%d.%d types=%zu checks=%zu worst_nmse=%.3g free_memory=%s\n", prop.name,
+            prop.major, prop.minor, covered, t.checks, t.worst, free_is_the_devices ? "checked" : "the system's, not checked");
         return 0;
     } catch (const std::exception & e) {
         std::fprintf(stderr, "SSD_VRAM_MM_FAIL: %s\n", e.what());
