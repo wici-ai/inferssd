@@ -1,5 +1,6 @@
 #include "server-chat.h"
 #include "server-common.h"
+#include "inferssd/app-versions.h"
 
 #include <algorithm>
 #include <cctype>
@@ -829,6 +830,10 @@ json server_chat_convert_anthropic_to_oai(const json & body) {
     // Convert system prompt
     json oai_messages = json::array();
     auto system_param = json_value(body, "system", json());
+    if (server_is_claude_code(system_param)) {
+        // the variants of Claude Code's system prompt render as one (see inferssd/app-versions.h)
+        server_unify_claude_code_system(system_param);
+    }
     if (!system_param.is_null()) {
         std::string system_content;
 

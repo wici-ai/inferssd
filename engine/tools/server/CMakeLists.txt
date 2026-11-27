@@ -11,6 +11,8 @@ add_library(${TARGET} STATIC
     server-task.h
     inferssd/prompt-cache.cpp
     inferssd/prompt-cache.h
+    inferssd/app-versions.cpp
+    inferssd/app-versions.h
     inferssd/checkpoint.h
     inferssd/identifiers.cpp
     inferssd/identifiers.h
