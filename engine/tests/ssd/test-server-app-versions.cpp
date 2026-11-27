@@ -247,6 +247,72 @@ static void test_codex_login_parameter_renders_as_in_0_172() {
             "the request's tool: " + chat.at("tools").dump());
 }
 
+// The ChatGPT desktop app's namespace functions, trimmed: its custom tool exec, whose description is a preamble (here
+// its first lines) and a section for each tool set the app offers to it, here the last one a request of 26.1120.41243
+// on macOS ends with, clock, as the app sends it.
+static const std::string EXEC_PREAMBLE =
+    "Run JavaScript code to orchestrate/compose tool calls\n- Evaluates the provided JavaScript code in a fresh V8 "
+    "isolate as an async module.";
+static const std::string EXEC_CLOCK =
+    "\n\n## clock\nTools for reading and waiting on time.\n\n### `clock__curr_time`\nReturn the current time in UTC.\n\n"
+    "exec tool declaration:\n```ts\ndeclare const tools: { clock__curr_time(args: {}): Promise<{\n  // Current UTC "
+    "time formatted as YYYY-MM-DD HH:MM:SS UTC.\n  current_time: string;\n}>; };\n```";
+
+static json functions_namespace(const std::string & exec_description) {
+    return {{"type", "namespace"},
+            {"name", "functions"},
+            {"description", ""},
+            {"tools", json::array({
+                {{"type", "custom"}, {"name", "exec"}, {"description", exec_description},
+                 {"format", {{"type", "grammar"}, {"syntax", "lark"}, {"definition", "start: /[\\s\\S]+/"}}}},
+                {{"type", "function"}, {"name", "wait"}, {"description", "Waits."}, {"strict", false},
+                 {"parameters", {{"type", "object"}, {"properties", json::object()}}}},
+            })}};
+}
+
+static void test_chatgpt_exec_lists_the_codex_app_tools() {
+    const std::string short_exec = EXEC_PREAMBLE + EXEC_CLOCK;
+    for (const bool windows : {false, true}) {
+        json ns = functions_namespace(short_exec);
+        server_unify_codex_tool(ns, windows);
+        const std::string exec = ns.at("tools").at(0).at("description").get<std::string>();
+        // the section as the app sends it: 40,771 bytes on Windows, 40,986 on macOS
+        const std::string head = "\n\n## mcp__codex_app\nTools provided by the Codex app.\n\n### "
+                                 "`mcp__codex_app__archive_worktree`\nArchive a managed worktree attached to this chat";
+        require(exec.size() == short_exec.size() + (windows ? 40771 : 40986) &&
+                    exec.compare(0, short_exec.size() + head.size(), short_exec + head) == 0 &&
+                    exec.compare(exec.size() - 35, 35, "}): Promise<CallToolResult>; };\n```") == 0,
+                "the section of the Codex app's tools follows the clock section: " + exec.substr(short_exec.size(), 300));
+        require((exec.find("Read the current foreground macOS app on demand") != std::string::npos) == !windows &&
+                    (exec.find("Screen context from other apps is not supported on this device.") != std::string::npos) ==
+                        windows,
+                "as the app sends it on the system");
+        json expected = functions_namespace(exec);
+        require(ns == expected, "the rest of the namespace stays: " + ns.dump().substr(0, 300));
+
+        // a description that has the section stays, whichever system it comes from
+        server_unify_codex_tool(ns, !windows);
+        require(ns == expected, "a description with the section stays");
+    }
+
+    // other descriptions and tools stay
+    for (json other : { functions_namespace(EXEC_PREAMBLE), functions_namespace(short_exec + "\n\n## other\nMore."),
+                        functions_namespace(EXEC_CLOCK.substr(2) + " and more" + EXEC_CLOCK + "\n") }) {
+        const json before = other;
+        server_unify_codex_tool(other, false);
+        require(other == before, "a description that does not end with the clock section stays: " + before.dump());
+    }
+    json renamed = functions_namespace(short_exec);
+    renamed["name"] = "tools";
+    json function_exec = functions_namespace(short_exec);
+    function_exec["tools"][0]["type"] = "function";
+    for (json other : { renamed, function_exec }) {
+        const json before = other;
+        server_unify_codex_tool(other, false);
+        require(other == before, "another namespace or a function tool stays: " + before.dump().substr(0, 200));
+    }
+}
+
 // A tool of Codex's namespace mcp__codex_tui, trimmed, and the three worktree tools as Codex 0.172 defines them.
 static json thread_tool(const std::string & name) {
     return {{"type", "function"}, {"name", name}, {"description", "A thread tool."}, {"strict", false},
@@ -454,6 +520,7 @@ int main() {
     test_other_prompts_stay();
     test_claude_code_tool_search_requires_only_the_query();
     test_codex_login_parameter_renders_as_in_0_172();
+    test_chatgpt_exec_lists_the_codex_app_tools();
     test_codex_namespace_has_the_worktree_tools();
     test_codex_requests_offer_the_common_mcp_tools();
     return 0;
