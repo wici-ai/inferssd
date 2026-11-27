@@ -3992,10 +3992,10 @@ void ssd_cpu_sink_parallel_last(struct ssd_cpu_sink * sink,
     sink->parallel_phase(function, userdata, true);
 }
 
-void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow) {
+void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow, bool pass) {
     if (!bytes) { grow(); return; }
-    auto ticket = sink->cache.ledger.client->take(sink->cache.allocation_cost(bytes), 0, ssd::host::requester::outside,
-        false, ssd::host::allocation_class::tracked);
+    auto ticket = sink->cache.ledger.client->take(sink->cache.allocation_cost(bytes), 0,
+        pass ? ssd::host::requester::pass : ssd::host::requester::outside, false, ssd::host::allocation_class::tracked);
     if (!ticket) { throw std::runtime_error(ticket.error); }
     grow();
     ticket.value.commit();

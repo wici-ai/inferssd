@@ -83,7 +83,10 @@ void ssd_cpu_sink_parallel(struct ssd_cpu_sink * sink,
 // Runs grow, which allocates and first touches `bytes` of host memory outside the caches, under a ticket of the sink's
 // host-memory context: the ledger makes room for them (the RAM cache gives slots back) and refuses only what the
 // envelope cannot hold, as the sink's own scratch is priced. Throws the refusal; call outside a run.
-void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow);
+// `bytes` of host memory outside the caches from the sink's ledger, then grow(): for the run (outside), or for a
+// prompt pass reserved with its graph (pass), whose refusal gives the prompt a smaller pass (ssd::host::requester).
+void ssd_cpu_sink_host_grow(struct ssd_cpu_sink * sink, uint64_t bytes, const std::function<void()> & grow,
+        bool pass = false);
 void ssd_cpu_sink_parallel_last(struct ssd_cpu_sink * sink,
         ssd_cpu_sink_parallel_fn function, void * userdata);
 bool ssd_cpu_sink_stream_hybrid(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * ids, int nexperts,

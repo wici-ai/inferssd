@@ -145,7 +145,7 @@ struct ssd_cpu_prefill {
     // The workspace at `sizes`, as host memory outside the caches: the sink's host-memory ledger makes room for what
     // it adds before any read and refuses only what the envelope cannot hold. A buffer that grows is replaced whole,
     // the old one alive until the new one holds its values, so each is priced at its new size. `exact` gives back
-    // what a buffer holds beyond its size first.
+    // what a buffer holds beyond its size first, for a pass reserved with its graph (ssd::host::requester::pass).
     void hold(const workspace_sizes & sizes, bool exact) {
         std::vector<float> * floats[] = { &activation, &activation_up, &post_exp_output, &routed_output };
         std::vector<uint8_t> * bytes[] = { &quant_hidden, &quant_input };
@@ -162,7 +162,7 @@ struct ssd_cpu_prefill {
             // reserve allocates exactly the priced size; resize then writes every new element
             for (size_t i = 0; i < 4; ++i) { floats[i]->reserve(sizes.floats[i]); floats[i]->resize(sizes.floats[i]); }
             for (size_t i = 0; i < 2; ++i) { bytes[i]->reserve(sizes.bytes[i]); bytes[i]->resize(sizes.bytes[i]); }
-        });
+        }, exact);
     }
 
     // Before a prompt pass of `ntokens` tokens: the workspace the pass can need on any of the sink's routed layers,

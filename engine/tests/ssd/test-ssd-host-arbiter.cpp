@@ -504,6 +504,15 @@ static void needed_allocations() {
     needed.cancel();
     require(!c->take(GiB, 0, requester::ram_cache, false, allocation_class::tracked),
         "needed: the RAM cache grew below the floor");
+    // A prompt pass's memory, reserved with its graph, is refused below the floor as the caches' growth is (a smaller
+    // pass follows), and admitted where both terms hold it.
+    require(!c->take(GiB, 0, requester::pass, false, allocation_class::tracked),
+        "needed: a prompt pass's memory was admitted below the floor");
+    m.available = 4*GiB;
+    auto pass = c->take(GiB, 0, requester::pass, false, allocation_class::tracked);
+    require(bool(pass), "needed: a prompt pass's memory was refused with both terms holding it");
+    pass.cancel();
+    m.available = 256*MiB;
     // Past the limit itself it is refused, and the error says which rule did.
     auto past = c->raw->take(2*GiB + 1);
     require(!past && past.code == ssd::status::resource && past.error == "host memory limit refused" &&

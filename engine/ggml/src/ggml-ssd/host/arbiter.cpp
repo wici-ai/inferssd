@@ -171,7 +171,7 @@ struct process_arbiter::impl {
         }
         const running done{ *this, *state, std::move(registered) };
         const actions & callbacks = *done.callbacks;
-        if (unified && who == requester::outside && callbacks.reclaim_tier) {
+        if (unified && (who == requester::outside || who == requester::pass) && callbacks.reclaim_tier) {
             if (callbacks.collect_deferred) { callbacks.collect_deferred(); }
             uint64_t need;
             {
@@ -340,7 +340,8 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
         if (classification != allocation_class::external && classification != allocation_class::tracked) {
             return failed<allocation_ticket>(status::invalid, "host allocation class");
         }
-        if (who != requester::outside && who != requester::ram_cache && who != requester::gpu_tier) {
+        if (who != requester::outside && who != requester::ram_cache && who != requester::gpu_tier &&
+                who != requester::pass) {
             return failed<allocation_ticket>(status::invalid, "host requester");
         }
         if (state_->config.unified && device > UINT64_MAX - host) {
@@ -381,7 +382,8 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
         // One measurement when the room is there. A shortage runs the context's reclaimer, which gives back what both
         // terms ask. The caches' own growth then measures them again. An allocation outside the caches is one the
         // run needs: refusing it ends the run, so after the reclaimer only a limit it would not fit refuses it,
-        // and terms that cannot be read do not.
+        // and terms that cannot be read do not. A pass's memory is refused as the caches' growth is, since a
+        // smaller pass follows; where the terms cannot be read, only the limits decide, as for the run's own.
         const bool needed = who == requester::outside;
         auto ticket = admit(false);
         if (ticket.code == status::resource) {
@@ -390,7 +392,7 @@ result<allocation_ticket> context_client::take(uint64_t host, uint64_t device, r
             if (needed) { return admit(true); }
             return reclaimed.value ? admit(false) : std::move(ticket);
         }
-        if (needed && ticket.code == status::io) { return admit(true); }
+        if ((needed || who == requester::pass) && ticket.code == status::io) { return admit(true); }
         return ticket;
     });
 }

@@ -48,8 +48,12 @@ struct actions {
 // needs, so after that only a limit it would not fit refuses it (room.h).
 // The RAM cache's own growth has its colder slots give room. The GPU tier's
 // growth takes free room only: it keeps the floor and the RAM cache's demand
-// free itself. The caches grow only while both terms fit.
-enum class requester { outside, ram_cache, gpu_tier };
+// free itself. The caches grow only while both terms fit. The working memory a
+// prompt pass reserves with its graph (pass) has the caches give room as an
+// allocation outside them does, but a refusal only gives the prompt a smaller
+// pass: it is admitted while both terms fit, so the floor stays free for the
+// growth nobody accounts while the pass runs.
+enum class requester { outside, ram_cache, gpu_tier, pass };
 
 struct snapshot {
     bool configured = false, unified = false, reclaimable_file = false;
