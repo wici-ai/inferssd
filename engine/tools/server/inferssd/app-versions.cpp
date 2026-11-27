@@ -91,6 +91,7 @@ const parameter_description codex_descriptions[] = {
 struct description_section {
     const char * ns;
     const char * tool;
+    const char * with;    // a tool the namespace has in the requests that get the section
     const char * heading; // the section's heading line
     const char * after;   // JSON string: the section before it, with which a description that lacks it ends
     const char * windows; // JSON string: the section, with the blank line before it
@@ -100,10 +101,12 @@ struct description_section {
 // The ChatGPT desktop app's custom tool exec, which runs the JavaScript the model writes, lists the JavaScript API of
 // each tool set the app offers to it; a request of 26.1120.41243 on macOS ends it after the section clock, without
 // the section of the Codex app's tools. That section from the requests of 26.1120.50957 on macOS (26.1120.41243 sends
-// the same) and of 26.1120.41243 on Windows.
+// the same) and of 26.1120.41243 on Windows. Only a conversation's requests get it, known by the tool
+// send_message_to_user_async of the namespace: the requests that title a conversation lack that tool and the section
+// alike, in every version, and keep their exec as sent.
 const description_section codex_description_sections[] = {
     {
-        "functions", "exec", "\n## mcp__codex_app\n",
+        "functions", "exec", "send_message_to_user_async", "\n## mcp__codex_app\n",
         R"("\n\n## clock\nTools for reading and waiting on time.\n\n### `clock__curr_time`\nReturn the current )"
         R"(time in UTC.\n\nexec tool declaration:\n```ts\ndeclare const tools: { clock__curr_time(args: {}): )"
         R"(Promise<{\n  // Current UTC time formatted as YYYY-MM-DD HH:MM:SS UTC.\n  current_time: string;\n}>; )"
@@ -1282,8 +1285,8 @@ void server_unify_codex_tool(json & tool, bool windows) {
         }
         for (const description_section & d : codex_description_sections) {
             const auto it = find(d.tool);
-            if (tool.at("name") != d.ns || it == tools.end() || !it->contains("type") || it->at("type") != "custom" ||
-                !it->contains("description") || !it->at("description").is_string()) {
+            if (tool.at("name") != d.ns || it == tools.end() || find(d.with) == tools.end() || !it->contains("type") ||
+                it->at("type") != "custom" || !it->contains("description") || !it->at("description").is_string()) {
                 continue;
             }
             std::string &     description = it->at("description").get_ref<std::string &>();

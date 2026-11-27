@@ -32,9 +32,11 @@ void server_unify_claude_code_tool(nlohmann::ordered_json & tool);
 // others. Codex 0.170 and 0.172 have three worktree tools in the namespace mcp__codex_tui that 0.160 lacks
 // (create_worktree, get_worktree_creation_status and list_worktrees): a namespace without one gets it, as 0.172 defines
 // it, after the tool it follows there. The ChatGPT desktop app's custom tool exec (namespace functions) lists the
-// JavaScript API of each tool set the app offers it, and some of its requests lack the section of the Codex app's tools
-// (mcp__codex_app): a description that ends with the section clock and lacks it gets it there, as the app sends it on
-// the system whose requests the server renders. tool is a Responses tool.
+// JavaScript API of each tool set the app offers it, and some of its conversations' requests lack the section of the
+// Codex app's tools (mcp__codex_app): in a conversation's request (send_message_to_user_async in the namespace), a
+// description that ends with the section clock and lacks it gets it there, as the app sends it on the system whose
+// requests the server renders; the requests that title a conversation keep their exec as sent. tool is a Responses
+// tool.
 void server_unify_codex_tool(nlohmann::ordered_json & tool, bool windows);
 
 // Codex and the ChatGPT desktop app offer the tools of the MCP servers and plugins configured on the computer, which

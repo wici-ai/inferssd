@@ -258,16 +258,23 @@ static const std::string EXEC_CLOCK =
     "exec tool declaration:\n```ts\ndeclare const tools: { clock__curr_time(args: {}): Promise<{\n  // Current UTC "
     "time formatted as YYYY-MM-DD HH:MM:SS UTC.\n  current_time: string;\n}>; };\n```";
 
-static json functions_namespace(const std::string & exec_description) {
-    return {{"type", "namespace"},
-            {"name", "functions"},
-            {"description", ""},
-            {"tools", json::array({
-                {{"type", "custom"}, {"name", "exec"}, {"description", exec_description},
-                 {"format", {{"type", "grammar"}, {"syntax", "lark"}, {"definition", "start: /[\\s\\S]+/"}}}},
-                {{"type", "function"}, {"name", "wait"}, {"description", "Waits."}, {"strict", false},
-                 {"parameters", {{"type", "object"}, {"properties", json::object()}}}},
-            })}};
+// The namespace of a conversation's request; the request that titles a conversation lacks send_message_to_user_async.
+static json functions_namespace(const std::string & exec_description, bool conversation = true) {
+    json ns = {{"type", "namespace"},
+               {"name", "functions"},
+               {"description", ""},
+               {"tools", json::array({
+                   {{"type", "custom"}, {"name", "exec"}, {"description", exec_description},
+                    {"format", {{"type", "grammar"}, {"syntax", "lark"}, {"definition", "start: /[\\s\\S]+/"}}}},
+                   {{"type", "function"}, {"name", "wait"}, {"description", "Waits."}, {"strict", false},
+                    {"parameters", {{"type", "object"}, {"properties", json::object()}}}},
+               })}};
+    if (conversation) {
+        ns["tools"].push_back({{"type", "function"}, {"name", "send_message_to_user_async"},
+                               {"description", "Sends the user a message."}, {"strict", false},
+                               {"parameters", {{"type", "object"}, {"properties", json::object()}}}});
+    }
+    return ns;
 }
 
 static void test_chatgpt_exec_lists_the_codex_app_tools() {
@@ -302,6 +309,12 @@ static void test_chatgpt_exec_lists_the_codex_app_tools() {
         server_unify_codex_tool(other, false);
         require(other == before, "a description that does not end with the clock section stays: " + before.dump());
     }
+    // the request that titles a conversation keeps its exec as sent
+    json title = functions_namespace(short_exec, false);
+    const json title_before = title;
+    server_unify_codex_tool(title, false);
+    require(title == title_before, "a title request's exec stays as sent: " + title.dump().substr(0, 300));
+
     json renamed = functions_namespace(short_exec);
     renamed["name"] = "tools";
     json function_exec = functions_namespace(short_exec);
