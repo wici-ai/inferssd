@@ -137,6 +137,77 @@ void run_shape(fixture_inputs & inputs, int latent, int hidden, int experts, mod
         (unsigned long long) mixed_reads, worst_rel, worst_abs);
 }
 
+// A decode step of several rows (ssd_cpu_sink_run_rows) on the real tier. With every expert resident, each row's routes
+// run in one engine call on the row's input, as a one-row layer's residents do: the rows' run is bit for bit each row's
+// own run, and its four rows of eight routes take more engine rows (32) than a one-row layer (16). With a tier of two
+// experts beside the RAM cache, the rows' run, its CPU experts read once, matches the CPU's within the GPU's tolerance.
+void run_rows(fixture_inputs & inputs, size_t & checks, double & worst_rel, double & worst_abs) {
+    fixture f;
+    f.type = f.down_type = GGML_TYPE_Q8_0;
+    f.latent = 512;
+    f.hidden = 256;
+    f.experts = 8;
+    make_synthetic(f, 20261127);
+    const uint64_t unit = triplet_bytes(f);
+    for (const char * name : { "early_up_gate", "role_major", "nonblocking_down_sched" }) { set_switch(inputs, name, true); }
+    inputs.set("vram_budget", "0");
+    set_switch(inputs, "tier.global", false);
+    set_switch(inputs, "vram_async", false);
+    set_switch(inputs, "vram_deferred", false);
+    auto cpu = make_sink(inputs, f, 9, 8);
+    set_switch(inputs, "tier.global", true);
+    set_switch(inputs, "vram_async", true);
+    set_switch(inputs, "vram_deferred", true);
+    set_switch(inputs, "tier.keep_across_requests", true);
+    inputs.set("vram_budget", std::to_string(uint64_t(2 * f.experts) * unit).c_str());
+    auto rows = make_sink(inputs, f, 9, 8), own = make_sink(inputs, f, 9, 8);
+    inputs.set("vram_budget", std::to_string(2 * unit).c_str());
+    auto small = make_sink(inputs, f, 9, 8);
+    for (auto * sink : { cpu.get(), rows.get(), own.get(), small.get() }) { configure_cache(sink, 2 * unit, {1, 2}, f.experts); }
+    const ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 0.75f, nullptr, 0.0f };
+    // a step of four rows of every expert, each row in its own order
+    auto step = [&](int layer) {
+        std::vector<int32_t> ids;
+        for (int row = 0; row < 4; ++row) { for (int i = 0; i < f.experts; ++i) { ids.push_back((i * 3 + row) % f.experts); } }
+        return make_rows(layer, f.experts, ids);
+    };
+    uint64_t token = 1;
+    // the full tiers take every expert of both layers from each row's own runs
+    for (; token <= 3; ++token) {
+        for (auto * sink : { rows.get(), own.get(), small.get() }) {
+            begin_cache(sink, 93, token);
+            for (int layer : {1, 2}) {
+                ssd_cpu_sink_stats stats = {};
+                const auto s = step(layer);
+                run_rows_step(inputs, f, sink, s, rows_input(f, s.rows(), int(token)), false, activation, stats);
+            }
+        }
+    }
+    for (; token <= 5; ++token) {
+        for (auto * sink : { cpu.get(), rows.get(), own.get(), small.get() }) { begin_cache(sink, 93, token); }
+        for (int layer : {1, 2}) {
+            const auto s = step(layer);
+            const auto input = rows_input(f, s.rows(), int(token) * 7 + layer);
+            ssd_cpu_sink_stats one = {}, each = {}, mixed = {}, reference = {};
+            const auto a = run_rows_step(inputs, f, rows.get(), s, input, true, activation, one);
+            const auto b = run_rows_step(inputs, f, own.get(), s, input, false, activation, each);
+            require(one.read_requests == 0 && one.cache_hits == 0 && each.read_requests == 0,
+                "the full tier did not serve every expert of the rows");
+            require(same_bits(a, b), "the rows' run on the tier differs from each row's own run");
+            const auto c = run_rows_step(inputs, f, small.get(), s, input, true, activation, mixed);
+            const auto expected = run_rows_step(inputs, f, cpu.get(), s, input, true, activation, reference);
+            require(mixed.read_requests <= 3 * s.experts(), "the rows' run read an expert more than once");
+            const double rel = relative_l2(c, expected), abs = max_abs_error(c, expected);
+            worst_rel = std::max(worst_rel, rel);
+            worst_abs = std::max(worst_abs, abs);
+            require(rel <= 2e-2, "the rows' run on a mixed tier exceeds 2e-2 relative L2");
+            checks += 3;
+        }
+    }
+    std::printf("GENERIC_VRAM_ROWS_PASS rows=4 routes=%d worst_rel_l2=%.6g worst_abs=%.6g\n", 4 * f.experts, worst_rel,
+        worst_abs);
+}
+
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -186,6 +257,7 @@ int main(int argc, char ** argv) {
             GGML_TYPE_IQ3_XXS, GGML_TYPE_Q2_0, GGML_TYPE_IQ4_NL);
         run_host_jobs(inputs, GGML_TYPE_Q8_0, checks);
         run_host_jobs(inputs, GGML_TYPE_MXFP4, checks);
+        run_rows(inputs, checks, worst_rel, worst_abs);
         std::printf("REAL_GPU_GENERIC_TIER_PASS checks=%zu worst_rel_l2=%.6g worst_abs=%.6g\n",
             checks, worst_rel, worst_abs);
         return 0;

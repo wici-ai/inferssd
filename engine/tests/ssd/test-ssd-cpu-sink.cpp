@@ -4341,6 +4341,320 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
     std::printf("CPU_SINK_LOOKAHEAD_OK threads=%d ring_experts=%d\n", threads, depth);
 }
 
+// ---- A decode step of several rows (a token and the draft rows it verifies) as one run: ssd_cpu_sink_run_rows ----
+
+// A step of a layer: its rows' experts (-1: an empty slot) and routing weights, row-major, nslots a row.
+struct rows_step {
+    int layer = 1, nslots = 1;
+    std::vector<int32_t> ids;
+    std::vector<float> weights;
+    int rows() const { return int(ids.size()) / nslots; }
+    // the distinct experts of its live slots
+    size_t experts() const {
+        std::vector<int32_t> live;
+        for (int32_t id : ids) { if (id >= 0) { live.push_back(id); } }
+        std::sort(live.begin(), live.end());
+        return size_t(std::unique(live.begin(), live.end()) - live.begin());
+    }
+};
+static rows_step make_rows(int layer, int nslots, const std::vector<int32_t> & ids) {
+    rows_step s;
+    s.layer = layer; s.nslots = nslots; s.ids = ids;
+    for (size_t i = 0; i < ids.size(); ++i) { s.weights.push_back(ids[i] < 0 ? 0.0f : float(1 + i * 7 % 5) / 8.0f); }
+    return s;
+}
+// A row's input after another, each its own.
+static std::vector<float> rows_input(const fixture & f, int rows, int salt) {
+    std::vector<float> input(size_t(rows) * size_t(f.latent));
+    for (size_t i = 0; i < input.size(); ++i) { input[i] = .2f * std::sin(.0137f * float(i) + float(salt)); }
+    return input;
+}
+// The step's runs: each row its own (ssd_cpu_sink_run_activation, as decode ran a draft's rows before), or one run of
+// all of them. The rows' outputs one after another; `sum` adds up the counters the comparisons take.
+static std::vector<float> run_rows_step(fixture_inputs & inputs, const fixture & f, ssd_cpu_sink * sink,
+        const rows_step & s, const std::vector<float> & input, bool one_run, const ssd_cpu_sink_activation & activation,
+        ssd_cpu_sink_stats & sum) {
+    const size_t latent = size_t(f.latent);
+    std::vector<float> guarded(size_t(s.rows()) * latent + 2, -12345.25f);
+    float * out = guarded.data() + 1;
+    char error[512] = {};
+    sum = {};
+    if (one_run) {
+        require(ssd_cpu_sink_run_rows(sink, s.layer, input.data(), s.ids.data(), s.weights.data(), s.nslots, s.rows(),
+            &activation, out, &sum, error, sizeof(error)), std::string("rows run: ") + error);
+        check_io_targets(inputs, sum, true);
+    } else {
+        for (int row = 0; row < s.rows(); ++row) {
+            ssd_cpu_sink_stats stats = {};
+            const size_t at = size_t(row) * size_t(s.nslots);
+            require(ssd_cpu_sink_run_activation(sink, s.layer, input.data() + size_t(row) * latent, s.ids.data() + at,
+                s.weights.data() + at, s.nslots, &activation, out + size_t(row) * latent, &stats, error, sizeof(error)),
+                std::string("row run: ") + error);
+            check_io_targets(inputs, stats, true);
+            sum.experts += stats.experts; sum.read_requests += stats.read_requests;
+            sum.cache_hits += stats.cache_hits; sum.cache_admitted += stats.cache_admitted;
+        }
+    }
+    require(guarded.front() == -12345.25f && guarded.back() == -12345.25f, "a decode run wrote past its rows");
+    return std::vector<float>(out, out + size_t(s.rows()) * latent);
+}
+// Each row of a SiTU step's output against the ggml graph of that row alone, bit for bit.
+static void rows_match_graph(const fixture & f, const rows_step & s, const std::vector<float> & input,
+        const std::vector<float> & output, const std::string & what) {
+    const size_t latent = size_t(f.latent);
+    for (int row = 0; row < s.rows(); ++row) {
+        const auto first = s.ids.begin() + std::ptrdiff_t(row) * s.nslots;
+        const auto weight = s.weights.begin() + std::ptrdiff_t(row) * s.nslots;
+        const std::vector<float> x(input.begin() + std::ptrdiff_t(size_t(row) * latent),
+            input.begin() + std::ptrdiff_t(size_t(row + 1) * latent));
+        const auto expected = reference(f, s.layer, x, { first, first + s.nslots }, { weight, weight + s.nslots }, 4.0f, 25.0f);
+        const std::vector<float> got(output.begin() + std::ptrdiff_t(size_t(row) * latent),
+            output.begin() + std::ptrdiff_t(size_t(row + 1) * latent));
+        require(same_bits(got, expected), what + ": row " + std::to_string(row) + " differs from its graph");
+    }
+}
+// The RAM caches of two sinks after the same steps: the same hits, admissions, evictions and slots.
+static void same_cache(ssd_cpu_sink * a, ssd_cpu_sink * b, const std::string & what) {
+    const auto x = cache_snapshot(a), y = cache_snapshot(b);
+    require(x.hits == y.hits && x.admitted_bytes == y.admitted_bytes && x.evictions == y.evictions &&
+            x.valid_bytes == y.valid_bytes && x.committed_bytes == y.committed_bytes &&
+            x.admission_skips == y.admission_skips,
+            what + ": the RAM cache differs after the rows' run and after their own runs (hits " + std::to_string(x.hits) +
+            "/" + std::to_string(y.hits) + ", evictions " + std::to_string(x.evictions) + "/" + std::to_string(y.evictions) +
+            ", valid " + std::to_string(x.valid_bytes) + "/" + std::to_string(y.valid_bytes) + ")");
+}
+// Which of `layer`'s first `experts` the two sinks' RAM caches hold, by a one-expert run of each on both in a token of
+// its own (one that misses admits its expert, on both alike): the same. Returns the ones held.
+static std::vector<int32_t> same_residents(fixture_inputs & inputs, const fixture & f, ssd_cpu_sink * a,
+        ssd_cpu_sink * b, int layer, int experts, uint64_t epoch, uint64_t token, const std::string & what) {
+    for (auto * sink : { a, b }) { begin_cache(sink, epoch, token); }
+    const ssd_cpu_sink_activation situ = { SSD_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f, nullptr, 0.0f };
+    const auto input = rows_input(f, 1, 5);
+    std::vector<int32_t> held;
+    for (int32_t expert = 0; expert < experts; ++expert) {
+        ssd_cpu_sink_stats x = {}, y = {};
+        const auto probe = make_rows(layer, 1, { expert });
+        run_rows_step(inputs, f, a, probe, input, false, situ, x);
+        run_rows_step(inputs, f, b, probe, input, false, situ, y);
+        require(x.cache_hits == y.cache_hits, what + ": the caches disagree on expert " + std::to_string(expert) +
+            " of layer " + std::to_string(layer));
+        if (x.cache_hits) { held.push_back(expert); }
+    }
+    return held;
+}
+
+// A decode step's rows as one run against each row's own run, on the production scheduler: every row's output bit
+// for bit (and against its ggml graph), each expert the rows select read once, and the RAM cache as the rows' own runs
+// leave it (LRU, a step's experts fewer than a layer's slots, so that no later row would take an earlier one's slot);
+// rows with repeated experts, empty slots and an empty row; the heat counting a token's first row (count_decay2: an
+// expert only later rows select is the first to go); no cache, SwiGLU and a per-expert post norm; a run of one row as
+// ssd_cpu_sink_run_activation; the next-layer prefetch; the layer's event; and the refusals.
+static void rows_tests(fixture_inputs & inputs, int threads, int depth) {
+    for (const auto & kv : { std::pair<const char *, const char *>{ "ready_first", "1" }, { "early_up_gate", "1" },
+            { "role_major", "1" }, { "nonblocking_down_sched", "1" }, { "dynamic_rows", "1" },
+            { "dynamic_chunk_rows", "64" }, { "cache_allocation", "uniform" } }) {
+        require(inputs.set(kv.first, kv.second) == 0, "set rows test environment");
+    }
+    fixture f; make_synthetic(f);
+    const uint64_t unit = triplet_bytes(f);
+    const ssd_cpu_sink_activation situ = { SSD_CPU_SINK_ACTIVATION_SITU, 4.0f, 25.0f, 0.0f, nullptr, 0.0f };
+    // the rows' run and the rows' own runs of a step on two sinks: outputs, graphs, reads, hits and the caches
+    auto compare_step = [&](ssd_cpu_sink * rows, ssd_cpu_sink * own, const rows_step & s, int salt,
+            const ssd_cpu_sink_activation & activation, bool graph, const std::string & what) {
+        const auto input = rows_input(f, s.rows(), salt);
+        ssd_cpu_sink_stats one = {}, each = {};
+        const auto a = run_rows_step(inputs, f, rows, s, input, true, activation, one);
+        const auto b = run_rows_step(inputs, f, own, s, input, false, activation, each);
+        require(same_bits(a, b), what + ": the rows' run differs from their own runs");
+        if (graph) { rows_match_graph(f, s, input, a, what); }
+        require(one.experts == s.experts() && one.read_requests <= each.read_requests &&
+                one.cache_hits == each.cache_hits && one.cache_admitted == each.cache_admitted,
+                what + ": the rows' run took its experts otherwise than their own runs");
+        same_cache(rows, own, what);
+        std::printf("case=%s rows=%d experts=%zu reads=%llu/%llu hits=%llu admitted=%llu status=PASS\n", what.c_str(),
+            s.rows(), s.experts(), (unsigned long long) one.read_requests, (unsigned long long) each.read_requests,
+            (unsigned long long) one.cache_hits, (unsigned long long) one.cache_admitted);
+    };
+
+    // LRU: three tokens of both layers, four rows of four slots each, with repeats in and across rows, empty slots and
+    // an empty row; at most five experts a step, six slots a layer
+    {
+        scoped_fixture_input policy(inputs, "cache_policy", "lru");
+        auto rows = make_sink(inputs, f, threads, depth), own = make_sink(inputs, f, threads, depth);
+        for (auto * s : { rows.get(), own.get() }) { configure_cache(s, 12 * unit, { 1, 2 }, 6); }
+        const std::vector<std::vector<rows_step>> tokens = {
+            { make_rows(1, 4, { 1, 2, -1, 3,  2, 1, 1, -1,  4, -1, -1, -1,  3, 4, 2, 1 }),
+              make_rows(2, 4, { 10, 11, 12, 13,  13, 12, 11, 10,  -1, -1, -1, -1,  14, 10, -1, 11 }) },
+            { make_rows(1, 4, { 5, 1, 6, -1,  6, 5, 5, 7,  1, -1, 7, 6,  7, 6, 5, 1 }),
+              make_rows(2, 4, { 15, 16, 10, -1,  16, 15, 17, 10,  17, -1, -1, 15,  10, 16, 17, 18 }) },
+            { make_rows(1, 4, { 2, 8, 9, 3,  8, 2, -1, -1,  9, 3, 8, 2,  3, 3, 3, 3 }),
+              make_rows(2, 4, { 11, 19, -1, 12,  12, 11, 19, -1,  19, 12, 11, 0,  0, 0, -1, -1 }) },
+        };
+        uint64_t token = 1;
+        for (const auto & steps : tokens) {
+            for (auto * s : { rows.get(), own.get() }) { begin_cache(s, 41, token); }
+            for (const auto & step : steps) {
+                compare_step(rows.get(), own.get(), step, int(token) * 3 + step.layer, situ, true,
+                    "rows_lru_token" + std::to_string(token) + "_layer" + std::to_string(step.layer));
+            }
+            ++token;
+        }
+        for (int layer : { 1, 2 }) {
+            const auto held = same_residents(inputs, f, rows.get(), own.get(), layer, f.experts, 41, token++, "rows_lru_residents");
+            require(!held.empty(), "rows_lru: the RAM cache holds none of the steps' experts");
+        }
+    }
+
+    // count_decay2: a token's heat counts its first row. Expert 5 only later rows select; once every slot is taken, the
+    // coldest experts go, and 5 with them. Then a step whose rows are all its first row's experts again.
+    {
+        scoped_fixture_input policy(inputs, "cache_policy", "count_decay2");
+        auto rows = make_sink(inputs, f, threads, depth), own = make_sink(inputs, f, threads, depth);
+        for (auto * s : { rows.get(), own.get() }) { configure_cache(s, 6 * unit, { 1 }, 6); }
+        const std::vector<rows_step> steps = {
+            make_rows(1, 2, { 0, 1,  5, 0,  3, -1 }),
+            make_rows(1, 2, { 0, 2,  1, 5,  4, 5 }),
+            make_rows(1, 2, { 1, 0,  5, 5,  2, 4 }),
+            make_rows(1, 1, { 6 }),
+            make_rows(1, 1, { 7 }),
+            make_rows(1, 2, { 0, 6,  6, 0,  0, 6 }),
+        };
+        uint64_t token = 1;
+        for (const auto & step : steps) {
+            for (auto * s : { rows.get(), own.get() }) { begin_cache(s, 42, token); }
+            compare_step(rows.get(), own.get(), step, int(token), situ, true, "rows_heat_token" + std::to_string(token));
+            ++token;
+        }
+        const auto held = same_residents(inputs, f, rows.get(), own.get(), 1, 8, 42, token, "rows_heat_residents");
+        require(std::find(held.begin(), held.end(), 5) == held.end() && std::find(held.begin(), held.end(), 3) == held.end(),
+            "rows_heat: the experts only later rows selected were not the first to go");
+    }
+
+    // no RAM cache: each expert of the step read once, whatever its rows; SwiGLU, and SwiGLU with a per-expert post norm
+    {
+        auto rows = make_sink(inputs, f, threads, depth), own = make_sink(inputs, f, threads, depth);
+        std::vector<float> norm(size_t(f.latent));
+        for (int i = 0; i < f.latent; ++i) { norm[size_t(i)] = .1f + float(i * 17 % 29) / 13.0f; }
+        const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, nullptr, 0.0f };
+        const ssd_cpu_sink_activation normed = { SSD_CPU_SINK_ACTIVATION_SWIGLU, 0.0f, 0.0f, 0.0f, norm.data(), 1e-6f };
+        const auto step = make_rows(1, 5, { 3, 9, 3, -1, 12,  9, 12, 0, 0, -1,  -1, -1, -1, -1, -1,  17, 3, 9, 12, 0,
+            0, 3, 17, 9, 12 });
+        int salt = 100;
+        for (const auto * activation : { &situ, &swiglu, &normed }) {
+            const std::string what = activation == &situ ? "rows_uncached_situ" : activation == &swiglu ?
+                "rows_uncached_swiglu" : "rows_uncached_post_norm";
+            compare_step(rows.get(), own.get(), step, salt++, *activation, activation == &situ, what);
+            const auto input = rows_input(f, step.rows(), salt);
+            ssd_cpu_sink_stats one = {};
+            run_rows_step(inputs, f, rows.get(), step, input, true, *activation, one);
+            require(one.read_requests == 3 * step.experts() && one.cache_misses == step.experts(),
+                what + ": the rows' run did not read each of its experts once");
+        }
+        // a row a run, as many rows as the ubatch reserve may hold, and one slot each
+        const auto wide = make_rows(2, 1, { 1, 2, 3, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13 });
+        compare_step(rows.get(), own.get(), wide, salt++, situ, true, "rows_uncached_sixteen_rows");
+    }
+
+    // a run of one row is ssd_cpu_sink_run_activation's, its RAM cache included
+    {
+        scoped_fixture_input policy(inputs, "cache_policy", "lru");
+        auto rows = make_sink(inputs, f, threads, depth), own = make_sink(inputs, f, threads, depth);
+        for (auto * s : { rows.get(), own.get() }) { configure_cache(s, 4 * unit, { 1 }, 4); }
+        const auto input = rows_input(f, 1, 7);
+        uint64_t token = 1;
+        for (const auto & ids : { std::vector<int32_t>{ 1, 2, 2, -1 }, { 2, 3, 4, 5 }, { 6, 1, -1, 3 } }) {
+            for (auto * s : { rows.get(), own.get() }) { begin_cache(s, 43, token); }
+            const auto step = make_rows(1, 4, ids);
+            ssd_cpu_sink_stats one = {}, each = {};
+            const auto a = run_rows_step(inputs, f, rows.get(), step, input, true, situ, one);
+            const auto b = run_rows_step(inputs, f, own.get(), step, input, false, situ, each);
+            require(same_bits(a, b) && one.experts == each.experts && one.read_requests == each.read_requests &&
+                    one.cache_hits == each.cache_hits && one.cache_admitted == each.cache_admitted,
+                    "rows_one_row: a run of one row differs from ssd_cpu_sink_run_activation");
+            same_cache(rows.get(), own.get(), "rows_one_row");
+            ++token;
+        }
+        std::printf("case=rows_one_row status=PASS\n");
+    }
+
+    // the next-layer prefetch before a rows' run (every row's predicted experts), which then takes them as its reads
+    // or hits; and the layer's one event, with its rows and the union of their experts
+    {
+        scoped_fixture_input policy(inputs, "cache_policy", "lru");
+        scoped_fixture_input prefetch(inputs, "prefetch_depth", "2");
+        // a fresh name: the writer creates its file
+        const std::string path = test_resources::temp_file("ssd-cpu-sink-rows-events");
+        test_resources::remove_file(path);
+        {
+            auto writer = ssd::telemetry::writer::open(path);
+            require(bool(writer), "open the rows events writer: " + writer.error);
+            inputs.events = writer.value.get();
+            auto sink = make_sink(inputs, f, threads, depth);
+            inputs.events = nullptr;
+            configure_cache(sink.get(), 12 * unit, { 1, 2 }, 6);
+            begin_cache(sink.get(), 44, 1);
+            const auto first = make_rows(1, 3, { 4, 5, 6,  5, 7, -1 });
+            const auto second = make_rows(2, 3, { 12, 13, 14,  14, 15, 12 });
+            ssd_cpu_sink_stats stats = {};
+            for (int round = 0; round < 2; ++round) {
+                const int32_t hint[] = { 12, 14, 13, 15 };
+                ssd_cpu_sink_prefetch_hint(sink.get(), 2, hint, 4);
+                const auto x = rows_input(f, first.rows(), 60 + round);
+                rows_match_graph(f, first, x, run_rows_step(inputs, f, sink.get(), first, x, true, situ, stats), "rows_prefetch_layer1");
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // the prefetches land
+                const auto y = rows_input(f, second.rows(), 70 + round);
+                rows_match_graph(f, second, y, run_rows_step(inputs, f, sink.get(), second, y, true, situ, stats), "rows_prefetch_layer2");
+                require(stats.experts == 4, "rows_prefetch: the second layer's run did not take its four experts");
+                begin_cache(sink.get(), 44, 2 + uint64_t(round));
+            }
+            sink.reset();
+            require(bool(writer.value->flush()), "flush the rows events");
+        }
+        std::ifstream events(path);
+        std::string line;
+        size_t layers = 0;
+        while (std::getline(events, line)) {
+            const auto record = nlohmann::json::parse(line);
+            if (record.at("ev") != "ssd.place.layer") { continue; }
+            ++layers;
+            require(record.at("rows") == 2 && record.at("success") == true, "rows_events: a rows' layer event lacks its rows");
+            const auto expected = record.at("layer") == 1 ? nlohmann::json::array({ 4, 5, 6, 7 }) :
+                nlohmann::json::array({ 12, 13, 14, 15 });
+            require(record.at("selected_experts") == expected && record.at("cache_hit").size() == 4,
+                "rows_events: a rows' layer event does not name the union of their experts in order");
+        }
+        test_resources::remove_file(path);
+        require(layers == 4, "rows_events: not one event a layer of each step");
+        std::printf("case=rows_prefetch_events layers=%zu status=PASS\n", layers);
+    }
+
+    // refusals: more than 256 routes, a schedule other than the ordered nonblocking one
+    {
+        auto sink = make_sink(inputs, f, threads, depth);
+        std::vector<float> input(size_t(f.latent) * 17, .1f), output(input.size());
+        std::vector<int32_t> ids(16 * 17, 1);
+        std::vector<float> weights(ids.size(), .1f);
+        char error[512] = {};
+        require(!ssd_cpu_sink_run_rows(sink.get(), 1, input.data(), ids.data(), weights.data(), 16, 17, &situ,
+            output.data(), nullptr, error, sizeof(error)) && std::strstr(error, "invalid CPU sink input"),
+            std::string("rows_refused: more than 256 routes were not refused: ") + error);
+        // at the bound: sixteen rows of sixteen slots
+        std::vector<int32_t> bound(256);
+        for (size_t i = 0; i < bound.size(); ++i) { bound[i] = int32_t((i * 7 + i / 16) % size_t(f.experts)); }
+        const auto step = make_rows(2, 16, bound);
+        ssd_cpu_sink_stats stats = {};
+        rows_match_graph(f, step, input, run_rows_step(inputs, f, sink.get(), step, input, true, situ, stats),
+            "rows_bound");
+        scoped_fixture_input blocking(inputs, "nonblocking_down_sched", "0");
+        auto other = make_sink(inputs, f, threads, depth);
+        require(!ssd_cpu_sink_run_rows(other.get(), 1, input.data(), ids.data(), weights.data(), 2, 2, &situ,
+            output.data(), nullptr, error, sizeof(error)) && std::strstr(error, "NONBLOCKING_DOWN_SCHED"),
+            std::string("rows_refused: another schedule was not refused: ") + error);
+        std::printf("case=rows_refused status=PASS\n");
+    }
+    std::printf("CPU_SINK_ROWS_OK threads=%d ring_experts=%d\n", threads, depth);
+}
+
 int main(int argc, char ** argv) {
     // As llama_backend_init does: on Windows ggml_time_us divides by the timer frequency this records.
     ggml_time_init();
@@ -4355,7 +4669,7 @@ int main(int argc, char ** argv) {
         bool cache_policy_mode = false, cache_large_mode = false, cache_pressure_transition = false, cache_unbounded = false;
         bool activation_mode = false, q2_activation_mode = false, dsv41_iq_mode = false, muse_q8_mode = false, muse_bf16_mode = false;
         bool auto_ring_mode = false, prefetch_mode = false, cache_load_mode = false, work_reclaim_mode = false, threadpool_mode = false;
-        bool swiglu_mode = false, swiglu_q2_mode = false, lookahead_mode = false;
+        bool swiglu_mode = false, swiglu_q2_mode = false, lookahead_mode = false, rows_mode = false;
         std::string pack, prefix;
         for (int i = 1; i < argc; ++i) {
             auto argument = [&]() { require(i + 1 < argc, "missing option argument"); return argv[++i]; };
@@ -4401,6 +4715,7 @@ int main(int argc, char ** argv) {
             else if (!std::strcmp(argv[i], "--swiglu-tests")) { swiglu_mode = true; }
             else if (!std::strcmp(argv[i], "--swiglu-q2-tests")) { swiglu_q2_mode = true; }
             else if (!std::strcmp(argv[i], "--lookahead-tests")) { lookahead_mode = true; }
+            else if (!std::strcmp(argv[i], "--rows-tests")) { rows_mode = true; }
             else { throw std::runtime_error("usage: test-ssd-cpu-sink [--registered-lifecycle|--cache-tests|--cache-pressure] [--threads N] [--fixture KEY=VALUE] [--real-pack FILE --fixture-prefix PREFIX --ring-experts N --repeats N --warmup N --policy fixture|top16|top8|mass085 --jsonl FILE --resident-dir TMPFS]"); }
         }
         require(options.threads >= 2 && options.threads <= 128 && options.ring_experts >= 1 && options.ring_experts <= 32, "invalid thread/ring count");
@@ -4411,7 +4726,7 @@ int main(int argc, char ** argv) {
             test_resources::io_ring();
         }
         if (cache_mode || hitrate_mode || elastic_cache_mode || cache_load_mode || work_reclaim_mode || max_cache_mode ||
-                early_up_gate_mode ||
+                early_up_gate_mode || rows_mode ||
                 role_major_mode || nonblocking_down_mode || poll_mode || poll_early_mode || schedules_mode ||
                 prefetch_mode || cache_policy_mode || cache_large_mode || activation_mode || muse_q8_mode || muse_bf16_mode ||
                 lookahead_mode) {
@@ -4456,6 +4771,7 @@ int main(int argc, char ** argv) {
         if (threadpool_mode) { threadpool_tests(inputs, ring_set ? options.ring_experts : 2); return 0; }
         if (swiglu_mode || swiglu_q2_mode) { swiglu_tests(inputs, ring_set ? options.ring_experts : 2, swiglu_q2_mode); return 0; }
         if (lookahead_mode) { lookahead_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
+        if (rows_mode) { rows_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (trace_profile_mode) { trace_profile_test(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (prefetch_mode) { prefetch_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }
         if (cache_policy_mode) { cache_policy_tests(inputs, options.threads, ring_set ? options.ring_experts : 2); return 0; }

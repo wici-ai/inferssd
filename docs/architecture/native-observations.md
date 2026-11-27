@@ -24,7 +24,9 @@ belongs to one native runtime and is closed after its users have drained.
 | `ssd.prefill.layer` | layer, n_tokens, read_bytes |
 
 Route arrays are captured from the completed native layer, not reconstructed
-from text. Wall-time counters are already collected by the executor; enabling
+from text. A decode step of several rows, a token and the draft rows it
+verifies, is one `ssd.place.layer` event a layer: its route arrays name each
+expert its rows select once, and `rows` gives their number. Wall-time counters are already collected by the executor; enabling
 this contract does not enable per-thread profiling or logits tracing. The
 reader treats a token position at or below the previous one in the same epoch
 as the start of a new run, so successive requests that reuse positions stay

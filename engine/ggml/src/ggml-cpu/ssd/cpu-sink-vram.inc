@@ -13,6 +13,9 @@ struct sink_vram {
     void * context = nullptr;
     std::vector<ssd_vram_request> requests;
     std::vector<int> slots;
+    // a run of several rows' routes, as launch_rows hands them over
+    std::vector<int32_t> route_request, route_row;
+    std::vector<float> route_weight;
     // the routes of each request of the next prefill prepare's union, set by the stream (prepare_prefill sends them)
     std::vector<int32_t> prefill_seed_routes;
     int hits = 0;
@@ -306,13 +309,17 @@ struct sink_vram {
         char error[512] = {};
         check(elastic->phase_complete(context, decode ? 1 : 0, error, sizeof(error)), error);
     }
-    // A decode run's experts of routed layer `layer`: the tier pins those it holds as hits.
-    void prepare(std::vector<sink_request> & source, int32_t layer, sink_cache & cache, bool unweighted = false) {
+    // A decode run's experts of routed layer `layer`: the tier pins those it holds as hits. A run of several rows names
+    // the union of its rows' experts, the first `counted` its first row's (prepare_rows); SIZE_MAX: a run of one row.
+    void prepare(std::vector<sink_request> & source, int32_t layer, sink_cache & cache, bool unweighted = false,
+            size_t counted = SIZE_MAX) {
         hits = 0;
         if (!context || prefill_only) { return; }
         place_threads();
-        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > 16) {
-            throw std::runtime_error("GPU tier requires a routed layer and <=16 slots");
+        const bool rows = counted != SIZE_MAX;
+        if (layer < 0 || layer >= SSD_VRAM_MAX_LAYERS || source.size() > (rows ? 256u : 16u)) {
+            throw std::runtime_error(rows ? "GPU tier requires a routed layer and <=256 experts a decode step" :
+                "GPU tier requires a routed layer and <=16 slots");
         }
         if (!format) {
             throw std::runtime_error("GPU tier lacks the explicit expert format ABI for these experts; no fallback");
@@ -332,7 +339,9 @@ struct sink_vram {
             }
         }
         char error[512] = {};
-        const int result = format->prepare(context, requests.data(), int(requests.size()), slots.data(), error, sizeof(error));
+        const int result = rows ?
+            format->prepare_rows(context, requests.data(), int(requests.size()), int(counted), slots.data(), error, sizeof(error)) :
+            format->prepare(context, requests.data(), int(requests.size()), slots.data(), error, sizeof(error));
         format_path = true;
         check(result, error);
         for (size_t i = 0; i < source.size(); ++i) { source[i].vram_slot = slots[i]; hits += slots[i] >= 0; }
@@ -349,6 +358,24 @@ struct sink_vram {
             throw std::runtime_error("GPU launch requires an explicit expert format");
         }
         check(result, error);
+    }
+    // A run of several rows: each route to an expert the tier holds runs on its row's f32 input (rows of `latent`
+    // floats), and finish writes its row of the contributions, a route's. A post-norm model's routes come back
+    // unweighted, as a one-row layer's requests do.
+    void launch_rows(const float * input, int latent, const std::vector<sink_route> & routes,
+            const ssd_cpu_sink_activation & activation, bool unweighted) {
+        if (!context || prefill_only) { return; }
+        if (!format_path) { throw std::runtime_error("GPU launch requires an explicit expert format"); }
+        route_request.clear(); route_row.clear(); route_weight.clear();
+        for (const auto & r : routes) {
+            route_request.push_back(int32_t(r.request));
+            route_row.push_back(r.row);
+            route_weight.push_back(unweighted ? 1.0f : r.weight);
+        }
+        const ssd_vram_activation a = { activation.kind, activation.situ_beta, activation.situ_linear_beta, activation.swiglu_limit };
+        char error[512] = {};
+        check(format->launch_rows(context, input, size_t(latent) * sizeof(float), route_request.data(), route_row.data(),
+            route_weight.data(), int(routes.size()), &a, error, sizeof(error)), error);
     }
     void pin_ram_batch(sink_cache & cache, const std::vector<sink_request> & source) {
         if (!async_upload || !decode) { return; }

@@ -31,7 +31,8 @@ struct llama_ssd_cpu_sink_node {
     float situ_beta;
     float situ_linear_beta;
     // SITU nodes keep the K3 entries (run, grouped prefill).
-    // Other activations are decode-only through ssd_cpu_sink_run_activation.
+    // Other activations are decode-only through ssd_cpu_sink_run_activation; a decode step of several rows runs any
+    // activation through ssd_cpu_sink_run_rows.
     ssd_cpu_sink_activation activation = { SSD_CPU_SINK_ACTIVATION_SITU, 0.0f, 0.0f, 0.0f };
     int layer; // a routed layer of the runtime's expert layout
     bool post_exp_norm = false;
@@ -72,7 +73,7 @@ struct llama_ssd_cpu_sink_runtime {
     int cache_max_per_layer = 8;
     std::vector<int32_t> layer_priority;
     decltype(&ssd_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
-    decltype(&ssd_cpu_sink_decode_rows) decode_rows = nullptr;
+    decltype(&ssd_cpu_sink_run_rows) run_rows = nullptr;
     decltype(&ssd_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
     llama_seq_id sequence = 0;
@@ -158,7 +159,7 @@ struct llama_ssd_cpu_sink_runtime {
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
-        decode_rows = cpu_api->decode_rows;
+        run_rows = cpu_api->run_rows;
         prefill_hint = cpu_api->prefill_hint;
         constexpr int ring_experts = 8;
         char error[512] = {};
@@ -427,7 +428,7 @@ struct llama_ssd_cpu_sink_call {
     llama_ssd_cpu_sink_call & operator=(const llama_ssd_cpu_sink_call &) = delete;
 };
 
-// A decode ubatch's measures: the sum of its rows' runs (pending_reads, zero after every run, the last row's).
+// A decode ubatch's measures: the sum of its runs (pending_reads, zero after every run, the last one's).
 inline void llama_ssd_add_row_stats(ssd_cpu_sink_stats & sum, const ssd_cpu_sink_stats & row) {
     sum.experts += row.experts;
     sum.read_requests += row.read_requests;
@@ -527,9 +528,9 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
             &grouped_stats, error, sizeof(error));
         stats = grouped_stats.stream;
     } else {
-        // A decode ubatch: one token, or a token and the draft rows it verifies. Each row is one decode run; the rows
-        // after the first find the experts the earlier rows read in the RAM cache, so the ubatch reads the union of
-        // its rows' experts once.
+        // A decode ubatch: one token, or a token and the draft rows it verifies, as one run of the layer, which finds or
+        // reads each expert its rows select once and computes it for every row that routes to it. A run of rows takes
+        // at most 256 routes (ssd_cpu_sink_run_rows): a longer draft runs as consecutive runs of rows.
         const ggml_tensor * hint = situ ? nullptr : dst->src[4];
         GGML_ASSERT(!hint || (hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint) &&
             ggml_nelements(hint) % ntokens == 0));
@@ -537,13 +538,13 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
         const auto * id = static_cast<const int32_t *>(ids->data);
         const auto * wt = static_cast<const float *>(weights->data);
         auto * out = static_cast<float *>(dst->data);
-        // the layer's next runs are the ubatch's rows: each keeps the prefetches its later rows take
-        if (ntokens > 1) { runtime.decode_rows(runtime.sink, node.layer, id, nslots, ntokens); }
+        const int per_run = ntokens == 1 ? 1 : std::max(1, 256 / std::max(1, nslots));
         ok = true;
-        for (int row = 0; row < ntokens && ok; ++row) {
-            // The next layer's predicted experts, for the sink's prefetch, before the last row only: a run drops the
+        for (int row = 0; row < ntokens && ok; row += per_run) {
+            const int rows = std::min(per_run, ntokens - row);
+            // The next layer's predicted experts, for the sink's prefetch, before the last run only: a run drops the
             // prefetches of layers other than its own. Every row's, likeliest first in each row, without repeats.
-            if (hint && runtime.prefetch_hint && row + 1 == ntokens) {
+            if (hint && runtime.prefetch_hint && row + rows == ntokens) {
                 const auto * predicted = static_cast<const int32_t *>(hint->data);
                 const int per_row = static_cast<int>(ggml_nelements(hint) / ntokens);
                 int32_t merged[64];
@@ -559,11 +560,19 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
             ssd_cpu_sink_stats row_stats = {};
             const size_t in_offset = size_t(row) * size_t(latent);
             const size_t slot_offset = size_t(row) * size_t(nslots);
-            ok = situ ?
-                runtime.run(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset, nslots,
-                    node.situ_beta, node.situ_linear_beta, out + in_offset, &row_stats, error, sizeof(error)) :
-                runtime.run_activation(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset,
-                    nslots, &activation, out + in_offset, &row_stats, error, sizeof(error));
+            if (rows > 1) {
+                // ssd_cpu_sink_run's activation for a SiTU node
+                const ssd_cpu_sink_activation rows_activation = situ ? ssd_cpu_sink_activation{
+                    SSD_CPU_SINK_ACTIVATION_SITU, node.situ_beta, node.situ_linear_beta, 0.0f, nullptr, 0.0f } : activation;
+                ok = runtime.run_rows(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset, nslots,
+                    rows, &rows_activation, out + in_offset, &row_stats, error, sizeof(error));
+            } else {
+                ok = situ ?
+                    runtime.run(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset, nslots,
+                        node.situ_beta, node.situ_linear_beta, out + in_offset, &row_stats, error, sizeof(error)) :
+                    runtime.run_activation(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset,
+                        nslots, &activation, out + in_offset, &row_stats, error, sizeof(error));
+            }
             llama_ssd_add_row_stats(stats, row_stats);
         }
     }

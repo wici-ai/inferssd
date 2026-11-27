@@ -143,7 +143,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         std::printf("case=%s tokens=0 cpu_custom=0 status=PASS\n", label);
         return;
     }
-    // a decode ubatch of several rows (a draft to verify) runs through the sink's decode, row by row
+    // a decode ubatch of several rows (a draft to verify) runs through the sink's decode, as one run of its rows
     const bool use_sink = prefill || decode;
     const auto dependencies = graph_dependencies(result.get_gf());
     if (use_sink) {

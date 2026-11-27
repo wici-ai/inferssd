@@ -45,11 +45,6 @@ GGML_BACKEND_API int ssd_cpu_sink_decode_threads(struct ssd_cpu_sink * sink, int
 // Next-layer expert prefetch: the experts that `layer` is predicted to select,
 // best first, given before the decode run of the layer before it. Ignored when prefetch is off.
 GGML_BACKEND_API void ssd_cpu_sink_prefetch_hint(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts, int n);
-// The rows of a decode ubatch (a token and the draft rows it verifies): the next `count` decode runs of `layer` are its
-// rows, `slots` experts each (`experts` row-major, -1 for none). A row's run keeps the prefetches of the experts its
-// later rows select queued for them. Given before the first row's run; one row (count 1) clears it.
-GGML_BACKEND_API void ssd_cpu_sink_decode_rows(struct ssd_cpu_sink * sink, int32_t layer, const int32_t * experts,
-        int slots, int count);
 // A grouped prefill's prediction of the next routed layer: the experts of `layer` that each of `ntokens` tokens is
 // predicted to select, `k` a token best first (token-major), given before the prefill call of the layer before it.
 // The read-ahead (prefill.lookahead) reads the experts it makes likely; ignored when that is off.
@@ -183,6 +178,21 @@ struct ssd_cpu_sink_activation {
 GGML_BACKEND_API bool ssd_cpu_sink_run_activation(
         struct ssd_cpu_sink * sink, int32_t layer, const float * input,
         const int32_t * ids, const float * weights, int nslots,
+        const struct ssd_cpu_sink_activation * activation, float * output,
+        struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
+
+// A decode ubatch of `ntokens` rows (a token and the draft rows it verifies) as one run of routed layer `layer`:
+// input and output are ntokens latent rows, ids and weights ntokens rows of nslots (nslots * ntokens <= 256). Each
+// expert the rows select is found in the GPU tier or the RAM cache, or read, once, and computed for every row that
+// routes to it; each row's output is bit for bit its own ssd_cpu_sink_run_activation's. The RAM cache and the GPU
+// tier take the rows' lookups and admissions as the rows' own runs would one after another, the token's heat
+// counting the first row, except that an earlier row's experts stay held through the later rows' admissions. A
+// prefetch of an expert any row selects is the run's, as for one row. Requires the ordered nonblocking scheduler
+// (READY_FIRST and NONBLOCKING_DOWN_SCHED, as production runs), and computes on the CPU every expert the tier does
+// not hold.
+GGML_BACKEND_API bool ssd_cpu_sink_run_rows(
+        struct ssd_cpu_sink * sink, int32_t layer, const float * input,
+        const int32_t * ids, const float * weights, int nslots, int ntokens,
         const struct ssd_cpu_sink_activation * activation, float * output,
         struct ssd_cpu_sink_stats * stats, char * error, size_t error_size);
 

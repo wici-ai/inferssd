@@ -638,6 +638,17 @@ struct expert_cache {
         }
         return state == room_ok;
     }
+    // A decode run of several rows whose later row the cache refused (a pause, a rejected admission): its earlier rows'
+    // hits lost their protection or their slots, so the run reads every expert. Their admissions go back unreserved,
+    // as a rejected admission's do.
+    void drop_run(std::vector<expert_request> & requests, ssd_cpu_sink_stats & current) {
+        for (auto & r : requests) {
+            if (r.cache_admit >= 0 && size_t(r.cache_admit) < entries.size()) { entries[size_t(r.cache_admit)].reserved = false; }
+            r.cache_hit = r.cache_admit = -1;
+        }
+        for (auto & e : entries) { e.protected_now = false; }
+        current.cache_hits = current.cache_hit_bytes = current.cache_new_slot_bytes = 0;
+    }
     void reject_admission(std::vector<expert_request> & requests, ssd_cpu_sink_stats & current, const char * reason) {
         count_rejection();
         if (!partial_reclaim) { pause(requests, current, reason, binding_term(last_room)); return; }
@@ -815,7 +826,10 @@ struct expert_cache {
             }
         }
     }
-    void prepare(std::vector<expert_request> & requests, int32_t id, ssd_cpu_sink_stats & current) {
+    // later: a later row of a decode run of several rows (the sink's prepare_rows_cache), which computes its rows after
+    // all of their lookups. What its earlier rows hit stays protected and what they admitted stays reserved, and a
+    // reserved entry is a hit, as the rows' own runs found it once the earlier row had admitted it.
+    void prepare(std::vector<expert_request> & requests, int32_t id, ssd_cpu_sink_stats & current, bool later = false) {
         if (!active || paused || !stats.budget_bytes) { return; }
         auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == id; });
         if (found == layers.end()) { return; }
@@ -833,6 +847,7 @@ struct expert_cache {
         for (size_t i = l.begin; i < l.begin + l.count; ++i) {
             auto & e = entries[i];
             if (e.leases) { throw std::runtime_error("CPU sink prepare with an outstanding cache lease"); }
+            if (later && (e.protected_now || e.reserved)) { continue; }
             e.protected_now = false;
             if (!e.enabled) { e.reserved = false; continue; }
             if (!e.valid) { e.reserved = false; continue; }
@@ -886,8 +901,8 @@ struct expert_cache {
         // A miss at the front of the batch must never overwrite a later hit.
         for (auto & r : requests) {
             for (size_t i = l.begin; i < l.begin + l.count; ++i) {
-                if (entries[i].enabled && entries[i].valid && entries[i].layer_index == layer_index &&
-                        entries[i].id == r.id && matches(entries[i], r)) {
+                if (entries[i].enabled && (entries[i].valid || (later && entries[i].reserved)) &&
+                        entries[i].layer_index == layer_index && entries[i].id == r.id && matches(entries[i], r)) {
                     r.cache_hit = int(i);
                     entries[i].protected_now = true;
                     if (entries[i].prefetched) { entries[i].prefetched = false; ++prefetch_hits; }

@@ -584,6 +584,14 @@ if (TARGET ggml-cpu)
     add_test(NAME ssd_cpu_sink_lookahead_d1 COMMAND test-ssd-cpu-sink --lookahead-tests --threads 2 --ring-experts 1
         --fixture ready_first=0)
     set_tests_properties(ssd_cpu_sink_lookahead ssd_cpu_sink_lookahead_d1 PROPERTIES TIMEOUT 180)
+    # A decode step of several rows (a token and the draft rows it verifies) as one run, against each row's own run:
+    # bit for bit, its experts read once, and the RAM cache as the rows' own runs leave it. Several participants, and
+    # one participant with one expert in flight.
+    add_test(NAME ssd_cpu_sink_rows COMMAND test-ssd-cpu-sink --rows-tests --threads 4 --ring-experts 8
+        --fixture read_fixed=0 --fixture profile=0)
+    add_test(NAME ssd_cpu_sink_rows_d1 COMMAND test-ssd-cpu-sink --rows-tests --threads 2 --ring-experts 1
+        --fixture read_fixed=1 --fixture profile=0)
+    set_tests_properties(ssd_cpu_sink_rows ssd_cpu_sink_rows_d1 PROPERTIES TIMEOUT 180)
     # Muse Spark's experts with their post norm (Q8_0; BF16, also from native payload ranges and the RAM cache) in
     # decode and grouped prefill, against the MoE graph Muse builds, bit for bit.
     add_test(NAME ssd_cpu_sink_muse_q8_0 COMMAND test-ssd-cpu-sink --muse-q8-test --threads 2)
@@ -682,6 +690,12 @@ if (TARGET ggml-cpu)
     target_link_libraries(test-ssd-prefetch-tier PRIVATE ggml-ssd-host ggml-ssd-settings ggml-cpu ggml-base Threads::Threads)
     add_test(NAME ssd_prefetch_tier COMMAND test-ssd-prefetch-tier)
     set_tests_properties(ssd_prefetch_tier PROPERTIES TIMEOUT 180)
+    # a decode step's rows as one run against a stand-in GPU tier that serves fixed experts (no GPU)
+    add_executable(test-ssd-rows-tier ssd/test-ssd-rows-tier.cpp)
+    target_include_directories(test-ssd-rows-tier PRIVATE ../ggml/src ../ggml/src/ggml-cpu ../vendor)
+    target_link_libraries(test-ssd-rows-tier PRIVATE ggml-ssd-host ggml-ssd-settings ggml-cpu ggml-base Threads::Threads)
+    add_test(NAME ssd_cpu_sink_rows_tier COMMAND test-ssd-rows-tier --threads 4 --ring-experts 2)
+    set_tests_properties(ssd_cpu_sink_rows_tier PROPERTIES TIMEOUT 180)
     add_test(NAME ssd_cpu_sink_registered COMMAND test-ssd-cpu-sink --registered-lifecycle
                     --fixture read_fixed=1)
 
@@ -1188,7 +1202,8 @@ foreach(resource_test IN LISTS ssdash_registered_tests)
         endif()
     endif()
 endforeach()
-foreach(ssd_executable test-ssd-cpu-sink test-ssd-cpu-prefill test-ssd-cpu-prefill-graph test-ssd-prefetch-tier)
+foreach(ssd_executable test-ssd-cpu-sink test-ssd-cpu-prefill test-ssd-cpu-prefill-graph test-ssd-prefetch-tier
+        test-ssd-rows-tier)
     if (TARGET ${ssd_executable})
         add_dependencies(inferssd-ci-tests ${ssd_executable})
     endif()
