@@ -163,7 +163,9 @@ struct expert_cache {
         room_unreadable = ssd::host::room_unreadable;
     bool decode_projection = false;
     bool keep_across_requests = false;
-    bool adopt = false; // the arena was made at load (reserve_at_load): the first decode keeps it, whatever its epoch
+    // The arena was made outside a decode token (at load, reserve_at_load, or by a grouped prefill's read-ahead,
+    // take_fresh): the first decode keeps it, whatever its epoch.
+    bool adopt = false;
     // An automatic budget's prices off unified memory (geometry): a slot, and the metadata room kept beside the slots.
     uint64_t slot_cost_bytes = 0, metadata_bytes = 0;
     bool prefill_read = false;
@@ -996,7 +998,9 @@ struct expert_cache {
         const uint64_t end = ceil_div(multiply(add(first, count), stride), page_size) * page_size;
         return ssd::platform::arena_commit(arena + begin, size_t(end - begin));
     }
-    // A slot's first touch: its pages committed and paged in. It writes only that slot's bytes.
+    // A slot's first touch: its pages committed and paged in. It writes only that slot's bytes and reads only the
+    // arena's geometry, which no one changes while a read into the arena is in flight (before_unmap), so the I/O thread
+    // pages in a read-ahead's fresh slot with it.
     bool page_in(size_t index) const {
         if (!commit_slots(index, 1)) { return false; }
         touch_pages(arena + index * stride, stride, size_t(page_size));
@@ -1123,7 +1127,8 @@ struct expert_cache {
     // holds what one sized at this token would, within the arena's slots. They are paged in at their admission, as
     // every slot was without the load step. So are the enabled slots the load step did not commit (the room it saw
     // was smaller than the one geometry sized from, or it left the first prefill's pages): with an automatic budget
-    // they take their room first (owed). `after`: "load" for the first request of an arena made at load, "prefill".
+    // they take their room first (owed). `after`: "load" for the first decode token of an arena made outside one
+    // (adopt: at load, or by the request's prefill read-ahead), "prefill".
     // A room-sized cache grows here past the size it had, up to every slot of its arena, so a cache that started
     // short of memory takes the room that frees up later; one that had no room for its metadata learns its geometry
     // again at this request. A grow leaves one slot of room unused: the cache changes by whole slots, and a slot
@@ -1217,12 +1222,57 @@ struct expert_cache {
     // cached. The slot is inflight, invisible to lookups and allocation, until prefetch_done publishes it (or
     // prefetch_activate publishes it early as a hit that its run waits for). keep: per expert of the layer, 1 for one
     // whose entry the caller's pass is about to use, which is no victim (null: none). prior: where the slot's entry is
-    // kept, not evicted, until its read is issued (null: evicted now).
+    // kept, not evicted, until its read is issued (null: evicted now). fresh (the read-ahead's): once the layer has no
+    // resident slot left to take, an enabled one whose pages no admission has committed yet (all of them before the
+    // arena is mapped), whose read waits for take_fresh's room and for page_in.
     // Returns -2 when the expert is already cached or on its way, -1 when there is no slot.
     int prefetch_reserve(int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles,
-            const std::vector<uint8_t> * keep = nullptr, prefetch_prior * prior = nullptr) {
-        if (!(active || prefill_read) || paused || !stats.budget_bytes || !arena || !stride) { return -1; }
-        return reserve_slot(layer_id, expert, roles, keep, false, prior);
+            const std::vector<uint8_t> * keep = nullptr, prefetch_prior * prior = nullptr, bool fresh = false) {
+        if (!(active || prefill_read) || paused || !stats.budget_bytes || !(arena || fresh) || !stride) { return -1; }
+        return reserve_slot(layer_id, expert, roles, keep, false, prior, fresh);
+    }
+    // A grouped prefill's read-ahead into a cache no decode token has sized: on unified memory beside a GPU tier that
+    // keeps experts, the load step leaves the RAM cache to the first decode token, so the first prompt finds it without
+    // slots. Its geometry, as the first decode admission learns it (max_requests: the experts a token, which price the
+    // frequency nodes), so that the read-ahead can take its fresh slots; take_fresh maps the arena. An elastic cache,
+    // which holds only the slots decode left it in a prefill, gets its slots from decode. False when it has no slots;
+    // a cache that cannot size itself now (no room, a configuration decode refuses) is left as it was.
+    bool readahead_geometry(size_t max_requests) {
+        if (!prefill_read || paused || !stats.budget_bytes || elastic) { return false; }
+        try { return geometry(max_requests) && !entries.empty(); }
+        catch (const std::exception &) { return false; }
+    }
+    // The room for a grouped prefill's read-ahead to page in `slots` fresh slots (prefetch_reserve), priced as a decode
+    // admission prices its first touches (prepare), and the arena when the cache has none yet. Free room only: a take
+    // that is short runs the reclaimer, which would give back slots the pass is about to read, so a shortage refuses
+    // it (an empty ticket) and changes nothing. The ticket stays open until the slots are paged in and counted
+    // (paged_in), as an admission's stays open over its first touches.
+    allocation_ticket take_fresh(uint64_t slots) {
+        if (!slots || !stride || entries.empty()) { return {}; }
+        const uint64_t extra = add(first_touch_bytes(slots), arena ? 0 : 64 * 1024);
+        if (check_room(extra, nullptr, nullptr, true) != room_ok) { return {}; }
+        auto ticket = take_guard(extra);
+        if (!ticket) { return {}; }
+        if (!arena) {
+            if (map_arena()) { release(); return {}; }
+            adopt = true;
+        }
+        return std::move(ticket.value);
+    }
+    // A read-ahead's fresh slot that the I/O thread paged in before its read (page_in): resident from here, counted as
+    // an admission counts the slots it touches (prepare). Before prefetch_done, which publishes only resident slots.
+    void paged_in(int index, uint64_t reserved_generation) {
+        if (index < 0 || size_t(index) >= entries.size() || reserved_generation != generation) { return; }
+        auto & e = entries[size_t(index)];
+        if (!e.inflight || e.resident || e.generation != reserved_generation) { return; }
+        count_page_tables(1);
+        if (e.was_released) {
+            stats.refaulted_bytes = add(stats.refaulted_bytes, stride);
+            e.was_released = false;
+        }
+        e.resident = true;
+        stats.committed_bytes = add(stats.committed_bytes, stride);
+        stats.peak_bytes = std::max(stats.peak_bytes, stats.committed_bytes);
     }
     // At load (the sink's preload), before any request: an empty slot of the layer for an expert no request has named,
     // its read to follow as a prefetch's (prefetch_done publishes it). -1 when the layer has no empty slot.
@@ -1231,27 +1281,29 @@ struct expert_cache {
         return reserve_slot(layer_id, expert, roles, nullptr, true);
     }
     int reserve_slot(int32_t layer_id, int32_t expert, const ssd_cpu_sink_source * roles,
-            const std::vector<uint8_t> * keep, bool empty_only, prefetch_prior * prior = nullptr) {
+            const std::vector<uint8_t> * keep, bool empty_only, prefetch_prior * prior = nullptr, bool fresh = false) {
         const auto found = std::find_if(layers.begin(), layers.end(), [&](const layer & l) { return l.id == layer_id; });
         if (found == layers.end() || !found->count) { return -1; }
         const size_t layer_index = size_t(found - layers.begin());
         source_key keys[3];
         for (int role = 0; role < 3; ++role) { keys[role] = key(roles[role]); }
-        // an empty slot, else a backup (even of an expert `keep` names: the tier serves that one), else the coldest
+        // an empty slot, else a backup (even of an expert `keep` names: the tier serves that one), else the coldest,
+        // else (fresh) one without pages: a resident slot costs no memory and no page-in inside the read-ahead's window
         if (empty_only) { backup_slots.assign(found->count, 0); } else { find_backups(*found, layer_index); }
-        int victim = -1, victim_rank = 3;
+        int victim = -1, victim_rank = 4;
         for (size_t i = found->begin; i < found->begin + found->count; ++i) {
             const auto & e = entries[i];
             if (!e.enabled) { continue; }
             if ((e.valid || e.reserved || e.inflight) && e.layer_index == layer_index && e.id == expert &&
                     e.source[0] == keys[0] && e.source[1] == keys[1] && e.source[2] == keys[2]) { return -2; }
-            if (!e.resident || e.reserved || e.inflight || e.leases || e.protected_now || e.lent) { continue; }
+            if ((!e.resident && !fresh) || e.reserved || e.inflight || e.leases || e.protected_now || e.lent) { continue; }
             const bool backup = backup_slots[i - found->begin] != 0;
             if (e.valid && !backup && (empty_only || (keep && e.id >= 0 && size_t(e.id) < keep->size() && (*keep)[size_t(e.id)]))) {
                 continue;
             }
-            const int rank = !e.valid ? 0 : backup ? 1 : 2;
-            if (victim < 0 || rank < victim_rank || (rank == victim_rank && rank > 0 && colder(i, size_t(victim)))) {
+            const int rank = !e.resident ? 3 : !e.valid ? 0 : backup ? 1 : 2;
+            if (victim < 0 || rank < victim_rank ||
+                    (rank == victim_rank && (rank == 1 || rank == 2) && colder(i, size_t(victim)))) {
                 victim = int(i); victim_rank = rank;
             }
         }

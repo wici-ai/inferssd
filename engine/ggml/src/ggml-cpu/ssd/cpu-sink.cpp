@@ -422,6 +422,8 @@ struct sink_lookahead_read {
     void * target[3] = {};
     unsigned remaining = 0, ready_roles = 0;
     bool issued = false, failed = false;
+    // fresh: the slot has no pages yet, and the I/O thread pages it in before its read (paged once it has)
+    bool fresh = false, paged = false;
 };
 // The CQE tags of read-ahead reads, above every ring slot's 3 * index + role: the plan's 3 * index + role from here.
 constexpr uint64_t sink_lookahead_tag = uint64_t(1) << 32;
@@ -764,8 +766,11 @@ struct ssd_cpu_sink {
     // reads in flight and publishes what landed (lookahead_handover), and its prefill read of the RAM cache takes them
     // as hits. The read-ahead holds no memory of its own: what it read into the layer's own slots stays cached, what
     // the next layer did not use is the coldest of what the cache holds, and a lent slot goes back empty after the
-    // call. A plan holds every read that pays, and the window decides how many are read: a slot's entry goes only once
-    // a read into it is issued.
+    // call. A slot of the cache's budget that has no pages yet (fresh: every slot before the first decode token on
+    // unified memory beside a GPU tier, where the load step leaves the RAM cache to decode, and slots the cache enabled
+    // since) gets them as a decode admission's first touch does, the room taken from the host ledger by the plan and
+    // the pages touched by the I/O thread before its read. A plan holds every read that pays, and the window decides
+    // how many are read: a slot's entry goes only once a read into it is issued.
     struct lookahead_state {
         bool enabled = false;
         uint64_t fail_every = 0, completions = 0; // explicit fixture fault injection: every n-th completion fails
@@ -773,6 +778,9 @@ struct ssd_cpu_sink {
         // reads it while `active` (io_mutex). next, inflight and batch are the I/O thread's.
         int32_t layer = -1;
         std::vector<sink_lookahead_read> plan;
+        // The host ledger's room for the plan's fresh slots (sink_cache::take_fresh; run_mutex), open until the plan is
+        // finished and the slots it paged in are counted.
+        ssd::host::allocation_ticket fresh_room;
         size_t next = 0;
         unsigned inflight = 0;                     // role reads in flight
         std::vector<std::pair<size_t, int>> batch; // (plan index, role) of the reads one step queues
@@ -795,7 +803,8 @@ struct ssd_cpu_sink {
         std::vector<int> landed_entries;
         // Totals for the report at destruction.
         uint64_t layers = 0, planned = 0, issued_total = 0, landed_total = 0, failed_total = 0, used = 0, unused = 0,
-                 used_bytes = 0, no_slot = 0, unresolved = 0, no_candidate = 0, borrowed = 0, declined = 0;
+                 used_bytes = 0, no_slot = 0, unresolved = 0, no_candidate = 0, borrowed = 0, declined = 0, fresh = 0,
+                 no_room = 0;
         // The prediction of the next layer's routes (ssd_cpu_sink_prefill_hint): `hint_layer`'s experts, hint_k a
         // token best first over hint_tokens tokens. The plan keeps its copy (`planned_hint`) until the call of the layer it
         // predicts, which measures it against the routes the layer took.
@@ -816,6 +825,8 @@ struct ssd_cpu_sink {
         uint64_t candidates = 0, declined = 0;
         uint64_t no_slot = 0; // the next layer's plan stopped short: no slot of its own or of another layer was left
         uint64_t borrowed = 0; // the next layer's plan reads into slots other layers lend
+        uint64_t fresh = 0;    // the next layer's plan reads into slots of its own that it pages in
+        uint64_t no_room = 0;  // the host ledger had no room for those: the plan was made without them
         size_t next_planned = 0;
     } lookahead_report;
 
@@ -1564,6 +1575,7 @@ struct ssd_cpu_sink {
         cache.before_release = nullptr; // vram is destroyed before cache
         cache.tier_held = nullptr;
         stop_threads(); // the I/O thread stops a read-ahead and waits for its reads before it returns
+        lookahead.fresh_room.cancel(); // before the host client, whose close waits for every open ticket
         ring_unlock(); // the tier is still here, and the ring's buffers too
         lookahead_summary();
         // Explicit unregister is synchronous. Do this before member destruction
@@ -2757,7 +2769,7 @@ struct ssd_cpu_sink {
             if (lookahead.active && !ahead) { lookahead.active = false; }
             if (ahead) {
                 lock.unlock();
-                lookahead_step();
+                lookahead_step(false); // the run waits for io_end: no slot is paged in before it
                 lock.lock();
             }
             io_end(ended);
@@ -2991,10 +3003,15 @@ struct ssd_cpu_sink {
 
     // The I/O thread: queues the plan's next experts into their RAM cache slots, as many as the ring's depth takes
     // beside the reads in flight, submits them and takes the completions the ring has. The ring is the I/O thread's
-    // here: a run's reads are over, and the next entry stops this before it uses the ring. False when nothing happened.
-    bool lookahead_step() {
+    // here: a run's reads are over, and the next entry stops this before it uses the ring. A fresh slot is paged in
+    // here first (sink_cache::page_in, a decode admission's first touch, off the run's path): its read goes out alone,
+    // so that the drive reads the reads before it meanwhile and the next entry waits for one page-in at most, and only
+    // when `may_page` (not in the step before the run is told its reads are over, which would wait for it). False when
+    // nothing happened.
+    bool lookahead_step(bool may_page = true) {
         auto & batch = lookahead.batch;
         batch.clear();
+        size_t paging = SIZE_MAX; // the plan's read whose fresh slot this step pages in
         try {
             {
                 std::lock_guard<std::mutex> lock(io_mutex);
@@ -3002,11 +3019,29 @@ struct ssd_cpu_sink {
                 while (!lookahead.stop && !io_stop && lookahead.next < lookahead.plan.size() &&
                         lookahead.inflight + batch.size() + 3 <= depth) {
                     auto & read = lookahead.plan[lookahead.next];
+                    if (read.fresh && (!may_page || !batch.empty())) { break; }
                     read.issued = true;
                     read.remaining = 3;
                     for (int role = 0; role < 3; ++role) { batch.push_back({ lookahead.next, role }); }
                     ++lookahead.next;
                     ++lookahead.issued;
+                    if (read.fresh) { paging = lookahead.next - 1; break; }
+                }
+            }
+            if (paging != SIZE_MAX) {
+                // the slot is inflight: nothing else touches it, and the arena stays until this read is over
+                auto & read = lookahead.plan[paging];
+                const bool paged = cache.page_in(size_t(read.entry));
+                std::lock_guard<std::mutex> lock(io_mutex);
+                read.paged = paged;
+                if (!paged) {
+                    // as a read that failed: the slot goes back empty, without pages
+                    std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] event=page_in_failed layer=%d expert=%d\n",
+                        lookahead.layer, read.expert);
+                    read.remaining = 0;
+                    read.failed = true;
+                    ++lookahead.failed;
+                    batch.clear();
                 }
             }
             // the plan does not change while the read-ahead runs, and an issued read's slot is inflight in the cache
@@ -3027,7 +3062,8 @@ struct ssd_cpu_sink {
                 if (cqe.user_data < sink_lookahead_tag) { throw std::runtime_error("a run's CQE beside the read-ahead"); }
                 lookahead_completion(cqe);
             }
-            return consumed || !batch.empty();
+            // a slot that failed to page in settled its read: progress, which may leave nothing in flight to wait for
+            return consumed || !batch.empty() || paging != SIZE_MAX;
         } catch (const std::exception & e) {
             lookahead_break(e);
             return false;
@@ -3117,10 +3153,14 @@ struct ssd_cpu_sink {
         for (const auto & read : lookahead.plan) {
             if (!read.issued) { cache.prefetch_restore(read.entry, read.generation, read.prior); continue; }
             cache.prefetch_issued(read.prior);
+            // a slot paged in is resident, whatever its read did, and counted before its entry is published
+            if (read.paged) { cache.paged_in(read.entry, read.generation); }
             const bool landed = !read.remaining && !read.failed;
             cache.prefetch_done(read.entry, read.generation, landed, false);
             if (landed && published && lookahead.layer == layer) { published->push_back(read.entry); }
         }
+        // the slots paged in are counted, and those never reached have no pages: the ledger's debit ends
+        lookahead.fresh_room.commit();
         lookahead.plan.clear();
         lookahead.next = 0;
         lookahead.layer = -1;
@@ -3149,6 +3189,7 @@ struct ssd_cpu_sink {
     void lookahead_unmap() {
         std::unique_lock<std::mutex> lock(io_mutex);
         lookahead_stop(lock);
+        lookahead.fresh_room.cancel(); // the pages it paged in go with the arena
         lookahead.plan.clear();
         lookahead.next = 0;
         lookahead.layer = -1;
@@ -3213,8 +3254,12 @@ struct ssd_cpu_sink {
     // most likely first, each into the slot that costs the pass least while its read pays (prefetch_read_value, the
     // decode prefetch's rule, over the pass's idle windows): a slot of the layer's RAM cache (prefetch_reserve, as the
     // decode prefetch takes one: a free slot first, else the coldest entry of an expert the prediction does not name),
+    // else one of the layer's fresh slots, which have no pages yet (decode's admissions commit them as they fill the
+    // cache: the read-ahead commits them earlier, within the cache's budget, and its expert stays in its own layer),
     // else one other layers lend (prefetch_borrow): first those that hold nothing the pass reads again, then entries
     // of layers it has yet to reach, each a hit the pass loses as often as its calls so far used what they retained.
+    // The fresh slots' room comes from the host ledger as a decode admission's does (sink_cache::take_fresh), for the
+    // plan at once; a ledger without it leaves the plan the one made without fresh slots.
     // The I/O thread reads them in that order from the end of this call's reads until the next call starts, whatever
     // that window's length: a slot's entry goes only once a read into it is issued, and a slot no read reached goes
     // back as it was (lookahead_finish). No plan without a prediction of the next layer or a measured rate, or for the
@@ -3294,9 +3339,6 @@ struct ssd_cpu_sink {
         std::vector<sink_lookahead_read> plan;
         plan.reserve(candidates.size());
         uint64_t unresolved = 0;
-        sink_cache::lendable_slots lendable; // the slots other layers lend, ranked when the layer's own run out
-        size_t lent_next = 0;
-        bool ranked = false;
         // A read's worth (ssd::place::prefetch_read_value, the decode prefetch's rule): what it gains if it lands, the
         // chance the next layer uses the expert less the chance the pass would have used what its slot held, against
         // the share of it a window leaves in flight. Reads go likeliest first into the slots that cost the pass least,
@@ -3313,41 +3355,69 @@ struct ssd_cpu_sink {
             return ssd::place::prefetch_read_value(gain, j + 1 > depth ? double(j + 1 - depth) * read_us : 0.0,
                 double(j) * read_us, read_us, windows);
         };
-        for (size_t i = 0; i < candidates.size(); ++i) {
-            sink_lookahead_read read;
-            read.expert = candidates[i];
-            bool resolved = true;
-            for (int role = 0; role < 3 && resolved; ++role) { resolved = source_of(next_index, read.expert, role, &read.role[role]); }
-            if (!resolved) { ++unresolved; ++skipped; continue; }
-            double gain = use[size_t(read.expert)];
-            read.entry = cache.prefetch_reserve(next, read.expert, read.role, &keep, &read.prior);
-            if (read.entry == -2) { ++skipped; continue; } // cached, or on its way
-            if (read.entry < 0) {                           // the layer has no idle slot left: one another layer lends
-                if (!ranked) { lendable = cache.lendable(next, layer); ranked = true; }
-                if (lent_next >= lendable.order.size()) { ++r.no_slot; break; }
-                // past the slots that hold nothing the pass reads again, each may cost it a hit
-                if (lent_next >= lendable.costless) { gain -= unreached_use; }
-                if (!(gain > 0)) { break; }
-                read.entry = cache.prefetch_borrow(lendable.order[lent_next++], next, read.expert, read.role,
-                    &read.prior);
-                if (read.entry < 0) { ++r.no_slot; break; }
-                ++r.borrowed;
+        // The plan, with the layer's fresh slots or without them.
+        auto make = [&](bool fresh) {
+            plan.clear();
+            worths.clear();
+            skipped = 0;
+            unresolved = 0;
+            r.no_slot = r.borrowed = 0;
+            sink_cache::lendable_slots lendable; // the slots other layers lend, ranked when the layer's own run out
+            size_t lent_next = 0;
+            bool ranked = false;
+            for (size_t i = 0; i < candidates.size(); ++i) {
+                sink_lookahead_read read;
+                read.expert = candidates[i];
+                bool resolved = true;
+                for (int role = 0; role < 3 && resolved; ++role) { resolved = source_of(next_index, read.expert, role, &read.role[role]); }
+                if (!resolved) { ++unresolved; ++skipped; continue; }
+                double gain = use[size_t(read.expert)];
+                read.entry = cache.prefetch_reserve(next, read.expert, read.role, &keep, &read.prior, fresh);
+                if (read.entry == -2) { ++skipped; continue; } // cached, or on its way
+                if (read.entry < 0) {                           // the layer has no idle slot left: one another layer lends
+                    if (!ranked) { lendable = cache.lendable(next, layer); ranked = true; }
+                    if (lent_next >= lendable.order.size()) { ++r.no_slot; break; }
+                    // past the slots that hold nothing the pass reads again, each may cost it a hit
+                    if (lent_next >= lendable.costless) { gain -= unreached_use; }
+                    if (!(gain > 0)) { break; }
+                    read.entry = cache.prefetch_borrow(lendable.order[lent_next++], next, read.expert, read.role,
+                        &read.prior);
+                    if (read.entry < 0) { ++r.no_slot; break; }
+                    ++r.borrowed;
+                }
+                read.generation = cache.generation;
+                read.fresh = !cache.entries[size_t(read.entry)].resident;
+                worths.push_back(worth(gain, read));
+                plan.push_back(read);
             }
-            read.generation = cache.generation;
-            for (int role = 0; role < 3; ++role) { read.target[role] = cache.data(read.entry, role); }
-            worths.push_back(worth(gain, read));
-            plan.push_back(read);
+            const size_t best = ssd::place::best_read_run(worths);
+            // the reads past the best run give their slots back as they were, as a read never issued does
+            for (size_t j = best; j < plan.size(); ++j) {
+                if (cache.entries[size_t(plan[j].entry)].lent) { --r.borrowed; }
+                cache.prefetch_restore(plan[j].entry, plan[j].generation, plan[j].prior);
+            }
+            plan.resize(best);
+        };
+        // fresh slots: the arena's, or those of a cache no decode token has sized yet
+        make(cache.arena || cache.readahead_geometry(size_t(nslots)));
+        r.fresh = size_t(std::count_if(plan.begin(), plan.end(),
+            [](const sink_lookahead_read & read) { return read.fresh; }));
+        if (r.fresh) {
+            lookahead.fresh_room = cache.take_fresh(r.fresh);
+            if (!lookahead.fresh_room) {
+                ++r.no_room;
+                for (const auto & read : plan) { cache.prefetch_restore(read.entry, read.generation, read.prior); }
+                make(false);
+                r.fresh = 0;
+            }
         }
-        const size_t best = ssd::place::best_read_run(worths);
-        // the reads past the best run give their slots back as they were, as a read never issued does
-        for (size_t j = best; j < plan.size(); ++j) {
-            if (cache.entries[size_t(plan[j].entry)].lent) { --r.borrowed; }
-            cache.prefetch_restore(plan[j].entry, plan[j].generation, plan[j].prior);
-        }
-        r.declined = candidates.size() - skipped - best;
-        plan.resize(best);
+        r.declined = candidates.size() - skipped - plan.size();
         lookahead.unresolved += unresolved;
         if (plan.empty()) { return; } // none resolves (the last routed layer's call), none pays, or no slot
+        // the slots' bytes: the arena is mapped by now
+        for (auto & read : plan) {
+            for (int role = 0; role < 3; ++role) { read.target[role] = cache.data(read.entry, role); }
+        }
         std::lock_guard<std::mutex> lock(io_mutex);
         lookahead.plan.swap(plan);
         lookahead.layer = next;
@@ -3395,28 +3465,29 @@ struct ssd_cpu_sink {
         lookahead.planned += r.next_planned; lookahead.issued_total += r.issued; lookahead.landed_total += r.landed;
         lookahead.failed_total += r.failed; lookahead.used += r.used; lookahead.unused += r.unused;
         lookahead.used_bytes += r.bytes; lookahead.no_slot += r.no_slot; lookahead.borrowed += r.borrowed;
-        lookahead.declined += r.declined;
+        lookahead.declined += r.declined; lookahead.fresh += r.fresh; lookahead.no_room += r.no_room;
         std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] layer=%d enabled=%d window_us=%.0f"
             " candidates=%llu planned=%llu issued=%llu read=%llu failed=%llu used=%llu unused=%llu"
-            " bytes=%llu next_planned=%zu declined=%llu no_slot=%llu borrowed=%llu\n", r.layer, int(lookahead.enabled),
-            r.window_us, (unsigned long long) r.candidates, (unsigned long long) r.planned,
+            " bytes=%llu next_planned=%zu declined=%llu no_slot=%llu borrowed=%llu fresh=%llu no_room=%llu\n", r.layer,
+            int(lookahead.enabled), r.window_us, (unsigned long long) r.candidates, (unsigned long long) r.planned,
             (unsigned long long) r.issued, (unsigned long long) r.landed, (unsigned long long) r.failed,
             (unsigned long long) r.used, (unsigned long long) r.unused, (unsigned long long) r.bytes,
             r.next_planned, (unsigned long long) r.declined, (unsigned long long) r.no_slot,
-            (unsigned long long) r.borrowed);
+            (unsigned long long) r.borrowed, (unsigned long long) r.fresh, (unsigned long long) r.no_room);
     }
     void lookahead_summary() {
         if (!lookahead.enabled || !lookahead.layers) { return; }
         std::fprintf(stderr, "[ssd_cpu_prefill_lookahead] reason=destroy layers=%llu planned=%llu issued=%llu read=%llu"
             " failed=%llu used=%llu unused=%llu used_bytes=%llu no_slot=%llu unresolved=%llu no_candidate=%llu"
-            " borrowed=%llu declined=%llu\n",
+            " borrowed=%llu declined=%llu fresh=%llu no_room=%llu\n",
             (unsigned long long) lookahead.layers, (unsigned long long) lookahead.planned,
             (unsigned long long) lookahead.issued_total, (unsigned long long) lookahead.landed_total,
             (unsigned long long) lookahead.failed_total, (unsigned long long) lookahead.used,
             (unsigned long long) lookahead.unused, (unsigned long long) lookahead.used_bytes,
             (unsigned long long) lookahead.no_slot, (unsigned long long) lookahead.unresolved,
             (unsigned long long) lookahead.no_candidate, (unsigned long long) lookahead.borrowed,
-            (unsigned long long) lookahead.declined);
+            (unsigned long long) lookahead.declined, (unsigned long long) lookahead.fresh,
+            (unsigned long long) lookahead.no_room);
         std::string rates;
         for (int rank = 0; rank < 16 && lookahead.rank_predicted[rank]; ++rank) {
             char one[32];

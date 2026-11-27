@@ -4110,8 +4110,10 @@ static void swiglu_tests(fixture_inputs & inputs, int depth, bool q2) {
 // read-ahead a prefill never admits to the cache, so layer 2 has none. Its outputs equal those of a sink without the
 // read-ahead, and the graph's, bit for bit. Injected failures of every read-ahead read, then of every third, give
 // their slots back: the pass computes the same output from its own reads. A decode run between two layers of a pass
-// stops the read-ahead, and a sink destroyed while it reads waits for its reads. The clamped SwiGLU is the graph's
-// scalar kernel: no packed division, which one core of a CI host computes wrongly at times.
+// stops the read-ahead, and a sink destroyed while it reads waits for its reads. RAM cache slots without pages yet (no
+// load step, as on unified memory beside a GPU tier, or slots decode has not filled) are paged in under the host
+// ledger's room, and a ledger without room reads nothing ahead. The clamped SwiGLU is the graph's scalar kernel: no
+// packed division, which one core of a CI host computes wrongly at times.
 static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
     const ssd_cpu_sink_activation swiglu = { SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP, 0.0f, 0.0f, 10.0f, nullptr, 0.0f };
     // the drive line the plan is sized from: fast enough that the window between two layers holds every expert
@@ -4337,6 +4339,190 @@ static void lookahead_tests(fixture_inputs & inputs, int threads, int depth) {
         std::printf("case=lookahead_borrow quota=%d layer2_ram_experts=%llu layer3_ram_experts=%llu status=PASS\n", quota,
             (unsigned long long) s2.ram_experts, (unsigned long long) s3.ram_experts);
         prefill.reset();
+    }
+    {
+        // Fresh slots: RAM cache slots that hold no pages yet, which the read-ahead pages in under the host ledger's
+        // room for them, as a decode admission's first touch does. Each case runs on a host client of its own, whose
+        // ledger it reads, and leaves layer 2's read-ahead a gap to read in, as the GPU's work between two layers does.
+        //  - No load step: on unified memory beside a GPU tier that keeps experts, the load step leaves the RAM cache
+        //    to the first decode token, and the first prompt finds it without slots. Layer 1's call sizes it as the
+        //    first decode admission would and pages in layer 2's slots: each is resident and counted (committed, peak
+        //    and page-table bytes), the ledger holds no debit once the reads landed, layer 2's call takes them as RAM
+        //    hits bit for bit, and the first decode token keeps them.
+        //  - After a decode token that left layer 2 four resident entries the pass does not use: the read-ahead takes
+        //    those slots first, then fresh ones, and borrows none.
+        //  - A ledger without room (a prefill holding more pages than a machine has), with no geometry yet and with
+        //    the geometry a decode token learned: nothing is read ahead, mapped or committed, and the outputs are the
+        //    same.
+        auto field = [](const std::string & log, const std::string & at, const char * key) {
+            const size_t line = log.find(at);
+            const size_t end = line == std::string::npos ? line : log.find('\n', line);
+            const size_t found = line == std::string::npos ? line : log.find(std::string(" ") + key + "=", line);
+            require(found != std::string::npos && found < end, at + "names no " + key + ": " + log.substr(0, 800));
+            return uint64_t(std::stoull(log.substr(found + std::strlen(key) + 2)));
+        };
+        // the graph's pass over `routes`, a token at a time
+        auto graph_of = [&](int layer, const std::vector<int32_t> & routes, const std::vector<float> & input) {
+            std::vector<float> output;
+            for (int t = 0; t < ntokens; ++t) {
+                const auto row = input.begin() + std::ptrdiff_t(t) * f.latent;
+                const auto slot = std::ptrdiff_t(t) * nslots;
+                const auto y = reference_moe_graph(f, layer, std::vector<float>(row, row + f.latent),
+                    std::vector<int32_t>(routes.begin() + slot, routes.begin() + slot + nslots),
+                    std::vector<float>(weights.begin() + slot, weights.begin() + slot + nslots), swiglu, 1);
+                output.insert(output.end(), y.begin(), y.end());
+            }
+            return output;
+        };
+        struct hosted {
+            std::shared_ptr<ssd::host::process_arbiter> owner = std::make_shared<ssd::host::process_arbiter>();
+            std::unique_ptr<ssd::host::context_client> client;
+            sink_ptr sink; // before the client it borrows goes
+        };
+        // a sink on its own host client, without the load step, its cache a slot for every expert of layers 1 and 2
+        auto host = [&](hosted & h) {
+            auto made = h.owner->make_client();
+            require(bool(made), made.error);
+            h.client = std::move(made.value);
+            const auto saved = inputs.runtime;
+            auto services = saved;
+            services.host = h.client.get();
+            inputs.set_runtime_services(services);
+            h.sink = make_sink(inputs, f, threads, depth);
+            inputs.set_runtime_services(saved);
+            configure_cache(h.sink.get(), 2 * uint64_t(f.experts) * stride, { 1, 2 }, f.experts);
+        };
+        auto pending = [](const hosted & h) {
+            const auto state = h.client->state();
+            require(bool(state), state.error);
+            return state.value.pending_bytes;
+        };
+        // a pass over `routes`, which name `experts` distinct experts; layer 1's call predicts layer 2's routes
+        struct fresh_pass { std::vector<float> y1, y2; ssd_cpu_prefill_stats layer2 = {}; std::string log; };
+        auto run = [&](hosted & h, ssd_cpu_prefill * prefill, const std::vector<int32_t> & routes, uint64_t experts,
+                bool gap) {
+            fresh_pass r;
+            auto call = [&](const tensors & meta, const std::vector<float> & input, std::vector<float> & output) {
+                if (&meta == &meta1) { ssd_cpu_sink_prefill_hint(h.sink.get(), 2, routes.data(), ntokens, nslots); }
+                output.assign(input.size(), 0.0f);
+                ssd_cpu_prefill_stats stats = {};
+                require(ssd_cpu_prefill_run_activation(prefill, meta.layer, input.data(), routes.data(), weights.data(),
+                    nslots, ntokens, &swiglu, output.data(), &stats, error, sizeof(error)),
+                    std::string("fresh slots prefill: ") + error);
+                require(!stats.stream.read_errors && !stats.stream.pending_reads &&
+                    stats.stream.read_completions == stats.stream.read_requests &&
+                    stats.stream.read_requests == 3 * stats.ssd_experts && stats.ram_experts + stats.ssd_experts == experts,
+                    "fresh slots prefill counters");
+                return stats;
+            };
+            stderr_capture capture;
+            call(meta1, x, r.y1);
+            if (gap) { std::this_thread::sleep_for(std::chrono::milliseconds(300)); }
+            r.layer2 = call(meta2, r.y1, r.y2);
+            r.log = capture.read();
+            return r;
+        };
+        const std::string planner = "[ssd_cpu_prefill_lookahead] layer=1 ", served = "[ssd_cpu_prefill_lookahead] layer=2 ";
+        {
+            hosted h;
+            host(h);
+            prefill_ptr prefill(ssd_cpu_prefill_create(h.sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
+            require(bool(prefill), error);
+            const auto measured = run(h, prefill.get(), ids, uint64_t(f.experts), false);
+            require(same_bits(measured.y1, y1) && same_bits(measured.y2, y2), "fresh slots, first pass: output differs from the graph");
+            require(!cache_snapshot(h.sink.get()).mapped_bytes, "fresh slots: a pass that read nothing ahead mapped the cache");
+            const auto ahead = run(h, prefill.get(), ids, uint64_t(f.experts), true);
+            require(same_bits(ahead.y1, y1) && same_bits(ahead.y2, y2), "fresh slots: output differs from the graph");
+            require(ahead.layer2.ram_experts >= 1, "fresh slots: the read-ahead put no expert of layer 2 in the RAM cache: " +
+                    ahead.log.substr(0, 800));
+            const uint64_t planned = field(ahead.log, planner, "next_planned"), fresh = field(ahead.log, planner, "fresh");
+            const uint64_t issued = field(ahead.log, served, "issued"), landed = field(ahead.log, served, "read");
+            require(planned >= 1 && fresh == planned && !field(ahead.log, planner, "borrowed") &&
+                    !field(ahead.log, planner, "no_room") && issued >= 1 && landed == ahead.layer2.ram_experts,
+                    "fresh slots: layer 2's experts were not read ahead into its fresh slots: " + ahead.log.substr(0, 800));
+            const auto s = cache_snapshot(h.sink.get());
+            require(s.mapped_bytes == 2 * uint64_t(f.experts) * stride && s.capacity_bytes == s.mapped_bytes &&
+                    s.committed_bytes == issued * stride && s.peak_bytes == s.committed_bytes && s.page_table_bytes > 0 &&
+                    s.valid_bytes == landed * stride && !s.refaulted_bytes && !s.clears,
+                    "fresh slots: the slots paged in are not counted as an admission's: committed " +
+                    std::to_string(s.committed_bytes) + ", peak " + std::to_string(s.peak_bytes) + ", " +
+                    std::to_string(issued) + " issued of stride " + std::to_string(stride));
+            require(!pending(h), "fresh slots: the ledger kept the read-ahead's debit after its reads landed");
+            begin_cache(h.sink.get(), 41, 1);
+            const auto kept = cache_snapshot(h.sink.get());
+            require(!kept.clears && kept.committed_bytes == s.committed_bytes && kept.valid_bytes == s.valid_bytes,
+                    "fresh slots: the first decode token did not keep what the read-ahead paged in");
+            std::printf("case=lookahead_fresh threads=%d ring_experts=%d planned=%llu issued=%llu layer2_ram_experts=%llu "
+                "committed_bytes=%llu status=PASS\n", threads, depth, (unsigned long long) planned,
+                (unsigned long long) issued, (unsigned long long) ahead.layer2.ram_experts,
+                (unsigned long long) s.committed_bytes);
+        }
+        {
+            // the pass routes to experts 0..19, six distinct a token; decode leaves layer 2 experts 20..23
+            std::vector<int32_t> routes(ids.size());
+            for (int t = 0; t < ntokens; ++t) {
+                for (int s = 0; s < nslots; ++s) { routes[size_t(t) * nslots + s] = int32_t((t * 3 + s * 3) % 20); }
+            }
+            const auto g1 = graph_of(1, routes, x);
+            const auto g2 = graph_of(2, routes, g1);
+            hosted h;
+            host(h);
+            begin_cache(h.sink.get(), 51, 1);
+            const int32_t unused[4] = { 20, 21, 22, 23 };
+            const float quarter[4] = { .25f, .25f, .25f, .25f };
+            std::vector<float> single(size_t(f.latent), 0.125f), out(size_t(f.latent));
+            ssd_cpu_sink_stats decoded = {};
+            require(ssd_cpu_sink_run_activation(h.sink.get(), meta2.layer, single.data(), unused, quarter, 4, &swiglu,
+                out.data(), &decoded, error, sizeof(error)), error);
+            require(decoded.cache_admitted == 4 && cache_snapshot(h.sink.get()).committed_bytes == 4 * stride,
+                    "fresh slots: decode did not admit four experts of layer 2");
+            begin_cache(h.sink.get(), 51, 2, false);
+            prefill_ptr prefill(ssd_cpu_prefill_create(h.sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
+            require(bool(prefill), error);
+            run(h, prefill.get(), routes, 20, false);
+            const auto ahead = run(h, prefill.get(), routes, 20, true);
+            require(same_bits(ahead.y1, g1) && same_bits(ahead.y2, g2), "fresh slots after decode: output differs from the graph");
+            require(ahead.layer2.ram_experts > 4, "fresh slots after decode: layer 2 had RAM hits from its resident slots "
+                    "alone: " + ahead.log.substr(0, 800));
+            const uint64_t planned = field(ahead.log, planner, "next_planned"), fresh = field(ahead.log, planner, "fresh");
+            const uint64_t issued = field(ahead.log, served, "issued");
+            require(planned > 4 && fresh + 4 == planned && !field(ahead.log, planner, "borrowed"),
+                    "fresh slots after decode: the read-ahead did not take the resident slots first, then fresh ones: " +
+                    ahead.log.substr(0, 800));
+            require(cache_snapshot(h.sink.get()).committed_bytes == std::max<uint64_t>(issued, 4) * stride && !pending(h),
+                    "fresh slots after decode: the fresh slots paged in are not counted");
+            std::printf("case=lookahead_fresh_after_decode planned=%llu fresh=%llu layer2_ram_experts=%llu status=PASS\n",
+                (unsigned long long) planned, (unsigned long long) fresh, (unsigned long long) ahead.layer2.ram_experts);
+        }
+        for (const bool decoded : { false, true }) {
+            hosted h;
+            host(h);
+            if (decoded) {
+                begin_cache(h.sink.get(), 61, 1);
+                const int32_t expert = 3;
+                const float one = 1.0f;
+                std::vector<float> single(size_t(f.latent), 0.125f), out(size_t(f.latent));
+                require(ssd_cpu_sink_run_activation(h.sink.get(), meta2.layer, single.data(), &expert, &one, 1, &swiglu,
+                    out.data(), nullptr, error, sizeof(error)), error);
+                begin_cache(h.sink.get(), 61, 2, false);
+            }
+            // the prefill holds a PiB of pages: no growth of the cache fits beside them
+            ssd_cpu_sink_cache_prefill_room(h.sink.get(), uint64_t(1) << 50, 0, 0);
+            prefill_ptr prefill(ssd_cpu_prefill_create(h.sink.get(), error, sizeof(error)), ssd_cpu_prefill_destroy);
+            require(bool(prefill), error);
+            const auto measured = run(h, prefill.get(), ids, uint64_t(f.experts), false);
+            const auto ahead = run(h, prefill.get(), ids, uint64_t(f.experts), true);
+            require(same_bits(measured.y2, y2) && same_bits(ahead.y1, y1) && same_bits(ahead.y2, y2),
+                    "fresh slots without room: output differs from the graph");
+            const auto s = cache_snapshot(h.sink.get());
+            // with no geometry, the room for its metadata is refused; with one, the room for the fresh slots
+            require(!ahead.layer2.ram_experts && !field(ahead.log, planner, "next_planned") &&
+                    !field(ahead.log, planner, "fresh") && field(ahead.log, planner, "no_room") == uint64_t(decoded) &&
+                    !s.mapped_bytes && !s.committed_bytes && (decoded || !s.capacity_bytes) && !pending(h),
+                    std::string("fresh slots without room") + (decoded ? " after decode" : "") +
+                    ": the read-ahead read, mapped or committed: " + ahead.log.substr(0, 800));
+            std::printf("case=lookahead_fresh_no_room decoded=%d status=PASS\n", int(decoded));
+        }
     }
     std::printf("CPU_SINK_LOOKAHEAD_OK threads=%d ring_experts=%d\n", threads, depth);
 }
