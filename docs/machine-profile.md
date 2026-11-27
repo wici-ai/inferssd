@@ -113,7 +113,7 @@ memory, the available memory) to choose:
   a GPU sharing host memory, a host margin of 4096 MiB (`host.headroom_mib`);
 - for a model published with an MTP draft head (an `mtp-*.gguf` file beside the model's
   files), whether to load it. The server measures the launch's decode steps with the head
-  once (`--ssd-decode-probe`, minutes, as loading the model takes): the dense time of a step
+  once (`--ssd-decode-probe`, about as long as loading the model): the dense time of a step
   of one to four rows and of a draft. Drafts save only the dense work the rows of a step
   share: each accepted token still pays its own routed experts, which the
   [speed estimate](#speed-estimates) prices with and without the head, its tensors and its
