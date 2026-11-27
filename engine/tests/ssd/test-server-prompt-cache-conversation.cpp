@@ -265,12 +265,125 @@ static void test_chat_request_reports_the_opening() {
             "the context prefix of a merged system turn ends with the turn");
 }
 
+// The layout of a request for reuse: the tools of MCP servers after the app's own tools, by server; a state kept
+// where each group of tools ends and where the data at the end of the user's context starts, or would start.
+static void test_chat_request_reports_branch_points() {
+    server_chat_params opt{};
+    opt.use_jinja          = true;
+    opt.prefill_assistant  = true;
+    opt.reasoning_format   = COMMON_REASONING_FORMAT_DEEPSEEK;
+    opt.force_pure_content = true;
+    // the first system message with the tools in one turn, as Gemma 4 renders them, then the other messages
+    opt.tmpls = common_chat_templates_init(/* model= */ nullptr,
+            "{% for message in messages %}<|im_start|>{{ message.role }}\n{{ message.content }}"
+            "{% if loop.first and tools %}{% for tool in tools %}<tool>{{ tool.function.name }}</tool>{% endfor %}{% endif %}"
+            "<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% endif %}");
+    const auto tool = [](const char * name) {
+        return json{{"type", "function"}, {"function", {{"name", name}, {"description", "d"},
+                                                        {"parameters", {{"type", "object"}}}}}};
+    };
+    const auto parse = [&](json body) {
+        std::vector<raw_buffer> files;
+        return oaicompat_chat_params_parse(body, opt, files);
+    };
+    const auto points = [](const json & params) {
+        std::vector<std::string> out;
+        const std::string prompt = params.at("prompt").get<std::string>();
+        for (const auto & p : json_value(params, "branch_points_chars", json::array())) {
+            out.push_back(prompt.substr(0, p.get<size_t>()));
+        }
+        return out;
+    };
+
+    json body = {
+        {"messages", json::array({{{"role", "system"}, {"content", "App."}},
+                                  {{"role", "user"}, {"content", "Hi."}}})},
+        {"tools", json::array({tool("mcp__web::fetch"), tool("read"), tool("mcp__docs__search"), tool("write"),
+                               tool("mcp__web::open")})},
+    };
+    const json params = parse(body);
+    const std::string system = "<|im_start|>system\nApp.";
+    require(params.at("prompt").get<std::string>().rfind(system + "<tool>read</tool><tool>write</tool>"
+                "<tool>mcp__docs__search</tool><tool>mcp__web::fetch</tool><tool>mcp__web::open</tool><|im_end|>\n", 0) == 0,
+            "the app's tools come first, then each MCP server's in the order of their names: " +
+                params.at("prompt").get<std::string>());
+    const std::vector<std::string> tools_points = points(params);
+    require(tools_points.size() == 3, "a point where each group of tools ends");
+    // where the renders part, here one byte into the next tag; the server keeps the state of the whole tokens before
+    require(tools_points[0] == system + "<tool>read</tool><tool>write</tool><", "after the app's tools: " + tools_points[0]);
+    require(tools_points[1] == system + "<tool>read</tool><tool>write</tool><tool>mcp__docs__search</tool><",
+            "after the first server's: " + tools_points[1]);
+    require(tools_points[2] == system + "<tool>read</tool><tool>write</tool><tool>mcp__docs__search</tool>"
+                "<tool>mcp__web::fetch</tool><tool>mcp__web::open</tool><",
+            "after the last tool, where another would go: " + tools_points[2]);
+
+    // a Responses request's user context with the approved commands at its end
+    const std::string data = "\n\n## Approved command prefixes\n- [\"git\", \"status\"]";
+    json with_data = {
+        {"messages", json::array({{{"role", "system"}, {"content", "App."}},
+                                  {{"role", "system"}, {"content", "<permissions instructions>\nAsk.\n</permissions instructions>" + data}},
+                                  {{"role", "user"}, {"content", "Hi."}}})},
+    };
+    with_data[SERVER_USER_CONTEXT_SYSTEM_MESSAGE] = true;
+    with_data[SERVER_USER_CONTEXT_DATA_CHARS]     = data.size();
+    const json data_params = parse(with_data);
+    const std::string context = "<|im_start|>system\nApp.<|im_end|>\n<|im_start|>system\n<permissions instructions>\nAsk.\n</permissions instructions>";
+    require(points(data_params) == std::vector<std::string>({ context }), "a point where the data starts");
+    require(!data_params.contains(SERVER_USER_CONTEXT_DATA_CHARS), "the request field is not passed on");
+
+    json no_data = with_data;
+    no_data["messages"][1]["content"] = "<permissions instructions>\nAsk.\n</permissions instructions>";
+    no_data.erase(SERVER_USER_CONTEXT_DATA_CHARS);
+    require(points(parse(no_data)) == std::vector<std::string>({ context }),
+            "a point where the data would start, so that a later context with data finds it");
+}
+
+// The conversion of a Responses request moves the data the user adds to over time to the end of the user's context
+// and replaces the sub-agent tool's model list.
+static void test_responses_request_layout() {
+    const std::string permissions = "<permissions instructions>\nApproval policy is `granular`.\n- `skill_approval`";
+    const std::string approved    = "\n\n## Approved command prefixes\nThe following prefix rules have already been approved: - [\"git\", \"status\"]";
+    const std::string roots       = "\n The writable roots are `/private/tmp`.\n</permissions instructions>";
+    const std::string deferred    = "<tools>\nDeferred tool namespaces:\n- mcp__node_repl\n</tools>";
+    const std::string mode        = "<collaboration_mode># Collaboration Mode: Default</collaboration_mode>";
+    const std::string models      = "Available model overrides (optional; inherited parent model is preferred):\n"
+                                    "- `gpt-6.2-sol`: Fast. Reasoning efforts: low (default), high.\n"
+                                    "- `gpt-6.1-sol`: Previous. Reasoning efforts: low (default).\n";
+    const json body = {
+        {"model", "m"},
+        {"input", json::array({
+            {{"role", "developer"}, {"content", json::array({{{"type", "input_text"}, {"text", "You are Codex."}}})}},
+            {{"role", "developer"}, {"content", json::array({{{"type", "input_text"}, {"text", permissions + approved + roots}},
+                                                             {{"type", "input_text"}, {"text", deferred}},
+                                                             {{"type", "input_text"}, {"text", mode}}})}},
+            {{"role", "user"}, {"content", "hi"}},
+        })},
+        {"tools", json::array({{{"type", "namespace"}, {"name", "multi_agent_v1"}, {"description", "Sub-agents."},
+                                {"tools", json::array({{{"type", "function"}, {"name", "spawn_agent"},
+                                                        {"description", "Spawns an agent.\n\n" + models + "\nDo not spawn unless asked."},
+                                                        {"parameters", {{"type", "object"}}}}})}}})},
+    };
+    const json chat = server_chat_convert_responses_to_chatcmpl(body);
+    const std::string context = chat.at("messages").at(1).at("content").get<std::string>();
+    const std::string moved   = approved.substr(2) + "\n\n" + deferred;
+    require(context == permissions + roots + "\n\n" + mode + "\n\n" + moved,
+            "the approved commands and the deferred tools go to the end of the context: " + context);
+    require(json_value(chat, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) == moved.size() + 2,
+            "the request says how long the data at the end is");
+    require(chat.at("tools").at(0).at("function").at("description").get<std::string>() ==
+                "Sub-agents.\nSpawns an agent.\n\nModel overrides: none; the new agent runs on the parent's model.\n"
+                "\nDo not spawn unless asked.",
+            "the model list becomes one sentence: " + chat.at("tools").at(0).at("function").at("description").get<std::string>());
+}
+
 int main() {
     try {
         test_supersedes();
         test_memory_cache();
         test_disk_cache();
         test_chat_request_reports_the_opening();
+        test_chat_request_reports_branch_points();
+        test_responses_request_layout();
     } catch (const std::exception & e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

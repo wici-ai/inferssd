@@ -7,6 +7,11 @@
 // Metadata policy unit tests only: no context, serialization, host admission or
 // first-touch claim. Real save/load remains covered by the native fixture.
 struct server_prompt_cache_testing {
+    static bool contains(server_prompt_cache & cache, const server_prompt & prompt,
+                         common_context_seq_rm_type seq_rm_type) {
+        return cache.contains(prompt, seq_rm_type);
+    }
+
     static server_prompt * alloc_metadata(
             server_prompt_cache & cache,
             const server_prompt & prompt,
@@ -55,5 +60,9 @@ struct server_prompt_cache_testing {
     // reads the prefix cache directory again if it changed, as load() does before it looks for a state
     static void scan_prefix_dir(server_prompt_cache & cache) {
         cache.scan_prefix_dir();
+    }
+
+    static size_t unusable_prefixes(const server_prompt_cache & cache) {
+        return cache.prefix_unusable.size();
     }
 };

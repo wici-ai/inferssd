@@ -61,6 +61,13 @@ llama_context::llama_context(
     const auto & hparams = model.hparams;
 
     cparams.n_seq_max = std::max(1u, params.n_seq_max);
+    // the rollback planes of the recurrent state exist where the model's graph writes them
+    cparams.n_rs_seq = params.n_rs_seq;
+    if (cparams.n_rs_seq > 0 && model.arch != LLM_ARCH_QWEN35MOE && model.arch != LLM_ARCH_QWEN4EXP) {
+        LLAMA_LOG_INFO("%s: the recurrent state of %s does not roll back; n_rs_seq %u -> 0\n", __func__,
+            llm_arch_name(model.arch), cparams.n_rs_seq);
+        cparams.n_rs_seq = 0;
+    }
     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
     }
@@ -211,6 +218,10 @@ llama_context::llama_context(
     cpu_sink_enabled = ssd_runtime && !ssd_runtime->settings.sources()->empty();
     dense_gpu_phase_gate_enabled = cpu_sink_enabled;
     if (cpu_sink_enabled) {
+        if (model.split_mode() == LLAMA_SPLIT_MODE_TENSOR ||
+                (model.split_mode() == LLAMA_SPLIT_MODE_ROW && model.n_devices() > 1)) {
+            throw std::runtime_error("SSD experts support single-device and layer split modes");
+        }
         if (llama_ssd::describe_experts(model.arch, model.hparams, -1).activation ==
                 llama_ssd::expert_activation::unsupported) {
             throw std::runtime_error("SSD CPU experts do not support this model architecture");
@@ -321,7 +332,7 @@ llama_context::llama_context(
         backends.emplace_back(backend_cpu);
 
         if (ssd_runtime) {
-            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get()); }
+            for (const auto & backend : backends) { ssd_runtime->attach_backend(backend.get(), model.split_mode()); }
             // A model without routed experts streams the layers it keeps in host memory to the GPU; one with them
             // keeps the scheduler's own rule for any weight there, as before.
             ssd_runtime->stream.set_streaming(model.hparams.n_expert == 0);
@@ -344,16 +355,27 @@ llama_context::llama_context(
             // After the backends: the sink has a GPU tier only when one of them injected its provider.
             if (cpu_sink_enabled) {
                 // the routed layers (up, gate and down experts each) and their expert layout, described once here
-                std::vector<ssd::store::expert_layout::routed_layer> routed;
-                for (uint32_t il = 0; il < model.hparams.n_layer; ++il) {
+                using layers = std::vector<ssd::store::expert_layout::routed_layer>;
+                std::vector<std::pair<const ssd::runtime_services *, layers>> groups;
+                const auto epoch = ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed);
+                for (uint32_t il = 0; il < model.hparams.n_layer_all(); ++il) {
                     const auto & layer = model.layers[il];
                     if (layer.ffn_up_exps && layer.ffn_gate_exps && layer.ffn_down_exps) {
-                        routed.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
+                        const auto * target = &ssd_runtime->services_for(model.dev_layer(il));
+                        auto group = std::find_if(groups.begin(), groups.end(),
+                            [target](const auto & item) { return item.first == target; });
+                        if (group == groups.end()) {
+                            groups.emplace_back(target, layers{});
+                            group = std::prev(groups.end());
+                        }
+                        group->second.push_back({ int32_t(il), { layer.ffn_up_exps, layer.ffn_gate_exps, layer.ffn_down_exps } });
                     }
                 }
-                cpu_sink_runtime = std::make_unique<llama_ssd_cpu_sink_runtime>(
-                    ssd_cpu_sink_context_epoch.fetch_add(1, std::memory_order_relaxed),
-                    routed, ssd_runtime->settings, ssd_runtime->services, ssd_runtime->sources);
+                if (groups.empty()) { throw std::runtime_error("the model has no routed expert layers"); }
+                cpu_sink_runtime = std::make_unique<llama_ssd_executor_group>();
+                for (const auto & group : groups) {
+                    cpu_sink_runtime->add(epoch, group.second, ssd_runtime->settings, *group.first, ssd_runtime->sources);
+                }
             }
             auto * registry = ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu));
             const auto get_api = reinterpret_cast<ssd::cpu::get_api_v2>(
@@ -366,6 +388,11 @@ llama_context::llama_context(
             // the CPU backend's work memory takes its room from it as the expert caches do.
             if (!api->cache_make_room(nullptr, &ssd_runtime->settings, &ssd_runtime->services, 0, 0)) {
                 throw std::runtime_error("cannot configure the context host budget");
+            }
+            for (auto & entry : ssd_runtime->additional_devices) {
+                if (!api->cache_make_room(nullptr, &ssd_runtime->settings, &entry.second.services, 0, 0)) {
+                    throw std::runtime_error("cannot configure host budget for the additional GPU");
+                }
             }
             if (!api->attach_services(backend_cpu, &ssd_runtime->services)) {
                 throw std::runtime_error("cannot attach context-owned CPU runtime services");
@@ -470,7 +497,7 @@ llama_context::llama_context(
                 if (!cpu_sink_runtime) {
                     return grow();
                 }
-                auto granted = cpu_sink_runtime->take_room(host_bytes, device_bytes);
+                auto granted = cpu_sink_runtime->primary().take_room(host_bytes, device_bytes);
                 if (!granted) {
                     LLAMA_LOG_ERROR("%s: no room for more KV cache: %s\n", __func__, granted.error.c_str());
                     return false;
@@ -569,7 +596,7 @@ llama_context::llama_context(
         // The expert caches' storage once the worst-case graph is reserved (the GPU tier's on unified memory, the RAM
         // cache's elsewhere when it can give room back; the sink decides): its page population then leaves every
         // request's path.
-        if (cpu_sink_runtime && (cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget) && backend_cpu) {
+        if (cpu_sink_runtime && cpu_sink_runtime->has_cache() && backend_cpu) {
             cpu_sink_runtime->reserve_tier(ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)),
                 int(model.hparams.n_expert_used));
         }
@@ -692,12 +719,12 @@ void llama_context::dense_graph_cache_end_phase() {
     dense_gpu_scheduler_graph_phase = 0;
 }
 
-static uint32_t ssd_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode) {
-    // CPU sink only executes one token at a time. Reserving the ubatch-sized
-    // fallback graph during decode needlessly allocates GPU expert workspace.
+static uint32_t ssd_cpu_sink_reserve_tokens(const llama_cparams & params, bool decode, uint32_t decode_rows) {
+    // A decode graph holds the rows of one decode step: a token, or the most rows a draft verification has had
+    // (decode_rows). Reserving the ubatch-sized graph during decode needlessly allocates GPU expert workspace.
     // Keep the configured ubatch intact so the next prefill is unchanged.
     if (decode && params.n_seq_max == 1) {
-        return 1;
+        return std::min(params.n_ctx, std::max(1u, decode_rows));
     }
     return std::min(params.n_ctx, params.n_ubatch);
 }
@@ -1003,7 +1030,7 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_seqs = cparams.n_seq_max;
     const uint32_t n_tokens = ssd_cpu_sink_reserve_tokens(cparams,
-        cpu_sink_enabled && cpu_sink_decode_active);
+        cpu_sink_enabled && cpu_sink_decode_active, cpu_sink_decode_rows);
     if (n_tokens < std::min(cparams.n_ctx, cparams.n_ubatch)) {
         LLAMA_LOG_INFO("[ssd_cpu_sink_decode_reserve] tokens=%u configured_ubatch=%u\n",
             n_tokens, cparams.n_ubatch);
@@ -1166,7 +1193,8 @@ void llama_context::sched_reserve() {
     // emit more outputs grow this reserve before building their next ubatch.
     // Pooled embeddings need all token outputs for their reduction graph.
     const uint32_t n_outputs_pp = cpu_prefill_output_sizing_enabled && !cparams.embeddings ?
-        std::min(n_tokens, std::max(n_seqs, sched_reserve_n_outputs)) : n_tokens;
+        std::min(n_tokens, std::max({n_seqs, sched_reserve_n_outputs,
+            cpu_sink_enabled && cpu_sink_decode_active ? cpu_sink_decode_rows : 0u})) : n_tokens;
     if (cpu_prefill_output_sizing_enabled) {
         LLAMA_LOG_INFO("[prefill_reserve_outputs] n_tokens=%u n_outputs=%u\n", n_tokens, n_outputs_pp);
     }
@@ -1301,12 +1329,12 @@ void llama_context::synchronize() {
 }
 
 bool llama_context::host_reserve(size_t bytes) {
-    return !cpu_sink_runtime || cpu_sink_runtime->make_room(bytes);
+    return !cpu_sink_runtime || cpu_sink_runtime->primary().make_room(bytes);
 }
 
 ssd::result<ssd::host::allocation_ticket> llama_context::host_take(size_t bytes) {
     if (!cpu_sink_runtime) { return {}; }
-    return cpu_sink_runtime->take_room(bytes);
+    return cpu_sink_runtime->primary().take_room(bytes);
 }
 
 void llama_context::host_note_memory_change() noexcept {
@@ -1318,7 +1346,7 @@ void llama_context::host_note_memory_change() noexcept {
 bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_tokens, uint32_t prefill_tokens) {
     const int64_t transition_start_us = ggml_time_us();
     auto complete_vram_phase = [&](bool decode) {
-        return !cpu_sink_runtime || !cpu_sink_runtime->vram_budget || cpu_sink_runtime->phase_complete(decode);
+        return !cpu_sink_runtime || !cpu_sink_runtime->primary().vram_budget || cpu_sink_runtime->phase_complete(decode);
     };
     // One line per request phase with the copies of the streamed weights: a request's start ends the
     // previous phase and begins its prefill, the prefill's end begins its decode, the request's end ends that
@@ -1339,7 +1367,13 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         }
     }
     // A prompt's graphs, its later batches' too, hold the memory pools; the decode reserve below gives back the rest.
+    // From that reserve on the pools hold again: decode's steps differ in rows (a token, a draft's verification), and
+    // a pool given back to a one-row step is memory the VRAM tier grows into before the next longer step needs it.
     dense_pool_hold(active);
+    const auto decode_reserved = [&](bool ok) {
+        if (!active) { dense_pool_hold(true); }
+        return ok;
+    };
     // This is the explicit request prefill boundary, including single-token
     // prompts. Release before every early return or prefill workspace reserve.
     if (active && cpu_sink_runtime) {
@@ -1447,7 +1481,7 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
         if (!cpu_prefill_actual_shape_active) {
             const bool reserved = !phase_changed || reserve_ubatch(1);
             const bool vram_complete = complete_vram_phase(reserved);
-            return reserved && vram_complete;
+            return decode_reserved(reserved && vram_complete);
         }
         const uint32_t released = cpu_prefill_selected_ubatch;
         const bool graph_restored = reserve_ubatch(1);
@@ -1460,12 +1494,12 @@ bool llama_context::moe_prefill_phase_workspace(bool active, uint32_t requested_
             "transition_ms=%.3f\n",
             released, graph_restored ? 1 : 0,
             (ggml_time_us() - transition_start_us) / 1000.0);
-        return graph_restored && vram_complete;
+        return decode_reserved(graph_restored && vram_complete);
     }
 
     const bool reserved = !phase_changed || reserve_ubatch(cparams.n_ubatch);
     const bool vram_complete = complete_vram_phase(reserved && !active);
-    return reserved && vram_complete;
+    return decode_reserved(reserved && vram_complete);
 }
 
 void llama_context::make_scheduler(size_t max_nodes) {
@@ -1619,7 +1653,7 @@ bool llama_context::memory_update(bool optimize) {
 
         const uint32_t n_seqs = cparams.n_seq_max;
         const uint32_t n_tokens = ssd_cpu_sink_reserve_tokens(cparams,
-            cpu_sink_enabled && cpu_sink_decode_active);
+            cpu_sink_enabled && cpu_sink_decode_active, cpu_sink_decode_rows);
 
         auto * gf = graph_reserve(n_tokens, n_seqs, n_tokens, mctx.get());
         if (!gf) {
@@ -1756,10 +1790,10 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         }
         const int64_t row = cparams.embeddings_nextn_masked ? output_resolve_row(i) :
             (i < 0 ? (int64_t) n_outputs + i : i);
-        if (row < 0 || (size_t) row * model.hparams.n_embd >= embd_nextn.size) {
+        if (row < 0 || (size_t) row * model.hparams.n_embd_h() >= embd_nextn.size) {
             throw std::runtime_error("nextn embedding index out of range");
         }
-        return embd_nextn.data + row * model.hparams.n_embd;
+        return embd_nextn.data + row * model.hparams.n_embd_h();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid nextn embeddings id %d, reason: %s\n", __func__, i, err.what());
         return nullptr;
@@ -2127,14 +2161,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    if (cpu_sink_decode_active && ubatch.n_tokens > 1 && !cpu_sink_multi_token_reported) {
-        // the sink decodes one token at a time and its grouped prefill is for prefill: a larger decode ubatch (a draft
-        // to verify) runs ggml's MUL_MAT_ID over the mapped experts, where the scheduler puts it
-        LLAMA_LOG_WARN("[ssd_cpu_sink] n_tokens=%u in decode runs ggml's MUL_MAT_ID over the mapped experts; "
-            "the sink decodes one token\n", ubatch.n_tokens);
-        cpu_sink_multi_token_reported = true;
-    }
-
     ggml_backend_sched_ssd_set_dense_decode(
         sched.get(),
         !dense_gpu_phase_gate_enabled ||
@@ -2232,18 +2258,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // Phase/token tracking is also required by a VRAM-only tier and by
     // zero-cache profiling. The runtime skips this when all are disabled.
     if (cpu_sink_cache_batch_decode && cpu_sink_runtime) {
-        // One begin per actual logical decode token, on new and reused graphs.
-        // Whole-batch eligibility excludes one-token tails of a larger batch.
+        // One begin per decode ubatch, on new and reused graphs: a token, or the rows a draft verification adds to
+        // one sequence, named by its first position. Rows of several sequences decode without the caches' sequence.
         ggml_backend_sched_synchronize(sched.get());
         const bool cache_decode = cpu_sink_cache_batch_decode &&
-            gtype == LLM_GRAPH_TYPE_DECODER && !res->cpu_sink_nodes.empty() &&
-            ubatch.n_tokens == 1 && ubatch.n_seqs_unq == 1 &&
-            ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
+            (gtype == LLM_GRAPH_TYPE_DECODER || gtype == LLM_GRAPH_TYPE_DECODER_MTP) && !res->cpu_sink_nodes.empty() &&
+            ubatch.n_seqs_unq == 1 && ubatch.n_seq_id[0] == 1 && ubatch.pos[0] >= 0;
         auto * registry = backend_cpu ? ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_cpu)) : nullptr;
         cpu_sink_runtime->begin(registry, cache_decode ? static_cast<uint64_t>(ubatch.pos[0]) : 0,
             cache_decode, cache_decode ? ubatch.seq_id[0][0] : 0);
     }
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, mctx);
+    // a decode ubatch of several rows runs on the decode pool, the threads the sink's decode is sized for
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1 && !cpu_sink_decode_active, mctx);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2617,7 +2643,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    // an MTP draft step's rows enter the MTP head's cache alone
+    llama_memory_i * mem_batch = mtp_draft ? memory->get_mem_mtp() : memory.get();
+    if (!mem_batch) {
+        LLAMA_LOG_ERROR("%s: the model has no MTP head memory\n", __func__);
+        return -1;
+    }
+
+    if (!balloc->init(batch_inp, vocab, mem_batch, n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -2625,9 +2658,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
-    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active && n_tokens_all == 1;
+    // Every batch between a prompt and the next request decodes: one token, or a token and the draft it verifies.
+    cpu_sink_cache_batch_decode = cpu_sink_enabled && cpu_sink_decode_active;
+    // A decode step of more rows than the decode graph's reserve holds (a longer draft than before) grows that reserve
+    // the way a decode step that outgrows it does, the VRAM tier giving blocks back for it: from then on steps of one
+    // row and of these rows alike fit what the reserve holds, and no step's graph needs device memory mid-decode.
+    if (cpu_sink_cache_batch_decode && cpu_prefill_actual_shape_enabled && cparams.n_seq_max == 1 &&
+            n_tokens_all > cpu_sink_decode_rows) {
+        LLAMA_LOG_INFO("[ssd_cpu_sink_decode_reserve] event=grow rows_from=%u rows_to=%u\n", cpu_sink_decode_rows,
+            n_tokens_all);
+        cpu_sink_decode_rows = n_tokens_all;
+        drop_scheduler();
+    }
     const bool cpu_sink_non_decode_phase = !cpu_sink_cache_batch_decode && cpu_sink_runtime &&
-        (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+        cpu_sink_runtime->has_cache();
 
     if (output_all) {
         // require that all tokens are output
@@ -2694,7 +2738,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // A decode step that outgrows the reserve takes the larger buffers the way a prefill does:
     // the VRAM tier yields blocks on demand while they are allocated and grows back afterwards.
     const bool reserve_grow_phase = (reserve_grown || sched_need_reserve) && cpu_sink_cache_batch_decode && cpu_sink_runtime &&
-        (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+        cpu_sink_runtime->has_cache();
     if (!reserve_with_tier(cpu_sink_non_decode_phase || reserve_grow_phase, reserve_grow_phase,
             cells_grow ? n_tokens_all : 0)) {
         LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after scheduler reserve\n", __func__);
@@ -2717,7 +2761,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
         bool refit = false;
 
         while (true) {
-            mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
+            // The decode graph is reserved for one token (n_ubatch), but a decode batch stays one ubatch: its rows
+            // share each layer's dense weights and expert reads, and its graph takes its memory when it is built.
+            const uint32_t n_ubatch_split = cpu_sink_decode_active && cpu_prefill_actual_shape_enabled ?
+                std::max(cparams.n_ubatch, cpu_prefill_configured_ubatch) : cparams.n_ubatch;
+            mctx = mem_batch->init_batch(*balloc, n_ubatch_split, output_all);
             if (!mctx) {
                 return -2;
             }
@@ -2796,7 +2844,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                     previous, sched_reserve_n_outputs, ubatch.n_tokens);
 
                 const bool tier_phase = cpu_sink_runtime &&
-                    (cpu_sink_runtime->cache_budget || cpu_sink_runtime->vram_budget);
+                    cpu_sink_runtime->has_cache();
                 if (!reserve_with_tier(tier_phase, cpu_sink_cache_batch_decode)) {
                     LLAMA_LOG_ERROR("%s: VRAM tier phase completion failed after output reserve grew\n", __func__);
                     return -1;
@@ -2806,7 +2854,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
             ggml_status status = GGML_STATUS_FAILED;
             const llm_graph_result * res = nullptr;
             try {
-                res = process_ubatch(ubatch, LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
+                res = process_ubatch(ubatch, mtp_draft ? LLM_GRAPH_TYPE_DECODER_MTP : LLM_GRAPH_TYPE_DECODER, mctx.get(), status);
             } catch (const std::exception & error) {
                 LLAMA_LOG_ERROR("%s: ubatch graph/runtime error: %s\n", __func__, error.what());
                 status = GGML_STATUS_FAILED;
@@ -2972,12 +3020,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const size_t n_rows = cparams.embeddings_nextn_masked ? n_outputs : ubatch.n_tokens;
                 const size_t row_offset = cparams.embeddings_nextn_masked ? n_outputs_prev : n_tokens_prev;
                 if (n_rows > 0) {
-                    GGML_ASSERT((row_offset + n_rows) * hparams.n_embd <= embd_nextn.size);
+                    const size_t n_embd_h = hparams.n_embd_h();
+                    GGML_ASSERT((row_offset + n_rows) * n_embd_h <= embd_nextn.size);
                     ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                     GGML_ASSERT(backend_h != nullptr);
                     ggml_backend_tensor_get_async(
-                        backend_h, t_h_nextn, embd_nextn.data + row_offset * hparams.n_embd,
-                        0, n_rows * hparams.n_embd * sizeof(float));
+                        backend_h, t_h_nextn, embd_nextn.data + row_offset * n_embd_h,
+                        0, n_rows * n_embd_h * sizeof(float));
                 }
             }
 
@@ -3056,7 +3105,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
 
-    if (batch_inp.n_tokens > 1) {
+    if (batch_inp.n_tokens > 1 && !cpu_sink_decode_active) {
         model.drop_expert_mmap_pages_after_prompt();
     }
 
@@ -3094,7 +3143,9 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     logits.size = has_logits ? n_vocab*n_outputs_max : 0;
     embd.size   = has_embd ? n_embd_out*n_outputs_max : 0;
-    embd_nextn.size = cparams.embeddings_nextn ? (size_t) n_embd * n_batch : 0;
+    // the masked rows are the outputs', else every row of a batch
+    embd_nextn.size = cparams.embeddings_nextn ? (size_t) hparams.n_embd_h() *
+        (cparams.embeddings_nextn_masked ? (size_t) n_outputs_max : (size_t) n_batch) : 0;
 
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
@@ -3274,8 +3325,9 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0 && cparams.embeddings_nextn_masked) {
-            for (uint64_t k = 0; k < n_embd; ++k) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            const uint64_t n_embd_h = model.hparams.n_embd_h();
+            for (uint64_t k = 0; k < n_embd_h; ++k) {
+                std::swap(embd_nextn.data[i0*n_embd_h + k], embd_nextn.data[i1*n_embd_h + k]);
             }
         }
 
@@ -3436,7 +3488,7 @@ bool llama_context::reserve_compute_graph(ggml_cgraph * graph, bool prefill, con
     }
     const uint64_t pages = prefill ? llama_host_gather_bytes(graph, llama_host_page_size(),
         [&](const ggml_tensor * tensor) { return model.file_mapped(tensor); }) : UINT64_MAX;
-    auto room = cpu_sink_runtime->take_room(host_bytes, device_bytes, pages);
+    auto room = cpu_sink_runtime->primary().take_room(host_bytes, device_bytes, pages);
     if (!room) {
         const auto & observed = room.value.observation();
         LLAMA_LOG_ERROR("%s: host budget refused the graph's %.1f MiB on the host and %.1f MiB on devices (%.1f MiB short "
@@ -3557,7 +3609,7 @@ std::string llama_dense_stream_meter::end(const ggml_backend_sched_ssd_copy_stat
 }
 
 bool llama_context::ssd_preload() {
-    if (!cpu_sink_runtime || !(cpu_sink_runtime->vram_budget || cpu_sink_runtime->cache_budget)) {
+    if (!cpu_sink_runtime || !cpu_sink_runtime->has_cache()) {
         return true;
     }
     // The load ends as a request's prefill does: in the decode phase, the graph reserved for one token. The caches
@@ -3612,7 +3664,7 @@ llm_graph_params llama_context::graph_params(
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
                           llm_graph_type   gtype) const {
-    return {
+    llm_graph_params params = {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
@@ -3634,6 +3686,8 @@ llm_graph_params llama_context::graph_params(
         /*.res         =*/ res,
         /*.n_ctx_reserve =*/ sched_reserve_n_ctx ? sched_reserve_n_ctx : cparams.n_ctx,
     };
+    params.mtp_h = gtype == LLM_GRAPH_TYPE_DECODER_MTP ? &mtp_h : nullptr;
+    return params;
 }
 
 ggml_status llama_context::graph_compute(
@@ -3662,7 +3716,7 @@ ggml_status llama_context::graph_compute(
             return GGML_STATUS_FAILED;
         }
         // Decode runs on the pool's threads that the machine's other work leaves a CPU each; the others wait.
-        if (!batched) { n_threads = cpu_sink_runtime->decode_threads(n_threads); }
+        if (!batched) { n_threads = cpu_sink_runtime->primary().decode_threads(n_threads); }
     }
 
     // set the number of threads for all the backends
@@ -4517,6 +4571,7 @@ llama_context_params llama_context_default_params() {
         /*.n_batch                     =*/ 2048,
         /*.n_ubatch                    =*/ 512,
         /*.n_seq_max                   =*/ 1,
+        /*.n_rs_seq                    =*/ 0,
         /*.n_threads                   =*/ GGML_DEFAULT_N_THREADS, // TODO: better default
         /*.n_threads_batch             =*/ GGML_DEFAULT_N_THREADS,
         /*.rope_scaling_type           =*/ LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED,
@@ -4680,6 +4735,10 @@ bool llama_ssd_preload(llama_context * ctx) {
     catch (const std::exception & failure) { LLAMA_LOG_ERROR("SSD expert preload failed: %s\n", failure.what()); }
     catch (...) { LLAMA_LOG_ERROR("SSD expert preload failed\n"); }
     return false;
+}
+
+uint32_t llama_n_rs_seq(const llama_context * ctx) {
+    return ctx->get_cparams().n_rs_seq;
 }
 
 uint32_t llama_n_seq_max(const llama_context * ctx) {
@@ -5211,6 +5270,39 @@ int32_t llama_encode(
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
 
+    return ret;
+}
+
+int llama_context::decode_mtp(const llama_batch & batch_inp, const float * h) {
+    if (model.hparams.n_mtp == 0 || h == nullptr || batch_inp.token == nullptr) {
+        LLAMA_LOG_ERROR("%s: an MTP draft step needs a model with an MTP head, tokens and their hidden states\n", __func__);
+        return -1;
+    }
+    mtp_h.assign(h, h + size_t(batch_inp.n_tokens) * model.hparams.n_embd_h());
+    struct reset { bool & flag; ~reset() { flag = false; } } guard{mtp_draft};
+    mtp_draft = true;
+    return decode(batch_inp);
+}
+
+bool llama_model_has_mtp(const llama_model * model) {
+    return model->hparams.n_mtp > 0;
+}
+
+int32_t llama_model_n_embd_h(const llama_model * model) {
+    return (int32_t) model->hparams.n_embd_h();
+}
+
+int32_t llama_decode_mtp(llama_context * ctx, llama_batch batch, const float * h) {
+    int ret = -3;
+    try {
+        ret = ctx->decode_mtp(batch, h);
+    } catch (const std::exception & error) {
+        LLAMA_LOG_ERROR("%s: graph/runtime error: %s\n", __func__, error.what());
+        ctx->discard_failed_graph();
+    } catch (...) {
+        LLAMA_LOG_ERROR("%s: unknown graph/runtime error\n", __func__);
+        ctx->discard_failed_graph();
+    }
     return ret;
 }
 

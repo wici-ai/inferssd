@@ -70,6 +70,10 @@ struct server_context {
     // write the final usage of every request still open, as it stands; call after start_loop() has returned
     void finish_usage();
 
+    // save the slots' states in the prompt cache on disk, where a server started later finds them; call after
+    // start_loop() has returned
+    void keep_states();
+
     // get the underlaying llama_context, can return nullptr if sleeping
     // not thread-safe, should only be used from the main thread
     llama_context * get_llama_context() const;

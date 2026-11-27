@@ -142,7 +142,7 @@ static bool ggml_cuda_memory_is_unified(int device);
 // allocations come out of system memory and cudaMemGetInfo reports MemFree, which leaves out the
 // reclaimable page cache, so the answer is MemAvailable there, as it reads at the kernel's full watermark
 // boost (ggml-ssd/host/budget-linux.h): a reserve kept on MemAvailable must survive the boost coming back.
-static void ggml_cuda_memory_info(int device, size_t * free, size_t * total);
+static cudaError_t ggml_cuda_memory_info(int device, size_t * free, size_t * total);
 
 // Memory that allocations must leave free, explicitly set by the typed tier
 // owner (on unified memory this also preserves the host working set).
@@ -173,7 +173,8 @@ static cudaError_t ggml_cuda_reserve_memory(int device, size_t size) {
     ggml_cuda_set_device(device);
     for (;;) {
         size_t free = 0, total = 0;
-        ggml_cuda_memory_info(device, &free, &total);
+        const cudaError_t status = ggml_cuda_memory_info(device, &free, &total);
+        if (status != cudaSuccess) { return status; }
         const size_t available = ggml_cuda_free_under_reserve(device, free);
         if (available >= reserve && size <= available - reserve) {
             return cudaSuccess;
@@ -1380,6 +1381,12 @@ static const char * ggml_backend_cuda_buffer_type_get_name(ggml_backend_buffer_t
 
 static bool ggml_backend_buft_is_cuda(ggml_backend_buffer_type_t buft) {
     return buft->iface.get_name == ggml_backend_cuda_buffer_type_get_name;
+}
+
+// Ordinary allocations and growable KV buffers have separate type objects on the same device.
+static bool ggml_backend_cuda_buffer_on_device(ggml_backend_buffer_t buffer, int device) {
+    return ggml_backend_buffer_is_cuda(buffer) &&
+           static_cast<ggml_backend_cuda_buffer_context *>(buffer->context)->device == device;
 }
 
 // An allocation that runs out of device memory is retried once the registered OOM reclaimer gives memory back
@@ -5411,11 +5418,11 @@ static void ggml_cuda_graph_evaluate_and_capture(
                     }
                 }
 #ifndef NDEBUG
-                assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+                assert(ggml_backend_cuda_buffer_on_device(node->buffer, cuda_ctx->device));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
-                        assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                        assert(ggml_backend_cuda_buffer_on_device(node->src[j]->buffer, cuda_ctx->device) ||
                                ggml_backend_buft_is_cuda_split(node->src[j]->buffer->buft) || (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
                     }
                 }
@@ -6410,9 +6417,23 @@ static bool ggml_cuda_memory_is_unified(int device) {
     return state == 2;
 }
 
-static void ggml_cuda_memory_info(int device, size_t * free, size_t * total) {
-    ggml_cuda_set_device(device);
-    CUDA_CHECK(cudaMemGetInfo(free, total));
+static cudaError_t ggml_cuda_memory_info(int device, size_t * free, size_t * total) {
+    // Device discovery may run before a context exists on an occupied card.
+    int current;
+    cudaError_t status = cudaGetDevice(&current);
+    if (status == cudaSuccess && current != device) {
+        status = cudaSetDevice(device);
+    }
+    if (status == cudaSuccess) {
+        status = cudaMemGetInfo(free, total);
+    }
+    if (status != cudaSuccess) {
+        GGML_LOG_ERROR("%s: cannot query " GGML_CUDA_NAME "%d memory: %s. Free memory on this device or exclude it from the visible devices.\n",
+                       __func__, device, cudaGetErrorString(status));
+        *free = *total = 0;
+        (void) cudaGetLastError();
+        return status;
+    }
 #if defined(__linux__)
     if (ggml_cuda_memory_is_unified(device)) {
         long available_memory_kb = 0;
@@ -6426,6 +6447,7 @@ static void ggml_cuda_memory_info(int device, size_t * free, size_t * total) {
         }
     }
 #endif // defined(__linux__)
+    return cudaSuccess;
 }
 
 static void ggml_backend_cuda_device_get_memory(ggml_backend_dev_t dev, size_t * free, size_t * total) {

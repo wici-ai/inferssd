@@ -220,7 +220,9 @@ class LiveArtifacts:
         if name == "disk_free":
             return host.disk_free(args[0])
         if name == "runtime_facts":
-            facts = strategy_inputs.read_runtime(host=self.strategy_host)
+            facts = strategy_inputs.read_runtime(
+                host=self.strategy_host, native_cuda="CUDA" in args
+            )
             return strategy_inputs.runtime_facts_json(facts)
         if name == "cpu_topology":
             from inferssd.machine.profile import TOPOLOGY

@@ -2659,6 +2659,22 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state);
 
+    // ggml_gated_delta_net that writes the state after each token in place into `planes`, rows of the state in
+    // F32 viewed as (S_v*S_v*H, n_planes, n_seqs), nb[1] the step from a plane to the next, nb[2] from a sequence to
+    // the next (a recurrent cache's rollback planes of the ubatch's cells): the state after token t goes into plane
+    // n_tokens - 1 - t, so plane 0 holds the final state; n_planes >= n_tokens, and the planes after them are not
+    // written. The result holds the attention output only, (S_v*H, n_tokens*n_seqs). `planes` must not overlap the
+    // other sources, and the op must run on a backend whose memory holds it.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_planes(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * planes);
+
     // DSA lightning indexer
     //
     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]

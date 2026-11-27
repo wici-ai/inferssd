@@ -18,6 +18,7 @@ from test_machine_identity import FakeHost, linux_tree, nvme_key
 from test_machine_probes import FakeRunner, replies
 from test_machine_profile import GIB, Clock, shards
 from test_strategy_inputs import ENGINE_FIXTURE, Q4_K, Q8_0, engine_facts, moe
+from test_windows_platform import REGISTRY, MultiGroupKernel, WindowsHost
 
 from inferssd.app import catalog
 from inferssd.cli import main
@@ -25,6 +26,7 @@ from inferssd.launch.resources import installed_resources
 from inferssd.machine import command
 from inferssd.machine.probes import Completed
 from inferssd.machine.store import exclusive, save
+from inferssd.platform.windows.system import Volume, Win32
 from inferssd.strategy.inputs import RuntimeFacts, facts_from_engine
 from inferssd.strategy.kernels import INPUT_BLOCK, VEC_DOT_TYPE, WEIGHT_BLOCK
 from inferssd.strategy.routing import cache_slot_bytes
@@ -225,13 +227,14 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
         "GPUs: NVIDIA GeForce RTX 5090 (CUDA)"
     )
     names = [line.split(":", 1)[0] for line in out[2:]]
-    assert names == ["cpu", "memory", "compute", "gpus", "storage"] + ["estimate"] * len(
-        catalog.MODELS
-    )
+    assert names == ["cpu", "memory", "compute", "gpus", "storage", "estimate memory"] + [
+        "estimate"
+    ] * len(catalog.MODELS)
+    assert out[7] == "estimate memory: 24.0 GiB (available now; --memory-gib sets another amount)"
     # This machine measured Q4_K alone: every expert model is priced with its other formats taken
     # from Q4_K's rate, and the model without routed experts by its dense weights from RAM (its GPU
     # measured no matrix product).
-    for model, line in zip(catalog.MODELS, out[7:]):
+    for model, line in zip(catalog.MODELS, out[8:]):
         assert line.startswith(f"estimate: {model.repo}:{model.quantization} ")
         assert " tok/s" in line and "none:" not in line
         if model.facts.experts is None:
@@ -258,7 +261,7 @@ def test_profile_saves_to_the_state_directory_and_summarizes(tmp_path):
     code, shown, _ = execute(["--show", "--model", files[0]], host, FakeRunner({}), tmp_path)
     assert code == 0 and shown == out
     code, shown, _ = execute(["--show"], host, FakeRunner({}), tmp_path)
-    assert code == 0 and shown == out[: -len(catalog.MODELS)]
+    assert code == 0 and shown == out[:7]
 
 
 def test_failed_sections_set_the_exit_status(tmp_path):
@@ -283,6 +286,36 @@ def test_unreadable_saved_profile_is_replaced(tmp_path):
         line.startswith("ignoring the unreadable saved profile") for line in progress
     )
     assert json.loads(output.read_text())["schema"] == "inferssd-machine/1"
+
+
+def test_memory_gib_sets_the_memory_the_estimates_plan_with(tmp_path):
+    host, files, build = machine(tmp_path)
+    execute(["--model", files[0], "--build", str(build)], host, FakeRunner(replies()), tmp_path)
+    show = ["--show", "--model", files[0]]
+    busy = replace(RUNTIME, available_bytes=2 * GIB)
+
+    def shown(argv, runtime):
+        code, out, _ = execute(show + argv, host, FakeRunner({}), tmp_path, runtime=runtime)
+        assert code == 0
+        return [line for line in out if line.startswith("estimate")]
+
+    now = shown([], busy)
+    assert now[0] == "estimate memory: 2.0 GiB (available now; --memory-gib sets another amount)"
+    asked = shown(["--memory-gib", "16"], busy)
+    assert asked[0] == "estimate memory: 16.0 GiB (--memory-gib)"
+    # The estimates are those of a host with that much available, not those of this moment.
+    assert asked[1:] == shown([], replace(RUNTIME, available_bytes=16 * GIB))[1:]
+    assert asked[1:] != now[1:]
+    # A smaller amount still lowers it, and no amount exceeds the installed memory.
+    assert shown(["--memory-gib", "1"], busy)[0] == "estimate memory: 1.0 GiB (--memory-gib)"
+    assert shown(["--memory-gib", "64"], busy)[0] == "estimate memory: 31.2 GiB (--memory-gib)"
+    code, out, _ = execute(
+        [*show, "--json", "--memory-gib", "16"], host, FakeRunner({}), tmp_path, runtime=busy
+    )
+    planned = {
+        row["components"].get("memory_budget_bytes") for row in json.loads(out[0])["estimates"]
+    }
+    assert code == 0 and planned - {None} == {16.0 * GIB}
 
 
 def test_show_measures_nothing(tmp_path):
@@ -354,6 +387,54 @@ def test_cli_entry_point(tmp_path, monkeypatch, capsys):
     with pytest.raises(SystemExit) as error:
         main(["profile", "--build", str(build), "--resources", str(output)])
     assert error.value.code == 2 and "not allowed with argument" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(
+    "process_defaults,reserved_elsewhere,expected_max",
+    [((), False, 128), ((257,), True, 127), ((257, 321), True, 1)],
+)
+def test_desktop_profile_and_saved_report_on_two_windows_processor_groups(
+    tmp_path, monkeypatch, capsys, process_defaults, reserved_elsewhere, expected_max
+):
+    models = tmp_path / "models"
+    models.mkdir()
+    kernel = MultiGroupKernel()
+    kernel.default_sets = process_defaults
+    if reserved_elsewhere:
+        kernel.flags[1] = 0b010
+    windows = Win32(kernel, lambda key, name: REGISTRY.get((key, name)), last_error=lambda: 122)
+    monkeypatch.setattr(windows, "volume", lambda path: Volume("C:\\", "NTFS", ()))
+    host = WindowsHost(tmp_path, windows)
+    host.devices[str(models)] = (0, 1)
+    monkeypatch.setattr(command, "NativeHost", lambda: host)
+    monkeypatch.setattr("inferssd.strategy.inputs.NativeHost", lambda: host)
+    monkeypatch.setattr("inferssd.machine.profile.TEST_FILE_BYTES", 4096)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    descriptor = resource_descriptor(tmp_path, tmp_path / "build")
+    monkeypatch.setenv("INFERSSD_RESOURCES", str(descriptor))
+    simulated = replies()
+    probe_maxima = []
+
+    def run_probe(argv, *_):
+        name = Path(argv[0]).name
+        if name == "inferssd-cpuprobe":
+            counts = argv[argv.index("--threads") + 1]
+            probe_maxima.append(max(map(int, counts.split(","))))
+        return simulated[name]
+
+    monkeypatch.setattr(command, "run_process", run_probe)
+
+    # Measure and read back what the desktop setup shows with its actual CLI arguments.
+    for flags in ([], ["--show"]):
+        assert main(["profile", "--model", str(models), *flags, "--json"]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["machine"]["logical_cpus"] == 128
+        assert report["machine"]["memory_bytes"] > 0 and report["machine"]["cpu"]
+        assert report["estimates"]
+    saved = json.loads(Path(report["profile"]).read_text())
+    assert saved["sections"]["cpu"]["status"] == "ok"
+    assert len(saved["cpu"]["logical"]) == 128
+    assert probe_maxima == [expected_max]
 
 
 def test_cli_estimates_an_unlisted_split_gguf_and_can_replay_its_exported_facts(

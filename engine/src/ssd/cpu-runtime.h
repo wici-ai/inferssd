@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -71,6 +72,7 @@ struct llama_ssd_cpu_sink_runtime {
     int cache_max_per_layer = 8;
     std::vector<int32_t> layer_priority;
     decltype(&ssd_cpu_sink_prefetch_hint) prefetch_hint = nullptr; // optional
+    decltype(&ssd_cpu_sink_decode_rows) decode_rows = nullptr;
     decltype(&ssd_cpu_sink_prefill_hint) prefill_hint = nullptr;
     bool sequence_known = false;
     llama_seq_id sequence = 0;
@@ -156,6 +158,7 @@ struct llama_ssd_cpu_sink_runtime {
         vram_phase_complete = cpu_api->vram_phase_complete;
         cache_get_stats = cpu_api->cache_get_stats;
         prefetch_hint = cpu_api->prefetch_hint;
+        decode_rows = cpu_api->decode_rows;
         prefill_hint = cpu_api->prefill_hint;
         constexpr int ring_experts = 8;
         char error[512] = {};
@@ -345,6 +348,69 @@ struct llama_ssd_cpu_sink_runtime {
     }
 };
 
+// Each executor owns the expert layout and caches for the layers placed on its device.
+// Host allocations are admitted once, through the shared process arbiter.
+struct llama_ssd_executor_group {
+    using routed_layer = ssd::store::expert_layout::routed_layer;
+    std::vector<std::unique_ptr<llama_ssd_cpu_sink_runtime>> executors;
+    std::vector<llama_ssd_cpu_sink_runtime *> by_layer;
+
+    void add(uint64_t epoch, const std::vector<routed_layer> & routed, const ssd::settings::snapshot & settings,
+            const ssd::runtime_services & services, const ssd::store::source_view & sources) {
+        auto executor = std::make_unique<llama_ssd_cpu_sink_runtime>(epoch, routed, settings, services, sources);
+        if (!executors.empty()) {
+            const auto & first = *primary().layout.abi();
+            const auto & next = *executor->layout.abi();
+            if (first.latent != next.latent || first.hidden != next.hidden || first.experts != next.experts) {
+                throw std::runtime_error("routed expert dimensions differ across devices");
+            }
+        }
+        if (size_t(routed.back().id) >= by_layer.size()) { by_layer.resize(size_t(routed.back().id) + 1); }
+        for (const auto & layer : routed) { by_layer[layer.id] = executor.get(); }
+        executors.emplace_back(std::move(executor));
+    }
+
+    llama_ssd_cpu_sink_runtime & primary() const { return *executors.front(); }
+
+    bool can_prefetch_after(int layer) const {
+        return executors.size() == 1 ||
+            (layer >= 0 && size_t(layer + 1) < by_layer.size() && by_layer[layer] == by_layer[layer + 1]);
+    }
+
+    bool has_cache() const { return primary().cache_budget || primary().vram_budget; }
+
+    void begin(ggml_backend_reg_t registry, uint64_t token, bool decode, llama_seq_id seq = 0) {
+        for (auto & executor : executors) { executor->begin(registry, token, decode, seq); }
+    }
+
+    void begin_request() {
+        for (auto & executor : executors) { executor->begin_request(); }
+    }
+
+    bool phase_complete(bool decode) {
+        for (auto & executor : executors) { if (!executor->phase_complete(decode)) { return false; } }
+        return true;
+    }
+
+    bool preload(std::string & error) {
+        for (auto & executor : executors) { if (!executor->preload(error)) { return false; } }
+        return true;
+    }
+
+    bool reserve_pass(uint32_t tokens) {
+        for (auto & executor : executors) { if (!executor->reserve_pass(tokens)) { return false; } }
+        return true;
+    }
+
+    void reserve_tier(ggml_backend_reg_t registry, int experts_used) {
+        for (auto & executor : executors) { executor->reserve_tier(registry, experts_used); }
+    }
+
+    void prepare_graph(ggml_backend_reg_t registry) {
+        for (auto & executor : executors) { executor->prepare_graph(registry); }
+    }
+};
+
 // One call of the executor per node: the CPU backend's ggml threads are its
 // compute participants. ith 0 opens it and runs the layer; the call closes on
 // every exit, after all nth - 1 others joined.
@@ -360,6 +426,48 @@ struct llama_ssd_cpu_sink_call {
     llama_ssd_cpu_sink_call(const llama_ssd_cpu_sink_call &) = delete;
     llama_ssd_cpu_sink_call & operator=(const llama_ssd_cpu_sink_call &) = delete;
 };
+
+// A decode ubatch's measures: the sum of its rows' runs (pending_reads, zero after every run, the last row's).
+inline void llama_ssd_add_row_stats(ssd_cpu_sink_stats & sum, const ssd_cpu_sink_stats & row) {
+    sum.experts += row.experts;
+    sum.read_requests += row.read_requests;
+    sum.read_bytes += row.read_bytes;
+    sum.read_errors += row.read_errors;
+    sum.fallback_count += row.fallback_count;
+    sum.ring_bytes += row.ring_bytes;
+    sum.total_us += row.total_us;
+    sum.io_us += row.io_us;
+    sum.compute_us += row.compute_us;
+    sum.wait_io_us += row.wait_io_us;
+    sum.input_quantize_us += row.input_quantize_us;
+    sum.hidden_quantize_us += row.hidden_quantize_us;
+    sum.up_gate_us += row.up_gate_us;
+    sum.down_reduce_us += row.down_reduce_us;
+    sum.demand_bytes += row.demand_bytes;
+    sum.cache_hits += row.cache_hits;
+    sum.cache_hit_bytes += row.cache_hit_bytes;
+    sum.cache_misses += row.cache_misses;
+    sum.cache_admitted += row.cache_admitted;
+    sum.cache_admitted_bytes += row.cache_admitted_bytes;
+    sum.cache_copy_us += row.cache_copy_us;
+    sum.cache_fill_read_requests += row.cache_fill_read_requests;
+    sum.cache_fill_read_bytes += row.cache_fill_read_bytes;
+    sum.ring_read_requests += row.ring_read_requests;
+    sum.ring_read_bytes += row.ring_read_bytes;
+    sum.fixed_read_requests += row.fixed_read_requests;
+    sum.read_completions += row.read_completions;
+    sum.pending_reads = row.pending_reads;
+    sum.cache_new_slot_bytes += row.cache_new_slot_bytes;
+    sum.compute_cpu_us += row.compute_cpu_us;
+    sum.caller_cpu_us += row.caller_cpu_us;
+    sum.io_cpu_us += row.io_cpu_us;
+    sum.io_wait_us += row.io_wait_us;
+    sum.io_credit_wait_us += row.io_credit_wait_us;
+    sum.other_us += row.other_us;
+    sum.ready_scratch_bytes = std::max(sum.ready_scratch_bytes, row.ready_scratch_bytes);
+    sum.ready_out_of_order_experts += row.ready_out_of_order_experts;
+    sum.ordered_reduce_us += row.ordered_reduce_us;
+}
 
 inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void * userdata) {
     // Every CPU-backend ggml thread enters (n_tasks = GGML_N_TASKS_MAX). No C++
@@ -418,25 +526,46 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
             &activation, static_cast<float *>(dst->data),
             &grouped_stats, error, sizeof(error));
         stats = grouped_stats.stream;
-    } else if (situ) {
-        GGML_ASSERT(ntokens == 1);
-        ok = runtime.run(runtime.sink, node.layer,
-            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
-            static_cast<const float *>(weights->data), nslots,
-            node.situ_beta, node.situ_linear_beta, static_cast<float *>(dst->data),
-            &stats, error, sizeof(error));
     } else {
-        GGML_ASSERT(ntokens == 1);
-        // the next layer's predicted experts, for the sink's prefetch
-        if (const ggml_tensor * hint = dst->src[4]; hint && runtime.prefetch_hint) {
-            GGML_ASSERT(hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint));
-            runtime.prefetch_hint(runtime.sink, node.layer + 1, static_cast<const int32_t *>(hint->data),
-                static_cast<int>(ggml_nelements(hint)));
+        // A decode ubatch: one token, or a token and the draft rows it verifies. Each row is one decode run; the rows
+        // after the first find the experts the earlier rows read in the RAM cache, so the ubatch reads the union of
+        // its rows' experts once.
+        const ggml_tensor * hint = situ ? nullptr : dst->src[4];
+        GGML_ASSERT(!hint || (hint->type == GGML_TYPE_I32 && ggml_is_contiguous(hint) &&
+            ggml_nelements(hint) % ntokens == 0));
+        const auto * in = static_cast<const float *>(input->data);
+        const auto * id = static_cast<const int32_t *>(ids->data);
+        const auto * wt = static_cast<const float *>(weights->data);
+        auto * out = static_cast<float *>(dst->data);
+        // the layer's next runs are the ubatch's rows: each keeps the prefetches its later rows take
+        if (ntokens > 1) { runtime.decode_rows(runtime.sink, node.layer, id, nslots, ntokens); }
+        ok = true;
+        for (int row = 0; row < ntokens && ok; ++row) {
+            // The next layer's predicted experts, for the sink's prefetch, before the last row only: a run drops the
+            // prefetches of layers other than its own. Every row's, likeliest first in each row, without repeats.
+            if (hint && runtime.prefetch_hint && row + 1 == ntokens) {
+                const auto * predicted = static_cast<const int32_t *>(hint->data);
+                const int per_row = static_cast<int>(ggml_nelements(hint) / ntokens);
+                int32_t merged[64];
+                int n = 0;
+                for (int rank = 0; rank < per_row && n < 64; ++rank) {
+                    for (int r = 0; r < ntokens && n < 64; ++r) {
+                        const int32_t expert = predicted[size_t(r) * per_row + rank];
+                        if (std::find(merged, merged + n, expert) == merged + n) { merged[n++] = expert; }
+                    }
+                }
+                runtime.prefetch_hint(runtime.sink, node.layer + 1, merged, n);
+            }
+            ssd_cpu_sink_stats row_stats = {};
+            const size_t in_offset = size_t(row) * size_t(latent);
+            const size_t slot_offset = size_t(row) * size_t(nslots);
+            ok = situ ?
+                runtime.run(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset, nslots,
+                    node.situ_beta, node.situ_linear_beta, out + in_offset, &row_stats, error, sizeof(error)) :
+                runtime.run_activation(runtime.sink, node.layer, in + in_offset, id + slot_offset, wt + slot_offset,
+                    nslots, &activation, out + in_offset, &row_stats, error, sizeof(error));
+            llama_ssd_add_row_stats(stats, row_stats);
         }
-        ok = runtime.run_activation(runtime.sink, node.layer,
-            static_cast<const float *>(input->data), static_cast<const int32_t *>(ids->data),
-            static_cast<const float *>(weights->data), nslots, &activation,
-            static_cast<float *>(dst->data), &stats, error, sizeof(error));
     }
     if (!ok) {
         GGML_ABORT("CPU sink layer=%d failed: %s read_errors=%" PRIu64
@@ -452,6 +581,9 @@ inline void llama_ssd_cpu_sink_compute(ggml_tensor * dst, int ith, int nth, void
     if (node.prefill && runtime.services.events) {
         const auto published = runtime.services.events->event("ssd.prefill.layer",
             "{\"layer\":" + std::to_string(node.layer) + ",\"n_tokens\":" + std::to_string(ntokens) +
+            ",\"gpu_device\":" + std::to_string(runtime.services.gpu ? runtime.services.gpu_device : -1) +
+            ",\"gpu_routes\":" + std::to_string(grouped_stats.gpu_routes + grouped_stats.gpu_transient_routes +
+                grouped_stats.gpu_ssd_transient_routes) +
             ",\"read_bytes\":" + std::to_string(grouped_stats.ssd_bytes) + "}");
         if (!published) { GGML_ABORT("prefill telemetry failed after layer drain: %s", published.error.c_str()); }
     }

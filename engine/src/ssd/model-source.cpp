@@ -63,7 +63,7 @@ void llama_model_loader::build_expert_tensor_index(const llama_hparams & hparams
         if (!llama_is_expert_tensor_name(name, layer)) {
             continue;
         }
-        if (layer >= hparams.n_layer) {
+        if (layer >= hparams.n_layer_all()) {
             throw std::runtime_error(format("expert tensor '%s' has invalid layer index %u", name.c_str(), layer));
         }
         if (weight.idx >= expert_tensor_index.file_ranges.size()) {

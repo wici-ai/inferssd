@@ -47,6 +47,7 @@ struct separate_domain {
             return ggml_backend_buffer_init(type, methods, data, size);
         };
         device.context = this;
+        device.iface.get_memory = [](ggml_backend_dev_t, size_t * free, size_t * total) { *free = 1024; *total = 4096; };
         device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_GPU; };
         device.iface.get_buffer_type = [](ggml_backend_dev_t device) { return &static_cast<separate_domain *>(device->context)->type; };
         device.iface.supports_op = [](ggml_backend_dev_t, const ggml_tensor * tensor) { return tensor->op != GGML_OP_CUSTOM; };
@@ -152,6 +153,28 @@ static void numerical(bool parallel) {
     require(executor.domain.scratch_reserves == 2, "backend scratch was not reserved once per graph");
 }
 
+// The graph assigns its output to the GPU, but the caller has already bound that output to host storage.
+static void incompatible_output() {
+    executor executor;
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> host(
+        ggml_backend_alloc_buffer(executor.cpu.get(), 256), &ggml_backend_buffer_free);
+    require(bool(host), "host output allocation failed");
+    {
+        graph_case graph(executor);
+        ggml_backend_tensor_alloc(host.get(), graph.output, ggml_backend_buffer_get_base(host.get()));
+        size_t sizes[2] = {};
+        require(ggml_backend_sched_prepare_graph(executor.scheduler.get(), graph.graph, sizes), "graph preparation failed");
+        require(ggml_backend_sched_reserve_prepared(executor.scheduler.get(), graph.graph), "graph reservation failed");
+        require(!ggml_backend_sched_alloc_prepared(executor.scheduler.get(), graph.graph), "GPU accepted an output in host storage");
+    }
+    graph_case retry(executor);
+    size_t sizes[2] = {};
+    require(ggml_backend_sched_prepare_graph(executor.scheduler.get(), retry.graph, sizes) &&
+            ggml_backend_sched_reserve_prepared(executor.scheduler.get(), retry.graph) &&
+            ggml_backend_sched_alloc_prepared(executor.scheduler.get(), retry.graph), "could not retry after placement refusal");
+    retry.compute(executor);
+}
+
 static void invalidation_and_failure() {
     for (int mode = 0; mode < 4; ++mode) {
         executor executor;
@@ -174,7 +197,7 @@ static void invalidation_and_failure() {
 
 int main() {
     try {
-        numerical(false); numerical(true); invalidation_and_failure();
+        numerical(false); numerical(true); invalidation_and_failure(); incompatible_output();
         std::cout << "prepared graph: three real copy splits, CPU custom math, parallel copies, reset/storage/scratch refusal passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }

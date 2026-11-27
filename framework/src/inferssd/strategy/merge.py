@@ -160,9 +160,30 @@ def server_arguments(
     for argument in extra:
         name = argument.split("=", 1)[0]
         given.add(name.replace("_", "-") if name.startswith("--") else name)
+    placement = {
+        "-dev",
+        "--device",
+        "-mg",
+        "--main-gpu",
+        "-sm",
+        "--split-mode",
+        "-ts",
+        "--tensor-split",
+    }
+    explicit_placement = not given.isdisjoint(placement) or any(
+        key in environment
+        for key in (
+            "LLAMA_ARG_DEVICE",
+            "LLAMA_ARG_MAIN_GPU",
+            "LLAMA_ARG_SPLIT_MODE",
+            "LLAMA_ARG_TENSOR_SPLIT",
+        )
+    )
     arguments: list[str] = []
     pairs = strategy.server_args
     for option, value in zip(pairs[::2], pairs[1::2]):
+        if option in placement and explicit_placement:
+            continue
         spellings, variable = SERVER_OPTIONS.get(option, ((option,), None))
         if given.isdisjoint(spellings) and (variable is None or variable not in environment):
             arguments += [option, value]

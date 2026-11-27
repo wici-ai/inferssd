@@ -16,6 +16,7 @@ import os
 from collections import Counter
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
+from math import prod
 from typing import Any, Optional, Protocol, cast
 
 from inferssd.configuration.settings import cpus as cpu_list
@@ -25,10 +26,12 @@ from inferssd.machine.characteristics import (
     COUNT,
     POSITIVE,
     TEXT,
+    Characteristics,
     array,
     nullable,
     record,
 )
+from inferssd.platform import cuda_devices
 from inferssd.strategy.kernels import GPU_EXPERT_TYPES, gpu_expert_refusal
 
 ROLES = ("gate", "up", "down")
@@ -119,6 +122,9 @@ class ModelFacts:
     # model has layers but lacks conventional block names, use its aggregate dense types.
     layer_format_bytes: tuple[tuple[str, int], ...]
     experts: Optional[Experts]  # None for a model without routed experts
+    # CUDA weight allocation for each repeating layer, followed by the output layer.
+    # Empty on older recordings that only retained aggregate weights.
+    cuda_layer_bytes: tuple[int, ...] = ()
 
     @property
     def cpu_format(self) -> str:
@@ -133,6 +139,46 @@ def _ranked(counts: Mapping[str, int]) -> tuple[tuple[str, int], ...]:
 
 def routed_tensor(layer: int, role: str) -> str:
     return f"blk.{layer}.ffn_{role}_exps.weight"
+
+
+def _cuda_layer_bytes(
+    model: Mapping[str, Any], dense: Sequence[Mapping[str, Any]]
+) -> tuple[int, ...]:
+    count = model["layers"]
+    if count > len(model["tensors"]):
+        return ()  # the headers do not describe all the claimed layers
+    block_indices = {str(index): index for index in range(count)}
+    layers = [0] * (count + 1)
+    tied = not any(t["name"] == "output.weight" for t in dense)
+    for t in dense:
+        name, size = t["name"], t["bytes"]
+        # Input embeddings stay on the CPU. A tied output has a device copy.
+        if name == "per_layer_token_embd.weight" or (name == "token_embd.weight" and not tied):
+            continue
+        # ggml's CUDA buffer aligns each allocation to 128 bytes and pads the
+        # last quantized row to 512 elements. The engine supplied the type's
+        # actual stored bytes and shape, including block quantization.
+        if t["type"].upper() not in {"F32", "F16", "BF16", "F64", "I8", "I16", "I32", "I64"}:
+            shape = t["shape"]
+            size += size * (-shape[0] % 512) // prod(shape)
+        size = (size + 127) // 128 * 128
+        # Both encoder and decoder weights are resident when a model loads.
+        if name.startswith(("enc.blk.", "dec.blk.")):
+            name = name[4:]
+        if name.startswith("blk."):
+            parts = name.split(".", 2)
+            index = block_indices.get(parts[1])
+            if index is None or len(parts) != 3:
+                return ()  # no verified layer placement for this recording
+            if model["architecture"] == "deepseek41" and parts[2] == "engram_embd.weight":
+                continue  # the loader pins these lookup tables to its CPU buffer
+            layers[index] += size
+        elif name.startswith(("rope_freqs.", "rope_factors_long.", "rope_factors_short.")):
+            for index in range(model["layers"]):
+                layers[index] += size
+        else:
+            layers[-1] += size
+    return tuple(layers)
 
 
 def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
@@ -201,7 +247,8 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
             not has_decoder and t["name"].startswith("enc.blk.")
         ):
             per_type[t["type"].upper()] += t["bytes"]
-    if not per_type and model["layers"] > 0:
+    has_block_layout = bool(per_type)
+    if not has_block_layout and model["layers"] > 0:
         for t in dense:
             if t["bytes"] > 0:
                 per_type[t["type"].upper()] += t["bytes"]
@@ -213,6 +260,7 @@ def facts_from_engine(model: Mapping[str, Any]) -> ModelFacts:
         dense_bytes=sum(t["bytes"] for t in dense),
         layer_format_bytes=_ranked(per_type),
         experts=found,
+        cuda_layer_bytes=_cuda_layer_bytes(model, dense) if found and has_block_layout else (),
     )
 
 
@@ -257,7 +305,8 @@ MODEL_RECORD = record(
         "dense_bytes": COUNT,
         "layer_format_bytes": _type_bytes,
         "experts": nullable(EXPERTS_RECORD),
-    }
+    },
+    optional={"cuda_layer_bytes": array(COUNT, minimum=1)},
 )
 
 
@@ -269,6 +318,7 @@ def model_facts_json(facts: ModelFacts) -> dict[str, object]:
         "architecture": facts.architecture,
         "dense_bytes": facts.dense_bytes,
         "layer_format_bytes": [list(item) for item in facts.layer_format_bytes],
+        **({"cuda_layer_bytes": list(facts.cuda_layer_bytes)} if facts.cuda_layer_bytes else {}),
         "experts": None
         if experts is None
         else {
@@ -341,6 +391,7 @@ def model_facts_from(value: object) -> ModelFacts:
         dense_bytes=item["dense_bytes"],
         layer_format_bytes=tuple((name, size) for name, size in item["layer_format_bytes"]),
         experts=found,
+        cuda_layer_bytes=tuple(item.get("cuda_layer_bytes", ())),
     )
 
 
@@ -391,11 +442,15 @@ class RuntimeFacts:
     # unknown, and then taken to be the backends of the machine's GPUs (engine_gpu_backends).
     # Set by the launch, not recorded with the facts above.
     gpu_backends: Optional[tuple[str, ...]] = None
+    # Visible CUDA UUIDs in native ordinal order. Old recordings omit this.
+    # An empty tuple alongside memory readings means no usable mapping.
+    cuda_uuids: Optional[tuple[str, ...]] = None
 
 
 class Host(identity.Host, Protocol):
     def affinity(self) -> Optional[tuple[int, ...]]: ...
     def environment(self) -> Mapping[str, str]: ...
+    def cuda_devices(self) -> Optional[tuple[str, ...]]: ...
 
 
 # A record made before GPUs carried their backend came from nvidia-smi: CUDA's.
@@ -408,7 +463,7 @@ RUNTIME_RECORD = record(
         "gpus": nullable(array(GPU_RECORD)),
         "available_bytes": nullable(COUNT),
     },
-    {"memory_budget_bytes": nullable(POSITIVE)},
+    {"memory_budget_bytes": nullable(POSITIVE), "cuda_uuids": array(TEXT)},
 )
 
 
@@ -429,6 +484,7 @@ def runtime_facts_json(facts: RuntimeFacts) -> dict[str, object]:
         ],
         "available_bytes": facts.available_bytes,
         "memory_budget_bytes": facts.memory_budget_bytes,
+        **({"cuda_uuids": list(facts.cuda_uuids)} if facts.cuda_uuids is not None else {}),
     }
 
 
@@ -455,6 +511,7 @@ def runtime_facts_from(value: object) -> RuntimeFacts:
         ),
         cast(Optional[int], item["available_bytes"]),
         cast(Optional[int], item.get("memory_budget_bytes")),
+        cuda_uuids=tuple(cast(list[str], item["cuda_uuids"])) if "cuda_uuids" in item else None,
     )
 
 
@@ -472,15 +529,16 @@ class NativeHost(identity.NativeHost):
     def environment(self) -> Mapping[str, str]:
         return os.environ if self.env is None else self.env
 
+    def cuda_devices(self) -> Optional[tuple[str, ...]]:
+        return cuda_devices.visible(self.environment())
+
 
 def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> list[tuple[int, str]]:
     """The (index, UUID) pairs a visible-devices list VALUE leaves, in its order.
 
     As CUDA and ROCm read CUDA_VISIBLE_DEVICES and ROCR_VISIBLE_DEVICES, the list
     ends at its first entry that names no GPU or one again. Numbers are taken as
-    the indices of LISTED: nvidia-smi's follow the PCI bus, and CUDA numbers
-    devices fastest first unless CUDA_DEVICE_ORDER=PCI_BUS_ID, so on a machine
-    with different GPUs a UUID is the unambiguous choice.
+    the indices of LISTED, before renumbering the remaining devices from zero.
     """
     if value is None:
         return list(listed)
@@ -498,11 +556,36 @@ def visible_gpus(listed: Sequence[tuple[int, str]], value: Optional[str]) -> lis
     return chosen
 
 
-def _gpus(host: Host) -> Optional[tuple[GPUState, ...]]:
+def cuda_device_order(
+    characteristics: Characteristics, order: Optional[str] = None
+) -> tuple[str, ...]:
+    """CUDA UUIDs in native order before visibility filtering, from the memory probe."""
+    rows = characteristics["gpus"]
+    uuids = {row["uuid"] for row in rows}
+    expected = {
+        gpu["uuid"]
+        for gpu in characteristics["identity"]["hard"]["gpus"]
+        if gpu["backend"] == "CUDA"
+    }
+    if len(uuids) != len(rows) or not expected <= uuids:
+        return ()
+    if order == "PCI_BUS_ID":
+        if len({row["pci_bus_id"] for row in rows}) != len(rows):
+            return ()
+        return tuple(row["uuid"] for row in sorted(rows, key=lambda row: row["pci_bus_id"]))
+    ordered = sorted(rows, key=lambda row: row["index"])
+    if [row["index"] for row in ordered] != list(range(len(rows))):
+        return ()
+    return tuple(row["uuid"] for row in ordered)
+
+
+def _gpus(
+    host: Host, native_cuda: bool
+) -> tuple[Optional[tuple[GPUState, ...]], Optional[tuple[str, ...]]]:
     """The tier backends' GPUs the launch can use: NVIDIA's (nvidia-smi) and AMD's on ROCm
     (amdkfd); None when NVIDIA's cannot be read."""
-    nvidia = _nvidia(host)
-    return None if nvidia is None else nvidia + _rocm(host)
+    nvidia, order = _nvidia(host, native_cuda)
+    return (None if nvidia is None else nvidia + _rocm(host)), order
 
 
 # amdkfd lists each process that uses an AMD GPU, with its memory on every GPU it opened. It tears
@@ -551,9 +634,11 @@ def _rocm(host: Host) -> tuple[GPUState, ...]:
     return tuple(states)
 
 
-def _nvidia(host: Host) -> Optional[tuple[GPUState, ...]]:
+def _nvidia(
+    host: Host, native_cuda: bool
+) -> tuple[Optional[tuple[GPUState, ...]], Optional[tuple[str, ...]]]:
     if not host.which("nvidia-smi"):
-        return ()
+        return (), None
     listed = host.command(
         [
             "nvidia-smi",
@@ -563,8 +648,8 @@ def _nvidia(host: Host) -> Optional[tuple[GPUState, ...]]:
     )
     if listed.returncode:
         if "No devices were found" in listed.stdout + listed.stderr:
-            return ()
-        return None
+            return (), None
+        return None, None
     rows: list[tuple[int, str, Optional[int]]] = []
     for line in listed.stdout.splitlines():
         fields = [field.strip() for field in line.split(",")]
@@ -576,14 +661,23 @@ def _nvidia(host: Host) -> Optional[tuple[GPUState, ...]]:
         ["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"]
     )
     if apps.returncode:
-        return None
+        return None, None
     busy = Counter(line.split(",")[0].strip() for line in apps.stdout.splitlines() if line.strip())
     memory = {uuid: value for _, uuid, value in rows}
-    chosen = visible_gpus(
-        [(index, uuid) for index, uuid, _ in rows],
-        host.environment().get("CUDA_VISIBLE_DEVICES"),
-    )
-    return tuple(GPUState(uuid, memory[uuid], busy[uuid]) for _, uuid in chosen)
+    listed_uuids = [(index, uuid) for index, uuid, _ in rows]
+    mask = host.environment().get("CUDA_VISIBLE_DEVICES")
+    order = None
+    if native_cuda and len(rows) > 1:
+        order = host.cuda_devices()
+        if order is not None and len(set(order)) == len(order) and set(order) <= memory.keys():
+            return tuple(GPUState(uuid, memory[uuid], busy[uuid]) for uuid in order), order
+        # Retain management readings for reserve and budget decisions where the
+        # mask still identifies the cards. Numeric masks need the driver's order.
+        if mask is not None and any(token.strip().isdigit() for token in mask.split(",")):
+            return None, ()
+        order = ()
+    chosen = visible_gpus(listed_uuids, mask)
+    return tuple(GPUState(uuid, memory[uuid], busy[uuid]) for _, uuid in chosen), order
 
 
 def _cgroup_room(host: Host) -> tuple[bool, Optional[int]]:
@@ -665,23 +759,29 @@ def _available(host: Host, system: str) -> Optional[int]:
 
 
 def read_runtime(
-    *, memory_budget_bytes: Optional[int] = None, host: Optional[Host] = None
+    *,
+    memory_budget_bytes: Optional[int] = None,
+    host: Optional[Host] = None,
+    native_cuda: bool = False,
 ) -> RuntimeFacts:
     """Read this machine's runtime facts now."""
     live: Host = host or NativeHost()
     system = live.platform()
+    cuda_uuids = None
     if system == "linux":
         allowed = live.affinity()
         cpus = allowed if allowed is not None else identity.online_cpus(live)
-        gpus = _gpus(live)
+        gpus, cuda_uuids = _gpus(live, native_cuda)
     elif system == "darwin":
         # macOS has no affinity: every logical CPU is usable.
         cpus = cpu_list(f"0-{identity.sysctl_int(live, 'hw.logicalcpu') - 1}")
         gpus = ()
     elif system == "windows":
-        # Group 0 logical processor indices, as the engine and its CPU masks number them.
+        # Group-qualified logical processor indices, as the Windows topology numbers them.
         cpus = live.windows().process_cpus()
-        gpus = _gpus(live)
+        gpus, cuda_uuids = _gpus(live, native_cuda)
     else:
         raise identity.UnsupportedPlatform(f"runtime facts are not read on {system} yet")
-    return RuntimeFacts(tuple(cpus), gpus, _available(live, system), memory_budget_bytes)
+    return RuntimeFacts(
+        tuple(cpus), gpus, _available(live, system), memory_budget_bytes, cuda_uuids=cuda_uuids
+    )

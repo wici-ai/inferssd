@@ -17,7 +17,7 @@ computes the same values up to rounding, as a GPU and a CPU do, and the server t
 them between its own prompt passes. A prefix cache is a file of a server's prompt cache on disk, whose fingerprint
 is
 
-    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>
+    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>|adapter-cache=1
 
 with the size and an FNV-1a hash of the header (the metadata and the tensor list) of each file the model is loaded
 from, the other files of a split model included, and the build that saved it. A server takes a file of its own prompt
@@ -25,6 +25,17 @@ cache only from its own build, and a prefix cache from any build: it compares th
 the files are and when they were written are not in it. A
 state saved with another layout (another KV type, or flash attention on where it was off) fails to restore; the
 server then leaves that file and processes the prefix itself.
+
+Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
+matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation
+position governs reuse. Older writable files without adapter provenance are rebuilt on the first launch
+with the new cache fingerprint. New published prefixes must carry the adapter-aware base fingerprint
+(ending in `|adapter-cache=1`). Previously published base prefixes remain readable after verification
+against their published sizes and SHA-256 digests.
+
+Explicit slot saves also record the model, build, and effective adapter key. Restoring a compatible
+save keeps its state available to automatic or pinned slot selection. A request with a different
+adapter recomputes the prompt. The server rejects older explicit slot files without provenance.
 
 ## The server
 
@@ -88,3 +99,8 @@ For a new engine, each published prefix cache is made again. If the new state di
 more than two backends differ, the file is kept and the new engine is added to its `engines`; otherwise the new file
 is published for it. A state computed twice on one GPU is not the same bytes either, so the comparison is by size of
 difference, not equality.
+
+The publisher updates the entry for the requested system, model, app, app version, and file SHA-256. It can add an
+engine to an existing legacy entry when the size and SHA-256 match both that entry and the native import inventory
+in the named engine commit. Fetch the engine commits before publishing so the publisher can inspect their source.
+The publisher keeps the existing download and verifies the bytes it serves before writing the updated list.

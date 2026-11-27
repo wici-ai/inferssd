@@ -226,8 +226,47 @@ def test_the_engines_facts_of_the_split_toy_model():
     # The layers' one other tensor is layer 0's attention query; the token embeddings are outside
     # the layers.
     assert facts.layer_format_bytes == (("F32", 64 * 64 * 4),)
+    # Only the first attention layer and the tied output require GPU weights.
+    assert facts.cuda_layer_bytes == (64 * 64 * 4, 0, 64 * 16 * 4)
     assert facts.cpu_format == "Q8_0"
     assert model_facts_from(model_facts_json(facts)) == facts
+
+
+def test_cuda_layer_bytes_count_padded_dense_weights_and_exclude_host_lookup_tables():
+    tensors, kv = deepseek_like()
+    tensors += [
+        ("blk.0.attn_q.weight", (256, 256), Q4_K),
+        ("blk.0.engram_embd.weight", (4096, 1024), F32),
+        ("per_layer_token_embd.weight", (4096, 1024), F32),
+        ("output.weight", (64, 256), F32),
+    ]
+    facts = facts_of(tensors, kv)
+    # The quantized tensor pads its last 256-element row to 512 and rounds
+    # the buffer allocation to 128. Neither the input nor the engrams use it.
+    assert facts.cuda_layer_bytes[0] == 37120
+    assert facts.cuda_layer_bytes[3:-1] == (5120 * 4,) * 40
+    assert facts.cuda_layer_bytes[-1] == (5120 + 64 * 256) * 4
+    recording = model_facts_json(facts)
+    del recording["cuda_layer_bytes"]
+    assert model_facts_from(recording).cuda_layer_bytes == ()
+
+
+@pytest.mark.parametrize(
+    "layer", ["foo", "-1", "2", "9" * 5000], ids=["text", "negative", "past-end", "huge"]
+)
+def test_unrecognized_block_numbers_leave_cuda_layout_unknown(layer):
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    attn = next(t for t in raw["tensors"] if t["name"] == "blk.0.attn_q.weight")
+    attn["name"] = f"blk.{layer}.attn_q.weight"
+    facts = facts_from_engine(engine_model.validate(raw))
+    assert facts.cuda_layer_bytes == () and facts.layer_format_bytes == (("F32", 16384),)
+
+
+def test_incomplete_model_headers_keep_aggregate_facts():
+    raw = json.loads(ENGINE_FIXTURE.read_text())
+    raw["layers"] = 1 << 60
+    facts = facts_from_engine(engine_model.validate(raw))
+    assert facts.experts.layers == 2 and facts.cuda_layer_bytes == ()
 
 
 def test_deepseek_like_facts():
@@ -367,15 +406,19 @@ def test_model_drive_key_follows_the_files(tmp_path):
 
 
 class RuntimeHost(FakeHost):
-    def __init__(self, root, *, affinity=None, environment=None, **options):
+    def __init__(self, root, *, affinity=None, environment=None, cuda_uuids=None, **options):
         super().__init__(root, **options)
         self.allowed, self.env = affinity, dict(environment or {})
+        self.cuda_uuids = cuda_uuids
 
     def affinity(self):
         return self.allowed
 
     def environment(self):
         return self.env
+
+    def cuda_devices(self):
+        return self.cuda_uuids
 
 
 SMI_GPUS = ("nvidia-smi", "--query-gpu=index,uuid,memory.free", "--format=csv,noheader,nounits")
@@ -436,6 +479,30 @@ def test_linux_runtime_respects_cuda_visible_devices(tmp_path):
         )
         gpus = read_runtime(host=host).gpus
         assert gpus is not None and tuple(gpu.uuid for gpu in gpus) == expected
+
+
+def test_runtime_reads_numeric_cuda_visibility_in_native_order(tmp_path):
+    commands = linux_runtime(tmp_path, gpus="0, GPU-a, 512\n1, GPU-b, 8192\n2, GPU-c, 4096\n")
+    host = RuntimeHost(
+        tmp_path, affinity=(0,), commands=commands, environment={"CUDA_VISIBLE_DEVICES": "2,0"}
+    )
+    host.cuda_uuids = ("GPU-a", "GPU-b")
+    facts = read_runtime(host=host, native_cuda=True)
+    assert facts.cuda_uuids == host.cuda_uuids
+    assert facts.gpus == (
+        GPUState("GPU-a", 512 << 20, 0),
+        GPUState("GPU-b", 8192 << 20, 0),
+    )
+    host.cuda_uuids = None
+    assert read_runtime(host=host, native_cuda=True).gpus is None
+    host.env.clear()
+    unknown = read_runtime(host=host, native_cuda=True)
+    assert unknown.cuda_uuids == ()
+    assert unknown.gpus == (
+        GPUState("GPU-a", 512 << 20, 0),
+        GPUState("GPU-b", 8192 << 20, 0),
+        GPUState("GPU-c", 4096 << 20, 0),
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason=LINUX_MACHINE)  # sysfs names carry colons

@@ -22,7 +22,6 @@ struct expert_requirements {
     float clamp = 0.0f;
     bool finite_clamp = false;
     bool require_post_norm = false;
-    bool single_token_or_prefill = false;
 };
 
 [[nodiscard]] expert_requirements describe_experts(
@@ -74,7 +73,6 @@ enum class expert_refusal {
     extra_parameters,
     lora,
     incompatible_gate,
-    token_batch,
     invalid_clamp,
     missing_post_norm,
 };

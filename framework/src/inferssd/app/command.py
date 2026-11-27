@@ -57,6 +57,7 @@ def add_commands(commands: argparse._SubParsersAction[argparse.ArgumentParser]) 
                 help="IPv4 address to listen on: 127.0.0.1 (default) is this machine only; "
                 "0.0.0.0 also accepts other devices on your network",
             )
+        typed_command.gpu_options(parser)
         parser.add_argument("--port", type=int, default=8080)
         parser.add_argument(
             "--context",
@@ -174,6 +175,10 @@ def run(args: argparse.Namespace) -> int:
         "--output-dir",
         str(state / "runs" / uuid.uuid4().hex),
     ]
+    for name in ("main_gpu", "split_mode", "tensor_split"):
+        option = getattr(args, name)
+        if option is not None:
+            command.extend(["--" + name.replace("_", "-"), str(option)])
     for shard in args.shards:
         command.extend(["--shard", shard])
     if args.context is not None:

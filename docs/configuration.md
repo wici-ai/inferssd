@@ -51,6 +51,16 @@ while the CPU sink computes every routed expert, and an explicit nonzero budget
 is an error. The lane holds no expert across layers, so for it a nonzero budget,
 like auto, only turns it on.
 
+A byte value for `vram.budget` is the size the tier starts at, not a limit. The
+first decode token grows the tier from there into the VRAM that is free. Two
+keys bound that growth. `vram.reserve_mib` is the VRAM the tier leaves free for
+other processes: growth stops there (with a small margin above it for the
+driver), and at a token boundary a tier that finds less than the reserve free
+gives its last block back. `vram.max_slots` is the most expert slots the tier
+holds; zero sets no limit of its own, and a value below the starting size keeps
+the starting size. To keep part of a card for something else, set one of these
+rather than a smaller budget.
+
 `kv.spill_directory` accepts one existing local SSD directory. With a growable attention
 cache and one sequence, context fitting admits a larger logical window when the SSD
 has room for the cache and the original devices can stage the active layers. The

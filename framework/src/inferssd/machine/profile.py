@@ -13,8 +13,8 @@ CPU clusters: Linux takes each CPU's ``cpu_capacity``, else
 relative drop above 10%; one CPU without either value makes one cluster. macOS
 takes ``hw.perflevel0.logicalcpu`` as the performance cluster and the remaining
 CPUs as efficiency. Windows takes the CPUs of the highest CPU Set efficiency
-class as the performance cluster; without a CPU Set for every CPU of processor
-group 0 the machine is one cluster.
+class as the performance cluster; without a CPU Set for every logical
+CPU the machine is one cluster.
 """
 
 from __future__ import annotations
@@ -74,6 +74,7 @@ from inferssd.machine.store import CPU_GROUP, Refresh, plan_refresh
 
 # A split GGUF's shard: <prefix>-00002-of-00004.gguf
 SHARD = re.compile("(.*)-\\d{5}-of-(\\d{5})\\.gguf$")
+MAX_PROBE_THREADS = 512  # GGML_MAX_N_THREADS in the native CPU probe
 MIN_FILE_BYTES = 1 << 30
 MAX_FILES = 8
 TEST_FILE_BYTES = 4 << 30  # spread over 4 GiB, reads do not stay in a drive's own cache
@@ -190,14 +191,12 @@ def darwin_topology(host: Host) -> CPU:
 
 
 def windows_topology(host: Host) -> CPU:
-    """Group 0's CPUs; ``capacity`` is the CPU Set efficiency class, ``core`` its CoreIndex."""
+    """Windows CPU Set efficiency classes and group-qualified logical CPU and core IDs."""
     processors = host.windows().processors()
-    if processors.groups > 1:
-        raise ValueError("more than one processor group (over 64 logical CPUs) is not supported")
     sets = {row.index: row for row in processors.sets}
-    ids = list(range(processors.group0))
+    ids = processors.ids
     known = all(cpu in sets for cpu in ids)
-    best = max(row.efficiency for row in sets.values()) if known else None
+    best = max(sets[cpu].efficiency for cpu in ids) if known else None
     fast = [cpu for cpu in ids if best is None or sets[cpu].efficiency == best]
     siblings: dict[int, list[int]] = {}
     for cpu in ids if known else ():
@@ -217,7 +216,7 @@ def windows_topology(host: Host) -> CPU:
     return {
         "logical": logical,
         "clusters": clusters(fast, [cpu for cpu in ids if cpu not in fast]),
-        "affinity_supported": True,
+        "affinity_supported": len(processors.counts) == 1,
         "isa": [],
     }
 
@@ -242,17 +241,19 @@ def curve_threads(count: int) -> list[int]:
     return counts + [count]
 
 
-def probe_threads(cpu: CPU) -> list[int]:
+def probe_threads(cpu: CPU, limit: Optional[int] = None) -> list[int]:
     """1, 2, 4, ... up to every logical CPU, the performance-cluster size, and every CPU but one.
 
     A prompt pass runs on the measured count that computes fastest of those that
     leave the sink's I/O threads a CPU, so every CPU but one is measured as well.
     """
     total = len(cpu["logical"])
+    if limit is not None:
+        total = min(total, limit, MAX_PROBE_THREADS)
     fast = next(
         (len(row["cpus"]) for row in cpu["clusters"] if row["kind"] == "performance"), total
     )
-    return sorted({*curve_threads(total), fast, *([total - 1] if total > 1 else [])})
+    return sorted({*curve_threads(total), min(fast, total), *([total - 1] if total > 1 else [])})
 
 
 def pinned_sets(cpu: CPU) -> list[list[int]]:
@@ -358,7 +359,7 @@ def measure_cpu(
                 for index in range(count)
             ],
             "clusters": clusters(range(count), []),
-            "affinity_supported": system != "darwin",
+            "affinity_supported": system == "linux",
             "isa": [],
         }
     memory: Memory = {
@@ -368,7 +369,14 @@ def measure_cpu(
         "dram_read_Bps": [],
     }
     read_end = clock()
-    threads = probe_threads(cpu)
+    if system == "windows" and not cpu["affinity_supported"]:
+        # An older Windows release or a restricted process may only use part of the machine.
+        available = host.windows().process_cpus()
+        if not available:
+            raise ValueError("no available CPUs for profiling")
+        threads = probe_threads(cpu, len(available))
+    else:
+        threads = probe_threads(cpu)
     method = f"{PROBE_SCHEMAS['cpu']} ggml_mul_mat, threads {','.join(map(str, threads))}"
     progress(f"CPU probe: ggml compute and DRAM read with {','.join(map(str, threads))} threads")
     probe_error = ""

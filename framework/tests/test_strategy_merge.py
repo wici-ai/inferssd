@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from inferssd.configuration.settings import parse, uncomment
@@ -205,3 +207,26 @@ def test_user_io_cpus_on_a_decode_cpu_drop_the_decode_cpus():
     result = apply(strategy(threads=DECODE_ON_FAST), user)
     assert result.threads == Threads(10, 19, ())
     assert result.dropped == ("threads.decode_cpus",)
+
+
+@pytest.mark.parametrize(
+    ("extra", "env"),
+    [
+        (("--split-mode", "layer"), {}),
+        (("--main-gpu", "0"), {}),
+        (("--tensor-split=1,1",), {}),
+        (("--device", "CUDA1"), {}),
+        ((), {"LLAMA_ARG_MAIN_GPU": "0"}),
+        ((), {"LLAMA_ARG_TENSOR_SPLIT": "1,1"}),
+    ],
+)
+@pytest.mark.parametrize(
+    "placement",
+    [
+        ("--split-mode", "none", "--main-gpu", "1"),
+        ("--split-mode", "layer", "--tensor-split", "2,1"),
+    ],
+)
+def test_placement_override_replaces_the_whole_strategy_placement(extra, env, placement):
+    proposed = replace(strategy(), server_args=("--ctx-checkpoints", "1", *placement))
+    assert server_arguments(proposed, extra, env) == ("--ctx-checkpoints", "1")

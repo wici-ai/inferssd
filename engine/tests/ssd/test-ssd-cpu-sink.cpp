@@ -888,7 +888,8 @@ static void schedule_tests(fixture_inputs & inputs, int threads, int depth, bool
             ready[index] = mode == 1 || mode == 7;
             inputs.set(names[0], ready[index] ? "1" : "0");
             inputs.set(names[1], mode == 6 ? weighted.c_str() : "");
-            inputs.set(names[2], mode >= 3 ? std::to_string(allowed.back()).c_str() : "");
+            const bool allow_pin = ssd::platform::thread_pinning() != ssd::platform::pin_policy::unsupported;
+            inputs.set(names[2], mode >= 3 && allow_pin ? std::to_string(allowed.back()).c_str() : "");
             // Mode 7 exercises dynamic rows through ordinary compute_phase.
         }
         char error[512] = {};
@@ -1281,9 +1282,13 @@ static void cache_policy_tests(fixture_inputs & inputs, int threads, int depth) 
     cache_case(inputs, "policy_unlisted_layer_bypass", f, sink.get(), 2, input, { 1 }, { 1 }, 0, 0);
     begin_cache(sink.get(), 1, 6);
     cache_case(inputs, "policy_layer_skip_retains_entries", f, sink.get(), 1, input, { 1, 3 }, { .2f, .8f }, 2, 0);
-    cache_case(inputs, "policy_repeated_layer_same_token_bypass", f, sink.get(), 1, input, { 1, 3 }, { .7f, .3f }, 0, 0);
+    // a decode ubatch's later row: the layer again within the token hits what the first row holds
+    cache_case(inputs, "policy_repeated_layer_same_token_row_hits", f, sink.get(), 1, input, { 1, 3 }, { .7f, .3f }, 2, 0);
+    // a draft's rows move the position by several tokens, its rejected rows back: the entries stay
     begin_cache(sink.get(), 1, 8);
-    cache_case(inputs, "policy_token_jump_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
+    cache_case(inputs, "policy_token_jump_keeps_entries", f, sink.get(), 1, input, { 1 }, { 1 }, 1, 0);
+    begin_cache(sink.get(), 1, 7);
+    cache_case(inputs, "policy_token_back_keeps_entries", f, sink.get(), 1, input, { 3 }, { 1 }, 1, 0);
     begin_cache(sink.get(), 2, 9);
     cache_case(inputs, "policy_epoch_cold", f, sink.get(), 1, input, { 1 }, { 1 }, 0, 1);
     begin_cache(sink.get(), 2, 10, false);
@@ -1428,7 +1433,8 @@ static void cache_tests(fixture_inputs & inputs, int threads, int depth) {
     begin_cache(sink.get(), 1, 2);
     input[3] += .125f;
     cache_case(inputs, "cache_full_hit_changed_activation_weights", f, sink.get(), 1, input, { 1, 2 }, { .8f, .2f }, 2, 0);
-    cache_case(inputs, "cache_repeat_same_token_bypass", f, sink.get(), 1, input, { 4, 5 }, { .3f, .7f }, 0, 0);
+    // a later row of a decode ubatch runs the layer again within the token: it hits what the first row left
+    cache_case(inputs, "cache_repeat_same_token_row_hits", f, sink.get(), 1, input, { 1, 4 }, { .3f, .7f }, 1, 0);
     begin_cache(sink.get(), 1, 3);
     cache_case(inputs, "cache_window_intersection_B", f, sink.get(), 1, input, { 2, 3 }, { .3f, .7f }, 1, 1);
     begin_cache(sink.get(), 1, 4);

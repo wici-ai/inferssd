@@ -91,6 +91,7 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
         help="IPv4 address the server listens on: 127.0.0.1 (default) is this machine only, "
         "0.0.0.0 every network interface",
     )
+    gpu_options(launch)
     launch.add_argument("--port", type=int, default=8080)
     launch.add_argument(
         "--context",
@@ -154,6 +155,20 @@ def add_arguments(launch: argparse.ArgumentParser) -> None:
     launch.set_defaults(mode="server")
 
 
+def gpu_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--main-gpu", type=int, metavar="INDEX", help="run on one visible GPU (zero-based index)"
+    )
+    parser.add_argument(
+        "--split-mode",
+        choices=("none", "layer"),
+        help="use one GPU or distribute layers over visible GPUs",
+    )
+    parser.add_argument(
+        "--tensor-split", metavar="RATIOS", help="layer proportions in visible GPU order, e.g. 1,1"
+    )
+
+
 def prompt_cache_directory() -> Path:
     """This user's cache directory for inferssd prompt caches."""
     return cache_directory() / "prompts"
@@ -192,6 +207,9 @@ def specification(args: argparse.Namespace, *, strategy: bool = False) -> Launch
         args.prompt_cache_mib,
         not args.no_layer_events,
         None if args.prompt_cache == "off" else str(prefix_cache_directory().resolve()),
+        main_gpu=args.main_gpu,
+        split_mode=args.split_mode,
+        tensor_split=args.tensor_split,
     )
 
 

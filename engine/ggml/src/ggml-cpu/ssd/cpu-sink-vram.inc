@@ -208,6 +208,10 @@ struct sink_vram {
     // of them when none is left, its own when the process's are unknown). Set again when the coordinator's change.
     void place_threads() {
         if (!placement_due || !policy_api) { return; }
+        if (ssd::platform::thread_pinning() == ssd::platform::pin_policy::unsupported) {
+            placement_due = false;
+            return;
+        }
         std::string why;
         if (!ssd::platform::current_thread_cpus(coordinator_cpus, &why)) {
             throw std::runtime_error("GPU tier thread placement: " + why);
@@ -239,8 +243,9 @@ struct sink_vram {
         // outside any request leaves its phase open.
         if (prefill_open && !decode && !request) { return; }
         if (deferred_upload) {
-            // Anything but the next decode token of this epoch may release the arena or the RAM cache.
-            const bool next = decode && this->decode && have_token && epoch == this->epoch && token == this->token + 1;
+            // Anything but a later decode step of this epoch (a token, or a draft's rows, at any position) may release
+            // the arena or the RAM cache.
+            const bool next = decode && this->decode && have_token && epoch == this->epoch;
             collect_deferred(cache, next ? SSD_VRAM_COLLECT_NONE : SSD_VRAM_COLLECT_ALL);
         }
         char error[512] = {};

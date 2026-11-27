@@ -17,6 +17,9 @@ using namespace std::chrono_literals;
 
 static constexpr int prefix_tokens = 96;
 static constexpr int vocab_size = 259;
+static constexpr int width = 32;
+static constexpr llama_token base_token = 3 + 'A';
+static constexpr llama_token adapted_token = 3 + 'B';
 
 static void require(bool condition, const char * message) {
     if (!condition) {
@@ -24,8 +27,8 @@ static void require(bool condition, const char * message) {
     }
 }
 
-// One small dense layer and byte tokens. The regression needs real context state,
-// but the generated text is immaterial and the fixture needs no downloaded model.
+// A single layer with uniform attention makes the first output depend on the
+// cached values. Base state favors A, while the value adapter favors B.
 static void write_model(const fs::path & path) {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
@@ -33,9 +36,9 @@ static void write_model(const fs::path & path) {
     gguf_set_val_str(model.get(), "general.architecture", "llama");
     gguf_set_val_str(model.get(), "tokenizer.ggml.model", "llama");
     gguf_set_val_u32(model.get(), "llama.context_length", 512);
-    gguf_set_val_u32(model.get(), "llama.embedding_length", 32);
+    gguf_set_val_u32(model.get(), "llama.embedding_length", width);
     gguf_set_val_u32(model.get(), "llama.block_count", 1);
-    gguf_set_val_u32(model.get(), "llama.feed_forward_length", 32);
+    gguf_set_val_u32(model.get(), "llama.feed_forward_length", width);
     gguf_set_val_u32(model.get(), "llama.attention.head_count", 1);
     gguf_set_val_f32(model.get(), "llama.attention.layer_norm_rms_epsilon", 1e-5f);
     gguf_set_val_u32(model.get(), "tokenizer.ggml.unknown_token_id", 0);
@@ -60,27 +63,55 @@ static void write_model(const fs::path & path) {
     gguf_set_arr_data(model.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
     gguf_set_arr_data(model.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
 
-    const auto add = [&](const char * name, int rows = 0) {
-        auto * tensor = rows ? ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, 32, rows) :
-                               ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, 32);
+    const auto add = [&](const char * name, int rows = 0, float value = 0.0f) {
+        auto * tensor = rows ? ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, width, rows) :
+                               ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, width);
         ggml_set_name(tensor, name);
         auto * values = static_cast<float *>(tensor->data);
-        std::fill(values, values + ggml_nelements(tensor), 0.25f);
+        std::fill(values, values + ggml_nelements(tensor), value);
         gguf_add_tensor(model.get(), tensor);
+        return values;
     };
-    add("token_embd.weight", vocab_size);
-    add("output_norm.weight");
-    add("output.weight", vocab_size);
-    add("blk.0.attn_norm.weight");
-    add("blk.0.attn_q.weight", 32);
-    add("blk.0.attn_k.weight", 32);
-    add("blk.0.attn_v.weight", 32);
-    add("blk.0.attn_output.weight", 32);
-    add("blk.0.ffn_norm.weight");
-    add("blk.0.ffn_gate.weight", 32);
-    add("blk.0.ffn_down.weight", 32);
-    add("blk.0.ffn_up.weight", 32);
+    auto * embeddings = add("token_embd.weight", vocab_size);
+    for (int i = 0; i < vocab_size; ++i) {
+        embeddings[i * width] = 1.0f;
+    }
+    add("output_norm.weight", 0, 1.0f);
+    auto * output = add("output.weight", vocab_size);
+    output[base_token * width] = 1.0f;
+    output[adapted_token * width + 1] = 1.0f;
+    add("blk.0.attn_norm.weight", 0, 1.0f);
+    add("blk.0.attn_q.weight", width);
+    add("blk.0.attn_k.weight", width);
+    add("blk.0.attn_v.weight", width);
+    add("blk.0.attn_output.weight", width)[width + 1] = 1.0f;
+    add("blk.0.ffn_norm.weight", 0, 1.0f);
+    add("blk.0.ffn_gate.weight", width);
+    add("blk.0.ffn_down.weight", width);
+    add("blk.0.ffn_up.weight", width);
     require(gguf_write_to_file(model.get(), path.string().c_str(), false), "could not write prompt-cache model fixture");
+}
+
+static void write_adapter(const fs::path & path) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 16, nullptr, false}), ggml_free);
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> adapter(gguf_init_empty(), gguf_free);
+    require(weights && adapter, "could not create LoRA fixture");
+    gguf_set_val_str(adapter.get(), "general.type", "adapter");
+    gguf_set_val_str(adapter.get(), "general.architecture", "llama");
+    gguf_set_val_str(adapter.get(), "adapter.type", "lora");
+    gguf_set_val_f32(adapter.get(), "adapter.lora.alpha", 1.0f);
+
+    const auto add = [&](const char * name, int columns, int rows, int component, float value) {
+        auto * tensor = ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, columns, rows);
+        ggml_set_name(tensor, name);
+        auto * values = static_cast<float *>(tensor->data);
+        std::fill(values, values + ggml_nelements(tensor), 0.0f);
+        values[component] = value;
+        gguf_add_tensor(adapter.get(), tensor);
+    };
+    add("blk.0.attn_v.weight.lora_a", width, 1, 0, 1.0f);
+    add("blk.0.attn_v.weight.lora_b", 1, width, 1, 4.0f);
+    require(gguf_write_to_file(adapter.get(), path.string().c_str(), false), "could not write LoRA fixture");
 }
 
 static bool has_prompt_file(const fs::path & cache) {
@@ -151,17 +182,33 @@ static server_task_result_ptr receive(server_response_reader & reader) {
     return result;
 }
 
-static void post_prompt(server_response_reader & reader, llama_token suffix) {
-    llama_tokens prompt(384, suffix);
-    std::fill_n(prompt.begin(), prefix_tokens, 3 + 'A');
+static void post_prompt(server_response_reader & reader, llama_token suffix, int count, bool progress) {
+    llama_tokens prompt(count, suffix);
+    std::fill_n(prompt.begin(), prefix_tokens, base_token);
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
     task.tokens = server_tokens(prompt, false);
-    task.n_shared_prefix = prefix_tokens;
+    task.points.n_shared = prefix_tokens;
     task.params.n_predict = 1;
-    task.params.stream = true;
-    task.params.return_progress = true;
+    task.params.stream = progress;
+    task.params.return_progress = progress;
+    task.params.return_tokens = true;
+    task.params.sampling.temp = 0;
     reader.post_task(std::move(task));
+}
+
+static void require_completion(common_params params, int cached, llama_token token, const char * message) {
+    server_run restarted(params);
+    auto reader = restarted.server.get_response_reader();
+    post_prompt(reader, 3 + 'y', prefix_tokens + 4, false);
+    const auto result = receive(reader);
+    const auto * completion = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
+    require(completion && completion->tokens.size() == 1, "the request did not complete with exactly one token");
+    if (completion->n_prompt_tokens_cache != cached || completion->tokens.front() != token) {
+        std::fprintf(stderr, "Cached tokens: %d (expected %d), first token: %d (expected %d)\n",
+                     completion->n_prompt_tokens_cache, cached, completion->tokens.front(), token);
+        throw std::runtime_error(message);
+    }
 }
 
 static void test_restart(const fs::path & work) {
@@ -186,7 +233,7 @@ static void test_restart(const fs::path & work) {
         suffix_gate gate(cache);
         server_run first(params, &gate);
         auto reader = first.server.get_response_reader();
-        post_prompt(reader, 3 + 'x');
+        post_prompt(reader, 3 + 'x', 384, true);
         // The server first acknowledges the request, before decoding any tokens.
         receive(reader);
         const auto result = receive(reader);
@@ -209,16 +256,17 @@ static void test_restart(const fs::path & work) {
     }
     params.cb_eval = nullptr;
     params.cb_eval_user_data = nullptr;
-    {
-        server_run restarted(params);
-        auto reader = restarted.server.get_response_reader();
-        post_prompt(reader, 3 + 'y');
-        const auto result = receive(reader);
-        const auto * progress = dynamic_cast<const server_task_result_cmpl_partial *>(result.get());
-        require(progress && progress->is_progress && progress->progress.cache == prefix_tokens,
-                "restart did not restore the exact shared prefix for a different suffix");
-        reader.stop();
-    }
+    require_completion(params, prefix_tokens, base_token,
+                       "base restart did not restore the exact shared prefix for a different suffix");
+
+    const auto adapter = work / "adapter.gguf";
+    write_adapter(adapter);
+    params.lora_adapters.push_back({adapter.string(), 1.0f, "", "", nullptr});
+    auto cold = params;
+    cold.cache_disk.clear();
+    cold.cache_ram_mib = 0;
+    require_completion(cold, 0, adapted_token, "cold adapted request did not select the adapted token");
+    require_completion(params, 0, adapted_token, "adapted restart used incompatible base prompt state");
 }
 
 int main() {

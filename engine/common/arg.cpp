@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cmath>
 #include <cstdarg>
 #include <fstream>
 #include <list>
@@ -609,6 +610,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
         common_params_handle_model(params.speculative.draft.mparams, params.hf_token, params.offline);
         common_params_handle_model(params.vocoder.model,             params.hf_token, params.offline);
+    }
+
+    // An MTP head is part of the model: a head file is one of the model's files (an extra shard), not a draft model.
+    if (params.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && !params.speculative.draft.mparams.path.empty()) {
+        params.model.shards.push_back(params.speculative.draft.mparams.path);
+        params.speculative.draft.mparams = {};
     }
 
     // model is required (except for server)
@@ -2448,6 +2455,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "- row: split weight across GPUs by rows (parallelized)\n"
         "- tensor: split weights and KV across GPUs (parallelized, EXPERIMENTAL)",
         [](common_params & params, const std::string & value) {
+            params.split_mode_explicit = true;
             if (value == "none") {
                 params.split_mode = LLAMA_SPLIT_MODE_NONE;
             } else if (value == "layer") {
@@ -2481,7 +2489,12 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             for (size_t i = 0; i < llama_max_devices(); ++i) {
                 if (i < split_arg.size()) {
-                    params.tensor_split[i] = std::stof(split_arg[i]);
+                    size_t consumed;
+                    const float weight = std::stof(split_arg[i], &consumed);
+                    if (consumed != split_arg[i].size() || !std::isfinite(weight) || weight < 0) {
+                        throw std::invalid_argument("tensor split proportions must be finite nonnegative numbers");
+                    }
+                    params.tensor_split[i] = weight;
                 } else {
                     params.tensor_split[i] = 0.0f;
                 }
@@ -3688,7 +3701,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
-        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod]",
+        {"--spec-type"}, "[none|ngram-cache|ngram-simple|ngram-map-k|ngram-map-k4v|ngram-mod|draft-mtp]",
         string_format("type of speculative decoding (default: %s)\n",
             common_speculative_type_to_str(params.speculative.type).c_str()),
         [](common_params & params, const std::string & value) {
@@ -3704,6 +3717,9 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V;
             } else if (value == "ngram-mod") {
                 params.speculative.type = COMMON_SPECULATIVE_TYPE_NGRAM_MOD;
+            } else if (value == "draft-mtp") {
+                // the model's own draft head; a head published as a file of its own is given with --spec-draft-model
+                params.speculative.type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
             } else {
                 throw std::invalid_argument("unknown speculative decoding type");
             }

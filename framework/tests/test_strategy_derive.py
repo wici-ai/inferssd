@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 from test_strategy_inputs import (
+    F32,
     MXFP4,
     Q3_K,
     Q4_K,
@@ -38,6 +39,7 @@ from inferssd.strategy.derive import (
     offered,
     prefill_threads,
 )
+from inferssd.strategy.estimate import dense_decode_estimate
 from inferssd.strategy.inputs import GPUState, RuntimeFacts
 
 MACHINES = Path(__file__).parent / "fixtures" / "machine"
@@ -616,6 +618,84 @@ def test_the_vram_tier_budget_follows_the_engines_tier_backend(models):
     assert f"vram.budget: default auto for {X86_GPU}" in s.notes and "link_gbps" in costs(s)
 
 
+def test_derive_cuda_placement_from_model_and_visible_memory(models):
+    c = machine(X86)
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    c["gpus"].append({**c["gpus"][0], "index": 1, "uuid": second})
+    cards = [GPUState(second, 2 << 30, 0), GPUState(X86_GPU, 8 << 30, 0)]
+
+    def arguments(model):
+        facts = runtime(range(61), cards)
+        return derive(c, model, facts, "linux", model_drive_key=drive(c)).server_args
+
+    assert arguments(models["dsv"]) == (
+        *SERVER_ARGS,
+        "--split-mode",
+        "layer",
+        "--tensor-split",
+        "36,8",
+    )
+    cards[0] = GPUState(second, 650 << 20, 1)
+    assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "0")
+    cards[0] = GPUState(second, 2 << 30, 0)
+    for index in (0, 1):
+        c["gpus"][index]["integrated"] = True
+        assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "0")
+    for gpu in c["gpus"]:
+        gpu["integrated"] = False
+    cards[1] = GPUState(X86_GPU, models["dsv"].dense_bytes + models["dsv"].experts.routed_bytes, 0)
+    assert arguments(models["dsv"]) == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "0")
+
+
+def test_mixed_cuda_cards_keep_the_allocation_floor_on_both_memory_types(models):
+    c = machine(X86)
+    unified = "GPU-00000000-0000-4000-8000-000000000017"
+    c["gpus"].append({**c["gpus"][0], "index": 1, "uuid": unified, "integrated": True})
+    # Subtracting the 1 GiB floor only from the discrete card would choose the
+    # unified card, even though both allocations have to preserve it.
+    cards = [GPUState(X86_GPU, 2 << 30, 1), GPUState(unified, 1536 << 20, 0)]
+    strategy = derive(
+        c, models["dsv"], runtime(range(61), cards), "linux", model_drive_key=drive(c)
+    )
+    assert strategy.server_args == (*SERVER_ARGS, "--split-mode", "none", "--main-gpu", "0")
+
+
+@pytest.mark.parametrize(
+    ("free_mib", "expected"),
+    [
+        ((1, 8192), ("--split-mode", "none", "--main-gpu", "1")),
+        ((63, 8192), ("--split-mode", "none", "--main-gpu", "1")),
+        ((64, 8192), ("--split-mode", "layer", "--tensor-split", "1,2")),
+        ((64, 64), ("--split-mode", "layer", "--tensor-split", "1,2")),
+    ],
+)
+def test_cuda_placement_fits_whole_layers_and_output(free_mib, expected):
+    c = machine(X86)
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    c["gpus"].append({**c["gpus"][0], "index": 1, "uuid": second})
+    tensors, kv = moe(
+        "muse-spark",
+        layers=2,
+        experts=256,
+        used=8,
+        latent=4096,
+        hidden=4096,
+        gate=Q4_K,
+        up=Q4_K,
+        down=Q4_K,
+    )
+    tensors = [t for t in tensors if "_exps." in t[0]]
+    tensors += [
+        ("blk.0.attn_q.weight", (4096, 4096), F32),
+        ("blk.1.attn_q.weight", (4096, 2048), F32),
+        ("output.weight", (4096, 2048), F32),
+    ]
+    model = facts_of(tensors, kv)
+    cards = [GPUState(uuid, mib << 20, 0) for uuid, mib in zip((X86_GPU, second), free_mib)]
+    strategy = derive(c, model, runtime(range(61), cards), "linux", model_drive_key=drive(c))
+    assert strategy.server_args == (*SERVER_ARGS, *expected)
+
+
 def test_gpu_states_that_leave_the_vram_budget_alone(models):
     c = machine(X86)
     cases = {
@@ -749,6 +829,39 @@ def test_experts_mixing_formats_across_layers_use_the_gpu_tier(tmp_path, experts
 
 
 WINDOWS = "windows-x64-igpu.json"  # 4 + 4 Intel cores with an integrated GPU, one NVMe drive
+
+
+@pytest.mark.parametrize(
+    "total,available,status",
+    [(128, range(128), "partial"), (64, range(64, 96), "failed"), (64, range(64, 96), "partial")],
+)
+def test_saved_windows_multigroup_fallback_uses_live_cpus(models, total, available, status):
+    c = machine(WINDOWS)
+    c["identity"]["hard"]["logical_cpus"] = total
+    # The old fallback numbered CPUs consecutively, even across partially filled groups.
+    c["cpu"]["logical"] = [
+        dict(c["cpu"]["logical"][0], id=i, core=None, capacity=None, smt_siblings=None)
+        for i in range(total)
+    ]
+    c["cpu"]["clusters"] = [{"id": 0, "kind": "uniform", "cpus": list(range(total))}]
+    c["cpu"]["affinity_supported"] = True
+    detail = (
+        "topology unavailable: more than one processor group "
+        "(over 64 logical CPUs) is not supported"
+    )
+    if status == "failed":
+        detail += "; ISA unknown: the CPU probe failed (see compute)"
+    c["sections"]["cpu"].update(status=status, detail=detail)
+    c["compute"]["cpu"] = []
+
+    s = derive(c, models["dsv"], runtime(available), "windows", model_drive_key=drive(c))
+    assert s.threads == Threads(len(available) - 1, len(available) - 1)
+    assert s.settings["cpu.io_cpus"].value_text == '""'
+    if status == "partial":
+        # The old probe could measure unpinned bandwidth despite the topology error.
+        c["memory"]["dram_read_Bps"] = [{"threads": len(available), "Bps": 1e9}]
+        estimate = dense_decode_estimate(c, 100_000_000, runtime(available))
+        assert estimate.tokens_per_second == pytest.approx(10)
 
 
 def test_windows_runs_the_one_derivation(models):
