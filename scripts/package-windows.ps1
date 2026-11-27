@@ -52,6 +52,14 @@ try {
   $targets = @('inferssd-server', 'inferssd-cpuprobe', 'inferssd-ssdprobe')
   if ($Backend -eq 'cuda') {
     $cuda = $env:CUDA_PATH.Replace('\', '/')
+    # The package runs on every GPU its toolkit compiles for: its first architecture is the toolkit's
+    # oldest (5.0 for CUDA 12), as in ggml-cuda's default. A list that starts later leaves the GPUs
+    # before it without code (no kernel image is available).
+    $toolkit = @(& "$cuda/bin/nvcc.exe" --list-gpu-arch | Where-Object { $_ -match '^compute_[0-9]+' })
+    if ($LASTEXITCODE -ne 0 -or !$toolkit.Count) { throw "nvcc --list-gpu-arch listed no architecture ($LASTEXITCODE)." }
+    $oldest = ($toolkit | ForEach-Object { [int]($_ -replace '^compute_([0-9]+).*$', '$1') } | Measure-Object -Minimum).Minimum
+    $first = ($CudaArchitectures -split ';' | ForEach-Object { [int]($_ -replace '^([0-9]+).*$', '$1') } | Measure-Object -Minimum).Minimum
+    if ($first -gt $oldest) { throw "CudaArchitectures starts at $first, after the toolkit's oldest architecture $oldest." }
     $configure = @('--preset', 'windows-cuda') + $configure + @('-DGGML_VULKAN=OFF',
       "-DCMAKE_CUDA_ARCHITECTURES=$CudaArchitectures", "-DCUDAToolkit_ROOT=$cuda", "-DCMAKE_CUDA_COMPILER=$cuda/bin/nvcc.exe")
     $targets += 'inferssd-memprobe'
