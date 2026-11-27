@@ -857,6 +857,31 @@ json server_chat_convert_responses_to_chatcmpl(const json & response_body) {
     }
     chatcmpl_body.erase("reasoning");
 
+    // text.format, the structured output the request asks for, becomes the chat-completions response_format, as
+    // llama.cpp converts it since 711f9f4c11. With a response format the chat templates' parsers and grammars take a
+    // reply of that format only, also where the request offers tools, as the ChatGPT desktop app's title request does
+    // with tool_choice "auto". A request without text.format keeps its text field as before.
+    const json text = json_value(response_body, "text", json());
+    if (text.is_object() && text.contains("format")) {
+        const json & format = text.at("format");
+        if (!format.is_object()) {
+            throw std::invalid_argument("'text.format' must be an object");
+        }
+        chatcmpl_body.erase("text");
+        const std::string type = json_value(format, "type", std::string());
+        if (type == "json_schema") {
+            chatcmpl_body["response_format"] = {
+                {"type",        "json_schema"},
+                {"json_schema", format},
+            };
+            chatcmpl_body["response_format"]["json_schema"].erase("type");
+        } else if (type == "json_object" || type == "text") {
+            chatcmpl_body["response_format"] = format;
+        } else if (!type.empty()) {
+            throw std::invalid_argument("'text.format.type' must be one of 'text', 'json_object', or 'json_schema'");
+        }
+    }
+
     return chatcmpl_body;
 }
 
