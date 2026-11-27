@@ -1269,15 +1269,22 @@ static std::string server_tool_mcp_server(const json & tool) {
 
 // The tools in the order every user of an app shares the most of: the client's own tools as sent, then the tools of
 // MCP servers, plugins and apps (named mcp__...), which differ from one user or computer to the next, grouped by
-// server in the order of the servers' names, each server's tools as sent. A tool is called by its name, so the
-// order says nothing to the model. Returns the end of each group in the new order: the client's own tools, then each
-// server's.
-static std::vector<size_t> server_order_tools(json & tools) {
+// server in the order of the servers' names, each server's tools as sent, then the request's custom tools as sent
+// (custom_tools, their names). A custom tool takes free-form text, and the ChatGPT desktop app's exec, which runs the
+// JavaScript the model writes, lists the JavaScript API of the app's own tools after a fixed preamble, so its
+// description changes with the tools the app has. A tool is called by its name, so the order says nothing to the
+// model. Returns the end of each group in the new order: the client's own tools, each server's, the custom tools.
+static std::vector<size_t> server_order_tools(json & tools, const std::vector<std::string> & custom_tools) {
     std::vector<json> own;
     std::vector<std::pair<std::string, json>> servers; // (server, tool)
+    std::vector<json> custom;
     for (auto & tool : tools) {
+        const json function = json_value(tool, "function", json::object());
+        const std::string name = function.is_object() ? json_value(function, "name", std::string()) : std::string();
         std::string server = server_tool_mcp_server(tool);
-        if (server.empty()) {
+        if (std::find(custom_tools.begin(), custom_tools.end(), name) != custom_tools.end()) {
+            custom.push_back(std::move(tool));
+        } else if (server.empty()) {
             own.push_back(std::move(tool));
         } else {
             servers.emplace_back(std::move(server), std::move(tool));
@@ -1298,6 +1305,12 @@ static std::vector<size_t> server_order_tools(json & tools) {
         if (i + 1 == servers.size() || servers[i + 1].first != servers[i].first) {
             ends.push_back(ordered.size());
         }
+    }
+    for (auto & tool : custom) {
+        ordered.push_back(std::move(tool));
+    }
+    if (!custom.empty()) {
+        ends.push_back(ordered.size());
     }
     tools = std::move(ordered);
     return ends;
@@ -1375,7 +1388,9 @@ json oaicompat_chat_params_parse(
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
-    const std::vector<size_t> tool_groups = has_tools ? server_order_tools(tools) : std::vector<size_t>();
+    // the custom tools of a Responses request (SERVER_CUSTOM_TOOLS), whose field stays in the request
+    const std::vector<std::string> custom_tools = json_value(body, SERVER_CUSTOM_TOOLS, std::vector<std::string>());
+    const std::vector<size_t> tool_groups = has_tools ? server_order_tools(tools, custom_tools) : std::vector<size_t>();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 

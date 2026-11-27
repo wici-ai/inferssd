@@ -333,8 +333,8 @@ inline constexpr const char * SERVER_USER_CONTEXT_DATA_CHARS = "inferssd_user_co
 
 // A chat request field set by the conversion of a Responses request (server_chat_convert_responses_to_chatcmpl): the
 // names of its custom tools as the prompt offers them, each a function of the one string argument "input".
-// oaicompat_chat_params_parse passes it on like any field it does not know; the task keeps it (task_params::
-// custom_tools), and the Responses output calls these tools with custom_tool_call items.
+// oaicompat_chat_params_parse offers them after the other tools (server_order_tools) and passes the field on; the task
+// keeps it (task_params::custom_tools), and the Responses output calls these tools with custom_tool_call items.
 inline constexpr const char * SERVER_CUSTOM_TOOLS = "inferssd_custom_tools";
 
 // A chat request field set by the conversion of an Anthropic Messages request (server_chat_convert_anthropic_to_oai):

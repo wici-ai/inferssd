@@ -432,6 +432,24 @@ static void test_chat_request_reports_branch_points() {
                 "<tool>mcp__web::fetch</tool><tool>mcp__web::open</tool><",
             "after the last tool, where another would go: " + tools_points[2]);
 
+    // the custom tools that the conversion of a Responses request names (SERVER_CUSTOM_TOOLS) come last, after the
+    // MCP servers' tools, so a state is kept before them; the field stays in the request
+    json with_custom = body;
+    with_custom["tools"] = json::array({tool("functions::exec"), tool("read"), tool("mcp__web::fetch"), tool("write")});
+    with_custom[SERVER_CUSTOM_TOOLS] = json::array({"functions::exec"});
+    const json custom_params = parse(with_custom);
+    const std::string own_and_web = system + "<tool>read</tool><tool>write</tool><tool>mcp__web::fetch</tool>";
+    require(custom_params.at("prompt").get<std::string>().rfind(own_and_web + "<tool>functions::exec</tool><|im_end|>\n", 0) == 0,
+            "the custom tools come after the MCP servers' tools: " + custom_params.at("prompt").get<std::string>());
+    require(points(custom_params) == std::vector<std::string>({ system + "<tool>read</tool><tool>write</tool><",
+                                                                own_and_web + "<", own_and_web + "<tool>functions::exec</tool><" }),
+            "a point where the MCP servers' tools end, before the custom tools: " + json(points(custom_params)).dump());
+    require(custom_params.at(SERVER_CUSTOM_TOOLS) == json::array({"functions::exec"}), "the field is passed on");
+    with_custom.erase(SERVER_CUSTOM_TOOLS);
+    require(parse(with_custom).at("prompt").get<std::string>().rfind(
+                system + "<tool>functions::exec</tool><tool>read</tool><tool>write</tool><tool>mcp__web::fetch</tool>", 0) == 0,
+            "without the field the tool is one of the app's own");
+
     // a Responses request's user context with the approved commands at its end
     const std::string data = "\n\n## Approved command prefixes\n- [\"git\", \"status\"]";
     json with_data = {
