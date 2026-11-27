@@ -20,12 +20,15 @@ from test_machine_identity import FakeHost, linux_tree, nvme_key, write
 from test_machine_probes import PATHS, FakeRunner, replies
 from test_machine_profile import Clock, linux_machine
 from test_strategy_inputs import (
+    Q8_0,
     SMI_APPS,
     SMI_GPUS,
     EngineHost,
     RuntimeHost,
     deepseek_like,
     engine_facts,
+    moe,
+    muse_like,
     recorded_facts,
 )
 from test_typed_launch import session, setup
@@ -220,6 +223,127 @@ def test_a_gpu_with_other_compute_processes_still_launches(tmp_path):
     result, _, _ = resolved(inputs, spec, adapter, out)
     assert result.code == 0
     assert "gpu_processes" not in {fact.name for fact in result.observations}
+
+
+@pytest.mark.parametrize(
+    ("processes", "file_reserve", "cli_reserve", "reserve_mib", "split"),
+    [
+        (0, None, None, 0, "layer"),
+        (1, None, None, 1024, "none"),
+        (0, 512, None, 512, "none"),
+        (1, 0, None, 0, "layer"),
+        (1, 1024, 0, 0, "layer"),
+        (0, 0, 512, 512, "none"),
+    ],
+)
+def test_cuda_placement_leaves_the_effective_reserve_on_every_card(
+    tmp_path, processes, file_reserve, cli_reserve, reserve_mib, split
+):
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(X86_GPU, 512 << 20, 0), (second, 8 << 30, processes)]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    machine["gpus"].append({**machine["gpus"][0], "uuid": second, "index": 1})
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(*muse_like(), path=spec.model)
+    if file_reserve is not None:
+        with Path(spec.settings_file).open("a") as stream:
+            stream.write(f"vram.reserve_mib = {file_reserve}\n")
+    if cli_reserve is not None:
+        spec = replace(spec, overrides=(*spec.overrides, ("vram.reserve_mib", str(cli_reserve))))
+    result, _, _ = resolved(inputs, spec, adapter, out)
+    assert native(out, spec).at("vram.reserve_mib").value == reserve_mib
+    assert result.argv[result.argv.index("--split-mode") + 1] == split
+    if split == "none":
+        assert result.argv[result.argv.index("--main-gpu") + 1] == "1"
+
+
+@pytest.mark.parametrize(
+    ("mask", "readings", "winner"),
+    [
+        (None, (2, 1, 0), "0"),
+        ("2,0", (2, 0), "1"),
+        ("uuid", (0, 2), "1"),
+        ("pci", (2, 0, 1), "2"),
+        ("live", (0, 1, 2), "2"),  # current driver order overrides a stale profile
+        ("unreadable", (2, 1, 0), None),
+        ("missing", (2, 1, 0), None),
+    ],
+)
+def test_main_gpu_uses_the_visible_cuda_ordinal(tmp_path, mask, readings, winner):
+    uuids = [X86_GPU[:-2] + str(n) for n in (16, 17, 18)]
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(uuids[i], (8192 if i == 0 else 512) << 20, 0) for i in readings]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    gpu = machine["gpus"][0]
+    machine["gpus"] = [
+        dict(gpu, index=i, uuid=uuids[i], pci_bus_id=f"0000:0{3 - i}:00.0") for i in (2, 0, 1)
+    ]
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(*muse_like(), path=spec.model)
+    spec = replace(spec, overrides=(*spec.overrides, ("vram.reserve_mib", "1024")))
+    if mask == "missing":
+        machine["gpus"].pop(0)
+    elif mask in ("live", "unreadable"):
+        host["runtime_facts"]["cuda_uuids"] = list(reversed(uuids)) if mask == "live" else []
+    elif mask == "pci":
+        inputs = replace(
+            inputs, environment=(*inputs.environment, ("CUDA_DEVICE_ORDER", "PCI_BUS_ID"))
+        )
+    elif mask is not None:
+        visible = ",".join((uuids[2], uuids[0])) if mask == "uuid" else mask
+        inputs = replace(
+            inputs, environment=(*inputs.environment, ("CUDA_VISIBLE_DEVICES", visible))
+        )
+    result, _, _ = resolved(inputs, spec, adapter, out)
+    if winner is None:
+        assert "--main-gpu" not in result.argv and "--split-mode" not in result.argv
+    else:
+        assert result.argv[result.argv.index("--main-gpu") + 1] == winner
+
+
+@pytest.mark.parametrize(
+    ("peer_free", "explicit", "mode"),
+    [(4 << 30, None, "layer"), (0, None, "none"), (4 << 30, "3,1", "layer")],
+)
+def test_kimi_native_fit_owns_automatic_layer_counts(tmp_path, peer_free, explicit, mode):
+    second = "GPU-00000000-0000-4000-8000-000000000017"
+    inputs, spec, host, adapter, out = strategic(
+        tmp_path, gpus=[(X86_GPU, 4 << 30, 0), (second, peer_free, 0)]
+    )
+    machine = json.loads(X86_FILE.read_text())
+    machine["gpus"].append(dict(machine["gpus"][0], uuid=second, index=1))
+    host["machine_characteristics"] = machine
+    host["model_facts"] = recorded_facts(
+        *moe(
+            "kimi-k3",
+            layers=8,
+            experts=128,
+            used=8,
+            latent=2048,
+            hidden=2048,
+            gate=Q8_0,
+            up=Q8_0,
+            down=Q8_0,
+        ),
+        path=spec.model,
+    )
+    result, _, _ = resolved(
+        replace(inputs, profile=""), replace(spec, tensor_split=explicit), adapter, out
+    )
+    argv = result.argv
+    assert argv[argv.index("--fit") + 1] == "on" and argv[argv.index("-ngl") + 1] == "auto"
+    assert argv[argv.index("--split-mode") + 1] == mode and argv.count("--split-mode") == 1
+    if explicit:
+        assert (
+            argv[argv.index("--tensor-split") + 1] == explicit and argv.count("--tensor-split") == 1
+        )
+    else:
+        assert "--tensor-split" not in argv
+    if mode == "none":
+        assert argv[argv.index("--main-gpu") + 1] == "0"
 
 
 def test_without_characteristics_the_strategy_is_skipped(tmp_path):

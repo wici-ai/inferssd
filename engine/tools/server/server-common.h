@@ -103,12 +103,6 @@ const char * get_media_marker();
 // check whether the given lora set has only aloras activated (empty => false)
 bool lora_all_alora(const std::vector<common_adapter_lora_info> & loras);
 
-// if the two sets of loras are different, they require a cache clear unless the
-// change is only from aloras to aloras.
-bool lora_should_clear_cache(
-        const std::vector<common_adapter_lora_info> & current,
-        const std::vector<common_adapter_lora_info> & next);
-
 std::map<int, float> parse_lora_request(const json & data);
 
 bool are_lora_equal(
@@ -324,6 +318,17 @@ json oaicompat_completion_params_parse(const json & body);
 // recognizes as generated, so the prompt matches the cache and the model sees what it actually wrote. `context` is
 // the request's "turn_context" (set by oaicompat_chat_params_parse): the turn is found after the same messages.
 void server_turn_memory_record(const common_chat_msg & msg, const std::string & context);
+
+// A chat request field set by the conversion of a Responses request (server_chat_convert_responses_to_chatcmpl): the
+// second of its two leading system messages holds the user's context and the first the app's own text, so the
+// shared prefix ends with the first. oaicompat_chat_params_parse reads and removes it.
+inline constexpr const char * SERVER_USER_CONTEXT_SYSTEM_MESSAGE = "inferssd_user_context_system_message";
+
+// A chat request field set with SERVER_USER_CONTEXT_SYSTEM_MESSAGE: the number of characters at the end of the
+// user's context that are data the user adds to over time (the commands approved, the tools deferred), moved there
+// so that the context before them stays the same (server_chat_convert_responses_to_chatcmpl). The server keeps a
+// state where they start. oaicompat_chat_params_parse reads and removes it.
+inline constexpr const char * SERVER_USER_CONTEXT_DATA_CHARS = "inferssd_user_context_data_chars";
 
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */

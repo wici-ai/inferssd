@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include "llama-memory-recurrent.h"
+
 #include "llama-impl.h"
 
 // utility to get one slice from the third dimension
@@ -442,4 +444,90 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     }
 
     return build_delta_net_chunking(q, k, v, g, b, s, il);
+}
+
+bool llm_build_delta_net_base::keeps_planes() const {
+    return cparams.n_rs_seq > 0 && ubatch.n_seq_tokens >= 2 && ubatch.n_seq_tokens <= 1 + cparams.n_rs_seq;
+}
+
+void llm_build_delta_net_base::build_conv_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * conv_input,
+                   int64_t   state_cols,
+                   int64_t   channels) const {
+    if (!keeps_planes()) {
+        return;
+    }
+    const int64_t n      = ubatch.n_seq_tokens;
+    const int64_t n_seqs = ubatch.n_seqs;
+    GGML_ASSERT(state_cols * channels == states_all->ne[0]);
+    const size_t row_size = states_all->nb[1];
+    const auto   head     = inp->mctx->get_head();
+    const auto   size     = inp->mctx->get_size();
+    for (int64_t j = 1; j < n; ++j) {
+        // the window that ends j tokens before the ubatch's last
+        ggml_tensor * window = ggml_view_3d(ctx0, conv_input, state_cols, channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, conv_input->ne[0] - state_cols - j));
+        ggml_tensor * dst = ggml_view_2d(ctx0, states_all, state_cols * channels, n_seqs, row_size,
+                (size_t(j) * size + head) * row_size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, window), dst));
+    }
+}
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * q,
+               ggml_tensor * k,
+               ggml_tensor * v,
+               ggml_tensor * g,
+               ggml_tensor * b,
+               ggml_tensor * s,
+                       int   il) {
+    const int64_t n      = q->ne[2];
+    const int64_t n_seqs = q->ne[3];
+    const size_t  row_size = states_all->nb[1];
+    const auto    head     = inp->mctx->get_head();
+    const auto    size     = inp->mctx->get_size();
+
+    // One op writes the state after each token straight into its plane, the final state into plane 0. It writes the
+    // planes in place, so it must run where they are: with the cache on the layer's device (offload_kqv), which must
+    // implement it, or the scheduler would run it elsewhere on a copy of the planes.
+    if (cparams.fused_gdn_ch && cparams.offload_kqv && states_all->type == GGML_TYPE_F32) {
+        const int64_t S_v = v->ne[0];
+        const int64_t H_v = v->ne[1];
+        GGML_ASSERT(states_all->ne[0] == S_v * S_v * H_v);
+        // planes 0 .. n - 1 of the ubatch's cells: a plane steps size rows, a cell one row
+        ggml_tensor * planes = ggml_view_3d(ctx0, states_all, states_all->ne[0], n, n_seqs,
+                size * row_size, row_size, head * row_size);
+        ggml_tensor * output = ggml_gated_delta_net_planes(ctx0, q, k, v, g, b, s, planes);
+        ggml_backend_buffer_t buf = states_all->buffer;
+        if (buf && ggml_backend_dev_supports_op(ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf)), output)) {
+            cb(output, LLAMA_TENSOR_NAME_FGDN_CH, il);
+            return { ggml_reshape_4d(ctx0, output, S_v, H_v, n, n_seqs), nullptr };
+        }
+    }
+
+    // otherwise the one-token delta net a token, its states copied into the planes
+    // token t of a [*, *, n_tokens, n_seqs] tensor
+    const auto token = [&](ggml_tensor * x, int64_t t) {
+        return ggml_cont(ctx0, ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], 1, x->ne[3], x->nb[1], x->nb[2], x->nb[3],
+                t * x->nb[2]));
+    };
+    ggml_tensor * output = nullptr;
+    ggml_tensor * state  = s;
+    for (int64_t t = 0; t < n; ++t) {
+        const auto step = build_delta_net(token(q, t), token(k, t), token(v, t), token(g, t), token(b, t), state, il);
+        output = output ? ggml_concat(ctx0, output, step.first, 2) : step.first;
+        state  = step.second;
+        if (t + 1 < n) {
+            // the state n - 1 - t tokens before the ubatch's end
+            ggml_tensor * dst = ggml_view_2d(ctx0, states_all, states_all->ne[0], n_seqs, row_size,
+                    (size_t(n - 1 - t) * size + head) * row_size);
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0, state, dst));
+        }
+    }
+    return { output, state };
 }

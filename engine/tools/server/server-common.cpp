@@ -10,11 +10,13 @@
 #include "server-common.h"
 #include "inferssd/identifiers.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cstdio>
 #include <deque>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <unordered_map>
 #include <sstream>
@@ -118,20 +120,6 @@ bool lora_all_alora(const std::vector<common_adapter_lora_info> & loras) {
         }
     }
     return found_alora;
-}
-
-bool lora_should_clear_cache(
-        const std::vector<common_adapter_lora_info> & current,
-        const std::vector<common_adapter_lora_info> & next) {
-
-    // This should always be called after determining that the two sets are
-    // _not_ equal. This assert is therefore some slightly wasted work and
-    // should be safe to remove as long as this method is called correctly.
-    GGML_ASSERT(!are_lora_equal(current, next));
-
-    return (
-        !(lora_get_enabled_ids(current).empty() || lora_all_alora(current)) ||
-        !lora_all_alora(next));
 }
 
 std::map<int, float> parse_lora_request(const json & data) {
@@ -1262,6 +1250,59 @@ static reasoning_choice resolve_reasoning_effort(const std::optional<common_chat
     return {true, chosen};
 }
 
+// The MCP server a tool belongs to: "mcp__<server>" for a tool named "mcp__<server>::<tool>" (a Codex namespace,
+// see server_chat_convert_responses_to_chatcmpl) or "mcp__<server>__<tool>" (Claude Code); empty for any other tool.
+static std::string server_tool_mcp_server(const json & tool) {
+    const json function = json_value(tool, "function", json::object());
+    const std::string name = function.is_object() ? json_value(function, "name", std::string()) : std::string();
+    static const std::string mcp = "mcp__";
+    if (name.compare(0, mcp.size(), mcp) != 0) {
+        return "";
+    }
+    const size_t ns = name.find("::", mcp.size());
+    if (ns != std::string::npos) {
+        return name.substr(0, ns);
+    }
+    const size_t sep = name.find("__", mcp.size());
+    return name.substr(0, sep == std::string::npos ? name.size() : sep);
+}
+
+// The tools in the order every user of an app shares the most of: the client's own tools as sent, then the tools of
+// MCP servers, plugins and apps (named mcp__...), which differ from one user or computer to the next, grouped by
+// server in the order of the servers' names, each server's tools as sent. A tool is called by its name, so the
+// order says nothing to the model. Returns the end of each group in the new order: the client's own tools, then each
+// server's.
+static std::vector<size_t> server_order_tools(json & tools) {
+    std::vector<json> own;
+    std::vector<std::pair<std::string, json>> servers; // (server, tool)
+    for (auto & tool : tools) {
+        std::string server = server_tool_mcp_server(tool);
+        if (server.empty()) {
+            own.push_back(std::move(tool));
+        } else {
+            servers.emplace_back(std::move(server), std::move(tool));
+        }
+    }
+    std::stable_sort(servers.begin(), servers.end(), [](const auto & a, const auto & b) { return a.first < b.first; });
+
+    std::vector<size_t> ends;
+    json ordered = json::array();
+    for (auto & tool : own) {
+        ordered.push_back(std::move(tool));
+    }
+    if (!ordered.empty()) {
+        ends.push_back(ordered.size());
+    }
+    for (size_t i = 0; i < servers.size(); ++i) {
+        ordered.push_back(std::move(servers[i].second));
+        if (i + 1 == servers.size() || servers[i + 1].first != servers[i].first) {
+            ends.push_back(ordered.size());
+        }
+    }
+    tools = std::move(ordered);
+    return ends;
+}
+
 json oaicompat_chat_params_parse(
     json & body, /* openai api json semantics */
     const server_chat_params & opt,
@@ -1273,6 +1314,10 @@ json oaicompat_chat_params_parse(
     // environment block and the writable root of Codex that is its cwd, and stand-ins take the place of the
     // identifiers of the user and the session, so that the context an app starts every conversation with is the same
     // prompt (see inferssd/identifiers.h).
+    const bool user_context_system = json_value(body, SERVER_USER_CONTEXT_SYSTEM_MESSAGE, false);
+    body.erase(SERVER_USER_CONTEXT_SYSTEM_MESSAGE);
+    const size_t user_context_data_chars = user_context_system ? json_value(body, SERVER_USER_CONTEXT_DATA_CHARS, (size_t) 0) : 0;
+    body.erase(SERVER_USER_CONTEXT_DATA_CHARS);
     if (body.contains("messages")) {
         server_strip_anthropic_billing_header(body.at("messages"));
         server_strip_claude_env_user_lines(body.at("messages"));
@@ -1285,6 +1330,7 @@ json oaicompat_chat_params_parse(
 
     auto tools = json_value(body, "tools", json());
     auto has_tools = tools.is_array() && !tools.empty();
+    const std::vector<size_t> tool_groups = has_tools ? server_order_tools(tools) : std::vector<size_t>();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
 
@@ -1496,6 +1542,9 @@ json oaicompat_chat_params_parse(
 
     // The leading system messages with the tools: what every conversation with this setup starts with. Rendered on
     // their own they must be a prefix of the prompt; their length tells the server where to keep a reusable state.
+    // When the last of them holds the user's context (SERVER_USER_CONTEXT_SYSTEM_MESSAGE), the shared prefix is the
+    // app's own system message with the tools, which every user of the app starts with, and the context prefix is
+    // all of them, which the users with the same context start with: the server keeps a state at both.
     // The user messages that follow them, up to the first reply, open the conversation: every later state of it
     // starts with them, which tells the prompt cache which of its states a new one replaces.
     {
@@ -1515,15 +1564,138 @@ json oaicompat_chat_params_parse(
             return 0;
         };
 
+        // For templates that merge the leading system messages into one turn (Qwen3.6), where the first n messages
+        // rendered on their own end the turn that the prompt goes on with the user's context: if the text they
+        // share with the prompt holds all of the app's text, its length up to the start of its last line; 0
+        // otherwise. A line start is where tokenizers start a token, so that prefix tokenizes as in the prompt.
+        const auto merged_prefix_chars = [&](size_t n) -> size_t {
+            common_chat_templates_inputs prefix_inputs = inputs;
+            prefix_inputs.messages.resize(n);
+            prefix_inputs.add_generation_prompt = false;
+            std::string prefix;
+            try {
+                prefix = common_chat_templates_apply(opt.tmpls.get(), prefix_inputs).prompt;
+            } catch (const std::exception &) {
+                return 0;
+            }
+            const std::string & prompt = chat_params.prompt;
+            size_t common = 0;
+            while (common < prefix.size() && common < prompt.size() && prefix[common] == prompt[common]) {
+                ++common;
+            }
+            // templates may trim a message's text, so its end is looked for without trailing white space
+            const std::string & content = inputs.messages[n - 1].content;
+            const std::string text = content.substr(0, content.find_last_not_of(" \t\r\n") + 1);
+            const std::string tail = text.substr(text.size() - std::min<size_t>(text.size(), 64));
+            const size_t at = tail.empty() ? std::string::npos : prefix.rfind(tail);
+            if (at == std::string::npos || at + tail.size() > common) {
+                return 0;
+            }
+            const size_t line = prompt.rfind('\n', common - 1);
+            return line == std::string::npos ? 0 : line + 1;
+        };
+
         size_t n_system = 0;
         while (n_system < inputs.messages.size() &&
                 (inputs.messages[n_system].role == "system" || inputs.messages[n_system].role == "developer")) {
             ++n_system;
         }
         if (n_system > 0 && n_system < inputs.messages.size()) {
-            const size_t n_chars = prefix_chars(n_system);
+            size_t n_chars = 0;
+            size_t n_context_chars = 0;
+            if (user_context_system && n_system == 2) {
+                n_chars = prefix_chars(1);
+                if (n_chars == 0) {
+                    n_chars = merged_prefix_chars(1);
+                }
+                n_context_chars = prefix_chars(n_system);
+            } else {
+                n_chars = prefix_chars(n_system);
+            }
             if (n_chars > 0) {
                 llama_params["shared_prefix_chars"] = n_chars;
+                if (n_context_chars > n_chars) {
+                    llama_params["context_prefix_chars"] = n_context_chars;
+                }
+
+                // Places inside these prefixes where the prompt of another user or setup is likely to part from
+                // this one, where the server keeps a state as well when the memory can save one after a batch
+                // (server_prompt_batch_stops): where each group of tools ends
+                // (server_order_tools; a user with more or fewer MCP servers or plugins goes on differently there)
+                // and, in the user's context, where the data the user adds to over time starts
+                // (SERVER_USER_CONTEXT_DATA_CHARS), or would start. Each is where the leading messages with part of
+                // the tools, or of the context, and the same with one more tool, or one more line, stop being the
+                // same; the server keeps the state after the last whole token before it.
+                const size_t n_lead = user_context_system && n_system == 2 ? 1 : n_system;
+                const auto render = [&](size_t n, const std::vector<common_chat_tool> & with_tools,
+                                        const std::string * last_text) -> std::optional<std::string> {
+                    common_chat_templates_inputs part_inputs = inputs;
+                    part_inputs.messages.resize(n);
+                    if (last_text != nullptr) {
+                        part_inputs.messages.back().content = *last_text;
+                    }
+                    part_inputs.tools                 = with_tools;
+                    part_inputs.add_generation_prompt = false;
+                    try {
+                        return common_chat_templates_apply(opt.tmpls.get(), part_inputs).prompt;
+                    } catch (const std::exception &) {
+                        return std::nullopt;
+                    }
+                };
+                // where `part` and `more` part, if the prompt holds `part` up to there; 0 otherwise. Without `more`
+                // the prompt itself goes on with more.
+                const auto part_end = [&](const std::optional<std::string> & part,
+                                          const std::optional<std::string> & more) -> size_t {
+                    const std::string & other = more ? *more : chat_params.prompt;
+                    if (!part) {
+                        return 0;
+                    }
+                    size_t n = 0;
+                    while (n < part->size() && n < other.size() && (*part)[n] == other[n]) {
+                        ++n;
+                    }
+                    return chat_params.prompt.compare(0, n, *part, 0, n) == 0 ? n : 0;
+                };
+                std::vector<size_t> branch;
+                const common_chat_tool another = {"x", "x", R"({"type": "object", "properties": {}})"};
+                for (const size_t end : tool_groups) {
+                    if (end > inputs.tools.size()) {
+                        break;
+                    }
+                    const std::vector<common_chat_tool> part(inputs.tools.begin(), inputs.tools.begin() + end);
+                    std::optional<std::string> more;
+                    if (end == inputs.tools.size()) {
+                        std::vector<common_chat_tool> more_tools = part;
+                        more_tools.push_back(another);
+                        more = render(n_lead, more_tools, nullptr);
+                        if (!more) {
+                            continue;
+                        }
+                    }
+                    branch.push_back(part_end(render(n_lead, part, nullptr), more));
+                }
+                if (n_context_chars > n_chars && inputs.messages[1].content_parts.empty() &&
+                        user_context_data_chars <= inputs.messages[1].content.size()) {
+                    const std::string & context = inputs.messages[1].content;
+                    const std::string before = context.substr(0, context.size() - user_context_data_chars);
+                    std::optional<std::string> more;
+                    if (user_context_data_chars == 0) {
+                        const std::string more_text = before + "\n\n-";
+                        more = render(2, inputs.tools, &more_text);
+                    }
+                    if (user_context_data_chars > 0 || more) {
+                        branch.push_back(part_end(render(2, inputs.tools, &before), more));
+                    }
+                }
+                const size_t n_kept = std::max(n_chars, n_context_chars);
+                branch.erase(std::remove_if(branch.begin(), branch.end(), [&](size_t p) {
+                    return p == 0 || p >= n_kept || p == n_chars;
+                }), branch.end());
+                std::sort(branch.begin(), branch.end());
+                branch.erase(std::unique(branch.begin(), branch.end()), branch.end());
+                if (!branch.empty()) {
+                    llama_params["branch_points_chars"] = branch;
+                }
 
                 size_t n_opening = n_system;
                 while (n_opening < inputs.messages.size() && inputs.messages[n_opening].role == "user") {

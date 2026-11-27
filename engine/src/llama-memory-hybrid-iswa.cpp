@@ -54,6 +54,7 @@ llama_memory_hybrid_iswa::llama_memory_hybrid_iswa(
         offload,
         rs_size,
         n_seq_max,
+        0, // no rollback planes: their graphs do not write them
         filter_recr == nullptr ?
             [&](int32_t il) { return hparams.is_recurrent(il); }
             : filter_recr

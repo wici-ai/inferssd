@@ -26,6 +26,7 @@ add_library(${TARGET} STATIC
     server-ssd-reservation.h
     server-tools.cpp
     server-tools.h
+    ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps/sha256/sha256.c
 )
 
 if (BUILD_SHARED_LIBS)
@@ -34,7 +35,8 @@ endif()
 
 target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
-target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
+target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR}/examples/gguf-hash/deps)
+target_link_libraries(${TARGET} PUBLIC llama-common mtmd ggml-ssd-platform ${CMAKE_THREAD_LIBS_INIT})
 if (GGML_CUDA)
     target_compile_definitions(${TARGET} PRIVATE LLAMA_SERVER_CUDA_MOE)
 endif()

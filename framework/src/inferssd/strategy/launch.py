@@ -18,8 +18,8 @@ from typing import Optional, cast
 from inferssd.configuration.settings import Snapshot
 from inferssd.launch.types import State, Threads
 from inferssd.machine.characteristics import loads
-from inferssd.strategy.derive import derive
-from inferssd.strategy.inputs import ModelFacts, runtime_facts_from
+from inferssd.strategy.derive import derive, tier_backends
+from inferssd.strategy.inputs import ModelFacts, cuda_device_order, runtime_facts_from, visible_gpus
 from inferssd.strategy.merge import apply, server_arguments
 
 
@@ -45,6 +45,9 @@ def plan(
     settings: Snapshot,
     threads: Threads,
     gpu_backends: Optional[tuple[str, ...]] = None,
+    placement: Sequence[str] = (),
+    *,
+    fit_layers: bool = False,
 ) -> Planned:
     """SETTINGS and the user's THREADS completed by the strategy for this launch.
 
@@ -65,7 +68,13 @@ def plan(
     characteristics = loads(cast(str, text))
     model = model_facts()
     key = cast(Optional[str], s.value("model_drive_key", *paths))
-    runtime = runtime_facts_from(s.value("runtime_facts"))
+    backends = tier_backends(gpu_backends, characteristics) if model.experts is not None else []
+    runtime = runtime_facts_from(s.value("runtime_facts", *backends))
+    if runtime.cuda_uuids is None:
+        # Legacy recordings kept memory readings and the unmasked native profile.
+        order = cuda_device_order(characteristics, s.env.get("CUDA_DEVICE_ORDER"))
+        visible = visible_gpus(list(enumerate(order)), s.env.get("CUDA_VISIBLE_DEVICES"))
+        runtime = replace(runtime, cuda_uuids=tuple(uuid for _, uuid in visible))
     available = runtime.available_bytes
     runtime = replace(
         runtime,
@@ -73,12 +82,23 @@ def plan(
         memory_budget_bytes=memory,
         gpu_backends=gpu_backends,
     )
+    # Placement must use the reserve the native context will actually receive.
+    reserve = settings.at("vram.reserve_mib")
     try:
-        strategy = derive(characteristics, model, runtime, platform, model_drive_key=key)
+        strategy = derive(
+            characteristics,
+            model,
+            runtime,
+            platform,
+            model_drive_key=key,
+            vram_reserve_mib=cast(int, reserve.value) if reserve.origin != "default" else None,
+            force_unified="GGML_CUDA_ENABLE_UNIFIED_MEMORY" in s.env,
+            fit_layers=fit_layers,
+        )
     except ValueError as error:
         return skipped(str(error))
     applied = apply(strategy, settings, threads)
-    arguments = server_arguments(strategy, s.inputs.extra, s.env)
+    arguments = server_arguments(strategy, (*placement, *s.inputs.extra), s.env)
     pairs = strategy.server_args
     yielded = [option for option in pairs[::2] if option not in arguments[::2]]
     kept = list(applied.kept) + ["server " + option for option in yielded]

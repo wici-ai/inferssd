@@ -175,6 +175,7 @@ struct llama_context {
 
     int encode(const llama_batch & batch_inp);
     int decode(const llama_batch & batch_inp);
+    int decode_mtp(const llama_batch & batch_inp, const float * h);
 
     //
     // state save/load
@@ -381,9 +382,13 @@ private:
     uint32_t sched_reserve_n_outputs = 0; // prompt outputs covered by the current scheduler
     uint32_t reserve_horizon_min = 0; // smallest horizon: the configured ubatch
     bool cpu_sink_decode_active = false;
-    bool cpu_sink_multi_token_reported = false;
     bool cpu_sink_cache_batch_decode = false;
-    std::unique_ptr<llama_ssd_cpu_sink_runtime> cpu_sink_runtime;
+    uint32_t cpu_sink_decode_rows = 1; // rows of the largest decode step the decode graph's reserve holds
+    std::unique_ptr<llama_ssd_executor_group> cpu_sink_runtime;
+
+    // an MTP draft step (decode_mtp): the next decode runs the MTP head's block over these hidden states
+    bool mtp_draft = false;
+    std::vector<float> mtp_h;
 
     llama_adapter_cvec_ptr  cvec;
     llama_adapter_loras_ptr loras;

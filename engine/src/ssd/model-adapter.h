@@ -14,7 +14,7 @@ namespace llama_ssd {
 // executor_checked: the model adds no type rule; the selected executor checks the types of up, gate and down
 // (which may all differ) against its own vec-dot and quantization traits when it initializes.
 enum class expert_quantization { unsupported, executor_checked };
-enum class expert_activation { unsupported, swiglu_clamp, swiglu };
+enum class expert_activation { unsupported, swiglu_clamp, swiglu, situ };
 
 struct expert_requirements {
     expert_quantization quantization = expert_quantization::unsupported;
@@ -22,7 +22,6 @@ struct expert_requirements {
     float clamp = 0.0f;
     bool finite_clamp = false;
     bool require_post_norm = false;
-    bool single_token_or_prefill = false;
 };
 
 [[nodiscard]] expert_requirements describe_experts(
@@ -45,7 +44,7 @@ struct expert_inputs {
     const ggml_tensor * down_scale;
     int64_t n_embd;
     int64_t n_tokens;
-    bool silu;
+    bool gate_matches_model;
     bool prefill;
     bool weight_before_ffn;
     bool has_lora;
@@ -73,8 +72,7 @@ enum class expert_refusal {
     layout,
     extra_parameters,
     lora,
-    not_silu_gated,
-    token_batch,
+    incompatible_gate,
     invalid_clamp,
     missing_post_norm,
 };

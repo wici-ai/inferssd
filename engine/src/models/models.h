@@ -74,6 +74,35 @@ struct llm_build_delta_net_base : public llm_graph_context {
                 ggml_tensor * b,
                 ggml_tensor * s,
                         int   il);
+
+    // Whether the ubatch leaves the rollback planes of its states behind: a decode step of 2 .. 1 + n_rs_seq tokens of
+    // a sequence (a draft's verification), as llama_memory_recurrent::keeps_planes counts them.
+    bool keeps_planes() const;
+
+    // The conv states after the ubatch's earlier tokens, into planes 1 .. n - 1 of `states_all` (plane j: j tokens
+    // back from its end); the caller writes plane 0. A row of `states_all` is state_cols x channels of conv_input.
+    void build_conv_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * conv_input,
+                   int64_t   state_cols,
+                   int64_t   channels) const;
+
+    // The states after the ubatch's tokens into planes n - 1 .. 0 of `states_all` (plane j: j tokens back from its
+    // end), written in place by one ggml_gated_delta_net_planes call, which runs each token as a one-token call of the
+    // op does: the output, and no new state (nullptr), as the planes hold it. Where the op cannot write the cache in
+    // place, build_delta_net one token at a time with the states after the earlier tokens copied into planes
+    // 1 .. n - 1, the new state returned for the caller to write into plane 0.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_planes(
+        llm_graph_input_rs * inp,
+               ggml_tensor * states_all,
+               ggml_tensor * q,
+               ggml_tensor * k,
+               ggml_tensor * v,
+               ggml_tensor * g,
+               ggml_tensor * b,
+               ggml_tensor * s,
+                       int   il);
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {
@@ -421,6 +450,47 @@ struct llm_build_jais2 : public llm_graph_context {
 
 struct llm_build_jamba : public llm_build_mamba_base {
     llm_build_jamba(const llama_model & model, const llm_graph_params & params);
+};
+
+struct llm_build_kimi_k3 : public llm_build_delta_net_base {
+    llm_build_kimi_k3(const llama_model & model, const llm_graph_params & params);
+
+    const llama_model & model;
+
+    ggml_tensor * resi_stack = nullptr;
+
+    void res_push(ggml_tensor * cur, int64_t n_embd, int64_t n_tokens);
+    ggml_tensor * res_mix(ggml_tensor * cur, ggml_tensor * score_w, int64_t n_tokens, int il);
+
+    ggml_tensor * build_kda_layer(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+    llm_graph_input_rs * inp_rs,
+                int64_t   d_conv,
+                int64_t   head_dim,
+                int64_t   n_head_kda,
+                int64_t   d_inner,
+                int64_t   n_seq_tokens,
+                int64_t   n_seqs,
+                    int   il);
+
+    ggml_tensor * build_mla_layer(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+    llm_graph_input_attn_k * inp_attn_k,
+    llm_graph_input_attn_kv * inp_attn_kv,
+                int64_t   n_embd_head_k_mla,
+                int64_t   n_embd_head_v_mla,
+                int64_t   kv_lora_rank,
+                int64_t   n_embd_head_qk_rope,
+                int64_t   n_embd_head_qk_nope,
+                  float   kq_scale,
+                    int   il);
+
+    ggml_tensor * build_latent_moe(
+            ggml_tensor * cur,
+      const llama_layer & layer,
+                    int   il);
 };
 
 struct llm_build_kimi_linear : public llm_build_delta_net_base {
@@ -874,6 +944,31 @@ struct llm_build_qwen4exp : public llm_build_delta_net_base {
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * hidden,
                             int   il);
+
+        // the MTP head's block input from the tokens' embeddings and the hidden states before them, [n_embd, hc, T]
+        ggml_tensor * build_mtp_input(
+                    ggml_tensor * embd,
+                    ggml_tensor * h,
+                            int   il);
+
+        // the hidden state of each token's previous position, [n_embd_h, T], from the model's rows of the ubatch
+        ggml_tensor * build_mtp_h_prev(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * h_all,
+                            int   il);
+
+        // the MTP head's attention cache rows of the ubatch's tokens
+        void build_mtp_cache(
+     llm_graph_input_mem_hybrid * inp,
+                    ggml_tensor * embd,
+                    ggml_tensor * h_all,
+                    ggml_tensor * inp_pos,
+                            int * sections);
+
+        // an MTP draft step (LLM_GRAPH_TYPE_DECODER_MTP)
+        void build_mtp_draft(
+                    ggml_tensor * embd,
+                            int * sections);
 
         // returns pair of qkv, z
         std::pair<ggml_tensor *, ggml_tensor *> build_qkvz(

@@ -201,6 +201,24 @@ For an AMD GPU on ROCm, see [Linux / AMD](#linux--amd). Without either, build
 `--preset linux-cpu` and leave out `inferssd-memprobe`; add `-DGGML_VULKAN=ON` with the
 Vulkan SDK to run an AMD or Intel GPU through Vulkan.
 
+### Try Kimi K3 text generation on one NVIDIA GPU
+
+Keep all 14 shards of the [UD-IQ1_S GGUF](https://huggingface.co/unsloth/Kimi-K3-GGUF/tree/a0836360ce58dfec088d966a97f2ddc8a606279b/UD-IQ1_S) together.
+Use the first shard with the Python package and CUDA engine built from this checkout:
+
+```sh
+CUDA_VISIBLE_DEVICES=0 inferssd cli --resources engine-resources.json \
+  -m /path/to/UD-IQ1_S/Kimi-K3-UD-IQ1_S-00001-of-00014.gguf \
+  --context 512 -p "What is 2 + 3? Reply with just the number." -n 32
+```
+
+K3 can spend a short output budget on reasoning. If the command stops before printing a final answer,
+increase `-n`. For repeated prompts, use `inferssd serve` to keep the expert cache loaded between requests.
+
+The launcher fits the backbone layers to available GPU memory and uses SSD-backed routed experts.
+If part of the backbone stays on the CPU and decode repeatedly faults its weights back in,
+try `--set host.headroom_mib=20480` to reserve 20 GiB of host memory from the expert cache.
+
 ## Linux / AMD
 
 An AMD GPU that ROCm supports runs the same engine as an NVIDIA GPU: ggml's HIP backend
@@ -252,6 +270,33 @@ inferssd serve \
 ```
 
 For Muse, Qwen3.8-Flash-Next or Qwen3.6-35B-A3B, select that model's first GGUF shard instead. The launch picks the model profile from the GGUF's `general.architecture`: `dsv` for DeepSeek-V4.1 (with its own sampling defaults, temperature 1.0, top-p 0.95), `muse` for Muse Spark, `qwen4exp` for Qwen3.8-Flash-Next, `qwen35moe` for Qwen3.6-35B-A3B and `gemma4` for Gemma 4; the Qwen and Gemma profiles keep the chat template embedded in their GGUF. A model with routed experts needs a profile; a model without them, such as Gemma 4 E4B, launches the same way with or without one, and takes the chat template in its GGUF. The context defaults to the largest multiple of 8192, up to the model's trained context, whose KV cache fits memory when full: the KV cache takes memory 8192 tokens at a time as a conversation grows and gives it back when a shorter one starts, so a long context costs nothing until a conversation fills it, and the expert caches give it room as it grows. Where the GPU's buffers cannot grow in place (CUDA without VMM, Vulkan without sparse residency buffers), the KV cache holds every token from the start and the context defaults to at most 32768. `--context` sets it. The batch sizes default to what the launch chooses for this machine. The server listens on `127.0.0.1:8080`; `--port` chooses another port, and `--host` another IPv4 address to listen on, `0.0.0.0` for every network interface. Each launch keeps its logs and receipts under `~/.local/share/inferssd/state/runs`, and uses the whole machine: the engine keeps its own margin for the host.
+
+On a profiled multi-GPU CUDA machine, the launcher matches free-memory readings to
+CUDA devices by UUID. It subtracts the effective `vram.reserve_mib` from each
+card, including idle cards. A settings file or `--set` can override the automatic
+reserve. The launcher uses one GPU if the routed model fits there. For larger
+models it splits whole layers across discrete GPUs after checking that each
+card can hold its assigned dense weights, including the output weights on the
+card that owns them. The chosen proportions are passed to the loader. The
+engine checks KV cache and working-buffer allocations at runtime. If the
+devices include a unified-memory GPU, the launcher selects the visible CUDA
+ordinal of the card with the most room. Without usable device identities or
+memory readings, the native default is the first visible GPU.
+Use `--main-gpu 1` to run on the second visible GPU, or `--split-mode layer` to place
+layers and their routed experts across the visible devices. With layer splitting,
+`--tensor-split 1,1` gives two devices equal proportions. Each positive proportion
+must refer to a device the model loader selects. For example, if it selects only
+the discrete GPU on a laptop, `0,1` cannot assign layers to the integrated GPU.
+Omitting the proportions
+lets the engine split by free device memory. Both `inferssd serve` and `inferssd cli`
+accept these options. GPU indices follow the process's CUDA visibility and ordering.
+Each participating GPU owns the expert cache for its layers and applies the configured
+VRAM tier budget locally. Host memory admission is shared. The native telemetry
+file records the visible GPU index on each `ssd.place.layer` event and the number
+of GPU routes in each `ssd.prefill.layer` event. If startup reports that the
+assigned weights exceed a card's free VRAM, stop the process using that card or
+reduce its share (for example, `--tensor-split 1,3` gives GPU 0 about a quarter
+of the layers).
 
 If `expert.source` is omitted, the launch sets it to the model's GGUF shards, and the engine indexes their routed experts from the headers without copying weights. Use the [deployment resources guide](engine-resources.md) when moving binaries and templates outside the checkout.
 

@@ -167,6 +167,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP,     // the draft head published with the model (MTP), in the target's context
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -474,6 +475,7 @@ struct common_params {
     // margin per device in bytes for fitting parameters to free memory:
     std::vector<size_t> fit_params_target = std::vector<size_t>(llama_max_devices(), 1024 * 1024*1024);
 
+    bool split_mode_explicit = false;
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
 
     common_cpu_params cpuparams;
@@ -609,6 +611,7 @@ struct common_params {
     bool    reuse_port          = false;         // allow multiple sockets to bind to the same port
     int32_t timeout_read        = 600;           // http read timeout in seconds
     int32_t timeout_write       = timeout_read;  // http write timeout in seconds
+    int32_t sse_ping_interval   = 30;            // SSE ping interval in seconds
     int32_t n_threads_http      = -1;    // number of threads to process HTTP requests (TODO: support threadpool)
     int32_t n_cache_reuse       = 0;     // min chunk size to reuse from the cache via KV shifting
     bool    cache_prompt        = true;  // whether to enable prompt caching
@@ -912,7 +915,11 @@ enum common_context_seq_rm_type {
     COMMON_CONTEXT_SEQ_RM_TYPE_NO   = 0, // seq_rm not supported (e.g. no memory module)
     COMMON_CONTEXT_SEQ_RM_TYPE_PART = 1, // can seq_rm partial sequences
     COMMON_CONTEXT_SEQ_RM_TYPE_FULL = 2, // can seq_rm full sequences only
+    COMMON_CONTEXT_SEQ_RM_TYPE_RS   = 3, // can seq_rm the tail of a sequence up to llama_n_rs_seq tokens (a draft's rows)
 };
+
+// the longest draft the configured speculative decoding verifies
+uint32_t common_speculative_draft_bound(const struct common_params_speculative & params);
 
 // check if the llama_context can remove sequences
 // note: clears the memory of the context

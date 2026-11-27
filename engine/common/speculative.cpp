@@ -11,6 +11,7 @@
 #include "../src/llama-ext.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <iomanip>
 #include <map>
@@ -27,7 +28,8 @@ const std::vector<enum common_speculative_type> common_speculative_types = {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K,
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V,
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
-    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE
+    COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,
+    COMMON_SPECULATIVE_TYPE_DRAFT_MTP
 };
 
 const std::map<std::string, enum common_speculative_type> common_speculative_type_from_name_map = {
@@ -38,7 +40,8 @@ const std::map<std::string, enum common_speculative_type> common_speculative_typ
     {"ngram_map_k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram_map_k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram_mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram_cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"draft_mtp",     COMMON_SPECULATIVE_TYPE_DRAFT_MTP}
 };
 
 struct common_speculative_config {
@@ -615,6 +618,132 @@ struct common_speculative_state_eagle3 : public common_speculative_state {
     }
 };
 
+// MTP: the draft head published with the model (llama_model_params.mtp), run in the target's own context. The
+// target's decodes leave the head's cache rows of their tokens and the hidden states of their output rows; a draft
+// is the head's steps from the hidden state of the last position the target kept, each step reading the hidden
+// state the one before it left. The steps' rows leave the head's cache again before the target verifies them.
+struct common_speculative_state_draft_mtp : public common_speculative_state {
+    llama_context * ctx;
+    llama_batch     batch;
+    int32_t         n_embd_h;
+    int32_t         n_vocab;
+
+    // the hidden states of the output rows of the target's last decode of the sequence, by position
+    llama_seq_id           seq_id = 0;
+    std::vector<llama_pos> h_pos;
+    std::vector<float>     h_rows;
+
+    std::vector<float> h_step; // the hidden state a step reads
+
+    common_speculative_state_draft_mtp(enum common_speculative_type type, llama_context * ctx)
+        : common_speculative_state(type), ctx(ctx) {
+        const llama_model * model = llama_get_model(ctx);
+        n_embd_h = llama_model_n_embd_h(model);
+        n_vocab  = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        batch    = llama_batch_init(1, 0, 1);
+        llama_set_embeddings_nextn(ctx, true, /* masked */ true);
+    }
+
+    ~common_speculative_state_draft_mtp() override {
+        llama_batch_free(batch);
+    }
+
+    void begin(const llama_tokens & prompt) override {
+        GGML_UNUSED(prompt);
+    }
+
+    bool process(const llama_batch & b, llama_seq_id target_seq_id) override {
+        std::vector<int32_t> rows;
+        bool has_seq = false;
+        for (int32_t i = 0; i < b.n_tokens; ++i) {
+            if (b.n_seq_id[i] > 0 && b.seq_id[i][0] == target_seq_id) {
+                has_seq = true;
+                if (b.logits && b.logits[i]) {
+                    rows.push_back(i);
+                }
+            }
+        }
+        if (rows.empty()) {
+            // a decode of the sequence without outputs (a prompt's earlier batches) moves it past the rows kept
+            if (has_seq) {
+                h_pos.clear();
+            }
+            return true;
+        }
+        seq_id = target_seq_id;
+        h_pos.resize(rows.size());
+        h_rows.resize(rows.size() * (size_t) n_embd_h);
+        for (size_t k = 0; k < rows.size(); ++k) {
+            const float * h = llama_get_embeddings_nextn_ith(ctx, rows[k]);
+            if (h == nullptr) {
+                h_pos.clear();
+                return false;
+            }
+            h_pos[k] = b.pos[rows[k]];
+            std::memcpy(h_rows.data() + k * (size_t) n_embd_h, h, (size_t) n_embd_h * sizeof(float));
+        }
+        return true;
+    }
+
+    void draft(
+            const common_params_speculative & params,
+            const llama_tokens & prompt_tgt,
+            llama_token id_last,
+            llama_tokens & result) override {
+        // the target's last kept position: the head's first step reads its hidden state
+        const llama_pos pos_last = (llama_pos) prompt_tgt.size() - 1;
+        const auto it = std::find(h_pos.begin(), h_pos.end(), pos_last);
+        if (it == h_pos.end()) {
+            return;
+        }
+        const size_t row = (size_t) std::distance(h_pos.begin(), it);
+        h_step.assign(h_rows.begin() + row * n_embd_h, h_rows.begin() + (row + 1) * n_embd_h);
+
+        llama_token tok = id_last;
+        for (int32_t k = 0; k < params.draft.n_max; ++k) {
+            common_batch_clear(batch);
+            common_batch_add(batch, tok, pos_last + 1 + k, { seq_id }, true);
+            if (llama_decode_mtp(ctx, batch, h_step.data()) != 0) {
+                LOG_WRN("%s: the MTP draft step at position %d failed\n", __func__, pos_last + 1 + k);
+                break;
+            }
+
+            // greedy: the most likely token, while the head is sure enough of it
+            const float * logits = llama_get_logits_ith(ctx, 0);
+            const float * h      = llama_get_embeddings_nextn_ith(ctx, 0);
+            if (logits == nullptr || h == nullptr) {
+                break;
+            }
+            const llama_token best = (llama_token) (std::max_element(logits, logits + n_vocab) - logits);
+            double sum = 0.0;
+            for (int32_t t = 0; t < n_vocab; ++t) {
+                sum += std::exp((double) logits[t] - (double) logits[best]);
+            }
+            if (1.0 / sum < params.draft.p_min) {
+                break;
+            }
+            result.push_back(best);
+            h_step.assign(h, h + n_embd_h);
+            tok = best;
+        }
+
+        // the steps' rows leave the head's cache: the target's verification writes the rows of the tokens it keeps
+        llama_memory_seq_rm(llama_get_memory(ctx), seq_id, pos_last + 1, -1);
+    }
+
+    void accept(uint16_t n_accepted) override {
+        GGML_UNUSED(n_accepted);
+    }
+
+    int32_t n_max(const common_params_speculative & params) const override {
+        return params.draft.n_max;
+    }
+
+    int32_t n_min(const common_params_speculative & params) const override {
+        return params.draft.n_min;
+    }
+};
+
 // state of self-speculation (simple implementation, not ngram-map)
 struct common_speculative_state_ngram_simple : public common_speculative_state {
     common_ngram_simple_config config;
@@ -975,6 +1104,7 @@ std::string common_speculative_type_to_str(enum common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram_map_k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram_mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram_cache";
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:     return "draft_mtp";
         default:                                    return "unknown";
     }
 }
@@ -1013,6 +1143,7 @@ common_speculative * common_speculative_init(
         bool has_ngram_map_k   = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         bool has_ngram_map_k4v = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
         bool has_ngram_mod     = (params.type == COMMON_SPECULATIVE_TYPE_NGRAM_MOD);
+        bool has_draft_mtp     = (params.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP);
 
         // In a more complex implementation we could use the same implementation but with different parameters.
         // This was initially used in PR-18471 but removed to simplify the code.
@@ -1047,6 +1178,13 @@ common_speculative * common_speculative_init(
         if (has_ngram_cache) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_NGRAM_CACHE, params));
         }
+        if (has_draft_mtp) {
+            if (llama_model_has_mtp(llama_get_model(ctx_tgt))) {
+                configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, params));
+            } else {
+                LOG_WRN("%s: the model has no MTP head to draft with\n", __func__);
+            }
+        }
         if (has_draft) {
             configs.push_back(common_speculative_config(COMMON_SPECULATIVE_TYPE_DRAFT, params));
         }
@@ -1075,6 +1213,10 @@ common_speculative * common_speculative_init(
             }
             case COMMON_SPECULATIVE_TYPE_EAGLE3: {
                 impls.push_back(std::make_unique<common_speculative_state_eagle3>(config.type));
+                break;
+            }
+            case COMMON_SPECULATIVE_TYPE_DRAFT_MTP: {
+                impls.push_back(std::make_unique<common_speculative_state_draft_mtp>(config.type, ctx_tgt));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {

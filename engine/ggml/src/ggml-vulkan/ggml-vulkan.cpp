@@ -864,6 +864,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128
     vk_pipeline pipeline_gated_delta_net[3][2];
+    // the same writing the state after each token into planes (ggml_gated_delta_net_planes)
+    vk_pipeline pipeline_gated_delta_net_planes[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1538,13 +1540,18 @@ struct vk_op_rwkv_wkv7_push_constants {
 struct vk_op_gated_delta_net_push_constants {
     uint32_t H;
     uint32_t n_tokens;
-    uint32_t n_seqs;
+    uint32_t t_begin;
     uint32_t s_off;
     uint32_t sq1, sq2, sq3;
     uint32_t sv1, sv2, sv3;
     uint32_t sb1, sb2, sb3;
     uint32_t neq1, rq3;
     float scale;
+};
+// ggml_gated_delta_net_planes: the planes' steps from a plane and from a sequence to the next, in floats
+struct vk_op_gated_delta_net_planes_push_constants {
+    vk_op_gated_delta_net_push_constants base;
+    uint32_t sp1, sp2;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -3048,6 +3055,28 @@ static void ggml_vk_sync_buffers(ggml_backend_vk_context* ctx, vk_context& subct
         { {
           { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) },
           { !transfer_queue ? (vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) : (vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite) }
+        } },
+        {},
+        {}
+    );
+}
+
+// Makes what the submission wrote visible to the host once a wait on its fence returns. A fence's memory dependency
+// covers device accesses only, so a host read after the wait needs a barrier into the host stage; without one, some
+// integrated GPUs return stale data from host-visible memory.
+static void ggml_vk_sync_host(vk_context& subctx) {
+    if (subctx->s == nullptr) {
+        return;
+    }
+    const bool transfer_queue = subctx->p->q->transfer_only;
+
+    subctx->s->buffer->buf.pipelineBarrier(
+        subctx->p->q->stage_flags,
+        vk::PipelineStageFlagBits::eHost,
+        {},
+        { {
+          { !transfer_queue ? (vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite) : vk::AccessFlagBits::eTransferWrite },
+          { vk::AccessFlagBits::eHostRead | vk::AccessFlagBits::eHostWrite }
         } },
         {},
         {}
@@ -4900,6 +4929,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             {"gated_delta_net_f32_d64",     "gated_delta_net_f32_d64_kda"},
             {"gated_delta_net_f32_d128",    "gated_delta_net_f32_d128_kda"},
         };
+        const char * gdn_planes_names[][2] = {
+            {"gated_delta_net_planes_f32_d32",  "gated_delta_net_planes_f32_d32_kda"},
+            {"gated_delta_net_planes_f32_d64",  "gated_delta_net_planes_f32_d64_kda"},
+            {"gated_delta_net_planes_f32_d128", "gated_delta_net_planes_f32_d128_kda"},
+        };
         const bool use_subgroup_reduce = device->subgroup_arithmetic;
         for (uint32_t si = 0; si < 3; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -4918,15 +4952,23 @@ static void ggml_vk_load_shaders(vk_device& device) {
             const bool need_clustered_shader = lanes_per_column != 1 && (lanes_per_column < device->subgroup_size);
             size_t gdn_len;
             const void * gdn_data;
+            size_t gdn_planes_len;
+            const void * gdn_planes_data;
             if (use_subgroup_reduce && need_clustered_shader) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
+                gdn_planes_len = gated_delta_net_planes_f32_len;
+                gdn_planes_data = (const void *)gated_delta_net_planes_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
+                gdn_planes_len = gated_delta_net_planes_f32_nocluster_len;
+                gdn_planes_data = (const void *)gated_delta_net_planes_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
+                gdn_planes_len = gated_delta_net_planes_f32_shmem_len;
+                gdn_planes_data = (const void *)gated_delta_net_planes_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -4935,7 +4977,10 @@ static void ggml_vk_load_shaders(vk_device& device) {
             for (uint32_t kda = 0; kda < 2; kda++) {
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net[si][kda],
                     gdn_names[si][kda], gdn_len, gdn_data, "main", 7, sizeof(vk_op_gated_delta_net_push_constants),
-                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_planes[si][kda],
+                    gdn_planes_names[si][kda], gdn_planes_len, gdn_planes_data, "main", 8, sizeof(vk_op_gated_delta_net_planes_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
     }
@@ -7241,6 +7286,7 @@ static void ggml_vk_buffer_read(vk_buffer& src, size_t offset, void * dst, size_
         ggml_vk_ctx_begin(src->device, subctx);
         bool ret = ggml_vk_buffer_read_async(subctx, src, offset, dst, size, true);
         GGML_ASSERT(ret);
+        ggml_vk_sync_host(subctx);
         ggml_vk_ctx_end(subctx);
 
         ggml_vk_submit(subctx, src->device->fence);
@@ -10053,7 +10099,8 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 case 128: si = 2; break;
                 default: return nullptr;
             }
-            return ctx->device->pipeline_gated_delta_net[si][kda];
+            // ggml_gated_delta_net_planes: the state after each token into the planes, src[6]
+            return dst->src[6] ? ctx->device->pipeline_gated_delta_net_planes[si][kda] : ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -10932,13 +10979,16 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, dst->src[0], dst->src[1], dst->src[2], dst, dst->op);
     GGML_ASSERT(pipeline != nullptr);
 
-    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+    const uint32_t chunk = GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH;
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, (n_tokens + chunk - 1) / chunk);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
     vk_subbuffer src_buf[6] = {};
     for (int i = 0; i < 6; i++) {
         src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
     }
+    // ggml_gated_delta_net_planes: the state after each token into the planes
+    const ggml_tensor * planes = dst->src[6];
 
     const uint32_t sq1 = (uint32_t)(src_q->nb[1] / sizeof(float));
     const uint32_t sq2 = (uint32_t)(src_q->nb[2] / sizeof(float));
@@ -10954,8 +11004,8 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     const uint32_t rq3  = (uint32_t)(src_v->ne[3] / src_q->ne[3]);
 
     const float scale = 1.0f / sqrtf((float)S_v);
-    const vk_op_gated_delta_net_push_constants pc = {
-        H, n_tokens, n_seqs, s_off,
+    vk_op_gated_delta_net_push_constants pc = {
+        H, n_tokens, 0, s_off,
         sq1, sq2, sq3,
         sv1, sv2, sv3,
         sb1, sb2, sb3,
@@ -10963,9 +11013,26 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
         scale
     };
 
-    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
-        {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
-        pc, { H, n_seqs, S_v });
+    for (uint32_t t0 = 0; t0 < n_tokens; t0 += chunk) {
+        if (t0 > 0) {
+            // this dispatch reads the state the one before wrote
+            ggml_vk_sync_buffers(ctx, subctx);
+        }
+        pc.t_begin = t0;
+        if (planes) {
+            const vk_op_gated_delta_net_planes_push_constants pc_planes = {
+                pc, (uint32_t)(planes->nb[1] / sizeof(float)), (uint32_t)(planes->nb[2] / sizeof(float)),
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf,
+                 ggml_vk_tensor_subbuffer(ctx, planes)},
+                pc_planes, { H, n_seqs, S_v });
+        } else {
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+                pc, { H, n_seqs, S_v });
+        }
+    }
 }
 
 static void ggml_vk_ssm_scan(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -13280,6 +13347,11 @@ static void ggml_vk_preallocate_buffers(ggml_backend_vk_context * ctx, vk_contex
 
 static void ggml_vk_compute_forward(ggml_backend_vk_context* ctx, ggml_cgraph * cgraph, ggml_tensor* tensor, int tensor_idx, bool almost_ready);
 
+// a source the op writes in place: the planes of ggml_gated_delta_net_planes
+static bool ggml_vk_src_written(const ggml_tensor * node, uint32_t i) {
+    return node->op == GGML_OP_GATED_DELTA_NET && i == 6;
+}
+
 // Returns true if node has enqueued work into the queue, false otherwise
 // If submit is true the current all operations queued so far are being submitted to Vulkan to overlap cmdlist creation and GPU execution.
 static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, int node_idx, ggml_tensor *node_begin, int node_idx_begin, bool last_node, bool almost_ready, bool submit){
@@ -13372,6 +13444,11 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     need_sync = true;
                     break;
                 }
+                // a source written in place, as the planes of ggml_gated_delta_net_planes, is a destination too
+                if (ggml_vk_src_written(cur_node, j) && overlaps_unsynced(cur_node->src[j], ctx->unsynced_nodes_read)) {
+                    need_sync = true;
+                    break;
+                }
             }
         }
 
@@ -13401,6 +13478,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
                     continue;
                 }
                 ctx->unsynced_nodes_read.push_back(cur_node->src[j]);
+                if (ggml_vk_src_written(cur_node, j)) {
+                    ctx->unsynced_nodes_written.push_back(cur_node->src[j]);
+                }
             }
         }
     }
@@ -13771,6 +13851,9 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 #endif
 
     if (submit || last_node) {
+        if (last_node) {
+            ggml_vk_sync_host(compute_ctx);
+        }
         ggml_vk_ctx_end(compute_ctx);
 
         // TODO probably it'd be better to pass a exit_node flag to ggml_vk_compute_forward
@@ -14440,6 +14523,7 @@ static void ggml_vk_synchronize(ggml_backend_vk_context * ctx) {
             cmd_buf = compute_ctx->s->buffer;
         }
 
+        ggml_vk_sync_host(compute_ctx);
         ggml_vk_ctx_end(compute_ctx);
 
         for (auto& cpy : compute_ctx->in_memcpys) {
@@ -17313,8 +17397,11 @@ static void ggml_vk_check_results_0(ggml_backend_vk_context * ctx, ggml_cgraph *
             tensor_clone = ggml_rwkv_wkv7(ggml_ctx, src_clone[0], src_clone[1], src_clone[2], src_clone[3],
             src_clone[4], src_clone[5], src_clone[6]);
         } else if (tensor->op == GGML_OP_GATED_DELTA_NET) {
-            tensor_clone = ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
-            src_clone[2], src_clone[3], src_clone[4], src_clone[5]);
+            tensor_clone = src_clone[6] ?
+                ggml_gated_delta_net_planes(ggml_ctx, src_clone[0], src_clone[1],
+                src_clone[2], src_clone[3], src_clone[4], src_clone[5], src_clone[6]) :
+                ggml_gated_delta_net(ggml_ctx, src_clone[0], src_clone[1],
+                src_clone[2], src_clone[3], src_clone[4], src_clone[5]);
         } else if (tensor->op == GGML_OP_OPT_STEP_ADAMW) {
             src_clone[0]->flags = tensor->src[0]->flags;
             tensor_clone = ggml_opt_step_adamw(ggml_ctx, src_clone[0], src_clone[1],

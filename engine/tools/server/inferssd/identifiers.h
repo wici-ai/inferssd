@@ -14,7 +14,8 @@
 // is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the
 // home directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop
 // app the skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the
-// folder of its visualizations, both dated. A new project, session or user would process all of the context after
+// folder of its visualizations, both dated; Codex and the ChatGPT desktop app name the folder of each version of a
+// plugin they list skills of. A new project, session, user or plugin update would process all of the context after
 // them again. The server gives the model stand-ins
 // for these identifiers wherever they occur in a request, and puts the request's identifiers back in place of the
 // stand-ins in what the model writes. The model only copies such strings into paths, so it does the same work, and

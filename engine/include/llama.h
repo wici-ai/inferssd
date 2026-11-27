@@ -324,6 +324,9 @@ extern "C" {
                               // load into host memory, and the context moves into a discrete GPU those its memory
                               // holds (the rest streamed)
         bool no_alloc;        // only load metadata and simulate memory allocations
+        bool check_tensor_split; // reject positive split weights outside the load's selected devices
+        bool mtp;             // keep the NextN block of a model that runs it as its draft head (MTP), from the file
+                              // or from a head file given as an extra file; without it NextN blocks are not loaded
     };
 
     struct llama_sampler_seq_config {
@@ -338,6 +341,7 @@ extern "C" {
         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
         uint32_t n_ubatch;          // physical maximum batch size
         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+        uint32_t n_rs_seq;          // tokens a sequence's recurrent state can roll back by (a draft's rejected rows), 0 for none
         int32_t  n_threads;         // number of threads to use for generation
         int32_t  n_threads_batch;   // number of threads to use for batch processing
 
@@ -541,6 +545,7 @@ extern "C" {
     LLAMA_API uint32_t llama_n_batch    (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
+    LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");

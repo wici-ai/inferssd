@@ -11017,6 +11017,7 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
     ggml_tensor * src_g     = dst->src[3];
     ggml_tensor * src_beta  = dst->src[4];
     ggml_tensor * src_state = dst->src[5];
+    ggml_tensor * planes    = dst->src[6]; // the state after token t into plane n_tokens - 1 - t, if given
 
     const int64_t S_v      = src_v->ne[0];
     const int64_t H        = src_v->ne[1];
@@ -11077,7 +11078,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
         const int64_t iq3 = iv3 / rq3;
         const int64_t ik3 = iv3 / rk3;
 
-        float * s_out = state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        // the state of head iv1 of sequence iv3 in plane p
+        const auto plane = [&](int64_t p) {
+            return (float *) ((char *) planes->data + p * planes->nb[1] + iv3 * planes->nb[2]) + iv1 * S_v * S_v;
+        };
+
+        // with planes, each token's plane, the first token's here
+        float * s_out = planes ? plane(n_tokens - 1) : state_out_base + (iv3 * H + iv1) * S_v * S_v;
 
         // copy input state into output buffer and operate in-place
         const float * s_in = state_in_base + (iv3 * H + iv1) * S_v * S_v;
@@ -11093,6 +11100,13 @@ static void ggml_compute_forward_gated_delta_net_one_chunk(
 
             const float beta_val = *(const float *)((const char *)src_beta->data + iv3 * nbb3 + t * nbb2 + iv1 * nbb1);
             const float * g_d    =  (const float *)((const char *)src_g->data    + iv3 * nbg3 + t * nbg2 + iv1 * nbg1);
+
+            if (planes && t > 0) {
+                // the token updates the state in its own plane, from the state of the token before
+                float * s_t = plane(n_tokens - 1 - t);
+                memcpy(s_t, s_out, S_v * S_v * sizeof(float));
+                s_out = s_t;
+            }
 
             // state is stored transposed: s_out[j*S_v + i] = S[i][j]
             // so row j of s_out = column j of S (contiguous access)

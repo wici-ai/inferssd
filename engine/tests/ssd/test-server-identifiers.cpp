@@ -277,6 +277,50 @@ static void test_chatgpt_visualizations_share_their_context() {
             "other folders under visualizations stay: " + text_of(o["messages"][0]));
 }
 
+// Codex and the ChatGPT desktop app list the skill folders of each plugin under its version's folder in the plugin
+// cache. An update of one plugin, or another plugin installed beside it, leaves the other plugins' stand-ins as they
+// were, and the model's paths come back with the real versions.
+static void test_plugin_versions_share_their_context() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    const std::string cache = env.home + "/.codex/plugins/cache/";
+    const auto request = [&](const std::string & drive, const std::string & extra) {
+        const std::string skills = "### Skill roots\n- `r1` = `" + cache + "openai-curated-remote/google-drive/" + drive +
+                                   "/skills`\n" + extra + "- `r3` = `" + cache + "openai-curated-remote`\n";
+        return json{{"messages", json::array({{{"role", "developer"}, {"content", skills}},
+                                              {{"role", "user"}, {"content", "hi"}}})}};
+    };
+    json a = request("0.1.28", "");
+    json b = request("0.1.29", "");
+    json c = request("0.1.28", "- `r2` = `" + cache + "openai-primary-runtime/spreadsheets/26.1123.11515/skills`\n");
+    const std::string original = text_of(c["messages"][0]);
+    server_identifiers_apply(a, env);
+    server_identifiers_apply(b, env);
+    const server_identifier_map map = server_identifiers_apply(c, env);
+    require(a["messages"][0] == b["messages"][0], "an update of a plugin keeps its stand-in: " + text_of(a["messages"][0]) +
+                                                      " | " + text_of(b["messages"][0]));
+    const std::string drive = STAND_IN + "/.codex/plugins/cache/openai-curated-remote/google-drive/0.0.0/skills`";
+    require(text_of(a["messages"][0]).find(drive) != std::string::npos, "the version's stand-in: " + text_of(a["messages"][0]));
+    require(text_of(c["messages"][0]).find(drive) != std::string::npos &&
+                text_of(c["messages"][0]).find("/spreadsheets/0.0.0/skills`") != std::string::npos,
+            "another plugin beside it does not change its stand-in: " + text_of(c["messages"][0]));
+    require(text_of(a["messages"][0]).find(STAND_IN + "/.codex/plugins/cache/openai-curated-remote`") != std::string::npos,
+            "the source's folder has no version: " + text_of(a["messages"][0]));
+    require(map.to_identifiers(text_of(c["messages"][0]), false) == original, "the versions come back");
+    require(map.to_identifiers("cat " + STAND_IN + "/.codex/plugins/cache/openai-curated-remote/google-drive/0.0.0/skills/x/SKILL.md", false) ==
+                "cat " + cache + "openai-curated-remote/google-drive/0.1.28/skills/x/SKILL.md",
+            "a path the model writes gets the real version");
+
+    server_identifier_env win;
+    win.home          = "C:\\Users\\bob";
+    win.home_stand_in = "C:\\Users\\infer";
+    win.windows       = true;
+    json w = {{"messages", json::array({{{"role", "developer"}, {"content",
+        "`C:\\Users\\bob\\.codex\\plugins\\cache\\openai-curated-remote\\pages\\0.1.26\\skills`"}}})}};
+    server_identifiers_apply(w, win);
+    require(text_of(w["messages"][0]) == "`C:\\Users\\infer\\.codex\\plugins\\cache\\openai-curated-remote\\pages\\0.0.0\\skills`",
+            "Windows: " + text_of(w["messages"][0]));
+}
+
 // a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
 // `roots`, and the environment
 static json codex_request(const std::string & roots, const std::string & cwd) {
@@ -485,6 +529,7 @@ int main() {
     test_claude_desktop_sessions_share_their_context();
     test_chatgpt_conversations_share_their_context();
     test_chatgpt_visualizations_share_their_context();
+    test_plugin_versions_share_their_context();
     test_codex_projects_share_their_context();
     test_identifiers_of_a_system();
     test_matches_stop_at_name_boundaries();

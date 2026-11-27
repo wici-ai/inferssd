@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
 import ntpath
 import posixpath
 import re
@@ -21,7 +22,16 @@ from inferssd.configuration.settings import (
     uncomment,
 )
 from inferssd.launch.resources import EngineResources, server_binary
-from inferssd.launch.types import AwaitFact, Fact, LaunchInput, Reply, Resolution, State, Threads
+from inferssd.launch.types import (
+    GPU_LAYERS,
+    AwaitFact,
+    Fact,
+    LaunchInput,
+    Reply,
+    Resolution,
+    State,
+    Threads,
+)
 from inferssd.machine.identity import TIER_BACKENDS
 from inferssd.strategy.inputs import model_facts_from, runtime_facts_from
 from inferssd.strategy.launch import Planned, plan
@@ -39,18 +49,21 @@ MODEL_OPTIONS = frozenset(
 PROFILES: dict[str, Optional[str]] = {
     "dsv": "deepseek-ai-DeepSeek-V4.1.jinja",
     "muse": "muse-spark.jinja",
+    "kimi-k3": None,
     "qwen4exp": None,  # Qwen3.8-Flash-Next
     "qwen35moe": None,  # Qwen3.6-35B-A3B; its GGUF carries the model's sampling
     "gemma4": None,  # Gemma 4
 }
-# The profile of each GGUF general.architecture; --profile overrides it.
-ARCHITECTURES = {
+# Architectures with a routed SSD executor in llama_ssd::describe_experts.
+SSD_ARCHITECTURES = {
     "deepseek41": "dsv",
     "muse-spark": "muse",
+    "kimi-k3": "kimi-k3",
     "qwen4exp": "qwen4exp",
     "qwen35moe": "qwen35moe",
-    "gemma4": "gemma4",
 }
+# The default launch profile also covers ordinary-graph models.
+ARCHITECTURES = {**SSD_ARCHITECTURES, "gemma4": "gemma4"}
 # The server's default sampling for each profile, from the model's own
 # generation config where the GGUF carries none; a request's values win.
 SAMPLING: dict[str, tuple[str, ...]] = {
@@ -97,6 +110,35 @@ class LaunchSpec:
     # downloads them), in a subdirectory named as the prompt cache's; the engine only reads
     # them. None passes none.
     prefix_cache: Optional[str] = None
+    main_gpu: Optional[int] = None
+    split_mode: Optional[str] = None
+    tensor_split: Optional[str] = None
+
+
+def gpu_arguments(spec: LaunchSpec) -> list[str]:
+    if spec.split_mode not in (None, "none", "layer"):
+        raise ValueError("--split-mode must be none or layer")
+    if spec.tensor_split is not None:
+        if spec.split_mode == "none" or spec.main_gpu is not None:
+            raise ValueError("--tensor-split requires layer mode")
+        try:
+            ratios = [float(part) for part in spec.tensor_split.split(",")]
+        except ValueError as exc:
+            raise ValueError("--tensor-split needs comma-separated GPU proportions") from exc
+        if not all(math.isfinite(x) and x >= 0 for x in ratios) or not any(ratios):
+            raise ValueError(
+                "--tensor-split needs finite nonnegative proportions with a positive sum"
+            )
+        return ["--split-mode", "layer", "--tensor-split", spec.tensor_split]
+    if spec.main_gpu is not None:
+        if spec.main_gpu < 0 or spec.split_mode == "layer":
+            raise ValueError(
+                "--main-gpu needs a nonnegative visible GPU index in single-device mode"
+            )
+        return ["--split-mode", "none", "--main-gpu", str(spec.main_gpu)]
+    if spec.split_mode is not None:
+        return ["--split-mode", spec.split_mode]
+    return []
 
 
 def listen_host(text: str) -> str:
@@ -255,6 +297,7 @@ def _resolve(
     if not 1 <= spec.port <= 65535 or any(size < 1 for size in sizes):
         raise ValueError("invalid port, context or batch size")
     listen_host(spec.host)
+    placement = gpu_arguments(spec)
     threads = threadpools(spec.threads, platform)
     protected = {
         "-m",
@@ -389,6 +432,8 @@ def _resolve(
     if gpu_backends is None:
         built = s.value("engine_gpu_backends", binary)
         gpu_backends = None if built is None else tuple(cast(list[str], built))
+    # K3 fits its non-expert weights before the SSD tier takes the remaining memory.
+    fit_layers = profile == "kimi-k3" and bool(gpu_backends)
     bundled = PROFILES[profile] if profile else None
     template_path = spec.template
     if not template_path and profile and bundled:
@@ -442,9 +487,14 @@ def _resolve(
             value,
             spec.threads,
             gpu_backends,
+            placement,
+            fit_layers=fit_layers,
         )
         value, threads = planned.settings, threadpools(planned.threads, platform)
-        if any(argument in protected for argument in planned.server_args[::2]):
+        if any(
+            argument in protected - {"--split-mode", "--main-gpu", "--tensor-split"}
+            for argument in planned.server_args[::2]
+        ):
             raise ValueError("the launch strategy names a protected server option")
         # This newly supported CPU model has no measured thread/compute priors on
         # many existing profiles. Avoid the unpriced all-core fallback on hybrid
@@ -569,7 +619,7 @@ def _resolve(
     if planned is not None and one_pass:
         given = [name for name, size in (("-b", spec.batch), ("-ub", spec.ubatch)) if size]
         cast(list[str], planned.receipt["kept"]).extend("server " + name for name in given)
-    command = [binary, "-m", model]
+    command = [binary, "-m", model, *placement]
     for shard in spec.shards:
         command += ["--shard", shard]
     command += ["--ssd-settings", settings, "--ssd-telemetry", telemetry]
@@ -585,10 +635,10 @@ def _resolve(
         "--mmap",
         "--no-repack",
         "--fit",
-        "off",
+        "on" if fit_layers else "off",
         "--no-warmup",
         "-ngl",
-        "99",
+        "auto" if fit_layers else str(GPU_LAYERS),
         "-c",
         str(context),
         "-b",

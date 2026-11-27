@@ -545,6 +545,50 @@ def test_prompt_cache_on_disk_per_model(tmp_path):
     assert argv[argv.index("--prefix-cache") + 1] == str(Path(prefixes) / "model")
 
 
+def test_explicit_main_gpu_selects_one_visible_device(tmp_path):
+    inputs, spec, _, adapter, out = setup(tmp_path)
+    result = resolve(inputs, replace(spec, main_gpu=1), adapter, out)
+    assert result.code == 0
+    start = result.argv.index("--split-mode")
+    assert list(result.argv[start : start + 4]) == ["--split-mode", "none", "--main-gpu", "1"]
+
+
+@pytest.mark.parametrize("platform", ["linux", "windows"])
+def test_explicit_ratios_select_layer_mode(tmp_path, platform):
+    inputs, spec, _, adapter, out = setup(tmp_path, platform)
+    template = str(Path(inputs.repo) / "engine/models/templates/muse-spark.jinja")
+    result = resolve(
+        inputs, replace(spec, template=template, tensor_split="0,2,1"), adapter, out, platform
+    )
+    start = result.argv.index("--split-mode")
+    assert list(result.argv[start : start + 4]) == [
+        "--split-mode",
+        "layer",
+        "--tensor-split",
+        "0,2,1",
+    ]
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"tensor_split": "0,0"},
+        {"tensor_split": "NaN,1"},
+        {"tensor_split": "inf,0"},
+        {"tensor_split": "-1,1"},
+        {"tensor_split": "1,,2"},
+        {"tensor_split": "1,1", "main_gpu": 0},
+        {"tensor_split": "1", "split_mode": "none"},
+        {"main_gpu": -1},
+        {"main_gpu": 1, "split_mode": "layer"},
+    ],
+)
+def test_invalid_gpu_placement_is_refused(tmp_path, options):
+    inputs, spec, _, adapter, out = setup(tmp_path)
+    with pytest.raises(ValueError, match="--(main-gpu|tensor-split)"):
+        resolve(inputs, replace(spec, **options), adapter, out)
+
+
 def test_sizes_default_to_the_context_and_batch():
     assert (LaunchSpec("m", 1).context, LaunchSpec("m", 1).batch) == (None, None)
 
@@ -617,7 +661,7 @@ def test_qwen_profiles_launch_with_the_template_in_their_gguf(tmp_path, profile)
 
 def test_unknown_profile_refused_before_native_file(tmp_path):
     inputs, spec, _, adapter, out = setup(tmp_path)
-    with pytest.raises(ValueError, match="dsv, muse, qwen4exp, qwen35moe"):
+    with pytest.raises(ValueError, match="dsv, muse, kimi-k3, qwen4exp, qwen35moe"):
         resolve(replace(inputs, profile="qwen"), spec, adapter, out)
     assert not (out / "settings.ssd").exists()
 
@@ -643,6 +687,7 @@ def qwen_like(arch="qwen4exp"):
         (muse_like, "muse"),
         (qwen_like, "qwen4exp"),
         (partial(qwen_like, "qwen35moe"), "qwen35moe"),
+        (partial(qwen_like, "kimi-k3"), "kimi-k3"),
     ],
 )
 def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
@@ -652,6 +697,8 @@ def test_the_profile_follows_the_gguf_architecture(tmp_path, layout, profile):
     result = resolve(replace(inputs, profile=""), replace(spec, model=model), adapter, out)
     assert json.loads(result.outputs[-1].text)["profile"] == profile
     argv = list(result.argv)
+    assert argv[argv.index("--fit") + 1] == ("on" if profile == "kimi-k3" else "off")
+    assert argv[argv.index("-ngl") + 1] == ("auto" if profile == "kimi-k3" else "99")
     templates = {"dsv": "deepseek-ai-DeepSeek-V4.1.jinja", "muse": "muse-spark.jinja"}
     if profile in templates:
         assert argv[argv.index("--chat-template-file") + 1].endswith(templates[profile])

@@ -1398,6 +1398,20 @@ std::string common_get_model_endpoint() {
     return model_endpoint;
 }
 
+// The longest draft the configured speculative decoding verifies (each implementation's n_max): what a recurrent state
+// must be able to roll back by.
+uint32_t common_speculative_draft_bound(const common_params_speculative & params) {
+    switch (params.type) {
+        case COMMON_SPECULATIVE_TYPE_NONE:          return 0;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE:  return params.ngram_simple.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K:   return params.ngram_map_k.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return params.ngram_map_k4v.size_m;
+        case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return (uint32_t) std::max(0, params.ngram_mod.n_max);
+        case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return 8;
+        default:                                    return (uint32_t) std::max(0, params.draft.n_max);
+    }
+}
+
 common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     auto * mem = llama_get_memory(ctx);
     if (mem == nullptr) {
@@ -1417,6 +1431,14 @@ common_context_seq_rm_type common_context_can_seq_rm(llama_context * ctx) {
     if (ret != 0) {
         LOG_ERR("%s: llama_decode() failed: %d\n", __func__, ret);
         res = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
+        goto done;
+    }
+
+    // A recurrent state with rollback planes removes a tail of up to llama_n_rs_seq tokens, after a decode step that
+    // verified them: the two tokens above may have been two steps (a context that splits outside a request's decode).
+    if (llama_n_rs_seq(ctx) > 0) {
+        LOG_INF("%s: the target context rolls back up to %u tokens\n", __func__, llama_n_rs_seq(ctx));
+        res = COMMON_CONTEXT_SEQ_RM_TYPE_RS;
         goto done;
     }
 
@@ -1457,6 +1479,17 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
+    mparams.check_tensor_split = llama_ssd_options_has_experts(params.ssd_options.get());
+    // A default SSD launch uses one visible CUDA device. Explicit layer placement is opt-in.
+    if (mparams.check_tensor_split && !params.split_mode_explicit &&
+            params.devices.empty() && params.split_mode == LLAMA_SPLIT_MODE_LAYER &&
+            std::none_of(std::begin(params.tensor_split), std::end(params.tensor_split), [](float w) { return w != 0; })) {
+        const auto cuda = ggml_backend_reg_by_name("CUDA");
+        if (cuda && ggml_backend_reg_dev_count(cuda) > 1) {
+            mparams.split_mode = LLAMA_SPLIT_MODE_NONE;
+            LOG_INF("%s: SSD experts use visible GPU %d (single-device mode)\n", __func__, params.main_gpu);
+        }
+    }
     mparams.use_mmap        = params.use_mmap;
     mparams.use_direct_io   = params.use_direct_io;
     mparams.use_mlock       = params.use_mlock;
@@ -1465,6 +1498,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.no_host         = params.no_host;
     mparams.defer_experts   = params.defer_experts;
     mparams.ssd_homes       = params.ssd_enabled;
+    mparams.mtp             = params.speculative.type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
@@ -1506,6 +1540,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.n_ctx             = params.n_ctx;
     cparams.ssd_options       = params.ssd_options.get();
     cparams.n_seq_max         = params.n_parallel;
+    cparams.n_rs_seq          = common_speculative_draft_bound(params.speculative);
     cparams.n_batch           = params.n_batch;
     cparams.n_ubatch          = params.n_ubatch;
     cparams.n_threads         = params.cpuparams.n_threads;

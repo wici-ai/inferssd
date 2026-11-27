@@ -5,6 +5,7 @@
 #define _WIN32_WINNT 0x0A00 // GetThreadSelectedCpuSets
 #endif
 #include "ggml-ssd/platform/threads.h"
+#include "ggml-ssd/platform/windows-cpu-sets.h"
 
 #include <algorithm>
 #include <atomic>
@@ -41,6 +42,35 @@ static std::string show(const cpu_list & cpus) {
 
 static bool contains(const cpu_list & cpus, int cpu) { return std::find(cpus.begin(), cpus.end(), cpu) != cpus.end(); }
 
+static void test_windows_cpu_sets() {
+    detail::windows_cpu_sets<uint32_t> sets(128);
+    const cpu_list hard = { 0, 1, 64, 65, 66 };
+    sets.record(1, 257, true, false);  // reserved by another process
+    sets.record(65, 321, false, false);
+    sets.record(66, 322, true, true);  // reserved by this process
+    sets.record(127, 383, false, false);
+    auto check = [&](const cpu_list & allowed, const std::vector<uint32_t> & defaults, const cpu_list & expected) {
+        cpu_list cpus;
+        std::string why;
+        const bool ok = sets.process_cpus(allowed, defaults, cpus, &why);
+        require(ok && cpus == expected, "Windows CPU Sets: expected " + show(expected) +
+                ", got " + show(cpus) + " " + why);
+    };
+    check(hard, {}, { 0, 64, 65, 66 });
+    check(hard, { 257 }, { 0, 64, 65, 66 });
+    check(hard, { 257, 321 }, { 65 });
+    check(hard, { 322, 321, 322 }, { 65, 66 });
+    check({ 64, 65, 66 }, { 257, 383 }, { 64, 65, 66 });
+    cpu_list cpus;
+    std::string why;
+    require(!sets.process_cpus({ 1 }, {}, cpus, &why) && why.find("no available CPUs") != std::string::npos,
+            "a hard mask containing only foreign reservations has no eligible CPU");
+    require(!sets.process_cpus(hard, { 9000 }, cpus, &why) && why.find("9000") != std::string::npos,
+            "unmapped default CPU Set IDs report the unresolved ID");
+    sets.record(1, 257, true, true);
+    check(hard, { 257 }, { 1 });
+}
+
 // The thread's placement as the OS reports it, to check scoped restores.
 static std::vector<unsigned long long> placement() {
     std::vector<unsigned long long> out;
@@ -51,8 +81,9 @@ static std::vector<unsigned long long> placement() {
         if (CPU_ISSET(cpu, &set)) { out.push_back(cpu); }
     }
 #elif defined(_WIN32)
-    ULONG ids[256] = {}, count = 0;
-    require(GetThreadSelectedCpuSets(GetCurrentThread(), ids, 256, &count) != 0, "GetThreadSelectedCpuSets");
+    std::vector<ULONG> ids(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
+    ULONG count = 0;
+    require(GetThreadSelectedCpuSets(GetCurrentThread(), ids.data(), ULONG(ids.size()), &count) != 0, "GetThreadSelectedCpuSets");
     out.push_back(count);
     for (ULONG i = 0; i < count; ++i) { out.push_back(ids[i]); }
     GROUP_AFFINITY group = {};
@@ -93,9 +124,21 @@ static cpu_list test_process_cpus() {
 
 static void test_pin(const cpu_list & cpus) {
     const auto before = placement();
-    require(thread_cpus_now() == cpus, "an unpinned thread runs on the process CPUs");
     require(pin_current_thread({}), "an empty pin is a no-op");
     require(placement() == before, "an empty pin leaves the thread as it was");
+#if defined(_WIN32)
+    if (GetActiveProcessorGroupCount() > 1) {
+        require(!affinity_supported(), "multi-group scheduling leaves placement to Windows");
+        require(!pin_current_thread({ cpus.front() }), "explicit multi-group pin refused");
+        require(placement() == before, "a refused pin leaves the thread as it was");
+        for (int cpu : cpus) {
+            require(cpu / 64 < GetActiveProcessorGroupCount() &&
+                    DWORD(cpu % 64) < GetActiveProcessorCount(WORD(cpu / 64)), "valid group-relative CPU ID");
+        }
+        return;
+    }
+#endif
+    require(thread_cpus_now() == cpus, "an unpinned thread runs on the process CPUs");
     if (affinity_supported()) {
         require(!pin_current_thread({ -1 }) && !pin_current_thread({ 100000 }), "invalid CPUs are refused");
         require(placement() == before, "a refused pin leaves the thread as it was");
@@ -170,7 +213,11 @@ static void test_clock() {
     std::printf("thread_cpu_time advanced %.3f ms over 150 ms of spinning\n", double(last - first) * 1e-6);
     require(monotonic && last > first, "thread CPU time is monotonic and advances");
     const int cpu = current_cpu();
-    require(affinity_supported() ? cpu >= 0 : cpu == -1, "current_cpu");
+#if defined(__APPLE__)
+    require(cpu == -1, "current_cpu");
+#else
+    require(cpu >= 0, "current_cpu");
+#endif
 }
 
 // The CPUs' busy time covers this thread's spin and no more than the CPUs' wall time, within a tick on each CPU.
@@ -202,6 +249,7 @@ static void test_busy(const cpu_list & cpus) {
 
 int main() {
     try {
+        test_windows_cpu_sets();
         const cpu_list cpus = test_process_cpus();
         test_busy(cpus);
         test_pin(cpus);

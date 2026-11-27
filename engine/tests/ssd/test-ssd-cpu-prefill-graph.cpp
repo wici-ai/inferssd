@@ -52,8 +52,10 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     unread.resolve = [](void *, const char *, int expert, size_t bytes, int64_t, int * fd, uint64_t * offset,
             size_t * logical) noexcept { *fd = 0; *offset = uint64_t(expert) * bytes; *logical = bytes; return true; };
     const std::vector<ssd::store::expert_layout::routed_layer> routed = { { 0, { meta_roles[0], meta_roles[1], meta_roles[2] } } };
-    llama_ssd_cpu_sink_runtime runtime(1, routed, configured.value, services, unread);
-    llama_ssd_cpu_sink_runtime other_runtime(2, routed, configured.value, services, unread);
+    llama_ssd_executor_group runtime;
+    runtime.add(1, routed, configured.value, services, unread);
+    llama_ssd_executor_group other_runtime;
+    other_runtime.add(2, routed, configured.value, services, unread);
     llm_graph_result result(2048);
     ggml_backend_t backends[] = { cpu };
     ggml_backend_buffer_type_t buffer_types[] = { ggml_backend_cpu_buffer_type() };
@@ -119,7 +121,7 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
     ggml_set_name(down, "blk.0.ffn_down_exps.weight");
     // The Qwen routers read the stream as it is, with no norm of their own: the next layer's router predicts from it.
     const bool qwen = arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE;
-    const bool predicted = qwen && decode && ntokens == 1;
+    const bool predicted = qwen && decode;
     if (predicted) {
         ggml_tensor * next_router = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, latent, experts);
         context.cpu_sink_prefetch_hint = context.build_moe_prefetch_hint(input, nullptr, next_router, nullptr,
@@ -141,12 +143,13 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         std::printf("case=%s tokens=0 cpu_custom=0 status=PASS\n", label);
         return;
     }
-    const bool use_sink = prefill || (decode && ntokens == 1);
+    // a decode ubatch of several rows (a draft to verify) runs through the sink's decode, row by row
+    const bool use_sink = prefill || decode;
     const auto dependencies = graph_dependencies(result.get_gf());
     if (use_sink) {
         require(output->op == GGML_OP_CUSTOM && result.cpu_sink_nodes.size() == 1, "missing CPU custom node");
         const auto & descriptor = *result.cpu_sink_nodes[0];
-        require(descriptor.runtime == &runtime && descriptor.prefill == prefill,
+        require(descriptor.runtime == &runtime.primary() && descriptor.prefill == prefill,
                 "custom node lost its context runtime or execution phase");
         require(qwen ? descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU :
                 descriptor.activation.kind == SSD_CPU_SINK_ACTIVATION_SWIGLU_CLAMP && descriptor.activation.swiglu_limit == 7.0f,
@@ -155,8 +158,8 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         require(ggml_backend_sched_get_tensor_backend(scheduler.get(), output) == cpu, "custom node not assigned to CPU");
         require(bool(output->src[4]) == predicted, "the custom node must carry the prediction it was given");
         if (predicted) {
-            require(output->src[4]->type == GGML_TYPE_I32 && output->src[4]->ne[0] == slots,
-                    "the prediction must rank as many experts as the router selects");
+            require(output->src[4]->type == GGML_TYPE_I32 && output->src[4]->ne[0] == slots &&
+                    output->src[4]->ne[1] == ntokens, "the prediction must rank as many experts as the router selects, a row each");
         }
         require(output->src[0] && output->src[1] && output->src[2] && !output->src[3], "custom node source count mismatch");
         for (int source = 0; source < 3; ++source) {
@@ -171,12 +174,22 @@ static void graph_case(ggml_backend_t cpu, int ntokens, bool prefill, bool decod
         require(!dependencies.count(up) && !dependencies.count(gate) && !dependencies.count(down),
                 "expert payload leaked into CPU sink graph dependencies");
     } else {
-        require(result.cpu_sink_nodes.empty() && output->op != GGML_OP_CUSTOM, "disabled/multi-token decode used CPU sink");
+        require(result.cpu_sink_nodes.empty() && output->op != GGML_OP_CUSTOM, "a disabled sink built a CPU sink node");
         require(dependencies.count(up) && dependencies.count(gate) && dependencies.count(down),
                 "legacy expert graph dependencies are missing");
     }
-    require(!runtime.sink && !runtime.prefill.context && !other_runtime.sink,
+    require(!runtime.primary().sink && !runtime.primary().prefill.context && !other_runtime.primary().sink,
             "graph construction unexpectedly initialized an executor");
+    const std::vector<ssd::store::expert_layout::routed_layer> remaining = {
+        { 1, { meta_roles[0], meta_roles[1], meta_roles[2] } },
+        { 2, { meta_roles[0], meta_roles[1], meta_roles[2] } },
+    };
+    runtime.add(1, remaining, configured.value, services, unread);
+    require(runtime.by_layer[0] != runtime.by_layer[1] && runtime.by_layer[1] == runtime.by_layer[2],
+            "a routed layer must borrow the executor that owns it");
+    require(!runtime.can_prefetch_after(0) && runtime.can_prefetch_after(1),
+            "read-ahead must stay on the owning device");
+
     std::printf("case=%s tokens=%d cpu_custom=%d nodes=%d status=PASS\n",
         label, ntokens, use_sink ? 1 : 0, ggml_graph_n_nodes(result.get_gf()));
 }
@@ -191,9 +204,10 @@ int main() {
         graph_case(cpu.get(), 1, true, false, "prefill_single_token_tail");
         graph_case(cpu.get(), 1, false, true, "decode_one");
         graph_case(cpu.get(), 2, false, false, "disabled_two");
-        graph_case(cpu.get(), 2, false, true, "decode_two_legacy");
+        graph_case(cpu.get(), 2, false, true, "decode_two_rows");
         graph_case(cpu.get(), 64, true, false, "qwen4exp_prefill_ub64", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
         graph_case(cpu.get(), 1, false, true, "qwen4exp_decode_one", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
+        graph_case(cpu.get(), 2, false, true, "qwen4exp_decode_two_rows", GGML_TYPE_Q8_0, LLM_ARCH_QWEN4EXP);
         graph_case(cpu.get(), 64, true, false, "qwen35moe_prefill_ub64", GGML_TYPE_Q8_0, LLM_ARCH_QWEN35MOE);
         graph_case(cpu.get(), 1, false, true, "qwen35moe_decode_one", GGML_TYPE_Q8_0, LLM_ARCH_QWEN35MOE);
         // up and gate of different types, as Qwen3.8-Flash-Next UD-IQ1_S's layer 18 (an IQ2_XXS up beside an IQ2_S

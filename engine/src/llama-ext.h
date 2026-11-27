@@ -95,6 +95,17 @@ LLAMA_API void llama_set_embeddings_nextn(
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
+// The draft head of a model loaded with llama_model_params.mtp: whether it has one, and the width of the hidden
+// states it reads (llama_get_embeddings_nextn_ith rows).
+LLAMA_API bool    llama_model_has_mtp (const struct llama_model * model);
+LLAMA_API int32_t llama_model_n_embd_h(const struct llama_model * model);
+
+// A draft step of the model's MTP head: the batch's tokens, each with the hidden state of the position before it in h
+// (llama_model_n_embd_h floats a token, in batch order), the model's or an earlier step's. The step enters the
+// head's attention cache alone, so llama_memory_seq_rm takes its positions back out; its logits and hidden states
+// are the outputs as a decode's are. Returns as llama_decode.
+LLAMA_API int32_t llama_decode_mtp(struct llama_context * ctx, struct llama_batch batch, const float * h);
+
 LLAMA_API void llama_set_embeddings_layer_inp(
         struct llama_context * ctx, uint32_t lid, bool value);
 LLAMA_API float * llama_get_embeddings_layer_inp(

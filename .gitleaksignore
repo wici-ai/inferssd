@@ -6,3 +6,6 @@
 # Reviewed source-file SHA-256 in the c0-store extraction reference receipt.
 fdb8fca8b6bb75972ea83fe565ee9064c0be54ac:experiments/c0-store/oracle/extraction.json:generic-api-key:7
 9f5c8c56bf0c848809b0329e5b26249d971f2d2f:experiments/c0-store/oracle/extraction.json:generic-api-key:7
+# Reviewed test fixture: the fake LoRA adapter key "0123456789abcdef" in the prompt cache tests (#394).
+47ebfe674891ed00b15a477ae8b123bcd315d3af:engine/tests/ssd/test-server-prompt-cache.cpp:generic-api-key:401
+47ebfe674891ed00b15a477ae8b123bcd315d3af:engine/tests/ssd/test-server-prompt-cache.cpp:generic-api-key:421

@@ -1,0 +1,587 @@
+{
+  "SPDX-License-Identifier": "Apache-2.0",
+  "date": "2026-11-23",
+  "baseline_revision": "910afae",
+  "models": {
+    "deepseek": {
+      "checkpoint": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+      "quantization": "IQ2_XS",
+      "checkpoint_revision": "sha256:e9c070fb2f4e1bdcd0ac26e7165f2fdde9cb4b38e0e49ec695f0f3a146fe2177",
+      "measured_engine": "1b89e6498c94d840cb0b7f217fbf480bd7ca327f",
+      "measurement_date": "2026-11-23",
+      "layers": 40,
+      "threads": 8,
+      "host_limit_GiB": 32,
+      "free_gpu_MiB": 31806
+    },
+    "qwen_moe": {
+      "checkpoint": "ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF",
+      "checkpoint_revision": "ed59f92082b1e93c0e96d60a8b11aab089b52f09",
+      "measured_engine": "050d3e1bfc2154def3ed7d0223133664b62ae4dc",
+      "measurement_date": "2026-11-19",
+      "layers": 48,
+      "threads": 60,
+      "host_cgroup_limit_bytes": 92769779712,
+      "gpu_free_MiB_at_native_device_selection": 31295,
+      "batch": 8192,
+      "ubatch": 8192
+    },
+    "qwen_dense": {
+      "checkpoint": "Qwen/Qwen2.5-7B-Instruct",
+      "quantization": "Q8_0",
+      "gguf_sha256": "e7e96d4b75612d16867e873c1e4d8dcb386f8af0ca99c962bd876218626a55e6",
+      "conversion": "convert_hf_to_gguf.py --outtype q8_0 applied to existing safetensors",
+      "measured_engine": "ca8db2e150e8665e9b959990f5774d27c714a7bf",
+      "measurement_date": "2026-11-23",
+      "layers": 28,
+      "threads": 8,
+      "free_gpu_MiB": 32094,
+      "batch": 512,
+      "ubatch": 512
+    }
+  },
+  "protocol": {
+    "prompts": "bench/prompts/prompt-{tier}.txt, one user message, chat template applied, greedy decoding, 256 output tokens, ignore EOS, prompt cache off, one sequence, context 8192.",
+    "actual": "128 / (arrival of token 256 - arrival of token 128) on the loopback streaming endpoint. Token ID hashes use the UTF-8 decimal JSON integer array without whitespace.",
+    "static": "All rows use the same estimator implementation. The comparison applies both algorithms retrospectively.",
+    "direct_reference": "Previous-request and first32 rates are same-deployment diagnostics in decode intervals per second. For each Qwen MoE 4K sample it comes from the earlier 512-tier request in a separate server. Prefix timing uses 32 intervals from T1 to T33 of the target request and excludes every interval in the test window.",
+    "server_failures": [
+      {
+        "run": 1,
+        "request": 1,
+        "prompt_tier": 4096,
+        "expert_vram_base": "auto",
+        "gpu_reserve_mib": 0,
+        "batch": 4096,
+        "ubatch": 512,
+        "phase": "prefill",
+        "failure": "CUDA graph allocation failed (364.76 MiB requested)."
+      },
+      {
+        "run": 2,
+        "request": 2,
+        "prompt_tier": 4096,
+        "expert_vram_base": "16 GiB, elastic",
+        "gpu_reserve_mib": 0,
+        "batch": 512,
+        "ubatch": 128,
+        "phase": "prefill",
+        "failure": "CUDA graph allocation failed (145.07 MiB requested)."
+      }
+    ]
+  },
+  "machines": {
+    "A": {
+      "gpu": "RTX 5090",
+      "cpu": "AMD EPYC 7B13 64-Core Processor"
+    },
+    "B": {
+      "gpu": "one visible RTX 5090",
+      "cpu": "INTEL(R) XEON(R) GOLD 6526Y"
+    }
+  },
+  "runs": [
+    {
+      "machine": "A",
+      "model": "deepseek",
+      "quantization": "IQ2_XS",
+      "tier": 512,
+      "input_tokens": 523,
+      "output_tokens": 256,
+      "expert_vram_base": "16 GiB elastic",
+      "reserve_mib": 0,
+      "batch": 512,
+      "ubatch": 128,
+      "request_in_server": 1,
+      "prompt_sha256": "17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
+      "input_ids_sha256": "b76e4a10b5db8c7fc1cf21bf78cb73f90710175a32f7709c6d0968facd666b49",
+      "output_ids_sha256": "3abd6401ebffd5eb0f4eb8f5ad6e08c51813ff2b05eab1eb86563d3c898bb331",
+      "T128_s": 38.45499427500181,
+      "T256_s": 50.101574254920706,
+      "actual_tps": 10.990351,
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 4079.9747860291973
+      },
+      "tps": {
+        "v1_static": 3.492128,
+        "v2_static": 11.359042,
+        "first32_rate": 7.843186
+      },
+      "signed_errors_percent": {
+        "v1_static": -68.226,
+        "v2_static": 3.355,
+        "first32_rate": -28.636
+      },
+      "v2_components_ms": {
+        "dense_ms": 5.936,
+        "cpu_experts_ms": 12.027,
+        "gpu_experts_ms": 5.352,
+        "storage_ms": 64.72
+      },
+      "last128_layer_events": {
+        "routes": 30720,
+        "gpu_hit": 0.730794,
+        "neither_cache_hit": 0.059212,
+        "foreground_read_MiB_per_token": 130.064,
+        "expert_layer_wall_ms_per_token": 66.849,
+        "io_wait_ms_per_token": 21.443
+      },
+      "static_routing": {
+        "gpu_hit": 0.719087,
+        "neither_cache_hit": 0.204918
+      }
+    },
+    {
+      "machine": "A",
+      "model": "deepseek",
+      "quantization": "IQ2_XS",
+      "tier": 4096,
+      "input_tokens": 4104,
+      "output_tokens": 256,
+      "expert_vram_base": "auto",
+      "reserve_mib": 2048,
+      "batch": 512,
+      "ubatch": 128,
+      "request_in_server": 1,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "4c778cdb115ae74127ae71c3b72d5f585a75cbb23b9819a1e1a602e19a030d0f",
+      "output_ids_sha256": "e06ec99643eb2b608207e7f7beae962839f70270cbcaf1e0898f8233bee60f92",
+      "T128_s": 140.9792910410324,
+      "T256_s": 153.0431629839586,
+      "actual_tps": 10.610192,
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 3547.4990810034797
+      },
+      "tps": {
+        "v1_static": 3.485925,
+        "v2_static": 11.158848,
+        "first32_rate": 9.020439
+      },
+      "signed_errors_percent": {
+        "v1_static": -67.146,
+        "v2_static": 5.171,
+        "first32_rate": -14.983
+      },
+      "v2_components_ms": {
+        "dense_ms": 5.936,
+        "cpu_experts_ms": 12.552,
+        "gpu_experts_ms": 5.261,
+        "storage_ms": 65.866
+      },
+      "last128_layer_events": {
+        "routes": 30720,
+        "gpu_hit": 0.735514,
+        "neither_cache_hit": 0.061361,
+        "foreground_read_MiB_per_token": 134.342,
+        "expert_layer_wall_ms_per_token": 65.084,
+        "io_wait_ms_per_token": 20.075
+      },
+      "static_routing": {
+        "gpu_hit": 0.706826,
+        "neither_cache_hit": 0.208546
+      }
+    },
+    {
+      "machine": "A",
+      "model": "deepseek",
+      "quantization": "IQ2_XS",
+      "tier": 512,
+      "input_tokens": 523,
+      "output_tokens": 256,
+      "expert_vram_base": "auto",
+      "reserve_mib": 2048,
+      "batch": 512,
+      "ubatch": 128,
+      "request_in_server": 2,
+      "prompt_sha256": "17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
+      "input_ids_sha256": "b76e4a10b5db8c7fc1cf21bf78cb73f90710175a32f7709c6d0968facd666b49",
+      "output_ids_sha256": "c5d13510e40b626a512a7cf6892b5bde358ac6762ecad04273b3090f00829095",
+      "T128_s": 27.226842821924947,
+      "T256_s": 39.005382889998145,
+      "actual_tps": 10.867221,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 24792.437
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 3318.724473938346
+      },
+      "tps": {
+        "v1_static": 3.485925,
+        "v2_static": 11.158848,
+        "prior_request_rate": 10.285395,
+        "first32_rate": 9.642259
+      },
+      "signed_errors_percent": {
+        "v1_static": -67.923,
+        "v2_static": 2.684,
+        "prior_request_rate": -5.354,
+        "first32_rate": -11.272
+      },
+      "v2_components_ms": {
+        "dense_ms": 5.936,
+        "cpu_experts_ms": 12.552,
+        "gpu_experts_ms": 5.261,
+        "storage_ms": 65.866
+      },
+      "last128_layer_events": {
+        "routes": 30720,
+        "gpu_hit": 0.69209,
+        "neither_cache_hit": 0.069076,
+        "foreground_read_MiB_per_token": 151.913,
+        "expert_layer_wall_ms_per_token": 70.833,
+        "io_wait_ms_per_token": 22.62
+      },
+      "static_routing": {
+        "gpu_hit": 0.706826,
+        "neither_cache_hit": 0.208546
+      }
+    },
+    {
+      "machine": "A",
+      "model": "qwen_moe",
+      "quantization": "Q2_0",
+      "tier": 4096,
+      "input_tokens": 4180,
+      "output_tokens": 256,
+      "reserve_mib": 2048,
+      "request_in_server": 1,
+      "host_available_bytes": 87731134464,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "7e047dce66d052b281b8b03404e10f1d1b4247d242ab71834ef01baa0201f5cd",
+      "output_ids_sha256": "e5c594d7c206ff64f22e21ce787bb6c2aaf0630826ab8d5952837bdd2dd09afb",
+      "T128_s": 10.471312226,
+      "T256_s": 14.439140099,
+      "actual_tps": 32.259464,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 7517.735
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 1185.4610470000005
+      },
+      "tps": {
+        "v1_static": 137.083841,
+        "v2_static": 50.736932,
+        "prior_request_rate": 33.919791,
+        "first32_rate": 26.993717
+      },
+      "signed_errors_percent": {
+        "v1_static": 324.941,
+        "v2_static": 57.278,
+        "prior_request_rate": 5.147,
+        "first32_rate": -16.323
+      },
+      "v2_components_ms": {
+        "dense_ms": 3.502,
+        "cpu_experts_ms": 0.367,
+        "gpu_experts_ms": 15.84,
+        "storage_ms": 0.0
+      },
+      "last128_layer_events": {
+        "routes": 61440,
+        "gpu_hit": 0.99362,
+        "neither_cache_hit": 0.001855,
+        "foreground_read_MiB_per_token": 1.185,
+        "expert_layer_wall_ms_per_token": 12.491,
+        "io_wait_ms_per_token": 0.387
+      },
+      "static_routing": {
+        "gpu_hit": 0.96552,
+        "neither_cache_hit": 0.0
+      }
+    },
+    {
+      "machine": "A",
+      "model": "qwen_moe",
+      "quantization": "IQ2_XS",
+      "tier": 4096,
+      "input_tokens": 4180,
+      "output_tokens": 256,
+      "reserve_mib": 2048,
+      "request_in_server": 1,
+      "host_available_bytes": 87785394176,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "7e047dce66d052b281b8b03404e10f1d1b4247d242ab71834ef01baa0201f5cd",
+      "output_ids_sha256": "fc2be744f4493d215f927a24e0f0de68f6105120c66937c59365f10df808336d",
+      "T128_s": 11.373401195,
+      "T256_s": 15.46313217,
+      "actual_tps": 31.297902,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 8106.746
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 1305.5171019999996
+      },
+      "tps": {
+        "v1_static": 127.696833,
+        "v2_static": 50.718083,
+        "prior_request_rate": 31.455284,
+        "first32_rate": 24.51136
+      },
+      "signed_errors_percent": {
+        "v1_static": 308.004,
+        "v2_static": 62.049,
+        "prior_request_rate": 0.503,
+        "first32_rate": -21.684
+      },
+      "v2_components_ms": {
+        "dense_ms": 3.561,
+        "cpu_experts_ms": 0.541,
+        "gpu_experts_ms": 15.615,
+        "storage_ms": 0.0
+      },
+      "last128_layer_events": {
+        "routes": 61440,
+        "gpu_hit": 0.99069,
+        "neither_cache_hit": 0.002458,
+        "foreground_read_MiB_per_token": 1.632,
+        "expert_layer_wall_ms_per_token": 13.24,
+        "io_wait_ms_per_token": 0.488
+      },
+      "static_routing": {
+        "gpu_hit": 0.951261,
+        "neither_cache_hit": 0.0
+      }
+    },
+    {
+      "machine": "A",
+      "model": "qwen_moe",
+      "quantization": "IQ3_XXS",
+      "tier": 4096,
+      "input_tokens": 4180,
+      "output_tokens": 256,
+      "reserve_mib": 2048,
+      "request_in_server": 1,
+      "host_available_bytes": 87812591616,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "7e047dce66d052b281b8b03404e10f1d1b4247d242ab71834ef01baa0201f5cd",
+      "output_ids_sha256": "23a9e49be09cec6490476da5d4077ee0555482b66d5ffde103b441f20f9d2c4d",
+      "T128_s": 12.521549938,
+      "T256_s": 17.172700594,
+      "actual_tps": 27.520072,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 10022.781
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 1486.7983309999993
+      },
+      "tps": {
+        "v1_static": 96.768919,
+        "v2_static": 50.450626,
+        "prior_request_rate": 25.44204,
+        "first32_rate": 21.522758
+      },
+      "signed_errors_percent": {
+        "v1_static": 251.63,
+        "v2_static": 83.323,
+        "prior_request_rate": -7.551,
+        "first32_rate": -21.793
+      },
+      "v2_components_ms": {
+        "dense_ms": 3.999,
+        "cpu_experts_ms": 1.544,
+        "gpu_experts_ms": 14.278,
+        "storage_ms": 0.0
+      },
+      "last128_layer_events": {
+        "routes": 61440,
+        "gpu_hit": 0.97443,
+        "neither_cache_hit": 0.005143,
+        "foreground_read_MiB_per_token": 3.917,
+        "expert_layer_wall_ms_per_token": 15.892,
+        "io_wait_ms_per_token": 0.828
+      },
+      "static_routing": {
+        "gpu_hit": 0.882248,
+        "neither_cache_hit": 0.0
+      }
+    },
+    {
+      "machine": "A",
+      "model": "qwen_moe",
+      "quantization": "IQ3_S",
+      "tier": 4096,
+      "input_tokens": 4180,
+      "output_tokens": 256,
+      "reserve_mib": 2048,
+      "request_in_server": 1,
+      "host_available_bytes": 87898636288,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "7e047dce66d052b281b8b03404e10f1d1b4247d242ab71834ef01baa0201f5cd",
+      "output_ids_sha256": "39b57e3dec5bd0f6e4f643b4e7491c1711709cfc4dc768cd9ca2cf4b546587bd",
+      "T128_s": 13.111879406,
+      "T256_s": 17.559420327,
+      "actual_tps": 28.779949,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 10586.263
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 1654.45551
+      },
+      "tps": {
+        "v1_static": 77.482754,
+        "v2_static": 48.665476,
+        "prior_request_rate": 24.08782,
+        "first32_rate": 19.341711
+      },
+      "signed_errors_percent": {
+        "v1_static": 169.225,
+        "v2_static": 69.095,
+        "prior_request_rate": -16.303,
+        "first32_rate": -32.794
+      },
+      "v2_components_ms": {
+        "dense_ms": 4.346,
+        "cpu_experts_ms": 2.138,
+        "gpu_experts_ms": 14.064,
+        "storage_ms": 0.0
+      },
+      "last128_layer_events": {
+        "routes": 61440,
+        "gpu_hit": 0.970264,
+        "neither_cache_hit": 0.005485,
+        "foreground_read_MiB_per_token": 5.151,
+        "expert_layer_wall_ms_per_token": 15.354,
+        "io_wait_ms_per_token": 1.027
+      },
+      "static_routing": {
+        "gpu_hit": 0.859832,
+        "neither_cache_hit": 0.0
+      }
+    },
+    {
+      "machine": "B",
+      "model": "qwen_dense",
+      "quantization": "Q8_0",
+      "tier": 512,
+      "input_tokens": 561,
+      "output_tokens": 256,
+      "reserve_mib": 0,
+      "request_in_server": 1,
+      "prompt_sha256": "17ac26b4a3bc13d6c51dd10b62eb54931651d48e41ca4071c587a931a662e283",
+      "input_ids_sha256": "f1b3bffd8d8ff007f99cfeef10a829c02dd50ab9cc36b48c91eeac31f196282a",
+      "output_ids_sha256": "83e159f4ecd414ffe18ba6e0fc5310f49da7b399000dc23113ec397f2718fc74",
+      "T128_s": 0.956932988,
+      "T256_s": 1.827213153,
+      "actual_tps": 147.079073,
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 226.90276000000003
+      },
+      "tps": {
+        "v1_static": 123.422976,
+        "v2_static": 123.089766,
+        "first32_rate": 141.029576
+      },
+      "signed_errors_percent": {
+        "v1_static": -16.084,
+        "v2_static": -16.31,
+        "first32_rate": -4.113
+      },
+      "v2_components_ms": {
+        "dense_ms": 8.124,
+        "storage_ms": 0.0
+      }
+    },
+    {
+      "machine": "B",
+      "model": "qwen_dense",
+      "quantization": "Q8_0",
+      "tier": 4096,
+      "input_tokens": 4176,
+      "output_tokens": 256,
+      "reserve_mib": 0,
+      "request_in_server": 2,
+      "prompt_sha256": "7eac0ca46f379476846f8221e2ab9617d3023c05f3655769eed523a101754dec",
+      "input_ids_sha256": "eebcfc191f88059be02bad243db5cc8b0d86b0012997459d24029ddb4745d798",
+      "output_ids_sha256": "9290dd115440b087ee55706eb8c80e0fd19423248e0880e6ddaac215ada17374",
+      "T128_s": 1.197114839,
+      "T256_s": 2.038891846,
+      "actual_tps": 152.059273,
+      "prior_request_timings": {
+        "predicted_n": 256,
+        "predicted_ms": 1739.528
+      },
+      "first32_timings": {
+        "predicted_n": 33,
+        "predicted_ms": 210.90522600000006
+      },
+      "tps": {
+        "v1_static": 123.422976,
+        "v2_static": 123.089766,
+        "prior_request_rate": 146.591489,
+        "first32_rate": 151.726918
+      },
+      "signed_errors_percent": {
+        "v1_static": -18.832,
+        "v2_static": -19.051,
+        "prior_request_rate": -3.596,
+        "first32_rate": -0.219
+      },
+      "v2_components_ms": {
+        "dense_ms": 8.124,
+        "storage_ms": 0.0
+      }
+    }
+  ],
+  "hdd_repeated_prompt": {
+    "machine": "B",
+    "comparison": "retrospective; existing single-card measurements and a later machine profile on the same host",
+    "model": "ISTA-DASLab/DeepSeek-V4.1-Flash-1017-GSQ-RCO-GGUF",
+    "quantization": "IQ2_XS",
+    "settings": "16 GiB cgroup, 1 visible GPU, 8 decode threads; 9 modeled CPUs for equivalent decode pool; 16 MiB measured occupied before archived run",
+    "drive_Bps": 143686000.0,
+    "static_uniform_tps": 0.07550211640262887,
+    "static_generic_tps": 0.2529647307555528,
+    "measurement": "Four consecutive identical 19-input/24-output requests on a shared SATA HDD. Full wait: 23 token intervals.",
+    "requests": [
+      {
+        "request": "warmup",
+        "generated": 24,
+        "measured_tps": 0.7813571888325344,
+        "logical_read_bytes_per_token": 182318480.6956522,
+        "mean_vram_hit": 0.9077898550724638,
+        "mean_storage_miss": 0.07898550724637682,
+        "static_ratio": 0.3237504362550504
+      },
+      {
+        "request": "measure-1",
+        "generated": 24,
+        "measured_tps": 2.945244867721428,
+        "logical_read_bytes_per_token": 41673060.17391305,
+        "mean_vram_hit": 0.9791666666666666,
+        "mean_storage_miss": 0.017572463768115942,
+        "static_ratio": 0.08588920178689848
+      },
+      {
+        "request": "measure-2",
+        "generated": 24,
+        "measured_tps": 4.214750096310962,
+        "logical_read_bytes_per_token": 28250112.0,
+        "mean_vram_hit": 0.9875,
+        "mean_storage_miss": 0.011956521739130435,
+        "static_ratio": 0.06001891570676156
+      },
+      {
+        "request": "measure-3",
+        "generated": 24,
+        "measured_tps": 6.864616318766027,
+        "logical_read_bytes_per_token": 15249229.913043479,
+        "mean_vram_hit": 0.9925724637681159,
+        "mean_storage_miss": 0.006340579710144928,
+        "static_ratio": 0.036850527255837276
+      }
+    ]
+  }
+}

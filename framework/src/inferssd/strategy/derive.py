@@ -31,10 +31,10 @@ from inferssd.configuration.settings import (
     schema,
     uncomment,
 )
-from inferssd.launch.types import Threads
+from inferssd.launch.types import GPU_LAYERS, Threads
 from inferssd.machine.characteristics import GPU, Characteristics, ComputeRow, dumps
 from inferssd.machine.identity import TIER_BACKENDS
-from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts
+from inferssd.strategy.inputs import Experts, GPUState, ModelFacts, RuntimeFacts, cuda_device_order
 
 # The engine's GB/s cost terms are 1e9 bytes per second: it prices a copy or a
 # read at 1e3 / gbps microseconds per 1e6 bytes.
@@ -130,6 +130,11 @@ def tier_gpus(
         return None
     backends = tier_backends(runtime.gpu_backends, characteristics)
     return tuple(gpu for gpu in runtime.gpus if gpu.backend in backends)
+
+
+def gpu_reserve_mib(usable: Optional[Sequence[GPUState]]) -> int:
+    """The launch's VRAM reserve for other compute processes on usable devices."""
+    return SHARED_GPU_RESERVE_MIB if any(gpu.processes for gpu in usable or ()) else 0
 
 
 def _validated(choices: Mapping[str, tuple[str, str]], platform: str) -> dict[str, Choice]:
@@ -272,6 +277,24 @@ def io_cpu(allowed: Sequence[int], strict: Sequence[int], performance: set[int])
     return ((other or free)[-1],)
 
 
+def cpu_affinity(characteristics: Characteristics, runtime: RuntimeFacts) -> tuple[set[int], bool]:
+    """The process's usable CPU IDs and whether the profile supports explicit pinning."""
+    available = set(runtime.cpus)
+    # Old Windows profiles stored placeholder IDs 0..N-1 and advertised pinning
+    # when topology discovery refused multiple groups. Only the live IDs apply.
+    old_group_error = (
+        "topology unavailable: more than one processor group "
+        "(over 64 logical CPUs) is not supported"
+    )
+    if (
+        characteristics["identity"]["hard"]["platform"] == "windows"
+        and characteristics["sections"]["cpu"]["detail"].partition(";")[0] == old_group_error
+    ):
+        return available, False
+    available.intersection_update(row["id"] for row in characteristics["cpu"]["logical"])
+    return available, characteristics["cpu"]["affinity_supported"]
+
+
 def placement(
     characteristics: Characteristics, model: ModelFacts, runtime: RuntimeFacts, notes: list[str]
 ) -> tuple[Threads, tuple[int, ...], str]:
@@ -288,8 +311,8 @@ def placement(
     pinned measurement placed them. The engine runs decode on fewer of them while the machine's
     other work needs their CPUs.
     """
-    logical = {row["id"] for row in characteristics["cpu"]["logical"]}
-    allowed = sorted(set(runtime.cpus) & logical)
+    available, can_pin = cpu_affinity(characteristics, runtime)
+    allowed = sorted(available)
     if not allowed:
         raise ValueError("none of the CPUs this process may use is in the machine characteristics")
     name = model.cpu_format.upper()
@@ -312,7 +335,7 @@ def placement(
     )
     notes.append(f"threads: decode {decode}, {decode_why}")
     notes.append(f"threads: prefill {batch}, {batch_why}")
-    if not characteristics["cpu"]["affinity_supported"]:
+    if not can_pin:
         return (
             Threads(decode, batch, ()),
             (),
@@ -567,7 +590,7 @@ def link_rates(
     if len(present) != 1:
         if not present:
             return {}, f"no {names} GPU is usable now"
-        return {}, f"{len(present)} {names} GPUs are usable and the engine drives one of them"
+        return {}, f"{len(present)} {names} GPUs are usable; link rates are per device"
     gpu = next((row for row in characteristics["gpus"] if row["uuid"] == present[0].uuid), None)
     if gpu is None:
         return {}, f"the GPU {present[0].uuid} was not measured"
@@ -625,6 +648,84 @@ def host_headroom_mib(
     return None
 
 
+def _cuda_layer_counts(layers: Sequence[int], room: Sequence[int], reserve: int) -> list[int]:
+    layers = layers[-GPU_LAYERS:]
+    if not layers or min(room) <= 0:
+        return []
+    # load_tensors assigns position i to the first cumulative free-memory
+    # share above i / n. Pass the resulting integer counts to the loader so a
+    # second memory reading cannot shift a checked boundary.
+    free = [size + reserve for size in room]
+    total = sum(free)
+    counts = []
+    start = 0
+    cumulative = 0
+    for size, available in zip(free, room):
+        cumulative += size
+        end = (len(layers) * cumulative + total - 1) // total
+        if sum(layers[start:end]) > available:
+            break
+        counts.append(end - start)
+        start = end
+    else:
+        return counts
+
+    if sum(layers) <= max(room):
+        return []  # the best card can hold all the dense weights
+
+    # A model may need several cards for its dense weights alone. Taking
+    # the longest prefix that fits leaves the least work for the next card.
+    counts = []
+    start = 0
+    for available in room:
+        end = start
+        while end < len(layers) and layers[end] <= available:
+            available -= layers[end]
+            end += 1
+        counts.append(end - start)
+        start = end
+    return counts if start == len(layers) else []
+
+
+def cuda_placement(
+    characteristics: Characteristics,
+    model: ModelFacts,
+    runtime: RuntimeFacts,
+    reserve_mib: int,
+    force_unified: bool,
+    fit_layers: bool,
+) -> tuple[str, ...]:
+    devices = tier_gpus(runtime, characteristics)
+    if model.experts is None or not devices or len(devices) < 2:
+        return ()
+    order = cuda_device_order(characteristics) if runtime.cuda_uuids is None else runtime.cuda_uuids
+    readings = {device.uuid: device for device in devices}
+    if len(order) != len(devices) or set(order) != readings.keys():
+        return ()
+    devices = tuple(readings[uuid] for uuid in order)
+    measured = {gpu["uuid"]: gpu for gpu in characteristics["gpus"]}
+    room = []
+    unified = force_unified
+    for device in devices:
+        gpu = measured.get(device.uuid)
+        if device.backend != "CUDA" or gpu is None or device.free_bytes is None:
+            return ()
+        unified = unified or gpu["integrated"]
+        # The native context registers the same allocation floor on every attached device.
+        room.append(device.free_bytes - (reserve_mib << 20))
+    best = max(range(len(room)), key=room.__getitem__)
+    # A resident model gains no cache capacity from crossing a device boundary.
+    # Layer splitting requires discrete GPUs, each with room for its own buffers.
+    if not unified and room[best] < model.dense_bytes + model.experts.routed_bytes:
+        counts = _cuda_layer_counts(model.cuda_layer_bytes, room, reserve_mib << 20)
+        if sum(count > 0 for count in counts) > 1:
+            if fit_layers:
+                # A fixed tensor split prevents the native fitter from adjusting the layers.
+                return ("--split-mode", "layer")
+            return ("--split-mode", "layer", "--tensor-split", ",".join(map(str, counts)))
+    return ("--split-mode", "none", "--main-gpu", str(best))
+
+
 def derive(
     characteristics: Characteristics,
     model: ModelFacts,
@@ -632,6 +733,9 @@ def derive(
     platform: str,
     *,
     model_drive_key: Optional[str],
+    vram_reserve_mib: Optional[int] = None,
+    force_unified: bool = False,
+    fit_layers: bool = False,
 ) -> Strategy:
     """The strategy for one launch of MODEL on this machine; see the module docstring."""
     if platform not in PLATFORMS:
@@ -704,15 +808,18 @@ def derive(
                     "vram.budget: default auto; the usable GPU is not in the characteristics, "
                     "run inferssd profile again"
                 )
-            busy = [
-                f"{gpu.uuid} runs {gpu.processes} compute process(es)"
-                for gpu in usable
-                if gpu.processes
-            ]
-            if busy:
-                why = ", ".join(busy) + f"; {SHARED_GPU_RESERVE_MIB} MiB stays free for them"
-                choices["vram.reserve_mib"] = (str(SHARED_GPU_RESERVE_MIB), why)
+            reserve = gpu_reserve_mib(usable)
+            if reserve:
+                busy = [
+                    f"{gpu.uuid} runs {gpu.processes} compute process(es)"
+                    for gpu in usable
+                    if gpu.processes
+                ]
+                why = ", ".join(busy) + f"; {reserve} MiB stays free for them"
+                choices["vram.reserve_mib"] = (str(reserve), why)
                 notes.append("vram.reserve_mib: " + why)
+                if vram_reserve_mib is None:
+                    vram_reserve_mib = reserve
         device = single_gpu(characteristics, runtime)
         if host_headroom_mib(characteristics, runtime, platform) == UNIFIED_HEADROOM_MIB:
             assert device is not None
@@ -752,11 +859,14 @@ def derive(
                 f"the memory budget of {runtime.memory_budget_bytes} bytes",
             )
             notes.append(f"host.budget_mib: {mib} from the memory budget")
-    notes.append("server: " + " ".join(SERVER_ARGS))
+    arguments = SERVER_ARGS + cuda_placement(
+        characteristics, model, runtime, vram_reserve_mib or 0, force_unified, fit_layers
+    )
+    notes.append("server: " + " ".join(arguments))
     return Strategy(
         settings=_validated(choices, platform),
         threads=threads,
-        server_args=SERVER_ARGS,
+        server_args=arguments,
         inputs=Inputs(hashlib.sha256(text.encode()).hexdigest(), model.paths, platform),
         notes=tuple(notes),
     )

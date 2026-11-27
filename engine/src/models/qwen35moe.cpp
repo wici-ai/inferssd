@@ -275,6 +275,8 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     cb(state_update_target, "state_update_target", il);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    // a draft's verification leaves its earlier tokens' conv states as rollback planes
+    build_conv_planes(inp, conv_states_all, conv_input, conv_kernel_size - 1, conv_channels);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
@@ -336,18 +338,22 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    auto attn_out = build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+    auto attn_out = keeps_planes() ?
+        build_delta_net_planes(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il) :
+        build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;
     cb(output, "attn_output", il);
-    cb(new_state, "new_state", il);
 
-    // Update the recurrent states
-    ggml_build_forward_expand(gf,
-            ggml_cpy(ctx0, new_state,
-                ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
-                    kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    // Update the recurrent states, unless the delta net wrote them into the rollback planes
+    if (new_state) {
+        cb(new_state, "new_state", il);
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, hparams.n_embd_s(), n_seqs, ssm_states_all->nb[1],
+                        kv_head * hparams.n_embd_s() * ggml_element_size(ssm_states_all))));
+    }
 
     // z: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * n_tokens * n_seqs, head_dim]
     ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_seq_tokens, n_seqs);

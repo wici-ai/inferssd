@@ -1705,8 +1705,9 @@ static void test_convert_responses_to_chatcmpl() {
 
 // Codex sends its instructions and several developer messages at the start, another developer message at the start
 // of a later turn, and now and then one inside a tool-call loop. They are converted as CC Switch's Codex proxy
-// converts them for Chat Completions: the leading ones become one system message, a later one that a user message
-// follows becomes a user message where it stands, and any other later one joins the first system message.
+// converts them for Chat Completions: the leading ones become one system message (two when some of them hold the
+// user's context, see test_responses_user_context), a later one that a user message follows becomes a user message
+// where it stands, and any other later one joins a second system message, after the app's own.
 static void test_responses_system_messages() {
     LOG_DBG("%s\n", __func__);
 
@@ -1749,18 +1750,20 @@ static void test_responses_system_messages() {
     assert_equals(std::string("user"), msgs2[5].at("role").get<std::string>());
     assert_equals(std::string("Permissions: read-only"), msgs2[5].at("content").get<std::string>());
 
-    // a developer notice inside a tool-call loop joins the first system message, so the loop stays one turn
+    // a developer notice inside a tool-call loop joins a second system message, so the loop stays one turn and the
+    // app's own system message stays the same
     json turn3 = turn2;
     turn3.push_back({ { "type", "function_call" }, { "call_id", "call_1" }, { "name", "shell" }, { "arguments", "{}" } });
     turn3.push_back({ { "type", "function_call_output" }, { "call_id", "call_1" }, { "output", "a.txt" } });
     turn3.push_back(message("developer", "<image_resize_notice>resized</image_resize_notice>"));
     turn3.push_back(message("assistant", "One file."));
     const json msgs3 = convert(turn3);
-    assert_equals((size_t)10, msgs3.size());
-    assert_equals(std::string("Base instructions.\n\nApp context.\n\nSkills.\n\n<image_resize_notice>resized</image_resize_notice>"),
-                  msgs3[0].at("content").get<std::string>());
-    assert_equals(std::string("tool"), msgs3[8].at("role").get<std::string>());
-    assert_equals(std::string("assistant"), msgs3[9].at("role").get<std::string>());
+    assert_equals((size_t)11, msgs3.size());
+    assert_equals(std::string("Base instructions.\n\nApp context.\n\nSkills."), msgs3[0].at("content").get<std::string>());
+    assert_equals(std::string("system"), msgs3[1].at("role").get<std::string>());
+    assert_equals(std::string("<image_resize_notice>resized</image_resize_notice>"), msgs3[1].at("content").get<std::string>());
+    assert_equals(std::string("tool"), msgs3[9].at("role").get<std::string>());
+    assert_equals(std::string("assistant"), msgs3[10].at("role").get<std::string>());
 
     // templates that take one system message at the start render the first turn; Qwen3.6's dropped the third
     // leading developer message and the later one
@@ -1779,6 +1782,73 @@ static void test_responses_system_messages() {
         assert_equals(std::string::npos, prompt.find("<|im_start|>system", 1));
         assert_equals(true, leading != std::string::npos && leading < env && env != std::string::npos && env < time &&
                                 time != std::string::npos && time < question && question != std::string::npos);
+    }
+}
+
+// Codex's leading developer messages become two system messages, cut before the first part that depends on the user
+// (display mode, skills, permissions, chosen mode, deferred tools), and the request says so: the templates put the
+// second after the app's instructions and the tools, so every user of the app shares the prompt up to it. No part
+// moves: a later part of the app's (multi_agent_mode) stays after the ones before it.
+static void test_responses_user_context() {
+    LOG_DBG("%s\n", __func__);
+
+    const auto developer = [](std::vector<const char *> texts) {
+        json content = json::array();
+        for (const char * text : texts) {
+            content.push_back({ { "type", "input_text" }, { "text", text } });
+        }
+        return json{ { "type", "message" }, { "role", "developer" }, { "content", content } };
+    };
+    const auto user = [](const char * text) {
+        return json{ { "type", "message" }, { "role", "user" },
+                     { "content", json::array({ { { "type", "input_text" }, { "text", text } } }) } };
+    };
+    const json tools = json::array({ { { "type", "function" }, { "name", "exec_command" }, { "description", "Run a command." },
+                                       { "parameters", { { "type", "object" }, { "properties", json::object() } } } } });
+    const json input = json::array({
+        developer({ "You are Codex." }),
+        developer({ "<app-context>\nDisplay mode.</app-context>", "<skills_instructions>\nSkills.</skills_instructions>",
+                    "<permissions instructions>\nSandbox.</permissions instructions>",
+                    "<collaboration_mode>Default.</collaboration_mode>", "<tools>\nDeferred.</tools>" }),
+        developer({ "<multi_agent_role>Root.</multi_agent_role>" }),
+        user("<environment_context>cwd</environment_context>"),
+        user("hi"),
+    });
+
+    const json body = server_chat_convert_responses_to_chatcmpl(json{ { "input", input }, { "model", "test-model" }, { "tools", tools } });
+    const json & msgs = body.at("messages");
+    assert_equals((size_t)4, msgs.size());
+    assert_equals(std::string("You are Codex."), msgs[0].at("content").get<std::string>());
+    assert_equals(std::string("system"), msgs[1].at("role").get<std::string>());
+    assert_equals(std::string("<app-context>\nDisplay mode.</app-context>\n\n<skills_instructions>\nSkills.</skills_instructions>\n\n"
+                              "<permissions instructions>\nSandbox.</permissions instructions>\n\n<collaboration_mode>Default.</collaboration_mode>\n\n"
+                              "<tools>\nDeferred.</tools>\n\n<multi_agent_role>Root.</multi_agent_role>"),
+                  msgs[1].at("content").get<std::string>());
+    assert_equals(true, json_value(body, SERVER_USER_CONTEXT_SYSTEM_MESSAGE, false));
+
+    // without such parts the leading messages stay one system message and the request says nothing
+    const json plain = server_chat_convert_responses_to_chatcmpl(
+        json{ { "input", json::array({ developer({ "You are Codex.", "<multi_agent_role>Root.</multi_agent_role>" }), user("hi") }) },
+              { "model", "test-model" } });
+    assert_equals((size_t)2, plain.at("messages").size());
+    assert_equals(false, plain.contains(SERVER_USER_CONTEXT_SYSTEM_MESSAGE));
+
+    // Gemma 4 renders the second message in a system turn after the one with the app's instructions and the tools;
+    // Qwen3.6 puts the tools first and the two system messages after them, in the order sent
+    for (const char * path : { "models/templates/google-gemma-4-31B-it.jinja", "models/templates/unsloth-Qwen3.6-35B-A3B.jinja" }) {
+        auto tmpls = read_templates(path);
+        common_chat_templates_inputs inputs;
+        inputs.messages = common_chat_msgs_parse_oaicompat(msgs);
+        inputs.tools    = common_chat_tools_parse_oaicompat(body.at("tools"));
+        const std::string prompt = common_chat_templates_apply(tmpls.get(), inputs).prompt;
+        const size_t app     = prompt.find("You are Codex.");
+        const size_t tool    = prompt.find("exec_command");
+        const size_t context = prompt.find("<app-context>");
+        const size_t env     = prompt.find("<environment_context>cwd</environment_context>");
+        assert_equals(true, app != std::string::npos && tool != std::string::npos && context != std::string::npos &&
+                                env != std::string::npos && app < context && tool < context && context < env);
+        const size_t role = prompt.find("<multi_agent_role>Root.</multi_agent_role>");
+        assert_equals(true, role != std::string::npos && context < role && role < env);
     }
 }
 
@@ -1887,6 +1957,49 @@ static void test_muse_spark_peg_parsers(bool detailed_debug) {
             assert_equals(true, prompt.find(expected) != std::string::npos);
         }
     }
+    // K3 GGUFs use XTML control tokens around ordinary text tag names.
+    {
+        const std::string tmpl =
+            R"({% for m in messages %}<|open|>message role="{{ m.role }}"<|sep|>{{ m.content }}<|close|>message<|sep|><|end_of_msg|>{% endfor %})"
+            R"({% if add_generation_prompt %}<|open|>message role="assistant"<|sep|>{% if enable_thinking %}<|open|>think<|sep|>{% else %}<|open|>response<|sep|>{% endif %}{% endif %})";
+        common_chat_templates_ptr tmpls(common_chat_templates_init(nullptr, tmpl));
+        test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+            tc.params.enable_thinking = false;
+            tc.params.tools = {{"measure", "", R"({"type":"object","properties":{"value":{"type":"number"}}})"}};
+            tc.input = "<|close|>response<|sep|><|open|>tools<|sep|>"
+                       "<|open|>call tool=\"measure\" index=\"1\"<|sep|>"
+                       "<|open|>argument key=\"value\" type=\"number\"<|sep|>-0.125<|close|>argument<|sep|>"
+                       "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
+            tc.expect = simple_assist_msg("", "", "measure", R"({"value":-0.125})");
+        }, detailed_debug);
+        for (bool thinking : {false, true}) {
+            test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                tc.params.enable_thinking = thinking;
+                tc.params.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+                tc.input = thinking ? "Calculate.<|close|>think<|sep|><|open|>response<|sep|>" : "";
+                tc.input += "5<|close|>response<|sep|><|close|>message<|sep|><|end_of_msg|>";
+                tc.expect = simple_assist_msg("5", thinking ? "Calculate." : "");
+            }, detailed_debug);
+            for (auto choice : {COMMON_CHAT_TOOL_CHOICE_AUTO, COMMON_CHAT_TOOL_CHOICE_NONE}) {
+                test_peg_parser(tmpls.get(), [&](peg_test_case & tc) {
+                    tc.params.enable_thinking = thinking;
+                    tc.params.reasoning_format = COMMON_REASONING_FORMAT_NONE;
+                    tc.params.tools = { special_function_tool };
+                    tc.params.tool_choice = choice;
+                    tc.input = thinking ? "Calculate.<|close|>think<|sep|><|open|>response<|sep|>" : "";
+                    tc.input += "5<|close|>response<|sep|><|open|>tools<|sep|>"
+                                "<|open|>call tool=\"special_function\" index=\"1\"<|sep|>"
+                                "<|open|>json type=\"object\"<|sep|>{\"arg1\":1}<|close|>json<|sep|>"
+                                "<|close|>call<|sep|><|close|>tools<|sep|><|close|>message<|sep|><|end_of_msg|>";
+                    const std::string content = thinking ? "<|open|>think<|sep|>Calculate.<|close|>think<|sep|>5" : "5";
+                    tc.expect = choice == COMMON_CHAT_TOOL_CHOICE_NONE
+                        ? simple_assist_msg(content)
+                        : simple_assist_msg(content, "", "special_function", "{\"arg1\":1}");
+                }, detailed_debug);
+            }
+        }
+    }
+
     // Muse Spark format tests
     {
         auto tst = peg_tester("models/templates/muse-spark.jinja", detailed_debug);
@@ -5099,6 +5212,7 @@ int main(int argc, char ** argv) {
         test_convert_responses_to_chatcmpl();
         test_developer_role_to_system_workaround();
         test_responses_system_messages();
+        test_responses_user_context();
         test_anthropic_system_messages();
         test_reka_edge_common_path();
         test_template_reasoning();

@@ -57,9 +57,9 @@ bool baseline_accepts(llm_arch arch, float clamp, const llama_ssd::expert_inputs
         !in.up_scale && !in.gate_scale && !in.down_scale &&
         !in.weight_before_ffn && !in.has_lora;
     const bool deepseek = layout && arch == LLM_ARCH_DEEPSEEK41 &&
-        in.silu && (in.n_tokens == 1 || in.prefill) && std::isfinite(clamp) && clamp > 1e-6f;
-    const bool muse = layout && arch == LLM_ARCH_MUSE_SPARK && in.silu && in.post_norm;
-    const bool qwen = layout && (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE) && in.silu;
+        in.gate_matches_model && std::isfinite(clamp) && clamp > 1e-6f;
+    const bool muse = layout && arch == LLM_ARCH_MUSE_SPARK && in.gate_matches_model && in.post_norm;
+    const bool qwen = layout && (arch == LLM_ARCH_QWEN4EXP || arch == LLM_ARCH_QWEN35MOE) && in.gate_matches_model;
     return deepseek || muse || qwen;
 }
 
@@ -131,7 +131,7 @@ void model_and_numeric_boundaries() {
     for (int tokens : {1, 2, 32}) {
         for (bool prefill : {false, true}) {
             in = f.inputs(); in.n_tokens = tokens; in.prefill = prefill;
-            compare(LLM_ARCH_DEEPSEEK41, 7.0f, in);
+            CHECK(compare(LLM_ARCH_DEEPSEEK41, 7.0f, in));
             CHECK(compare(LLM_ARCH_MUSE_SPARK, 7.0f, in));
             CHECK(compare(LLM_ARCH_QWEN4EXP, 7.0f, in));
             CHECK(compare(LLM_ARCH_QWEN35MOE, 7.0f, in));
@@ -173,12 +173,34 @@ void qwen_experts(llm_arch arch, ggml_type up_gate, ggml_type down, int64_t n_em
     }
     auto lora = in; lora.has_lora = true;
     CHECK(!compare(arch, 0.0f, lora));
-    auto gelu = in; gelu.silu = false;
+    auto gelu = in; gelu.gate_matches_model = false;
     CHECK(!compare(arch, 0.0f, gelu));
     const ggml_type other_type = up_gate == GGML_TYPE_Q4_K ? GGML_TYPE_Q5_K : GGML_TYPE_Q4_K;
     const ggml_tensor other = tensor(other_type, n_embd, n_ff, n_expert);
     auto mixed = in; mixed.gate = &other;
     CHECK(compare(arch, 0.0f, mixed)); // the executor checks the gate's type
+}
+
+void kimi_k3_quantized_experts() {
+    const auto requirements = llama_ssd::describe_experts(LLM_ARCH_KIMI_K3, llama_hparams{}, 1);
+    for (const auto up : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS}) {
+        for (const auto down : {GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS}) {
+            fixture f;
+            f.up = f.gate = tensor(up, 3584, 3072, 896);
+            f.down = tensor(down, 3072, 3584, 896);
+            auto in = f.inputs();
+            in.n_embd = 3584;
+            in.post_norm = nullptr;
+            for (int tokens : {1, 16}) {
+                in.n_tokens = tokens;
+                in.prefill = tokens > 1;
+                const auto validated = llama_ssd::validate_experts(requirements, in);
+                CHECK(validated.accepted() && validated.execution.activation == llama_ssd::expert_activation::situ);
+            }
+            in.gate_matches_model = false;
+            CHECK(llama_ssd::validate_experts(requirements, in).refusal == llama_ssd::expert_refusal::incompatible_gate);
+        }
+    }
 }
 
 void layout_refusals() {
@@ -205,7 +227,7 @@ void layout_refusals() {
     }
     using flag = bool llama_ssd::expert_inputs::*;
     for (flag field : {&llama_ssd::expert_inputs::backend_available,
-            &llama_ssd::expert_inputs::runtime_available, &llama_ssd::expert_inputs::silu,
+            &llama_ssd::expert_inputs::runtime_available, &llama_ssd::expert_inputs::gate_matches_model,
             &llama_ssd::expert_inputs::weight_before_ffn, &llama_ssd::expert_inputs::has_lora}) {
         auto in = f.inputs(); in.*field = !(in.*field);
         CHECK(!compare(LLM_ARCH_DEEPSEEK41, 7.0f, in));
@@ -289,10 +311,11 @@ void refusal_reasons() {
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::extra_parameters);
     in = good; in.has_lora = true;
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::lora);
-    in = good; in.silu = false;
-    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::not_silu_gated);
+    in = good; in.gate_matches_model = false;
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::incompatible_gate);
+    // a decode ubatch of several rows (a draft to verify): the decode runs each row as one token
     in = good; in.n_tokens = 2;
-    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::token_batch);
+    CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, in) == refusal::none);
     CHECK(refusal_of(LLM_ARCH_DEEPSEEK41, good, 0.0f) == refusal::invalid_clamp);
     in = good; in.post_norm = nullptr;
     CHECK(refusal_of(LLM_ARCH_MUSE_SPARK, in) == refusal::missing_post_norm);
@@ -324,6 +347,7 @@ int main() {
     model_and_numeric_boundaries();
     qwen_experts(LLM_ARCH_QWEN4EXP, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 2560, 640, 512);
     qwen_experts(LLM_ARCH_QWEN35MOE, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, 2048, 512, 256);
+    kimi_k3_quantized_experts();
     layout_refusals();
     quantization_contract();
     refusal_reasons();

@@ -25,6 +25,13 @@ source tree.
    the commit that ports a change names its upstream commit. Copyright (c)
    2023-2026 The ggml authors. MIT (engine/LICENSE).
 
+   Slot-start SSE headers and idle pings are backported from llama.cpp revisions
+   0821c5fcfd729af70037bc1e9e60769d42c081ba and
+   60130d18f9ac7f42cb4d7f6060b088a45d8f242e (pull requests 23884 and 24013).
+   The response-queue wait deadline is backported from revision
+   4e201388c319fc9f747fbe6a666793e2dc2a6d8e (pull request 29707).
+   The same MIT license applies.
+
 2. DeepSeek V4 support
    https://github.com/nisparks/llama.cpp
    Ported from Nicholas Sparks' MIT-licensed fork. Copyright (c) 2023-2026

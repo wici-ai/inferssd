@@ -2394,6 +2394,32 @@ bool ggml_backend_sched_alloc_prepared(ggml_backend_sched_t sched, struct ggml_c
         ggml_backend_sched_reset(sched);
         return false;
     }
+    // An explicit assignment or an in-place op can give a GPU node a destination in another memory domain.
+    // Check the actual buffers once when binding a prepared graph, before any split executes or begins capture.
+    for (int i = 0; i < sched->n_splits; ++i) {
+        const auto & split = sched->splits[i];
+        ggml_backend_t backend = sched->backends[split.backend_id];
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        const auto default_buft = ggml_backend_get_default_buffer_type(backend);
+        for (int j = split.i_start; j < split.i_end; ++j) {
+            const ggml_tensor * node = graph->nodes[j];
+            if (!node->buffer || node->buffer->buft == default_buft || !(node->flags & GGML_TENSOR_FLAG_COMPUTE) ||
+                    node->op == GGML_OP_NONE || ggml_is_view_op(node->op) || ggml_is_empty(node) ||
+                    ggml_backend_supports_buft(backend, node->buffer->buft)) {
+                continue;
+            }
+            size_t free = 0, total = 0;
+            ggml_backend_dev_memory(dev, &free, &total);
+            GGML_LOG_ERROR("%s: %s cannot write %s (%s) in buffer %s; %zu of %zu MiB free on this device\n",
+                __func__, ggml_backend_name(backend), node->name, ggml_op_name(node->op),
+                ggml_backend_buffer_name(node->buffer), free >> 20, total >> 20);
+            ggml_backend_sched_reset(sched);
+            return false;
+        }
+    }
     sched->prepared_graph = nullptr;
     sched->prepared_reserved = false;
     sched->is_alloc = true;
