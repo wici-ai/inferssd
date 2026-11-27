@@ -11,6 +11,7 @@
 #include "declared-layout.h"
 #include "host-jobs-test.inc"
 #include "gpu-runtime.h"
+#include "ggml-cuda.h"
 
 namespace {
 double relative_l2(const std::vector<float> & got, const std::vector<float> & expected) {
@@ -189,7 +190,16 @@ void run_rows(fixture_inputs & inputs, size_t & checks, double & worst_rel, doub
             const auto s = step(layer);
             const auto input = rows_input(f, s.rows(), int(token) * 7 + layer);
             ssd_cpu_sink_stats one = {}, each = {}, mixed = {}, reference = {};
+            size_t held = 0, now_held = 0, reachable = 0;
+            ggml_cuda_reserve_state(0, &held, &reachable);
             const auto a = run_rows_step(inputs, f, rows.get(), s, input, true, activation, one);
+            ggml_cuda_reserve_state(0, &now_held, &reachable);
+            if (token == 4 && layer == 1) {
+                // the first run of the rows' 32 routes grows the decode engine past a one-row layer's 16 rows: what
+                // the process holds grows by the new rows' device buffers, 2 latent and 3 hidden floats a row
+                require(now_held >= held + size_t(16) * size_t(2 * f.latent + 3 * f.hidden) * sizeof(float),
+                    "the decode engine grew without counting its device memory as held");
+            }
             const auto b = run_rows_step(inputs, f, own.get(), s, input, false, activation, each);
             require(one.read_requests == 0 && one.cache_hits == 0 && each.read_requests == 0,
                 "the full tier did not serve every expert of the rows");
