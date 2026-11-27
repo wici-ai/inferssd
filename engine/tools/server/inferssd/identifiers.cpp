@@ -208,11 +208,12 @@ struct learned_identifier {
     int         kind;
 };
 
-// The folders the apps name in their system and developer messages that change with the project, the session or an
-// update. Each one found, in the order found, becomes an identifier; the n-th one of a kind gets "-n" after its
-// stand-in, unless its stand-in already names it alone.
+// The folders the apps name in their system and developer messages (app_message) that change with the project, the
+// session or an update, and those of the folders that an app names in a system message the server renders as the
+// user's, in any message. Each one found, in the order found, becomes an identifier; the n-th one of a kind gets "-n"
+// after its stand-in, unless its stand-in already names it alone.
 void learn_identifiers(const std::string & text, const server_identifier_env & env,
-                       std::vector<learned_identifier> & out) {
+                       std::vector<learned_identifier> & out, bool app_message) {
     const auto found = [&](int kind, std::string id, std::string stand_in, bool numbered = true) {
         int n = 1;
         for (const auto & l : out) {
@@ -227,6 +228,26 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
         out.push_back({std::move(id), std::move(stand_in), kind});
     };
     const auto sep_at = [&](size_t i) { return i < text.size() && is_separator(text[i]); };
+
+    // the folder of the job that titles a Claude desktop session, .../Claude-3p/ccd-session-secrets/fork-<uuid>: the
+    // app names it as the working directory in the environment it sends after the job's prompt, as a system message
+    // that the server renders as the user's (server_chat_convert_anthropic_to_oai)
+    static const std::string secrets = "ccd-session-secrets";
+    for (size_t at = text.find(secrets); at != std::string::npos; at = text.find(secrets, at + 1)) {
+        const size_t begin = literal_end(text, at + secrets.size(), "/fork-");
+        const size_t end   = begin == std::string::npos ? begin : run_end(text, begin, is_hex_or_dash);
+        if (begin == std::string::npos || end != begin + 36 || (end < text.size() && is_name_byte(text[end]))) {
+            continue;
+        }
+        std::string stand_in = text.substr(at, begin - at);
+        for (size_t j = begin; j < end; ++j) {
+            stand_in += text[j] == '-' ? '-' : '0';
+        }
+        found(8, text.substr(at, end - at), stand_in);
+    }
+    if (!app_message) {
+        return;
+    }
 
     // Claude Code's memory folder: ~/.claude/projects/<project>/memory
     for (size_t at = text.find(".claude"); at != std::string::npos; at = text.find(".claude", at + 1)) {
@@ -549,10 +570,8 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
         for (auto & msg : messages) {
             const std::string role = msg.is_object() && msg.contains("role") && msg.at("role").is_string() ?
                                          msg.at("role").get<std::string>() : std::string();
-            if (role != "system" && role != "developer") {
-                continue;
-            }
-            auto learn = [&](std::string & text) { learn_identifiers(text, env, learned); };
+            const bool app_message = role == "system" || role == "developer";
+            auto learn = [&](std::string & text) { learn_identifiers(text, env, learned, app_message); };
             if (msg.contains("content")) {
                 for_each_text(msg.at("content"), learn);
             }

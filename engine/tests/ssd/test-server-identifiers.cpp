@@ -221,6 +221,53 @@ static void test_claude_desktop_sessions_share_their_context() {
             "a path in the session's Linux environment: " + map_a.to_identifiers(vm_path, false));
 }
 
+// The job that titles a Claude desktop session works in a folder of its own, which the app names in the environment
+// it sends as a system message; the server renders that as the user's text (server_chat_convert_anthropic_to_oai).
+static void test_claude_desktop_title_jobs_share_their_context() {
+    const server_identifier_env env = mac_env(users("alice"), "");
+    const auto request = [&](const std::string & folder) {
+        const std::string text = "<system-reminder>\n# Environment\nYou have been invoked in the following "
+                                 "environment: \n - Primary working directory: " + folder +
+                                 "\n - Is a git repository: false\n"
+                                 "</system-reminder>\n\nYou are coming up with a title.";
+        return json{{"messages", json::array({{{"role", "system"}, {"content", "You write short session titles."}},
+                                              {{"role", "user"}, {"content", text}}})}};
+    };
+    const std::string secrets = "/Library/Application Support/Claude-3p/ccd-session-secrets/fork-";
+    json a = request(env.home + secrets + "a87d132d-619f-4c94-9d22-5c0497c0e2bd");
+    json b = request(env.home + secrets + "4b8b9797-82fb-4214-88e6-69d30e8af713");
+    const std::string original = text_of(a["messages"][1]);
+    const server_identifier_map map = server_identifiers_apply(a, env);
+    server_identifiers_apply(b, env);
+    require(a == b, "two sessions' title jobs get the same text: " + text_of(a["messages"][1]) + " | " +
+                        text_of(b["messages"][1]));
+    require(text_of(a["messages"][1]).find(" - Primary working directory: " + STAND_IN + secrets +
+                                           "00000000-0000-0000-0000-000000000000\n") != std::string::npos,
+            "the folder's stand-in: " + text_of(a["messages"][1]));
+    require(map.to_identifiers(text_of(a["messages"][1]), false) == original, "the folder comes back");
+
+    server_identifier_env win;
+    win.home          = "C:\\Users\\bob";
+    win.home_stand_in = "C:\\Users\\infer";
+    win.windows       = true;
+    const std::string local = "\\AppData\\Local\\Claude-3p\\ccd-session-secrets\\fork-";
+    json w = request(win.home + local + "a6e7798f-d31e-4748-8176-c58c2b23205b");
+    server_identifiers_apply(w, win);
+    require(text_of(w["messages"][1]).find(" - Primary working directory: " + win.home_stand_in + local +
+                                           "00000000-0000-0000-0000-000000000000\n") != std::string::npos,
+            "Windows: " + text_of(w["messages"][1]));
+
+    // a folder of another shape stays, and the other folders are learned from the apps' system messages only
+    for (const std::string & other : { secrets + "a87d132d", secrets + "a87d132d-619f-4c94-9d22-5c0497c0e2bdx",
+                                       std::string("/Documents/Codex/2026-11-19/q") }) {
+        json o = request(env.home + other);
+        server_identifiers_apply(o, env);
+        require(text_of(o["messages"][1]).find(" - Primary working directory: " + STAND_IN + other + "\n") !=
+                    std::string::npos,
+                "another folder in a user message stays: " + text_of(o["messages"][1]));
+    }
+}
+
 static void test_chatgpt_conversations_share_their_context() {
     const server_identifier_env env = mac_env(users("alice"), "");
     const auto request = [&](const std::string & date, const std::string & name) {
@@ -527,6 +574,7 @@ int main() {
     test_claude_desktop_env_lines();
     test_claude_code_shares_its_context();
     test_claude_desktop_sessions_share_their_context();
+    test_claude_desktop_title_jobs_share_their_context();
     test_chatgpt_conversations_share_their_context();
     test_chatgpt_visualizations_share_their_context();
     test_plugin_versions_share_their_context();

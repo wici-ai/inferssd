@@ -11,21 +11,22 @@
 // and the fixed stand-ins the model sees in their place.
 //
 // A prompt is cached as a prefix: the state of an app's leading context (its system prompt and tools, 10k-50k tokens)
-// is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the
-// home directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop
-// app the skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the
-// folder of its visualizations, both dated; Codex and the ChatGPT desktop app name the folder of each version of a
-// plugin they list skills of. A new project, session, user or plugin update would process all of the context after
-// them again. The server gives the model stand-ins
-// for these identifiers wherever they occur in a request, and puts the request's identifiers back in place of the
-// stand-ins in what the model writes. The model only copies such strings into paths, so it does the same work, and
+// is shared only up to the first byte that differs. Claude Code writes its memory directory into that context (the home
+// directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop app the
+// skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the folder of its
+// visualizations, both dated; Codex and the ChatGPT desktop app name the folder of each version of a plugin they list
+// skills of; the Claude desktop app names the folder of the job that titles a session as its working directory. A new
+// project, session, user or plugin update would process all of the context after them again. The server gives the model
+// stand-ins for these identifiers wherever they occur in a request, and puts the request's identifiers back in place of
+// the stand-ins in what the model writes. The model only copies such strings into paths, so it does the same work, and
 // the client sees its own paths. The user name in the stand-ins is infer: with inferssd, three tokens to Qwen3.6,
-// Qwen3.6-35B-A3B left out the .claude after it in 3 of 4 copies of Claude Code's memory folder, with infer in none
-// of 6.
+// Qwen3.6-35B-A3B left out the .claude after it in 3 of 4 copies of Claude Code's memory folder, with infer in none of
+// 6.
 //
-// The identifiers are the home directory, the user's temporary directory, and the folders the apps name in their
-// system and developer messages (see identifiers.cpp). A match must start and end at a name boundary. A request whose
-// text the stand-ins cannot be taken back out of exactly (one that has a stand-in in it already, say) is left as it is.
+// The identifiers are the home directory, the user's temporary directory, and the folders the apps name in their system
+// and developer messages (see identifiers.cpp), and the title job's folder in any message: the app names it in a system
+// message that the server renders as the user's. A match must start and end at a name boundary. A request whose text
+// the stand-ins cannot be taken back out of exactly (one that has a stand-in in it already, say) is left as it is.
 struct server_identifier_map {
     // (identifier, stand-in), every spelling; empty: the request is left as it is
     std::vector<std::pair<std::string, std::string>> pairs;
