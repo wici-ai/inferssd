@@ -4,7 +4,7 @@ and drafting can be faster on the machine."""
 
 import hashlib
 import json
-import posixpath
+import os
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -67,19 +67,19 @@ def test_heads_beside_above_and_in_an_mtp_directory(tmp_path):
     model = touch(tmp_path / "bart" / "Qwen3.8-Flash-Next-IQ4_XS" / FLASH)
     small = touch(tmp_path / "bart" / "mtp-Qwen3.8-Flash-Next-Q4_0.gguf", 4)
     touch(tmp_path / "bart" / "mtp-Qwen3.8-Flash-Next-Q8_0.gguf", 8)
-    assert draft_head(Files(), model, posixpath) == small
+    assert draft_head(Files(), model, os.path) == small
     # unsloth: the heads in an MTP directory; a head borrowing the model's matrices comes first
     model = touch(
         tmp_path / "uns" / "UD-Q4_K_XL" / "Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
     )
     touch(tmp_path / "uns" / "MTP" / "mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf", 4)
     shared = touch(tmp_path / "uns" / "MTP" / "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", 8)
-    assert draft_head(Files(), model, posixpath) == shared
+    assert draft_head(Files(), model, os.path) == shared
     # a head of another model, or none
     model = touch(tmp_path / "other" / "Muse-Spark-Q4_0.gguf")
     touch(tmp_path / "other" / "mtp-Qwen3.8-Flash-Next-Q4_0.gguf")
-    assert draft_head(Files(), model, posixpath) is None
-    assert draft_head(Files(), touch(tmp_path / "alone" / FLASH), posixpath) is None
+    assert draft_head(Files(), model, os.path) is None
+    assert draft_head(Files(), touch(tmp_path / "alone" / FLASH), os.path) is None
 
 
 def probe(dense, draft=0.5):
@@ -98,6 +98,10 @@ PAYS = probe([10.0, 10.2, 10.4, 10.6])
 NEVER = probe([10.0, 20.0, 30.0, 40.0], 5.0)
 DRAFT_FACTS = ("draft_model_facts", "decode_steps", "decode_probe")
 FLASH_SHAPE = dict(experts=64, used=4, latent=256, hidden=128, gate=Q8_0, up=Q8_0, down=Q8_0)
+
+
+# A Linux launch names its files with POSIX paths, which a Windows tmp_path is not.
+linux_launch = pytest.mark.skipif(sys.platform == "win32", reason="a Linux launch: POSIX paths")
 
 
 def flash_launch(tmp_path, head=True, measured=PAYS):
@@ -121,6 +125,7 @@ def asked(result, name):
     return [fact for fact in result.observations if fact.name == name]
 
 
+@linux_launch
 def test_the_strategy_drafts_with_the_head_and_reads_its_experts(tmp_path):
     inputs, spec, adapter, out, head = flash_launch(tmp_path)
     result, line, stderr = resolved(inputs, spec, adapter, out)
@@ -156,6 +161,7 @@ def test_the_strategy_drafts_with_the_head_and_reads_its_experts(tmp_path):
     assert request.characteristics_sha256 == line["strategy"]["inputs"]["characteristics_sha256"]
 
 
+@linux_launch
 def test_a_head_that_cannot_pay_is_left_out(tmp_path):
     inputs, spec, adapter, out, head = flash_launch(tmp_path, measured=NEVER)
     result, line, _ = resolved(inputs, spec, adapter, out)
@@ -173,6 +179,7 @@ def test_a_head_that_cannot_pay_is_left_out(tmp_path):
     assert line["strategy"]["notes"][:-1] == plain_line["strategy"]["notes"]
 
 
+@linux_launch
 def test_a_failed_probe_or_facts_leave_the_head_out(tmp_path):
     reason = "the server exited with status 1: unknown argument: --ssd-decode-probe"
     inputs, spec, adapter, out, head = flash_launch(tmp_path / "probe", measured=reason)
@@ -192,6 +199,7 @@ def test_a_failed_probe_or_facts_leave_the_head_out(tmp_path):
     assert not asked(result, "decode_steps") and not asked(result, "decode_probe")
 
 
+@linux_launch
 def test_a_kept_measurement_is_reused_without_the_engine(tmp_path):
     inputs, spec, adapter, out, head = flash_launch(tmp_path, measured=None)
     adapter.host["decode_steps"] = PAYS
@@ -210,6 +218,7 @@ def test_without_a_head_nothing_drafts(tmp_path):
     assert not any(asked(result, name) for name in DRAFT_FACTS) and stderr == ""
 
 
+@linux_launch
 def test_a_users_speculative_decoding_wins(tmp_path):
     inputs, spec, adapter, out, head = flash_launch(tmp_path)
     inputs = replace(inputs, extra=("--spec-type", "ngram-simple"))
