@@ -263,6 +263,9 @@ replaces that reading with the amount given, up to the installed memory and, on
 Linux, the tightest cgroup `memory.max` above the process, since a launch never
 gets more. The `estimate memory` line names the amount used. GPU memory is
 still the free memory read when the estimate is made.
+Where a launch measured a routed model's decode steps on this machine, as it is profiled
+now, with the selected engine, the measured dense time of a one-row step replaces the
+priced one, and `assumptions` says so.
 An explicit target is estimated where a launch runs it as its header describes it: a
 decoder needs no model profile; separated routed experts need one, a layout the SSD
 path runs and expert formats its CPU executor computes. GPU placement follows the GPU

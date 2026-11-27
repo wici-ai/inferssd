@@ -14,6 +14,8 @@ from unittest.mock import Mock
 import pytest
 from test_decode_profiling import setup as gpu_machine
 from test_launch_strategy import native, resolved, strategic
+from test_machine_command import execute, machine
+from test_machine_probes import FakeRunner
 from test_strategy_estimate import MAC
 from test_strategy_inputs import Q8_0, EngineHost, engine_facts, moe, recorded_facts
 
@@ -23,7 +25,9 @@ from inferssd.launch.live import LiveArtifacts
 from inferssd.launch.recorded import RecordedArtifacts
 from inferssd.launch.typed import draft_head, head_model
 from inferssd.launch.types import Fact, LaunchInput
+from inferssd.machine.characteristics import dumps
 from inferssd.machine.identity import Command
+from inferssd.machine.store import save
 from inferssd.strategy.drafting import drafting, routed_ms
 from inferssd.strategy.estimate import decode_estimate
 from inferssd.strategy.inputs import (
@@ -325,6 +329,25 @@ def test_without_an_expert_estimate_only_the_dense_work_is_compared():
     assert routed_ms(gone) is None
 
 
+def test_a_measured_dense_time_replaces_the_priced_one():
+    characteristics, runtime = gpu_machine()
+    plain, _ = qwen_facts()
+    drive = characteristics["storage"][0]["drive_key"]
+
+    def estimate(**options):
+        return decode_estimate(
+            characteristics, plain, plain.dense_read_bytes, runtime, "linux", drive, **options
+        )
+
+    priced, measured = estimate(), estimate(measured_dense_ms=4.5)
+    assert measured.components["dense_ms"] == 4.5 != priced.components["dense_ms"]
+    assert routed_ms(measured) == routed_ms(priced)
+    assert measured.tokens_per_second == pytest.approx(1e3 / (4.5 + routed_ms(priced)))
+    added = set(measured.assumptions) - set(priced.assumptions)
+    assert len(added) == 1 and "engine's measurement" in added.pop()
+    assert estimate(measured_dense_ms=None) == priced
+
+
 def test_the_engines_facts_with_the_head(tmp_path):
     model, head = str(tmp_path / "m.gguf"), str(tmp_path / "mtp-m.gguf")
     shape = dict(experts=8, used=2, latent=64, hidden=32, gate=Q8_0, up=Q8_0, down=Q8_0)
@@ -459,3 +482,48 @@ def test_recorded_decode_probes():
         recorded({"decode_steps": dict(PAYS, steps=0)}, "decode_steps")
     with pytest.raises(ValueError, match="decode_steps"):
         recorded({"decode_steps": "not a measurement"}, "decode_steps")
+
+
+def test_the_estimates_take_a_kept_measurement_of_the_model(tmp_path):
+    host, paths, build = machine(tmp_path)
+    profile, runtime = gpu_machine()
+    saved = tmp_path / "machine.json"
+    save(profile, saved)
+    server = build / "bin" / "inferssd-server"
+    server.write_bytes(b"server build")
+    raw = engine_facts(*moe("qwen4exp", layers=2, **FLASH_SHAPE), path=paths[0])
+    exported = tmp_path / "facts.json"
+    exported.write_text(json.dumps(raw))
+    args = ["--show", "--output", str(saved), "--json", "--build", str(build)]
+    args += ["--estimate-facts", str(exported)]
+
+    def dense_ms():
+        (row,) = json.loads(execute(args, host, FakeRunner({}), tmp_path, runtime=runtime)[1][0])[
+            "estimates"
+        ]
+        return row["components"]["dense_ms"]
+
+    priced = dense_ms()
+    # A launch on this machine and engine measured the model with any arguments.
+    kept = tmp_path / "state" / "inferssd" / decode_steps.FILENAME
+    entry = {
+        "key": "k",
+        "server_sha256": decode_steps.file_sha256(str(server)),
+        "characteristics_sha256": hashlib.sha256(dumps(profile).encode()).hexdigest(),
+        "model": [["/elsewhere/" + Path(paths[0]).name, 1]],
+        "head": ["/elsewhere/mtp-head.gguf", 1],
+        "arguments": [str(server)],
+        "measured_utc": "2026-11-27T00:00:00Z",
+        "measurement": probe([3.25, 3.5]),
+    }
+    kept.parent.mkdir(parents=True)
+    kept.write_text(json.dumps({"schema": decode_steps.SCHEMA, "entries": [entry]}))
+    assert priced != 3.25 and dense_ms() == 3.25
+    # Not another engine's, nor another model's.
+    kept.write_text(
+        json.dumps({"schema": decode_steps.SCHEMA, "entries": [dict(entry, server_sha256="x")]})
+    )
+    assert dense_ms() == priced
+    entry["model"] = [["/elsewhere/other.gguf", 1]]
+    kept.write_text(json.dumps({"schema": decode_steps.SCHEMA, "entries": [entry]}))
+    assert dense_ms() == priced

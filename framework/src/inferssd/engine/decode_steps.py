@@ -227,3 +227,25 @@ def probe(request: Request, path: Path, run: Run) -> Union[dict[str, Any], str]:
         entries = [old for old in kept(path) if old["key"] != entry["key"]] + [entry]
         replace_text(path, json.dumps({"schema": SCHEMA, "entries": entries}, indent=2) + "\n")
     return measured
+
+
+def dense_ms(
+    entries: Sequence[Mapping[str, Any]],
+    server_sha256: str,
+    characteristics_sha256: str,
+    model: Sequence[str],
+) -> Optional[float]:
+    """The dense time of a one-row step of MODEL (its files, by name) measured with this server
+    on this machine, by any launch arguments: the latest such measurement's, None without one."""
+    names = sorted(os.path.basename(path) for path in model)
+    matching = [
+        entry
+        for entry in entries
+        if entry["server_sha256"] == server_sha256
+        and entry["characteristics_sha256"] == characteristics_sha256
+        and sorted(os.path.basename(path) for path, _ in entry["model"]) == names
+    ]
+    if not matching:
+        return None
+    latest = max(matching, key=lambda entry: cast(str, entry["measured_utc"]))
+    return cast(float, latest["measurement"]["rows"][0]["dense_ms"])

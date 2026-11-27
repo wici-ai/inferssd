@@ -305,6 +305,7 @@ def decode_estimate(
     gpu_work_bytes: int = 0,
     observed_hits: Optional[tuple[float, float]] = None,
     graph_weights: Optional[DenseWeights] = None,
+    measured_dense_ms: Optional[float] = None,
 ) -> Estimate:
     """Estimate default placement, optionally reserving known KV/graph working memory.
 
@@ -313,6 +314,8 @@ def decode_estimate(
     Zero means unknown and makes cache capacities upper estimates. OBSERVED_HITS, the
     fraction of routes hitting VRAM and the fraction missing both VRAM and the host cache,
     replace the routing prior in the reference, for checking the prior against a measured run.
+    MEASURED_DENSE_MS, the dense time of a one-row decode step the engine measured on this
+    machine (inferssd.engine.decode_steps), replaces the dense time priced from bytes.
     """
     if min(host_work_bytes, gpu_work_bytes, dense_read_bytes) < 0:
         raise ValueError("memory sizes must be nonnegative")
@@ -505,6 +508,13 @@ def decode_estimate(
     else:
         dense_fast = resident / memory_Bps + (spill / io_high if spill else 0)
         dense_slow = resident / memory_Bps + (spill / io_low if spill else 0)
+    if measured_dense_ms is not None:
+        dense_s = dense_fast = dense_slow = measured_dense_ms / 1e3
+        assumptions.append(
+            "The dense time is the engine's measurement of a one-row decode step on this machine "
+            "and engine, with the model's draft head loaded, in place of the time priced from "
+            "the dense bytes."
+        )
     cases: list[tuple[str, float, float, dict[str, object]]] = []
     hits = rank_hit_curve(experts.count, experts.used)
     gpu_hit = hit_at_slots(hits, gpu_slots / experts.layers)

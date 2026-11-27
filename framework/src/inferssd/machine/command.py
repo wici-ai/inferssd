@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -15,6 +16,7 @@ from typing import Any, Optional
 
 from inferssd.app import catalog
 from inferssd.contracts import ContractError
+from inferssd.engine import decode_steps
 from inferssd.engine import model as engine_model
 from inferssd.launch.resources import (
     cmake_gpu_backends,
@@ -28,6 +30,7 @@ from inferssd.machine.characteristics import (
     STORAGE_PREFIX,
     Characteristics,
     Section,
+    dumps,
 )
 from inferssd.machine.decode_probe import measure_decode_compute
 from inferssd.machine.identity import Host, NativeHost, UnsupportedPlatform
@@ -306,8 +309,12 @@ def estimates(
     target: Optional[catalog.Model] = None,
     weights: Optional[DenseWeights] = None,
     target_refusal: Optional[str] = None,
+    dense_ms: Callable[[ModelFacts], Optional[float]] = lambda facts: None,
 ) -> list[tuple[catalog.Model, Estimate]]:
-    """Each supported model's decode speed estimate with its shards on DRIVE_KEY."""
+    """Each supported model's decode speed estimate with its shards on DRIVE_KEY.
+
+    DENSE_MS is a model's measured dense time of a one-row decode step, where the engine
+    measured one on this machine; it replaces the time a routed model's estimate prices."""
     if target and target_refusal:
         return [(target, Estimate(None, target_refusal))]
     reason = "pass --model with the directory that holds the models"
@@ -331,6 +338,7 @@ def estimates(
                         host_work_bytes=host_work_bytes,
                         gpu_work_bytes=gpu_work_bytes,
                         graph_weights=weights if weights and weights.graph_store_bytes else None,
+                        measured_dense_ms=dense_ms(model.facts),
                     )
                     if model.facts.experts is not None
                     else dense_decode_estimate(
@@ -534,6 +542,20 @@ def run(
                 readings.append(estimate_runtime())
                 return readings[-1]
 
+            # The dense times launches measured with this engine on this machine as profiled now.
+            kept = decode_steps.kept(decode_steps.store_path(host.platform(), environ, home))
+            server = (
+                decode_steps.file_sha256(str(binary))
+                if kept and binary is not None and binary.is_file()
+                else None
+            )
+            machine = hashlib.sha256(dumps(value).encode()).hexdigest()
+
+            def dense_ms(facts: ModelFacts) -> Optional[float]:
+                if server is None:
+                    return None
+                return decode_steps.dense_ms(kept, server, machine, facts.paths)
+
             rows = estimates(
                 value,
                 drive_key,
@@ -544,6 +566,7 @@ def run(
                 target=target,
                 weights=weights,
                 target_refusal=target_refusal,
+                dense_ms=dense_ms,
             )
             if args.json:
                 emit(json.dumps(report(value, path, drive_key, rows), separators=(",", ":")))
