@@ -30,10 +30,29 @@ jobs:
         # This snapshot is already in main's history. Create the local alias
         # without depending on a separately maintained remote branch.
         run: git branch upstream 8884f8314ce8ea96d62cd602b6bbf7fc25758a09
+      - name: Commits to check
+        # The checkout fetches every branch. A pull request checks its own commits and a merge to main
+        # the commits it adds, so that one branch's content does not fail every other run; a run by hand
+        # checks every branch.
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+        run: |
+          range=
+          if [ "$EVENT" = pull_request ]; then
+            range="$PR_BASE..$PR_HEAD"
+          elif [ "$EVENT" = push ] && git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            range="$BEFORE..$AFTER"
+          fi
+          echo "SCAN_RANGE=$range" >> "$GITHUB_ENV"
+          echo "Checking ${range:-every branch}"
       - name: Public content
         env:
           PROPOSED_REF: ${{ github.head_ref || github.ref_name }}
-        run: python3 scripts/public-scan.py --skip upstream --ref "$PROPOSED_REF"
+        run: python3 scripts/public-scan.py --skip upstream --ref "$PROPOSED_REF" $SCAN_RANGE
       - name: Production module boundaries
         run: |
           python3 scripts/inferssd/check-layering.py
@@ -50,7 +69,7 @@ jobs:
         run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
       - name: Secret scan
         run: |
-          "$(go env GOPATH)/bin/gitleaks" git --redact=100 --log-opts="--all"
+          "$(go env GOPATH)/bin/gitleaks" git --redact=100 --log-opts="${SCAN_RANGE:---all}"
 
   python:
     runs-on: ubuntu-24.04
