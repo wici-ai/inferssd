@@ -39,6 +39,16 @@ def test_publish_verified_package_to_its_platform_list(
         "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
     }
     (tmp_path / (name + ".json")).write_text(json.dumps(package))
+    if suffix == "macos-arm64":
+        compatibility = {
+            "minimum_app_build": 240,
+            "app_engine_requirement": {"from_app_build": 240, "minimum_engine_build": 401},
+            "model_format_changed_at_build": 401,
+        }
+        policy = tmp_path / "update-compatibility.json"
+        policy.write_text(json.dumps(compatibility))
+        monkeypatch.setattr(module, "COMPATIBILITY_FILE", policy)
+        package["compatibility"] = compatibility
     url, requests = "https://cdn.example/" + archive.name, []
 
     def call(method, address, body=None, headers=None, token=None):

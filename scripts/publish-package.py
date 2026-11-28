@@ -11,6 +11,12 @@ as the desktop app's releases do. Then the package list, the .json with the arch
 replaces latest-macos.json, latest-windows-vulkan.json or latest-windows-cuda.json, which the
 installers read. The list never moves to an older build.
 
+For a breaking desktop update, add scripts/update-compatibility.json to the release commit.
+Its optional fields are minimum_app_build, app_engine_requirement (from_app_build and
+minimum_engine_build), and model_format_changed_at_build. Keep applicable version boundaries
+in subsequent releases so older clients can still detect them before downloading. The App's
+runtime compatibility checks still apply when users install it outside the updater.
+
 The CDN keeps a file for a year, so a name never gets other bytes: a package built again for a
 version already uploaded is refused. Re-run the failed release job of the Release run that built
 it instead; it uploads the same bytes, which the service skips. See docs/macos-package.md.
@@ -34,6 +40,7 @@ LISTS = {"macos-arm64": ("darwin-arm64", "latest-macos.json", ".tar.gz"),
          "windows-x64-cuda": ("windows-x64", "latest-windows-cuda.json", ".zip")}
 # The CDN in front of the service refuses Python's default User-Agent.
 AGENT = "inferssd-publish"
+COMPATIBILITY_FILE = Path(__file__).with_name("update-compatibility.json")
 
 
 def call(
@@ -59,6 +66,26 @@ def fail(message: str) -> None:
     sys.exit("publish-package: " + message)
 
 
+def release_compatibility() -> dict:
+    if not COMPATIBILITY_FILE.is_file():
+        return {}
+    compatibility = json.loads(COMPATIBILITY_FILE.read_text(encoding="utf-8"))
+    if not isinstance(compatibility, dict):
+        fail("desktop update compatibility must be a JSON object")
+    builds = {"minimum_app_build", "model_format_changed_at_build"}
+    if compatibility.keys() - builds - {"app_engine_requirement"}:
+        fail("unknown desktop update compatibility field")
+    values = [compatibility[key] for key in builds & compatibility.keys()]
+    if "app_engine_requirement" in compatibility:
+        requirement = compatibility["app_engine_requirement"]
+        if not isinstance(requirement, dict) or requirement.keys() != {"from_app_build", "minimum_engine_build"}:
+            fail("app_engine_requirement must declare from_app_build and minimum_engine_build")
+        values.extend(requirement.values())
+    if any(type(value) is not int or not 0 < value < 2**53 for value in values):
+        fail("desktop update compatibility build numbers must be positive integers")
+    return compatibility
+
+
 def main() -> None:
     if len(sys.argv) != 2:
         fail("usage: publish-package.py DIST_DIR")
@@ -71,6 +98,9 @@ def main() -> None:
         fail(f"expected one package in {sys.argv[1]}, found {len(found)}")
     suffix, manifest = found[0]
     package = json.loads(manifest.read_text(encoding="utf-8"))
+    compatibility = release_compatibility()
+    if compatibility:
+        package["compatibility"] = compatibility
     platform, listing_name, extension = LISTS[suffix]
     if package.get("platform") != platform:
         fail("the package platform does not match its name")
