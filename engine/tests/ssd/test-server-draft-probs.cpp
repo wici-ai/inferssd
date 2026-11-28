@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-// A completion that drafts reports every token's probabilities as one that does not: each token a verified draft
-// keeps has those of its own row, whether the draft token was accepted, rejected or followed the draft.
+// A completion that drafts reports what one that does not reports: as many tokens, and for each token a verified draft
+// keeps the probabilities of its own row, whether the draft token was accepted, rejected or followed the draft.
 #include "server-context.h"
 #include "gguf.h"
 
@@ -22,6 +22,8 @@ static constexpr int width = 8;
 static constexpr llama_token tok_a = 3 + 'A';
 static constexpr llama_token tok_b = 3 + 'B';
 static constexpr llama_token tok_c = 3 + 'C';
+// a draft of two tokens verifies three rows: the last block of a completion of this many tokens ends at its limit
+static constexpr int n_predict = 24;
 
 static void require(bool condition, const std::string & message) {
     if (!condition) {
@@ -134,7 +136,7 @@ static generated complete(const common_params & params, bool post_sampling) {
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
     task.tokens = server_tokens({ tok_c, tok_a, tok_b, tok_a, tok_a, tok_c, tok_a }, false);
-    task.params.n_predict = 24;
+    task.params.n_predict = n_predict;
     task.params.stream = false;
     task.params.return_tokens = true;
     task.params.sampling.temp = 0;
@@ -158,13 +160,12 @@ static void compare(const common_params & params, bool post_sampling) {
 
     require(drafts.drafted > drafts.accepted && drafts.accepted > 0,
             std::string(mode) + ": the fixture must both reject and accept draft tokens");
-    // a completion that drafts can stop a few tokens short of n_predict: it counts a block's tokens before it sends them
-    const size_t n = drafts.tokens.size();
-    require(n >= 16 && n <= base.tokens.size() && std::equal(drafts.tokens.begin(), drafts.tokens.end(), base.tokens.begin()),
-            std::string(mode) + ": drafts changed the greedy tokens");
-    require(base.probs.size() == base.tokens.size() && drafts.probs.size() == n,
+    require(base.tokens.size() == size_t(n_predict), std::string(mode) + ": the completion without drafts stopped early");
+    require(drafts.tokens.size() == base.tokens.size(), std::string(mode) + ": the completion with drafts stopped early");
+    require(drafts.tokens == base.tokens, std::string(mode) + ": drafts changed the greedy tokens");
+    require(base.probs.size() == base.tokens.size() && drafts.probs.size() == drafts.tokens.size(),
             std::string(mode) + ": a token is missing from the probabilities");
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < base.tokens.size(); ++i) {
         const auto & want = base.probs[i];
         const auto & got = drafts.probs[i];
         const std::string at = std::string(mode) + ", token " + std::to_string(i) + ": ";

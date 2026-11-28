@@ -4026,7 +4026,6 @@ private:
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
-                slot.n_decoded += ids.size();
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
@@ -4055,6 +4054,9 @@ private:
                     result.tok          = ids[i];
                     result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
 
+                    // counted as it is sent, as a step without drafts counts its token: the limit stops the block at
+                    // its last token, not at its first
+                    slot.n_decoded += 1;
                     if (!process_token(result, slot)) {
                         slot.print_timings();
                         send_final_response(slot);
