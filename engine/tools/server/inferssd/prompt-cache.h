@@ -330,6 +330,13 @@ private:
 // file it loads from, the files of a split model included. Neither the path nor the time of a file is in it.
 std::string server_model_files_identity(const std::vector<std::string> & paths);
 
+// The settings a state's values depend on besides the model's files and its adapters, as a hash: the GGUF metadata
+// the server overrides, its RoPE and YaRN settings, its attention type, its control vectors, a quantized KV cache's
+// rows stored without their rotation (LLAMA_ATTN_ROT_DISABLE), and for a model with long and short RoPE factors the
+// ones its context selects (rope_factors_long, llama_rope_factors_long). Empty when none is set and the factors do
+// not depend on the context, so the states of servers that run such a model as its files describe it, prefix caches
+// among them, keep their fingerprint.
+std::string server_prompt_settings_identity(const common_params & params, int32_t rope_factors_long = -1);
 std::string server_adapter_file_identity(const std::string & path);
 std::optional<std::string> server_prompt_adapter_key(const std::vector<std::string> & identities,
         const std::vector<common_adapter_lora_info> & adapters);

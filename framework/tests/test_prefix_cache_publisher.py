@@ -21,8 +21,8 @@ def publisher():
     return module
 
 
-def prepare(tmp_path, monkeypatch, suffix):
-    fingerprint = ("prefix-cache 1|this model|old-build" + suffix).encode()
+def prepare(tmp_path, monkeypatch, suffix, head="prefix-cache 1|"):
+    fingerprint = (head + "this model|old-build" + suffix).encode()
     prompt = (
         struct.pack("<III", 0x4643504C, 1, len(fingerprint)) + fingerprint + struct.pack("<I", 96)
     )
@@ -53,6 +53,16 @@ def test_rejects_adapted_file_before_contacting_service(publisher, tmp_path, mon
         publisher, "call", lambda *_args: pytest.fail("unexpected release service request")
     )
     with pytest.raises(SystemExit, match="computed with LoRA adapters"):
+        publisher.main()
+
+
+def test_rejects_file_computed_with_other_settings(publisher, tmp_path, monkeypatch):
+    head = "prefix-cache 1|settings=0123456789abcdef|"
+    prepare(tmp_path, monkeypatch, "|adapter-cache=1", head=head)
+    monkeypatch.setattr(
+        publisher, "call", lambda *_args: pytest.fail("unexpected release service request")
+    )
+    with pytest.raises(SystemExit, match="computed with settings"):
         publisher.main()
 
 

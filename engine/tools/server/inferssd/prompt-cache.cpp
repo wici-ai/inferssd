@@ -21,6 +21,7 @@ extern "C" {
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -970,6 +971,81 @@ static void server_fnv1a(uint64_t & hash, const char * data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         hash = (hash ^ (uint8_t) data[i])*1099511628211ull;
     }
+}
+
+std::string server_prompt_settings_identity(const common_params & params, int32_t rope_factors_long) {
+    const common_params unset {};
+    std::string settings;
+    const auto add = [&](const std::string & setting) {
+        settings += setting + "\n";
+    };
+    const auto integer = [&](const char * name, int64_t value, int64_t value_unset) {
+        if (value != value_unset) {
+            add(string_format("%s %" PRId64, name, value));
+        }
+    };
+    // a number by its bits, as an adapter's scale: the same on every system
+    const auto bits = [](float value) {
+        uint32_t out;
+        std::memcpy(&out, &value, sizeof(out));
+        return out;
+    };
+    const auto real = [&](const char * name, float value, float value_unset) {
+        if (bits(value) != bits(value_unset)) {
+            add(string_format("%s %08" PRIx32, name, bits(value)));
+        }
+    };
+    for (const auto & kv : params.kv_overrides) {
+        if (!kv.key[0]) {
+            break;
+        }
+        uint64_t f64 = 0;
+        switch (kv.tag) {
+            case LLAMA_KV_OVERRIDE_TYPE_INT:   add(string_format("kv %s int %" PRId64, kv.key, kv.val_i64)); break;
+            case LLAMA_KV_OVERRIDE_TYPE_FLOAT:
+                std::memcpy(&f64, &kv.val_f64, sizeof(f64));
+                add(string_format("kv %s float %016" PRIx64, kv.key, f64));
+                break;
+            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  add(string_format("kv %s bool %d", kv.key, kv.val_bool ? 1 : 0)); break;
+            case LLAMA_KV_OVERRIDE_TYPE_STR:   add(string_format("kv %s str %s", kv.key, kv.val_str)); break;
+        }
+    }
+    integer("rope-scaling", params.rope_scaling_type, unset.rope_scaling_type);
+    real("rope-freq-base", params.rope_freq_base, unset.rope_freq_base);
+    real("rope-freq-scale", params.rope_freq_scale, unset.rope_freq_scale);
+    real("yarn-ext-factor", params.yarn_ext_factor, unset.yarn_ext_factor);
+    real("yarn-attn-factor", params.yarn_attn_factor, unset.yarn_attn_factor);
+    real("yarn-beta-fast", params.yarn_beta_fast, unset.yarn_beta_fast);
+    real("yarn-beta-slow", params.yarn_beta_slow, unset.yarn_beta_slow);
+    integer("yarn-orig-ctx", params.yarn_orig_ctx, unset.yarn_orig_ctx);
+    integer("attention", params.attention_type, unset.attention_type);
+    // what the context selects, not a setting: a sequence's context past the original one takes the long factors
+    if (rope_factors_long >= 0) {
+        add(rope_factors_long ? "rope-factors long" : "rope-factors short");
+    }
+    // A quantized KV cache stores its rows Hadamard-rotated unless LLAMA_ATTN_ROT_DISABLE turns the rotation off
+    // (llama_kv_cache): the same layout in another basis.
+    const char * rot_disable = std::getenv("LLAMA_ATTN_ROT_DISABLE");
+    if (rot_disable && std::atoi(rot_disable) != 0 &&
+            (ggml_is_quantized(params.cache_type_k) || ggml_is_quantized(params.cache_type_v))) {
+        add("kv-rotation off");
+    }
+    for (const auto & cvec : params.control_vectors) {
+        add(string_format("control-vector %s %08" PRIx32, server_adapter_file_identity(cvec.fname).c_str(),
+                          bits(cvec.strength)));
+    }
+    if (!params.control_vectors.empty()) {
+        add(string_format("control-vector-layers %d %d", params.control_vector_layer_start,
+                          params.control_vector_layer_end));
+    }
+    if (settings.empty()) {
+        return "";
+    }
+    uint64_t hash = 1469598103934665603ull;
+    server_fnv1a(hash, settings.data(), settings.size());
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016" PRIx64, hash);
+    return out;
 }
 
 std::string server_adapter_file_identity(const std::string & path) {

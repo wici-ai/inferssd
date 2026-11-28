@@ -17,14 +17,21 @@ computes the same values up to rounding, as a GPU and a CPU do, and the server t
 them between its own prompt passes. A prefix cache is a file of a server's prompt cache on disk, whose fingerprint
 is
 
-    prefix-cache 1|<size>:<header hash>,...|<model description>|<build>|adapter-cache=1
+    prefix-cache 1|[settings=<hash>|]<size>:<header hash>,...|<model description>|<build>|adapter-cache=1
 
 with the size and an FNV-1a hash of the header (the metadata and the tensor list) of each file the model is loaded
 from, the other files of a split model included, and the build that saved it. A server takes a file of its own prompt
 cache only from its own build, and a prefix cache from any build: it compares the fingerprint up to the build. Where
-the files are and when they were written are not in it. A
-state saved with another layout (another KV type, or flash attention on where it was off) fails to restore; the
-server then leaves that file and processes the prefix itself.
+the files are and when they were written are not in it. A state saved with another layout (another KV type, or flash
+attention on where it was off) fails to restore; the server then leaves that file and processes the prefix itself.
+
+The `settings=<hash>|` field names what else a state's values depend on, so that its states serve only servers that
+compute the same: GGUF metadata overrides, RoPE or YaRN settings, an attention type, control vectors, a quantized KV
+cache stored without its rotation by `LLAMA_ATTN_ROT_DISABLE`, and for a model with long and short RoPE factors
+(LongRoPE) the factors the server's context selects, the long ones when a sequence's context is past the model's
+original one. A server that runs the model as its files describe it, without LongRoPE factors, has no field, so its
+fingerprints are those of servers before the field, and published prefix caches keep theirs. The publisher refuses a
+file with the field, and so takes no prefix cache of a LongRoPE model.
 
 Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
 matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation

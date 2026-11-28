@@ -4815,6 +4815,17 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+int32_t llama_rope_factors_long(const llama_context * ctx) {
+    // the choice of llama_model::get_rope_factors
+    const llama_model & model = ctx->get_model();
+    for (const auto & layer : model.layers) {
+        if (!layer.rope_freqs && (layer.rope_long || layer.rope_short)) {
+            return ctx->get_cparams().n_ctx_seq > model.hparams.n_ctx_orig_yarn ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
 void llama_set_warmup(llama_context * ctx, bool warmup) {
     ctx->set_warmup(warmup);
 }

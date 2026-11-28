@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <optional>
 #include <random>
 #include <stdexcept>
@@ -31,18 +35,32 @@ static void require(bool condition, const char * message) {
 
 // Uniform attention makes the first output depend on values stored during prefill.
 // The logits choose A for the base model and B with the active value adapter.
-static void write_model(const fs::path & path) {
+// With long_rope, a llama model with long and short RoPE factors (LongRoPE) whose queries and keys see the tokens:
+// its attention, and the first output with it, depends on the factors the context selects. `width` is the embedding
+// and head size.
+static void write_model(const fs::path & path, bool sliding_window = false, bool long_rope = false,
+                        int width = ::width) {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
     require(weights && model, "could not create prompt-cache model fixture");
-    gguf_set_val_str(model.get(), "general.architecture", "llama");
+    const std::string arch = sliding_window ? "gemma2" : "llama";
+    const auto key = [&](const char * name) { return arch + "." + name; };
+    gguf_set_val_str(model.get(), "general.architecture", arch.c_str());
     gguf_set_val_str(model.get(), "tokenizer.ggml.model", "llama");
-    gguf_set_val_u32(model.get(), "llama.context_length", 512);
-    gguf_set_val_u32(model.get(), "llama.embedding_length", width);
-    gguf_set_val_u32(model.get(), "llama.block_count", 1);
-    gguf_set_val_u32(model.get(), "llama.feed_forward_length", width);
-    gguf_set_val_u32(model.get(), "llama.attention.head_count", 1);
-    gguf_set_val_f32(model.get(), "llama.attention.layer_norm_rms_epsilon", 1e-5f);
+    gguf_set_val_u32(model.get(), key("context_length").c_str(), long_rope ? 1024 : 512);
+    gguf_set_val_u32(model.get(), key("embedding_length").c_str(), width);
+    gguf_set_val_u32(model.get(), key("block_count").c_str(), sliding_window ? 2 : 1);
+    gguf_set_val_u32(model.get(), key("feed_forward_length").c_str(), width);
+    gguf_set_val_u32(model.get(), key("attention.head_count").c_str(), 1);
+    gguf_set_val_f32(model.get(), key("attention.layer_norm_rms_epsilon").c_str(), 1e-5f);
+    if (sliding_window) {
+        gguf_set_val_u32(model.get(), "gemma2.attention.sliding_window", 16);
+    }
+    if (long_rope) {
+        // the long factors past a sequence context of 256
+        gguf_set_val_str(model.get(), "llama.rope.scaling.type", "longrope");
+        gguf_set_val_u32(model.get(), "llama.rope.scaling.original_context_length", 256);
+    }
     gguf_set_val_u32(model.get(), "tokenizer.ggml.unknown_token_id", 0);
     gguf_set_val_u32(model.get(), "tokenizer.ggml.bos_token_id", 1);
     gguf_set_val_u32(model.get(), "tokenizer.ggml.eos_token_id", 2);
@@ -67,10 +85,10 @@ static void write_model(const fs::path & path) {
     gguf_set_arr_data(model.get(), "tokenizer.ggml.token_type", GGUF_TYPE_INT32, types.data(), types.size());
     gguf_set_arr_data(model.get(), "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), scores.size());
 
-    const auto add = [&](const char * name, int rows = 0, float value = 0.0f) {
+    const auto add = [&](const std::string & name, int rows = 0, float value = 0.0f) {
         auto * tensor = rows ? ggml_new_tensor_2d(weights.get(), GGML_TYPE_F32, width, rows) :
                                ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, width);
-        ggml_set_name(tensor, name);
+        ggml_set_name(tensor, name.c_str());
         auto * values = static_cast<float *>(tensor->data);
         std::fill(values, values + ggml_nelements(tensor), value);
         gguf_add_tensor(model.get(), tensor);
@@ -81,18 +99,61 @@ static void write_model(const fs::path & path) {
         embeddings[i * width] = 1.0f;
     }
     add("output_norm.weight", 0, 1.0f);
-    auto * output = add("output.weight", vocab_size);
-    output[base_token * width] = 1.0f;
-    output[adapted_token * width + 1] = 1.0f;
-    add("blk.0.attn_norm.weight", 0, 1.0f);
-    add("blk.0.attn_q.weight", width);
-    add("blk.0.attn_k.weight", width);
-    add("blk.0.attn_v.weight", width);
-    add("blk.0.attn_output.weight", width)[width + 1] = 1.0f;
-    add("blk.0.ffn_norm.weight", 0, 1.0f);
-    add("blk.0.ffn_gate.weight", width);
-    add("blk.0.ffn_down.weight", width);
-    add("blk.0.ffn_up.weight", width);
+    if (sliding_window) {
+        // Gemma 2 ties its output weights to the input embeddings.
+        embeddings[base_token * width] = 2.0f;
+        // Layer 0 copies the suffix marker into channel 1. Layer 1 reads that channel
+        // from cached rows and activates a distinct output token when the suffix leaked.
+        embeddings[adapted_token * width + 1] = 1.0f;
+        embeddings[merged_token * width + 2] = 10.0f;
+    } else {
+        auto * output = add("output.weight", vocab_size);
+        output[base_token * width] = 1.0f;
+        output[adapted_token * width + 1] = 1.0f;
+    }
+    if (long_rope) {
+        // tokens and logits of no particular pattern
+        for (int i = 0; i < vocab_size * width; ++i) {
+            embeddings[i] = std::sin(0.7f * (i / width) + 1.3f * (i % width));
+        }
+        auto * output = static_cast<float *>(ggml_get_tensor(weights.get(), "output.weight")->data);
+        for (int i = 0; i < vocab_size * width; ++i) {
+            // logits for the printable ASCII bytes only: another token ends the reply or leaves it incomplete text
+            const int token = i / width;
+            const bool printable = token >= 3 + ' ' && token <= 3 + '~';
+            output[i] = printable ? std::cos(0.9f * token + 0.5f * (i % width)) : 0.0f;
+        }
+        for (const auto & [name, factor] : { std::pair<const char *, float>{ "rope_factors_long.weight", 32.0f },
+                                             std::pair<const char *, float>{ "rope_factors_short.weight", 1.0f } }) {
+            auto * factors = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, width / 2);
+            ggml_set_name(factors, name);
+            std::fill_n(static_cast<float *>(factors->data), width / 2, factor);
+            gguf_add_tensor(model.get(), factors);
+        }
+    }
+    for (int layer = 0; layer < (sliding_window ? 2 : 1); ++layer) {
+        const auto block = "blk." + std::to_string(layer) + ".";
+        add(block + "attn_norm.weight", 0, 1.0f);
+        auto * queries = add(block + "attn_q.weight", width);
+        auto * keys = add(block + "attn_k.weight", width);
+        auto * values = add(block + "attn_v.weight", width);
+        auto * output = add(block + "attn_output.weight", width);
+        output[(layer + 1) * width + 1] = 1.0f;
+        if (long_rope) {
+            for (int i = 0; i < width; ++i) {
+                queries[i * width + i] = keys[i * width + i] = values[i * width + i] = output[i * width + i] = 1.0f;
+            }
+        }
+        if (sliding_window) {
+            values[width + 1] = 1.0f;
+            add(block + "post_attention_norm.weight", 0, 1.0f);
+            add(block + "post_ffw_norm.weight", 0, 1.0f);
+        }
+        add(block + "ffn_norm.weight", 0, 1.0f);
+        add(block + "ffn_gate.weight", width);
+        add(block + "ffn_down.weight", width);
+        add(block + "ffn_up.weight", width);
+    }
     require(gguf_write_to_file(model.get(), path.string().c_str(), false), "could not write prompt-cache model fixture");
 }
 
@@ -168,6 +229,7 @@ static llama_tokens make_prompt(llama_token suffix, int count = prompt_tokens) {
 struct completion {
     int cached;
     llama_token token;
+    float probability;
 };
 
 static void require_completion(completion actual, int cached, llama_token token, const char * message) {
@@ -191,6 +253,7 @@ static completion first_token(server_context & server, const llama_tokens & prom
     task.params.stream = false;
     task.params.return_tokens = true;
     task.params.sampling.temp = 0;
+    task.params.sampling.n_probs = 1;
     if (scale) {
         task.params.lora[id_adapter] = *scale;
     }
@@ -198,7 +261,20 @@ static completion first_token(server_context & server, const llama_tokens & prom
     const auto result = receive(reader);
     const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
     require(done && done->tokens.size() == 1, "the request did not complete with exactly one token");
-    return {done->n_prompt_tokens_cache, done->tokens.front()};
+    require(done->probs_output.size() == 1, "missing greedy token probability");
+    return {done->n_prompt_tokens_cache, done->tokens.front(), done->probs_output.front().prob};
+}
+
+static void set_env(const char * name, const char * value) {
+#if defined(_WIN32)
+    _putenv_s(name, value ? value : "");
+#else
+    if (value) {
+        setenv(name, value, 1);
+    } else {
+        unsetenv(name);
+    }
+#endif
 }
 
 static completion first_token(server_context & server, std::optional<float> scale = {}, int id_slot = -1) {
@@ -210,14 +286,21 @@ static completion first_token(const common_params & params, std::optional<float>
     return first_token(restarted.server, scale);
 }
 
-static void save_completed_prefix(const common_params & params, std::optional<float> scale = {}) {
-    const fs::path cache = params.cache_disk;
-    require(fs::create_directory(cache), "could not create prompt-cache directory");
+// Processes the prompt, with a shared prefix of n_shared tokens, and then a disjoint prompt on the server's one slot.
+static void write_completed_prefix(const common_params & params, std::optional<float> scale,
+        const llama_tokens & prompt, int n_shared = 0) {
+    require(fs::create_directory(params.cache_disk), "could not create prompt-cache directory");
     server_run original(params);
-    first_token(original.server, llama_tokens(prefix_tokens, base_token), scale, -1, 0, 0);
+    first_token(original.server, prompt, scale, -1, 0, n_shared);
     // A disjoint request reuses the one idle slot and saves its completed state to disk.
     first_token(original.server, llama_tokens(prefix_tokens, 3 + 'x'), scale, -1, 0, 0);
-    require(has_prompt_file(cache), "the completed prefix was not saved on slot reuse");
+}
+
+static void save_completed_prefix(const common_params & params, std::optional<float> scale = {},
+        const llama_tokens & prompt = llama_tokens(prefix_tokens, base_token), bool saved = true) {
+    write_completed_prefix(params, scale, prompt);
+    require(has_prompt_file(params.cache_disk) == saved,
+            saved ? "the completed prefix was not saved on slot reuse" : "a server without causal attention saved a state");
 }
 
 static void test_import_replacement(common_params params, const fs::path & work) {
@@ -393,6 +476,218 @@ static void test_live_slot_text_reuse(common_params params) {
     }
 }
 
+// A control vector that adds `value` to the first channel of layer 1's output.
+static void write_control_vector(const fs::path & path, float value) {
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 16, nullptr, false}), ggml_free);
+    std::unique_ptr<gguf_context, decltype(&gguf_free)> vector(gguf_init_empty(), gguf_free);
+    require(weights && vector, "could not create control vector fixture");
+    auto * direction = ggml_new_tensor_1d(weights.get(), GGML_TYPE_F32, width);
+    ggml_set_name(direction, "direction.1");
+    auto * values = static_cast<float *>(direction->data);
+    std::fill(values, values + width, 0.0f);
+    values[0] = value;
+    gguf_add_tensor(vector.get(), direction);
+    require(gguf_write_to_file(vector.get(), path.string().c_str(), false), "could not write control vector fixture");
+}
+
+// A state of 90 tokens whose last 16, a window, are the suffix marker, and a prompt that shares its first 74 tokens and
+// then parts from it: rows that depend on the suffix choose another first token.
+static llama_tokens window_saved_prompt() {
+    llama_tokens saved_prompt(90, base_token);
+    std::fill(saved_prompt.begin() + 74, saved_prompt.end(), adapted_token);
+    return saved_prompt;
+}
+
+static void require_cold_probability(completion actual, completion cold) {
+    require(std::abs(std::log(actual.probability) - std::log(cold.probability)) < 1e-5f,
+            "cached greedy log probability differs from cold inference");
+}
+
+struct prompt_file_header {
+    std::string fingerprint;
+    llama_tokens tokens;
+};
+
+static prompt_file_header read_prompt_header(const fs::path & path) {
+    std::ifstream in(path, std::ios::binary);
+    uint32_t head[3] = {};
+    in.read(reinterpret_cast<char *>(head), sizeof(head));
+    prompt_file_header header;
+    header.fingerprint.resize(head[2] <= 4096 ? head[2] : 0);
+    in.read(header.fingerprint.data(), header.fingerprint.size());
+    uint32_t n_tokens = 0;
+    in.read(reinterpret_cast<char *>(&n_tokens), sizeof(n_tokens));
+    header.tokens.resize(n_tokens <= 4096 ? n_tokens : 0);
+    in.read(reinterpret_cast<char *>(header.tokens.data()), header.tokens.size() * sizeof(llama_token));
+    require(bool(in) && head[0] == 0x4643504c && header.fingerprint.size() == head[2] &&
+            header.tokens.size() == n_tokens, "could not read a cached prompt header");
+    return header;
+}
+
+static std::vector<fs::path> prompt_files(const fs::path & dir) {
+    std::vector<fs::path> files;
+    for (const auto & item : fs::directory_iterator(dir)) {
+        if (item.path().extension() == ".prompt") {
+            files.push_back(item.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    return files;
+}
+
+// A quantized KV cache stores its rows Hadamard-rotated, or with LLAMA_ATTN_ROT_DISABLE as they are: the same layout
+// in another basis. A writer that stored them the other way serves no reader, one that stored them the same way does.
+static void test_sliding_window_kv_rotation(common_params params, const fs::path & work) {
+    // heads of 64, which the rotation needs
+    const auto model = work / "sliding-window-64.gguf";
+    write_model(model, true, false, 64);
+    params.model.path = model.string();
+    params.cache_type_k = params.cache_type_v = GGML_TYPE_Q8_0;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    // rows that are not zero, whose basis tells
+    auto saved_prompt = window_saved_prompt();
+    std::fill(saved_prompt.begin() + 10, saved_prompt.begin() + 15, adapted_token);
+    auto prompt = saved_prompt;
+    prompt.push_back(3 + 'y');
+    const auto request = [&](const common_params & config) {
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    };
+    const auto cold = request(params);
+    for (bool rotated : { true, false }) {
+        auto writer = params;
+        writer.cache_disk = (work / (rotated ? "kv-rotated" : "kv-unrotated")).string();
+        set_env("LLAMA_ATTN_ROT_DISABLE", rotated ? nullptr : "1");
+        save_completed_prefix(writer, {}, saved_prompt);
+        set_env("LLAMA_ATTN_ROT_DISABLE", nullptr);
+        for (bool imported : { true, false }) {
+            auto reader = params;
+            reader.prefix_cache = imported ? writer.cache_disk : "";
+            reader.cache_disk = imported ? "" : writer.cache_disk;
+            const auto actual = request(reader);
+            require_completion(actual, rotated ? (int) saved_prompt.size() : 0, cold.token,
+                               "rows stored in another basis were reused, or in the same one not");
+            require_cold_probability(actual, cold);
+        }
+    }
+}
+
+// Rows computed with other settings (an overridden window, another RoPE base, a control vector)
+// serve only a reader with the same settings, after a restart and as a prefix cache alike.
+static void test_sliding_window_writer_settings(common_params params, const fs::path & work) {
+    const auto saved_prompt = window_saved_prompt();
+    // a prompt that the saved state is an exact prefix of
+    auto prompt = saved_prompt;
+    prompt.push_back(3 + 'y');
+    const int n_saved = saved_prompt.size();
+    const auto request = [&](const common_params & config) {
+        server_run reader(config);
+        return first_token(reader.server, prompt, {}, -1, 0, 0);
+    };
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    const auto cold = request(params);
+    require(cold.cached == 0, "a cold request must evaluate every token");
+
+    // the prefix cache first: a writable cache removes the files of other fingerprints
+    const auto check = [&](common_params reader, const fs::path & dir, int expected, completion baseline) {
+        for (bool imported : {true, false}) {
+            reader.prefix_cache = imported ? dir.string() : "";
+            reader.cache_disk = imported ? "" : dir.string();
+            auto actual = request(reader);
+            require_completion(actual, expected, baseline.token, "incorrect prefix after restart");
+            require_cold_probability(actual, baseline);
+        }
+    };
+    const auto vector = work / "control-vector.gguf";
+    write_control_vector(vector, 4.0f);
+    // (a writer without causal attention saves no state: test_sliding_window_non_causal_cache)
+    for (const std::string kind : {"default", "short-window", "rope", "control-vector"}) {
+        auto writer = params;
+        if (kind == "short-window") {
+            require(string_parse_kv_override("gemma2.attention.sliding_window=int:8", writer.kv_overrides),
+                    "invalid attention override");
+            writer.kv_overrides.emplace_back();
+        } else if (kind == "rope") {
+            writer.rope_freq_base = 32;
+        } else if (kind == "control-vector") {
+            writer.control_vectors.push_back({1.0f, vector.string()});
+        }
+        const auto dir = work / ("writer-" + kind);
+        writer.cache_disk = dir.string();
+        save_completed_prefix(writer, {}, saved_prompt);
+        for (const auto & path : prompt_files(dir)) {
+            const auto fingerprint = read_prompt_header(path).fingerprint;
+            require((fingerprint.rfind("prefix-cache 1|settings=", 0) == 0) == (kind != "default"),
+                    "a state names the settings that change its values, and only those");
+        }
+        if (kind != "default") {
+            auto same = writer;
+            same.cache_disk.clear();
+            check(same, dir, n_saved, request(same));
+        }
+        check(params, dir, kind == "default" ? n_saved : 0, cold);
+    }
+}
+
+static void test_sliding_window(common_params params, const fs::path & work) {
+    const auto model = work / "sliding-window.gguf";
+    write_model(model, true);
+    params.model.path = model.string();
+    test_sliding_window_writer_settings(params, work);
+    test_sliding_window_kv_rotation(params, work);
+}
+
+// A model with long and short RoPE factors (LongRoPE) rotates its keys by the long ones when a sequence's context is
+// past the model's original one and by the short ones otherwise: a writer whose context selects the other factors
+// serves no reader, one whose context selects the same ones serves it, from its prefix caches and its own cache alike.
+static void test_long_rope(common_params params, const fs::path & work) {
+    const auto model = work / "long-rope.gguf";
+    write_model(model, false, true);
+    params.model.path = model.string();
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    params.n_ctx = 512;
+    // F32 rows and no flash attention: the attention sees the tokens, and a prompt's last token then reads reused rows
+    // as a cold pass reads its own, without the F16 rounding or tiling that differ between them
+    params.cache_type_k = params.cache_type_v = GGML_TYPE_F32;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    llama_tokens saved_prompt(prefix_tokens);
+    for (int i = 0; i < prefix_tokens; ++i) {
+        saved_prompt[i] = base_token + i % 22;
+    }
+    auto prompt = saved_prompt;
+    prompt.push_back(4);
+    const auto request = [&](const common_params & config) {
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    };
+    const auto cold = request(params);
+    auto short_context = params;
+    short_context.n_ctx = 256;
+    const auto cold_short = request(short_context);
+    require(cold.cached == 0 && cold_short.cached == 0 &&
+            std::abs(std::log(cold.probability) - std::log(cold_short.probability)) > 1e-3f,
+            "the fixture's first output must depend on the RoPE factors");
+    for (const int n_ctx : { 768, 256 }) {
+        auto writer = params;
+        writer.n_ctx = n_ctx;
+        writer.cache_disk = (work / ("long-rope-" + std::to_string(n_ctx))).string();
+        save_completed_prefix(writer, {}, saved_prompt);
+        for (bool imported : { true, false }) {
+            auto reader = params;
+            reader.prefix_cache = imported ? writer.cache_disk : "";
+            reader.cache_disk = imported ? "" : writer.cache_disk;
+            const auto actual = request(reader);
+            require_completion(actual, n_ctx > 256 ? prefix_tokens : 0, cold.token,
+                               "rows of other RoPE factors were reused, or of the same ones not");
+            require_cold_probability(actual, cold);
+        }
+    }
+}
+
 static void test_restart(const fs::path & work) {
     const fs::path model = work / "model.gguf";
     const fs::path cache = work / "cache";
@@ -410,6 +705,27 @@ static void test_restart(const fs::path & work) {
     params.cache_disk_mib = 4;
     params.warmup = false;
     params.fit_params = false;
+
+    test_sliding_window(params, work);
+    test_long_rope(params, work);
+
+    // The rows of a server with other settings are not this server's on any model: not even the exact shared prefix
+    // of a writer with another RoPE base is reused, after a restart or as a prefix cache.
+    {
+        auto writer = params;
+        writer.rope_freq_base = 32;
+        writer.cache_disk = (work / "rope-cache").string();
+        save_completed_prefix(writer);
+        require_completion(first_token(writer), prefix_tokens, base_token, "the same settings must reuse the prefix");
+        auto reader = params;
+        reader.cache_disk.clear();
+        reader.cache_ram_mib = 4;
+        reader.prefix_cache = writer.cache_disk;
+        require_completion(first_token(reader), 0, base_token, "a prefix cache computed with other settings was reused");
+        reader.prefix_cache.clear();
+        reader.cache_disk = writer.cache_disk;
+        require_completion(first_token(reader), 0, base_token, "a cached prompt computed with other settings was reused");
+    }
 
     save_completed_prefix(params);
     require_completion(first_token(params), prefix_tokens, base_token,

@@ -73,6 +73,8 @@ def prompt_metadata(path: Path, data: bytes) -> tuple[int, bool]:
         fail(f"{path} is a prompt cache of one server, not a prefix cache (fingerprint {fingerprint[:40]!r})")
     if "|lora=" in fingerprint:
         fail(f"{path} was computed with LoRA adapters and is not a portable base-model prefix cache")
+    if fingerprint.startswith(FINGERPRINT + "settings="):
+        fail(f"{path} was computed with settings that change the model's values and is not a portable prefix cache")
     (n_tokens,) = struct.unpack_from("<I", data, 12 + n_fp)
     return n_tokens, fingerprint.endswith(BASE_PROVENANCE)
 

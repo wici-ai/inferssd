@@ -1080,8 +1080,17 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
-    // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
+    // The settings that change what the model computes, as a field of the fingerprints; empty when the server runs
+    // the model as its files describe it and its RoPE factors do not depend on the context
+    // (server_prompt_settings_identity).
+    std::string prompt_cache_settings() const {
+        const std::string settings = server_prompt_settings_identity(params_base, llama_rope_factors_long(ctx));
+        return settings.empty() ? "" : "settings=" + settings + "|";
+    }
+
+    // What a cached state on disk depends on besides its tokens: the model, the settings that change what it
+    // computes, and the build that computed it. A file of the cache is a prefix cache for another build
+    // (prefix_cache_fingerprint is the start of its fingerprint).
     std::string prompt_cache_fingerprint(const std::string & model_fp) const {
         // Legacy writable states did not identify their adapters, including
         // states from a binary with an unknown build revision.
@@ -1090,7 +1099,7 @@ private:
             return model_fp + "|" + llama_build_info() + cache_revision;
         }
         // the model files cannot be read as GGUF files: by the first file's path, size and time
-        std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
+        std::string fp = prompt_cache_settings() + llama_build_info() + "|" + params_base.model.path;
         std::error_code ec;
         const auto size  = std::filesystem::file_size(params_base.model.path, ec);
         const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
@@ -1101,7 +1110,8 @@ private:
     }
 
     // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
-    // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
+    // headers of its files, not where they are or when they were written, and the settings that change what it
+    // computes. Not the build: a prefix cache is published
     // for the builds that compute it the same, up to rounding (docs/prefix-cache.md). A prefix cache is a file of a
     // server's prompt cache on disk, whose fingerprint is this and the build.
     std::string prefix_cache_fingerprint() const {
@@ -1111,7 +1121,7 @@ private:
         }
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
-        return "prefix-cache 1|" + files + "|" + desc;
+        return "prefix-cache 1|" + prompt_cache_settings() + files + "|" + desc;
     }
 
     void slot_save_and_clear(server_slot & slot) {
