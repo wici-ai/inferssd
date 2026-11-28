@@ -55,6 +55,8 @@ public:
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
+    void set_commit(const commit_cb & cb) override { commit = cb; }
+
     bool prepare(const std::vector<llama_ubatch> & ubatches);
 
     // find a contiguous slot of memory cells and emplace the ubatch there
@@ -175,6 +177,7 @@ private:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> keep_bufs;
 
+    commit_cb commit;
     bool alloc_keep();
     void drop_keep(llama_seq_id seq_id, llama_pos p0);
 

@@ -929,47 +929,66 @@ bool llama_memory_recurrent::alloc_keep() {
     if (hparams.no_alloc) {
         return false;
     }
-    // a row of each layer's states, on the device the layer's states are on
-    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctx_map;
-    for (size_t il = 0; il < r_l.size(); ++il) {
-        if (r_l[il] == nullptr || s_l[il] == nullptr) {
-            continue;
-        }
-        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(r_l[il]->buffer);
-        auto it = ctx_map.find(buft);
-        if (it == ctx_map.end()) {
-            ggml_init_params params = {
-                /*.mem_size   =*/ size_t(2u*r_l.size()*ggml_tensor_overhead()),
-                /*.mem_buffer =*/ NULL,
-                /*.no_alloc   =*/ true,
-            };
-            ggml_context * ctx = ggml_init(params);
-            if (!ctx) {
-                return false;
+    // Prepare one row per state on its original backend. Publish the rows together after their buffers are admitted.
+    decltype(r_keep) r(r_l.size());
+    decltype(s_keep) s(s_l.size());
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr> ctxs;
+    const auto prepare = [&]() {
+        for (size_t il = 0; il < r_l.size(); ++il) {
+            if (!r_l[il] || !s_l[il]) {
+                continue;
             }
-            it = ctx_map.emplace(buft, ggml_context_ptr(ctx)).first;
+            auto buft = ggml_backend_buffer_get_type(r_l[il]->buffer);
+            auto & ctx = ctxs[buft];
+            if (!ctx) {
+                ctx.reset(ggml_init({ 2 * r_l.size() * ggml_tensor_overhead(), nullptr, true }));
+                if (!ctx) {
+                    return false;
+                }
+            }
+            r[il] = ggml_new_tensor_2d(ctx.get(), r_l[il]->type, hparams.n_embd_r(), 1);
+            s[il] = ggml_new_tensor_2d(ctx.get(), s_l[il]->type, hparams.n_embd_s(), 1);
+            ggml_format_name(r[il], "cache_r_keep_l%zu", il);
+            ggml_format_name(s[il], "cache_s_keep_l%zu", il);
         }
-        r_keep[il] = ggml_new_tensor_2d(it->second.get(), r_l[il]->type, hparams.n_embd_r(), 1);
-        s_keep[il] = ggml_new_tensor_2d(it->second.get(), s_l[il]->type, hparams.n_embd_s(), 1);
-        ggml_format_name(r_keep[il], "cache_r_keep_l%zu", il);
-        ggml_format_name(s_keep[il], "cache_s_keep_l%zu", il);
+        return true;
+    };
+    if (!prepare()) {
+        return false;
     }
-    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> bufs;
-    for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        if (!buf) {
-            LLAMA_LOG_WARN("%s: no memory for a kept recurrent state on %s\n", __func__, ggml_backend_buft_name(buft));
-            std::fill(r_keep.begin(), r_keep.end(), nullptr);
-            std::fill(s_keep.begin(), s_keep.end(), nullptr);
+
+    const auto allocate = [&]() {
+        // The admission callback can retry after releasing device memory. A failed ggml allocation may have
+        // bound some tensors already, so each retry starts with fresh tensor descriptors.
+        if (ctxs.empty() && !prepare()) {
             return false;
         }
-        ggml_backend_buffer_clear(buf, 0);
-        LLAMA_LOG_INFO("%s: %10s kept state buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf),
-                ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
-        bufs.emplace_back(std::move(ctx), buf);
+        decltype(keep_bufs) bufs;
+        for (auto & [buft, ctx] : ctxs) {
+            ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft));
+            if (!buf) {
+                LLAMA_LOG_WARN("%s: no memory for a kept recurrent state on %s\n", __func__, ggml_backend_buft_name(buft));
+                ctxs.clear();
+                return false;
+            }
+            ggml_backend_buffer_clear(buf.get(), 0);
+            LLAMA_LOG_INFO("%s: %10s kept state buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf.get()),
+                    ggml_backend_buffer_get_size(buf.get())/1024.0/1024.0);
+            bufs.emplace_back(std::move(ctx), std::move(buf));
+        }
+        r_keep = std::move(r);
+        s_keep = std::move(s);
+        keep_bufs = std::move(bufs);
+        return true;
+    };
+    if (!commit) {
+        return allocate();
     }
-    keep_bufs = std::move(bufs);
-    return true;
+    size_t host = 0, device = 0;
+    for (const auto & [buft, ctx] : ctxs) {
+        (ggml_backend_buft_is_host(buft) ? host : device) += ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft);
+    }
+    return commit(host, device, allocate);
 }
 
 // a change to the sequence before the kept state's place, or to every sequence (seq_id -1), loses it

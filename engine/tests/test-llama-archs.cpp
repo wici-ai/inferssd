@@ -10,6 +10,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-memory.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
 #include "../src/ssd/dense-homes.h"
@@ -1187,6 +1188,35 @@ static int test_keep_at(const size_t seed, const ggml_log_level log_level) {
             printf("%s: %s: %s\n", __func__, name.c_str(), ok ? "OK" : "FAIL");
             failures += ok ? 0 : 1;
             continue;
+        }
+
+        if (arch == LLM_ARCH_QWEN35MOE) {
+            llama_context_ptr lctx = make_ctx(512);
+            llama_memory_t mem = llama_get_memory(lctx.get());
+            auto total = [&]() {
+                size_t bytes = 0;
+                for (const auto & item : mem->memory_breakdown()) { bytes += item.second; }
+                return bytes;
+            };
+            // The first kept state needs a budget grant. A refusal leaves nothing allocated and can be retried.
+            bool grant = false;
+            int calls = 0;
+            size_t charged = 0;
+            mem->set_commit([&](size_t host, size_t device, const std::function<bool()> & allocate) {
+                ++calls;
+                charged = host + device;
+                return grant && allocate();
+            });
+            const size_t before = total();
+            const bool refused = !llama_state_seq_keep_at(lctx.get(), 0, 177);
+            const size_t on_refusal = total() - before;
+            grant = true;
+            const bool accepted = llama_state_seq_keep_at(lctx.get(), 0, 177);
+            const size_t growth = total() - before;
+            const bool reused = llama_state_seq_keep_at(lctx.get(), 0, 200);
+            printf("checkpoint admission: refused=%d, growth on refusal=%zu, accepted=%d, reused=%d, "
+                   "calls=%d, charged=%zu, growth=%zu\n", refused, on_refusal, accepted, reused, calls, charged, growth);
+            ok = ok && refused && on_refusal == 0 && accepted && reused && calls == 2 && charged == growth && growth > 0;
         }
 
         for (const auto [n_ubatch, k] : std::vector<std::pair<uint32_t, uint32_t>>{ { 512, 177 }, { 128, 177 }, { 128, 256 } }) {
