@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Label new issues and pull requests and ask their owner to pick them up.
+"""Label new issues and assign them to their owner.
 
 An issue form already sets its type label (bug, app, model-request, enhancement, perf
 or question). This adds the labels its answers name and assigns the issue to the owner
-of the first matching rule. A pull request gets one label per area in its title and
-asks that area's owner for a review. When an issue's answers or a pull request's title
-change, the labels the old text named and the new one does not are removed; labels
-added by hand stay.
+of the first matching rule. When an issue's answers change, the labels the old answers
+named and the new ones do not are removed; labels added by hand stay. Pull requests are
+left to the automated reviewer (docs/development/review.md).
 
 Run by .github/workflows/triage.yml with the event from GITHUB_EVENT_NAME and
 GITHUB_EVENT_PATH. With --dry-run it prints the calls instead of making them.
 """
 import argparse
-import importlib.util
 import json
 import os
 import re
@@ -21,7 +19,6 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from pathlib import Path
 
 # Form answers that become labels: the question's heading, then each option's label.
 # An option mapped to None adds none.
@@ -34,20 +31,7 @@ FIELDS = {
 # An issue goes to the owner of the first label it carries here, else to FALLBACK.
 ISSUE_OWNERS = (("app", "DearJohnn"), ("model-request", "Bi666666"), ("multi-drive", "ustc-sunny"),
                 ("perf", "YOURENXIAKE"))
-# A pull request asks the owner of the first title area here, else FALLBACK.
-PULL_OWNERS = (("model", "Bi666666"),)
 FALLBACK = "Chikati"
-
-
-def load_title_rules():
-    spec = importlib.util.spec_from_file_location(
-        "check_pr_title", Path(__file__).with_name("check-pr-title.py"))
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-TITLE_RULES = load_title_rules()
 
 
 def answers(body):
@@ -74,24 +58,8 @@ def issue_labels(body):
     return labels
 
 
-def title_areas(title):
-    """The known areas a pull request title names, in title order."""
-    match = TITLE_RULES.FORM.fullmatch((title or "").strip())
-    if not match:
-        return []
-    areas = []
-    for area in match.group("areas").split(", "):
-        if area in TITLE_RULES.AREAS and area not in areas:
-            areas.append(area)
-    return areas
-
-
 def issue_owner(labels):
     return next((owner for label, owner in ISSUE_OWNERS if label in labels), FALLBACK)
-
-
-def pull_owner(areas):
-    return next((owner for area, owner in PULL_OWNERS if area in areas), FALLBACK)
 
 
 def names(labels):
@@ -117,24 +85,6 @@ def plan(event_name, event):
             calls.append(("POST", f"/issues/{number}/labels", {"labels": sorted(new - current)}))
         if action == "opened" and not issue.get("assignees"):
             calls.append(("POST", f"/issues/{number}/assignees", {"assignees": [issue_owner(current | new)]}))
-    elif event_name == "pull_request_target":
-        pull = event["pull_request"]
-        number = pull["number"]
-        new = set(title_areas(pull.get("title")))
-        current = names(pull.get("labels"))
-        if action == "edited":
-            if "title" not in event.get("changes", {}):
-                return calls
-            old = set(title_areas(event["changes"]["title"].get("from")))
-            for label in sorted((old - new) & current):
-                calls.append(("DELETE", f"/issues/{number}/labels/{urllib.parse.quote(label, safe='')}", None))
-        if new - current:
-            calls.append(("POST", f"/issues/{number}/labels", {"labels": sorted(new - current)}))
-        if action in ("opened", "reopened", "ready_for_review") and not pull.get("draft"):
-            owner = pull_owner(title_areas(pull.get("title")))
-            requested = {user["login"] for user in pull.get("requested_reviewers") or ()}
-            if owner != pull["user"]["login"] and owner not in requested:
-                calls.append(("POST", f"/pulls/{number}/requested_reviewers", {"reviewers": [owner]}))
     return calls
 
 

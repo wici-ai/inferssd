@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the issue and pull request triage, and keep it in step with the issue forms."""
+"""Exercise the issue triage, and keep it in step with the issue forms."""
 import importlib.util
 import json
 from pathlib import Path
@@ -62,15 +62,6 @@ def issue_event(action, text, labels=(), assignees=(), old=None):
     return event
 
 
-def pull_event(action, title, author="someone", labels=(), draft=False, old=None, requested=()):
-    event = {"action": action, "pull_request": {
-        "number": 9, "title": title, "draft": draft, "user": {"login": author},
-        "labels": [{"name": n} for n in labels], "requested_reviewers": [{"login": n} for n in requested]}}
-    if old is not None:
-        event["changes"] = {"title": {"from": old}}
-    return event
-
-
 class FormTests(unittest.TestCase):
     def test_every_form_sets_one_type_label(self):
         for name, (labels, _) in forms().items():
@@ -104,8 +95,6 @@ class FormTests(unittest.TestCase):
         known = TYPES | {label for options in triage.FIELDS.values() for label in options.values() if label}
         for label, _ in triage.ISSUE_OWNERS:
             self.assertIn(label, known)
-        for area, _ in triage.PULL_OWNERS:
-            self.assertIn(area, triage.TITLE_RULES.AREAS)
 
 
 class IssueTests(unittest.TestCase):
@@ -141,41 +130,6 @@ class IssueTests(unittest.TestCase):
         event = issue_event("edited", new, labels=["bug", "cuda", "windows"], old=old)
         self.assertEqual(triage.plan("issues", event), [])
         self.assertEqual(triage.plan("issues", {"action": "edited", "issue": event["issue"], "changes": {}}), [])
-
-
-class PullTests(unittest.TestCase):
-    def test_title_areas(self):
-        self.assertEqual(triage.title_areas("cuda, metal: fix expert staging"), ["cuda", "metal"])
-        self.assertEqual(triage.title_areas("vulkan: add the backend"), ["vulkan"])
-        self.assertEqual(triage.title_areas("misc: something, else"), [])
-        self.assertEqual(triage.title_areas("Fix everything"), [])
-
-    def test_opened_pull_is_labelled_and_asks_the_area_owner(self):
-        self.assertEqual(triage.plan("pull_request_target", pull_event("opened", "model, server: add Qwen4")), [
-            ("POST", "/issues/9/labels", {"labels": ["model", "server"]}),
-            ("POST", "/pulls/9/requested_reviewers", {"reviewers": ["Bi666666"]})])
-        self.assertEqual(triage.plan("pull_request_target", pull_event("opened", "cpu: fix the sink"))[-1],
-                         ("POST", "/pulls/9/requested_reviewers", {"reviewers": ["Chikati"]}))
-
-    def test_no_review_request_for_the_author_a_draft_or_twice(self):
-        for event in (pull_event("opened", "cpu: fix the sink", author="Chikati"),
-                      pull_event("opened", "cpu: fix the sink", draft=True),
-                      pull_event("reopened", "cpu: fix the sink", labels=["cpu"], requested=["Chikati"])):
-            with self.subTest(event=event):
-                self.assertNotIn("/pulls/9/requested_reviewers",
-                                 [path for _, path, _ in triage.plan("pull_request_target", event)])
-        self.assertEqual(triage.plan("pull_request_target", pull_event("ready_for_review", "cpu: fix the sink",
-                                                                       labels=["cpu"])),
-                         [("POST", "/pulls/9/requested_reviewers", {"reviewers": ["Chikati"]})])
-
-    def test_retitled_pull_replaces_only_its_area_labels(self):
-        event = pull_event("edited", "metal: fix staging", labels=["cuda", "help wanted"], old="cuda: fix staging")
-        self.assertEqual(triage.plan("pull_request_target", event), [
-            ("DELETE", "/issues/9/labels/cuda", None),
-            ("POST", "/issues/9/labels", {"labels": ["metal"]})])
-        unchanged = pull_event("edited", "metal: fix staging", labels=["metal"])
-        unchanged["changes"] = {"body": {"from": ""}}
-        self.assertEqual(triage.plan("pull_request_target", unchanged), [])
 
 
 if __name__ == "__main__":

@@ -1,21 +1,17 @@
 name: Triage
 
-# Labels new issues and pull requests and asks their owner to pick them up; see scripts/triage.py.
-# pull_request_target runs in this repository's context so that it can label fork pull requests.
-# It checks out the base branch and reads only the event payload, never the pull request's code.
+# Labels new issues and assigns them to their owner; see scripts/triage.py. Pull requests are left to the
+# automated reviewer in pr-agent.yml.
 on:
   issues:
     types: [opened, edited]
-  pull_request_target:
-    types: [opened, edited, reopened, ready_for_review]
 
 permissions:
   contents: read
   issues: write
-  pull-requests: write
 
 concurrency:
-  group: triage-${{ github.event.issue.number || github.event.pull_request.number }}
+  group: triage-${{ github.event.issue.number }}
 
 jobs:
   triage:

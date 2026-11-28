@@ -14,8 +14,7 @@ implementing them.
 Open an issue with one of the forms: bug report, WiCi AI desktop app, model or quantization request, feature or
 hardware request, performance report or question. The form sets the issue's type label, and its answers on the
 operating system, backend and model storage add labels of their own. [Triage](.github/workflows/triage.yml)
-assigns each new issue to an owner, labels each pull request with the areas in its title and asks an owner for
-a review.
+assigns each new issue to an owner.
 
 ## Pull requests
 
