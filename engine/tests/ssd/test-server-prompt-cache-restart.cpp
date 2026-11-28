@@ -1075,6 +1075,33 @@ static void test_sliding_window_wake_attention(common_params params, const fs::p
     require_cold_probability(actual, cold);
 }
 
+// A load of a model that turned non-causal while the server slept has no prompt cache: it caches no idle slot either,
+// though the load before it did.
+static void test_sliding_window_wake_idle_slots(common_params params, const fs::path & work) {
+    const auto model = work / "sliding-window-idle.gguf";
+    write_model(model, true);
+    params.model.path = model.string();
+    params.n_parallel = 2;
+    params.kv_unified = true;
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    params.cache_idle_slots = true;
+    params.sleep_idle_seconds = 1;
+    server_run server(params);
+    sleep_and_wake(server.server, [&] { write_model(model, true, false, width, 0, false); });
+    const auto prompt = window_saved_prompt();
+    first_token(server.server, prompt, {}, 0, 0, 0);
+    // a task on the other slot, which would save the idle one in the prompt cache and clear it
+    first_token(server.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, 1, 0, 0);
+    const auto actual = first_token(server.server, prompt, {}, 0, 0, 0);
+    const auto cold = [&] {
+        server_run cold_server(params);
+        return first_token(cold_server.server, prompt, {}, 0, 0, 0);
+    }();
+    require_completion(actual, 0, cold.token, "a non-causal load reused a state");
+    require_cold_probability(actual, cold);
+}
+
 static void test_sliding_window(common_params params, const fs::path & work) {
     const auto model = work / "sliding-window.gguf";
     write_model(model, true);
@@ -1087,6 +1114,7 @@ static void test_sliding_window(common_params params, const fs::path & work) {
     test_sliding_window_context_shift(params, work);
     test_sliding_window_wake_control_vector(params, work);
     test_sliding_window_wake_attention(params, work);
+    test_sliding_window_wake_idle_slots(params, work);
 
     // The attention type of a request: only a causal slot is cut back to the tokens a prompt shares with it, and only
     // a causal server keeps a state.
@@ -1218,6 +1246,44 @@ static void test_shifted_slot_file(common_params params, const fs::path & work) 
                        "a slot restored from a save after a context shift reused its rows");
 }
 
+// Sets the scale of the server's first adapter as the adapter API does, for the requests that name no scale.
+static void set_adapter_scale(server_context & server, float scale) {
+    auto reader = server.get_response_reader();
+    server_task task(SERVER_TASK_TYPE_SET_LORA);
+    task.id = reader.get_new_id();
+    task.set_lora = { { 0, scale } };
+    reader.post_task(std::move(task));
+    receive(reader);
+}
+
+// A server that sleeps loads the model again from its active parameters: the adapter scale set through the adapter API
+// serves the requests after the wake as before, and the idle-slot policy holds: with separate KV caches each slot
+// keeps its state while another serves a request, and its next prompt reuses it.
+static void test_wake_keeps_active_parameters(common_params params) {
+    params.n_parallel = 2;
+    params.n_ctx = 2 * 512;
+    params.kv_unified = false;
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    params.cache_idle_slots = true;
+    params.sleep_idle_seconds = 1;
+    server_run server(params);
+    set_adapter_scale(server.server, 1.0f);
+    const auto prompt = make_prompt(3 + 'y');
+    auto next = prompt;
+    next.back() = 3 + 'z';
+    const auto serve = [&] {
+        first_token(server.server, prompt, {}, 0, 0, 0);
+        first_token(server.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, 1, 0, 0);
+        return first_token(server.server, next, {}, 0, 0, 0);
+    };
+    const auto before = serve();
+    require_completion(before, prompt_tokens - 1, adapted_token,
+                       "the slot did not keep its state, or the adapter scale set through the API was not applied");
+    sleep_and_wake(server.server, [] {});
+    require_completion(serve(), before.cached, before.token, "a woken server lost its adapter scale or idle-slot policy");
+}
+
 static void test_restart(const fs::path & work) {
     const fs::path model = work / "model.gguf";
     const fs::path cache = work / "cache";
@@ -1280,6 +1346,7 @@ static void test_restart(const fs::path & work) {
     params.lora_adapters.push_back({adapter.string(), 0.0f, "", "", nullptr});
     test_explicit_slots(params, work);
     test_live_slot_text_reuse(params);
+    test_wake_keeps_active_parameters(params);
     params.cache_disk.clear();
     const auto cold_base = first_token(params);
     const auto cold_adapted = first_token(params, 1.0f);

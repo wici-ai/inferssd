@@ -60,8 +60,12 @@ whose fingerprint is the model's, and looks for a state among them as among its 
 removes or evicts them, and they do not count against `--cache-disk-mib`. It reads the directory again when the
 directory changes, so a file that arrives while the server runs serves the next request.
 
-A server that wakes from sleep loads the model again and derives its cache from that load, as a server that starts
-does: its fingerprint, its settings, its attention mode and its checkpoints, and a prompt cache of that fingerprint.
+A server that wakes from sleep loads the model again from its active parameters, the adapter scales set through the
+adapter API included, and derives its cache from that load, as a server that starts does: its fingerprint, its
+settings, its attention mode and its checkpoints, and a prompt cache of that fingerprint. What an earlier load turned
+off for its model or context (context checkpoints without causal attention, caching idle slots without a prompt cache
+or a unified KV cache, a context shift or `--cache-reuse` that the memory cannot do) the load decides again from what
+was asked.
 
 Every restore reads the fingerprint and the layout of the file it opened, from that file: one that another server,
 with this directory or another fingerprint, wrote or replaced since the server indexed it is a miss. A server writes

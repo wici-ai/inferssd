@@ -1010,8 +1010,18 @@ private:
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
 
-    // the parameters the server was started with, which every load derives its own from (load_model)
-    common_params params_given;
+    // What was asked of the server for what a load turns off or fills in when its model or context cannot have it
+    // or leaves it to the model: every load, a wake from sleep included, decides it again from this (load_model).
+    struct {
+        bool    ctx_shift;
+        int32_t n_cache_reuse;
+        bool    swa_full;
+        int32_t n_ctx_checkpoints;
+        bool    cache_idle_slots;
+        int32_t control_vector_layer_start;
+        int32_t control_vector_layer_end;
+        common_params_sampling sampling;
+    } requested = {};
 
 
 
@@ -1196,13 +1206,24 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
-        // Every load, a wake from sleep included, derives what it applies from the parameters the server was started
-        // with, not from what an earlier load made of them: the settings, the attention mode, the cache and the
-        // checkpoints are this load's.
+        // A wake from sleep loads the model again from the active parameters, those set since the start included,
+        // such as adapter scales. What an earlier load turned off or filled in for its model or context, this load
+        // decides again from what was asked: the settings, the attention mode, the checkpoints and the cache are
+        // this load's.
         if (!is_resume) {
-            params_given = params;
+            requested = { params.ctx_shift, params.n_cache_reuse, params.swa_full, params.n_ctx_checkpoints,
+                          params.cache_idle_slots, params.control_vector_layer_start, params.control_vector_layer_end,
+                          params.sampling };
         }
-        params_base = params_given;
+        params_base = params;
+        params_base.ctx_shift                  = requested.ctx_shift;
+        params_base.n_cache_reuse              = requested.n_cache_reuse;
+        params_base.swa_full                   = requested.swa_full;
+        params_base.n_ctx_checkpoints          = requested.n_ctx_checkpoints;
+        params_base.cache_idle_slots           = requested.cache_idle_slots;
+        params_base.control_vector_layer_start = requested.control_vector_layer_start;
+        params_base.control_vector_layer_end   = requested.control_vector_layer_end;
+        params_base.sampling                   = requested.sampling;
 
         adapter_identities.clear();
         if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0 || !params_base.slot_save_path.empty()) {
@@ -1474,6 +1495,23 @@ private:
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
 
+        // on every load: a wake whose load has no prompt cache keeps the idle slots
+        if (params_base.cache_idle_slots) {
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (params_base.cache_ram_mib == 0) {
+                SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (!prompt_cache) {
+                SRV_WRN("%s: --cache-idle-slots requires the prompt cache, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else {
+                SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
+                SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
+            }
+        }
+
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
             model_name = *params_base.model_alias.begin();
@@ -1516,22 +1554,6 @@ private:
         });
 
         metrics.init();
-
-        if (params_base.cache_idle_slots) {
-            if (!params_base.kv_unified) {
-                SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
-                params_base.cache_idle_slots = false;
-            } else if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
-                params_base.cache_idle_slots = false;
-            } else if (!prompt_cache) {
-                SRV_WRN("%s: --cache-idle-slots requires the prompt cache, disabling\n", __func__);
-                params_base.cache_idle_slots = false;
-            } else {
-                SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
-                SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
-            }
-        }
 
         // populate webui settings
         {
