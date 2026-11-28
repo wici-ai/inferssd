@@ -618,7 +618,7 @@ static void test_plugin_versions_share_their_context() {
 
 static void test_desktop_skill_alias_versions() {
     const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
-    const std::string root = "D:/Apps/plugins/cache/team";
+    const std::string root = R"(D:\Apps\plugins\cache\team)";
     const auto request = [&](const std::string & version) {
         const std::string catalog = "<skills_instructions>\r\n### Skill roots\r\n- `r3` = `" + root +
             "`\r\n- `r4` = `D:/Other`\r\n### Available skills\r\n- doc (file: r3/doc/" + version +
@@ -636,6 +636,13 @@ static void test_desktop_skill_alias_versions() {
             "both relative and expanded paths restore the current request's version");
     require(map.to_identifiers("r3\\\\doc\\\\0.0.0\\\\skills", false) == "r3\\\\doc\\\\2.4.1\\\\skills" &&
             map.to_identifiers("open r3/doc/0.", true) == "open ", "escaped and streaming path spellings restore");
+    const auto args = [&](const std::string & version) {
+        return json{{"path", root + "/doc/" + version + "/skills/doc/SKILL.md"}};
+    };
+    const std::string normalized = args("0.0.0").dump();
+    require(json::parse(map.to_identifiers(normalized, false)) == args("2.4.1") &&
+            map.to_stand_ins(args("2.4.1").dump()) == normalized,
+            "serialized tool arguments round-trip a native root joined to a forward-slash skill reference");
     auto regular = request("2.4.1");
     server_identifiers_apply(regular, env);
     require(regular == request("2.4.1"), "other clients keep catalog aliases as supplied");

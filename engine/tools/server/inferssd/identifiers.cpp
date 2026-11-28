@@ -135,6 +135,7 @@ void add_pair(pair_list & pairs, const std::string & id, const std::string & sta
     std::vector<std::pair<std::string, std::string>> forms = {
         {id_back, stand_in_back},
         {id_fwd, stand_in_fwd},
+        {replace_char(id, '\\', "\\\\"), replace_char(stand_in, '\\', "\\\\")},
         {replace_char(id_back, '\\', "\\\\"), replace_char(stand_in_back, '\\', "\\\\")},
     };
     const auto drive = [](const std::string & s) {
