@@ -221,8 +221,12 @@ bool plugin_version(const std::string & path, size_t at, size_t & begin, size_t 
     return end == path.size() || is_separator(path[end]) || !is_folder_byte((unsigned char) path[end]);
 }
 
-// Read only file references in a Desktop skill catalog with a declared root. Learn both ways the
-// model can use a file: as listed, or after following Desktop's instructions to expand its root.
+// The versions of plugins behind the skill roots of a skill list. Codex and the ChatGPT desktop app list the roots
+// ("- `r1` = `<home>/.codex/plugins/cache/openai-bundled`") and give each skill's file from one
+// ("(file: r1/computer-use/26.1120.41243/skills/computer-use/SKILL.md)"), so the version is in the skill's line and not
+// in a path learn_identifiers sees. Each such skill gives two pairs, in this order: the reference as listed and the
+// path the model gets by putting the root in its place, from plugins/cache on, each up to the version and with 0.0.0
+// for it. A root that names a version itself is a path learn_identifiers sees.
 void learn_skill_alias_versions(const std::string & text, pair_list & aliases) {
     if (text.find("<skills_instructions>") == std::string::npos) { return; }
     std::map<std::string, std::string> roots;
@@ -246,7 +250,9 @@ void learn_skill_alias_versions(const std::string & text, pair_list & aliases) {
             if (!entry.second && entry.first->second != root) { entry.first->second.clear(); }
         }
         const size_t marker = line.rfind(" (file: ");
-        if (section != catalog || line.compare(0, 2, "- ") != 0 || marker == std::string::npos || line.back() != ')') { continue; }
+        if (section != catalog || line.compare(0, 2, "- ") != 0 || marker == std::string::npos || line.back() != ')') {
+            continue;
+        }
         const std::string ref = line.substr(marker + 8, line.size() - marker - 9);
         const size_t sep = ref.find_first_of("/\\");
         if (sep == std::string::npos) { continue; }
@@ -449,9 +455,10 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
     }
 
     // the folder of a version of a plugin in an app's plugin cache: .../plugins/cache/<source>/<plugin>/<version>
-    // (Codex and the ChatGPT desktop app list the skills of their plugins there; Claude Code keeps its plugins the
-    // same way). Every update of a plugin changes it. The model sees the version 0.0.0 for each plugin, which names
-    // the plugin's folder alone, so that its stand-in does not depend on the other plugins installed.
+    // (Codex and the ChatGPT desktop app list the skills of their plugins there, or behind a skill root:
+    // learn_skill_alias_versions; Claude Code keeps its plugins the same way). Every update of a plugin changes it.
+    // The model sees the version 0.0.0 for each plugin, which names the plugin's folder alone, so that its stand-in
+    // does not depend on the other plugins installed.
     for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
         size_t i, end;
         if (!plugin_version(text, at, i, end)) { continue; }
@@ -687,7 +694,7 @@ const server_identifier_env & server_identifier_env::current() {
     return env;
 }
 
-server_identifier_map server_identifiers_apply(json & body, const server_identifier_env & env, bool skill_alias_versions) {
+server_identifier_map server_identifiers_apply(json & body, const server_identifier_env & env) {
     pair_list pairs;
     // a home directory of a few bytes ("/", "C:\") would match too much
     const bool home = env.home.size() >= 4 && !env.home_stand_in.empty();
@@ -713,7 +720,9 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
             const bool app_message = role == "system" || role == "developer";
             auto learn = [&](std::string & text) {
                 learn_identifiers(text, env, learned, app_message);
-                if (skill_alias_versions && app_message) { learn_skill_alias_versions(text, aliases); }
+                if (app_message) {
+                    learn_skill_alias_versions(text, aliases);
+                }
             };
             if (msg.contains("content")) {
                 for_each_text(msg.at("content"), learn);
@@ -733,16 +742,21 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
 
-    for (const auto & alias : aliases) {
-        add_pair(pairs, alias.first, alias.second, env.windows);
+    // a skill behind a root takes its stand-ins only if both restore its own version: the path the model makes from
+    // the root occurs nowhere in the request, and two versions of one plugin share the stand-ins (the first keeps
+    // them, and the other skill stays as sent)
+    for (size_t k = 0; k + 1 < aliases.size(); k += 2) {
+        server_identifier_map with;
+        with.pairs = pairs;
+        add_pair(with.pairs, aliases[k].first, aliases[k].second, env.windows);
+        add_pair(with.pairs, aliases[k + 1].first, aliases[k + 1].second, env.windows);
+        if (with.to_identifiers(aliases[k].second, false) == aliases[k].first &&
+                with.to_identifiers(aliases[k + 1].second, false) == aliases[k + 1].first) {
+            pairs = std::move(with.pairs);
+        }
     }
     server_identifier_map map;
     map.pairs = std::move(pairs);
-    for (const auto & alias : aliases) {
-        // The expanded form may never occur in the input. It must still restore uniquely,
-        // including when two aliases expose different versions of the same plugin.
-        if (map.to_identifiers(alias.second, false) != alias.first) { return {}; }
-    }
     if (map.empty()) {
         return map;
     }

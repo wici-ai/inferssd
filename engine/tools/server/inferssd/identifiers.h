@@ -15,9 +15,10 @@
 // directory and the project), the Claude desktop app the folders of the session, Codex and the ChatGPT desktop app the
 // skill folders under the home directory, and the ChatGPT desktop app the conversation's folder and the folder of its
 // visualizations, both dated; Codex and the ChatGPT desktop app name the folder of each version of a plugin they list
-// skills of; the Claude desktop app names the folder of the job that titles a session as its working directory; the
-// environment Claude Code sends after the user's first words, which the server puts ahead of them, opens with the
-// working directory. A new project, session, user or plugin update would process all of the context after them again.
+// skills of, in the path or behind the skill root the path starts with; the Claude desktop app names the folder of the
+// job that titles a session as its working directory; the environment Claude Code sends after the user's first words,
+// which the server puts ahead of them, opens with the working directory. A new project, session, user or plugin update
+// would process all of the context after them again.
 // The server gives the model stand-ins for these identifiers wherever they occur in a request, and puts the request's
 // identifiers back in place of the stand-ins in what the model writes. The model only copies such strings into paths,
 // so it does the same work, and the client sees its own paths. The user name in the stand-ins is infer: with inferssd,
@@ -69,8 +70,7 @@ struct server_identifier_env {
 
 // Puts stand-ins in place of the identifiers in the messages and tools of a chat request (OpenAI chat completions
 // form), and returns the map that takes them back; empty when the request has none or cannot be mapped exactly.
-server_identifier_map server_identifiers_apply(nlohmann::ordered_json & body, const server_identifier_env & env,
-                                             bool skill_alias_versions = false);
+server_identifier_map server_identifiers_apply(nlohmann::ordered_json & body, const server_identifier_env & env);
 
 // Codex names the project's folder in that context as well, as a writable root in its permission instructions
 // (" The writable roots are `<cwd>`, `/private/tmp`."), after it says that the sandbox permits "editing files in `cwd`

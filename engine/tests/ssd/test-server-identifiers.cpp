@@ -626,8 +626,8 @@ static void test_desktop_skill_alias_versions() {
         return json{{"messages", json::array({{{"role", "developer"}, {"content", catalog}}})}};
     };
     auto old = request("2.3.4"), current = request("2.4.1");
-    server_identifiers_apply(old, env, true);
-    const auto map = server_identifiers_apply(current, env, true);
+    server_identifiers_apply(old, env);
+    const auto map = server_identifiers_apply(current, env);
     require(!map.empty() && current == old && text_of(current["messages"][0]).find("r3/doc/0.0.0/") != std::string::npos,
             "updating a plugin behind a source-root alias leaves identical prompt text");
     require(text_of(current["messages"][0]).find("r4/doc/2.3.4/") != std::string::npos, "ordinary roots are literal");
@@ -643,15 +643,15 @@ static void test_desktop_skill_alias_versions() {
     require(json::parse(map.to_identifiers(normalized, false)) == args("2.4.1") &&
             map.to_stand_ins(args("2.4.1").dump()) == normalized,
             "serialized tool arguments round-trip a native root joined to a forward-slash skill reference");
-    auto regular = request("2.4.1");
-    server_identifiers_apply(regular, env);
-    require(regular == request("2.4.1"), "other clients keep catalog aliases as supplied");
     auto ambiguous = request("2.4.1");
     auto & text = ambiguous["messages"][0]["content"].get_ref<std::string &>();
     text.insert(text.find("</skills_instructions>"), "- previous (file: r3/doc/2.3.4/skills/doc/SKILL.md)\n");
-    const auto original = ambiguous;
-    require(server_identifiers_apply(ambiguous, env, true).empty() && ambiguous == original,
-            "two versions that would restore to the same expanded path remain literal");
+    const auto ambiguous_map = server_identifiers_apply(ambiguous, env);
+    const std::string ambiguous_text = text_of(ambiguous["messages"][0]);
+    require(ambiguous_text.find("r3/doc/0.0.0/") != std::string::npos &&
+            ambiguous_text.find("r3/doc/2.3.4/") != std::string::npos &&
+            ambiguous_map.to_identifiers(root + "/doc/0.0.0/skills", false) == root + "/doc/2.4.1/skills",
+            "of two versions of one plugin, the first takes the stand-in and the other stays as sent");
 }
 
 // a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
