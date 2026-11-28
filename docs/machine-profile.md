@@ -119,7 +119,9 @@ memory, the available memory) to choose:
   [speed estimate](#speed-estimates) prices with and without the head, its tensors and its
   routed layer taking expert cache. The head is loaded when drafting some length, every
   draft accepted, costs less a token than decoding without it; the server then drafts the
-  length that pays as it runs, down to none. A `--spec-*` option of yours leaves speculative
+  length that pays as it runs, down to none. A request picks from `speculative.n_min` (0 by
+  default) to `speculative.n_max` tokens a step; the two equal fix the length, so the drafts
+  do not depend on how long the steps take. A `--spec-*` option of yours leaves speculative
   decoding to you, and nothing is measured.
 
 Without a measurement of the model's weight format, both pools take every

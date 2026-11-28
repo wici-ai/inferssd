@@ -566,7 +566,7 @@ struct server_slot {
     void update_batch(llama_batch & batch) {
         int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0 && spec_adaptive && spec_draft.empty()) {
-            n_draft_max = spec_adapt.choose(n_draft_max);
+            n_draft_max = spec_adapt.choose(common_speculative_n_min(spec.get(), task->params.speculative), n_draft_max);
         }
         spec_draft_len = n_draft_max;
         if (n_draft_max > 0) {

@@ -18,12 +18,15 @@ static void require(bool ok, const char * what) {
 // once; a block accepts its first `ok` draft tokens; a head that is never sure enough (`propose` false) drafts nothing.
 // The length it settles on: the one it runs most in its last 200 steps.
 static int settle(double t1, double row_ms, double step_ms, int ok, int n_max, bool propose = true,
-        double switch_ms = 0.0) {
+        double switch_ms = 0.0, int n_min = 0, std::vector<int> * all = nullptr) {
     common_speculative_adapt a;
     std::vector<int> runs(n_max + 1, 0);
     int prev = -1;
     for (int i = 0; i < 600; ++i) {
-        const int n = a.choose(n_max);
+        const int n = a.choose(n_min, n_max);
+        if (all) {
+            all->push_back(n);
+        }
         const double extra = n != prev ? switch_ms : 0.0;
         prev = n;
         if (n == 0) {
@@ -47,7 +50,7 @@ int main() {
     {
         common_speculative_adapt a;
         for (int i = 0; i < 4 * common_speculative_adapt::burst; ++i) {
-            require(a.choose(3) == i / common_speculative_adapt::burst, "warm-up order");
+            require(a.choose(0, 3) == i / common_speculative_adapt::burst, "warm-up order");
         }
     }
     // a change of length that costs a lot once does not make the length that keeps running look slow
@@ -71,18 +74,33 @@ int main() {
         const int burst = common_speculative_adapt::burst;
         // both warm-up bursts, the best length until the probe, and the probe's burst of length 0
         for (int i = 0; i < 2 * burst + common_speculative_adapt::probe_every + burst; ++i) {
-            if (a.choose(1) == 0) {
+            if (a.choose(0, 1) == 0) {
                 a.on_plain(i < burst ? 200.0 : 60.0);
             } else {
                 a.on_block(1, 1, 130.0);
             }
         }
-        require(a.choose(1) == 0, "a length probed again after a cold start");
+        require(a.choose(0, 1) == 0, "a length probed again after a cold start");
     }
     // nothing to draft
     {
         common_speculative_adapt a;
-        require(a.choose(0) == 0, "n_max 0");
+        require(a.choose(0, 0) == 0, "n_max 0");
+    }
+    // a minimum: the lengths below it never run; rows as dear as tokens settle on the shortest length allowed
+    {
+        std::vector<int> all;
+        require(settle(100.0, 100.0, 5.0, 3, 3, true, 0.0, 1, &all) == 1, "the minimum, rows dear");
+        require(*std::min_element(all.begin(), all.end()) == 1, "no length below the minimum");
+        require(settle(100.0, 10.0, 2.0, 3, 3, true, 0.0, 2) == 3, "the minimum, rows cheap");
+    }
+    // a minimum equal to the maximum fixes the length, whatever the steps take
+    {
+        std::vector<int> all;
+        settle(100.0, 100.0, 5.0, 0, 3, true, 0.0, 3, &all);
+        require(std::all_of(all.begin(), all.end(), [](int n) { return n == 3; }), "a fixed length");
+        common_speculative_adapt a;
+        require(a.choose(5, 2) == 2, "a minimum above the maximum");
     }
     std::printf("ok\n");
     return 0;

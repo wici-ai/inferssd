@@ -1446,9 +1446,9 @@ double common_speculative_adapt::rate_of(int n) const {
     return n_len[n] / t_len[n];
 }
 
-int common_speculative_adapt::best(int n_max) const {
-    int b = 0;
-    for (int n = 1; n <= n_max; ++n) {
+int common_speculative_adapt::best(int n_min, int n_max) const {
+    int b = n_min;
+    for (int n = n_min + 1; n <= n_max; ++n) {
         if (rate_of(n) > rate_of(b)) {
             b = n;
         }
@@ -1456,23 +1456,28 @@ int common_speculative_adapt::best(int n_max) const {
     return b;
 }
 
-int common_speculative_adapt::choose(int n_max) {
+int common_speculative_adapt::choose(int n_min, int n_max) {
     if (n_max <= 0) {
         return 0;
     }
+    n_min = std::clamp(n_min, 0, n_max);
+    if (n_min == n_max) {
+        return n_max;
+    }
+    const int n_lens = n_max - n_min + 1;
     if (hold > 0 && held >= 0) {
         --hold;
-        return std::min(held, n_max);
+        return std::clamp(held, n_min, n_max);
     }
-    if (n_warm < n_max + 1) {
-        held = n_warm++;
+    if (n_warm < n_lens) {
+        held = n_min + n_warm++;
     } else if (++n_best > probe_every) {
         // the next length other than the best, for a burst
-        const int b = best(n_max);
-        held = (b + 1 + n_probe++ % n_max) % (n_max + 1);
+        const int b = best(n_min, n_max);
+        held = n_min + (b - n_min + 1 + n_probe++ % (n_lens - 1)) % n_lens;
         n_best = 0;
     } else {
-        held = best(n_max);
+        held = best(n_min, n_max);
         hold = 0;
         return held;
     }
@@ -1481,7 +1486,7 @@ int common_speculative_adapt::choose(int n_max) {
         c_len[held] = 0;
     }
     hold = burst - 1;
-    return std::min(held, n_max);
+    return std::clamp(held, n_min, n_max);
 }
 
 void common_speculative_print_stats(const common_speculative * spec) {
