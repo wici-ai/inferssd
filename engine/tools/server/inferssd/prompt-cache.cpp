@@ -27,6 +27,7 @@ extern "C" {
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <random>
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -1073,13 +1074,12 @@ std::string server_prompt_settings_identity(const common_params & params, int32_
             (ggml_is_quantized(params.cache_type_k) || ggml_is_quantized(params.cache_type_v))) {
         add("kv-rotation off");
     }
-    for (const auto & cvec : params.control_vectors) {
-        add(string_format("control-vector %s %08" PRIx32, server_adapter_file_identity(cvec.fname).c_str(),
-                          bits(cvec.strength)));
-    }
+    // The control vector the server applied (common_init_from_params), not its files as they are now. One whose
+    // identity is unknown is this process's alone.
     if (!params.control_vectors.empty()) {
-        add(string_format("control-vector-layers %d %d", params.control_vector_layer_start,
-                          params.control_vector_layer_end));
+        std::random_device random;
+        static const std::string unknown = string_format("unknown %08x%08x", random(), random());
+        add("control-vector " + (params.control_vector_identity.empty() ? unknown : params.control_vector_identity));
     }
     if (settings.empty()) {
         return "";
