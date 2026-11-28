@@ -199,9 +199,10 @@ static int64_t server_prompt_prefix_tokens(const llama_vocab * vocab, const json
 }
 
 // The prompt's points (server_prompt_points): its shared and context prefixes, and its branch points
-// ("branch_points_chars", see oaicompat_chat_params_parse), each the tokens the prompt shares with its text up to
-// that place tokenized on its own, so that a place inside a token stands for the tokens before it. A point less than
-// 64 tokens in, or at or after the prefix it lies in, is left out.
+// ("branch_points_chars", see oaicompat_chat_params_parse, those in the user's context also in
+// "context_branch_points_chars"), each the tokens the prompt shares with its text up to that place tokenized on its
+// own, once, so that a place inside a token stands for the tokens before it. A point less than 64 tokens in, or at or
+// after the prefix it lies in, is left out.
 static server_prompt_points server_prompt_points_of(const llama_vocab * vocab, const json & data,
         const llama_tokens & tokens) {
     server_prompt_points points;
@@ -212,6 +213,7 @@ static server_prompt_points server_prompt_points_of(const llama_vocab * vocab, c
     const int64_t n_context = server_prompt_prefix_tokens(vocab, data, tokens, "context_prefix_chars");
     points.n_context = n_context > points.n_shared ? n_context : 0;
     const int64_t n_kept = std::max(points.n_shared, points.n_context);
+    const json context_chars = json_value(data, "context_branch_points_chars", json::array());
     for (const auto & chars : json_value(data, "branch_points_chars", json::array())) {
         const llama_tokens head = server_prompt_head_tokens(vocab, data, chars.get<size_t>());
         int64_t n = 0;
@@ -220,10 +222,15 @@ static server_prompt_points server_prompt_points_of(const llama_vocab * vocab, c
         }
         if (n >= 64 && n < n_kept && !points.kept(n)) {
             points.branch.push_back(n);
+            if (std::find(context_chars.begin(), context_chars.end(), chars) != context_chars.end()) {
+                points.context_branch.push_back(n);
+            }
         }
     }
-    std::sort(points.branch.begin(), points.branch.end());
-    points.branch.erase(std::unique(points.branch.begin(), points.branch.end()), points.branch.end());
+    for (auto * branch : { &points.branch, &points.context_branch }) {
+        std::sort(branch->begin(), branch->end());
+        branch->erase(std::unique(branch->begin(), branch->end()), branch->end());
+    }
     return points;
 }
 
@@ -288,11 +295,15 @@ struct server_slot {
 
     // Prompt tokens [n0, n1) of the slot went into the batch being decoded, ending at batch row `row_end`. A memory
     // that can save an earlier state (llama_state_seq_at_align) is checkpointed inside them once they are decoded,
-    // instead of stopping the batch at each checkpoint (see checkpoint_decoded_prompt()).
+    // instead of stopping the batch at each checkpoint (see checkpoint_decoded_prompt()). A memory that cannot keeps
+    // the state after n_kept of the prompt's tokens inside the batch when asked to (llama_state_seq_keep_at), for a
+    // checkpoint once the rows up to `kept_row_end` are decoded (see checkpoint_kept_state()); 0 for none.
     struct {
         int64_t n0 = 0;
         int64_t n1 = 0;
         int32_t row_end = -1;
+        int64_t n_kept = 0;
+        int32_t kept_row_end = -1;
     } prompt_batch;
 
     // generation props
@@ -691,6 +702,7 @@ struct server_slot {
     void release() {
         end_request();
         prompt_batch.row_end = -1;
+        prompt_batch.n_kept  = 0;
         collect_usage();
 
         if (is_processing()) {
@@ -2458,6 +2470,22 @@ private:
         }
     }
 
+    // A checkpoint at the state the memory kept inside the decoded batch (prompt_batch.n_kept), as at the end of a batch.
+    void checkpoint_kept_state(server_slot & slot) {
+        const int64_t n = slot.prompt_batch.n_kept;
+        slot.prompt_batch.n_kept = 0;
+        if (!llama_state_seq_can_save_at(ctx, slot.id, n)) {
+            SLT_WRN(slot, "cannot save the state after %" PRId64 " tokens\n", n);
+            return;
+        }
+        auto reservation = checkpoint_room(slot, llama_state_seq_get_size_at(ctx, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY, n), n);
+        if (reservation) {
+            auto checkpoint = server_get_checkpoint_at(ctx, slot.id, n, n - 1);
+            reservation.commit();
+            add_checkpoint(slot, std::move(checkpoint));
+        }
+    }
+
     // Puts the first `n` prompt tokens of the slot, the prompt part other conversations share, in the prompt cache,
     // where a conversation started later, or after a restart, finds it: with the sequence's current state (current,
     // which must be the state after them) or with the earlier state a memory that can save one has after them, and
@@ -3577,6 +3605,18 @@ private:
                         slot.prompt_batch.row_end = batch.n_tokens;
                     }
 
+                    // A memory checkpointed only between batches does not stop the batch where the user's context
+                    // parts (another mode, commands the user approved), which would cost a pass over the weights: it
+                    // keeps the state there inside the batch when it can.
+                    slot.prompt_batch.n_kept = 0;
+                    if (do_checkpoint && n_tokens_cur > 0 && !has_mtmd) {
+                        const int64_t n_kept = slot.task->points.context_branch_in(n_batch_start, slot.prompt.n_tokens());
+                        if (n_kept >= 64 && llama_state_seq_keep_at(ctx, slot.id, n_kept)) {
+                            slot.prompt_batch.n_kept       = n_kept;
+                            slot.prompt_batch.kept_row_end = batch.n_tokens;
+                        }
+                    }
+
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
@@ -3764,6 +3804,9 @@ private:
             for (auto & slot : slots) {
                 if (slot.prompt_batch.row_end > 0 && slot.prompt_batch.row_end <= i_next && slot.task) {
                     checkpoint_decoded_prompt(slot);
+                }
+                if (slot.prompt_batch.n_kept > 0 && slot.prompt_batch.kept_row_end <= i_next && slot.task) {
+                    checkpoint_kept_state(slot);
                 }
             }
 

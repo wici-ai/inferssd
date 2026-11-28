@@ -1741,9 +1741,9 @@ json oaicompat_chat_params_parse(
                 }
 
                 // Places inside these prefixes where the prompt of another user or setup is likely to part from
-                // this one, where the server keeps a state as well when the memory can save one after a batch
-                // (server_prompt_batch_stops): where each group of tools ends
-                // (server_order_tools; a user with more or fewer MCP servers or plugins goes on differently there)
+                // this one, where the server keeps a state as well (server_prompt_points): where each group of
+                // tools ends (server_order_tools; a user with more or fewer MCP servers or plugins goes on differently
+                // there)
                 // and, in the user's context, where the data the user adds to over time starts
                 // (SERVER_USER_CONTEXT_DATA_CHARS), or would start. Each is where the leading messages with part of
                 // the tools, or of the context, and the same with one more tool, or one more line, stop being the
@@ -1779,6 +1779,7 @@ json oaicompat_chat_params_parse(
                     return chat_params.prompt.compare(0, n, *part, 0, n) == 0 ? n : 0;
                 };
                 std::vector<size_t> branch;
+                std::vector<size_t> context_branch;
                 const common_chat_tool another = {"x", "x", R"({"type": "object", "properties": {}})"};
                 for (const size_t end : tool_groups) {
                     if (end > inputs.tools.size()) {
@@ -1807,16 +1808,24 @@ json oaicompat_chat_params_parse(
                     }
                     if (user_context_data_chars > 0 || more) {
                         branch.push_back(part_end(render(2, inputs.tools, &before), more));
+                        context_branch.push_back(branch.back());
                     }
                 }
+                // the points inside the prefixes, each once; those in the user's context are also reported apart
+                // from the tools' (server_prompt_points::context_branch)
                 const size_t n_kept = std::max(n_chars, n_context_chars);
-                branch.erase(std::remove_if(branch.begin(), branch.end(), [&](size_t p) {
-                    return p == 0 || p >= n_kept || p == n_chars;
-                }), branch.end());
-                std::sort(branch.begin(), branch.end());
-                branch.erase(std::unique(branch.begin(), branch.end()), branch.end());
+                for (auto * points : { &branch, &context_branch }) {
+                    points->erase(std::remove_if(points->begin(), points->end(), [&](size_t p) {
+                        return p == 0 || p >= n_kept || p == n_chars;
+                    }), points->end());
+                    std::sort(points->begin(), points->end());
+                    points->erase(std::unique(points->begin(), points->end()), points->end());
+                }
                 if (!branch.empty()) {
                     llama_params["branch_points_chars"] = branch;
+                }
+                if (!context_branch.empty()) {
+                    llama_params["context_branch_points_chars"] = context_branch;
                 }
 
                 size_t n_opening = n_system;

@@ -176,11 +176,13 @@ static void test_full_removal_only_removes_obsolete_shorter_with_checkpoint() {
     }
 }
 
-static server_prompt_points shared_at(int64_t n_shared, int64_t n_context = 0, std::vector<int64_t> branch = {}) {
+static server_prompt_points shared_at(int64_t n_shared, int64_t n_context = 0, std::vector<int64_t> branch = {},
+                                      std::vector<int64_t> context_branch = {}) {
     server_prompt_points points;
-    points.n_shared  = n_shared;
-    points.n_context = n_context;
-    points.branch    = std::move(branch);
+    points.n_shared       = n_shared;
+    points.n_context      = n_context;
+    points.branch         = std::move(branch);
+    points.context_branch = std::move(context_branch);
     return points;
 }
 
@@ -258,7 +260,7 @@ static void test_batches_end_with_the_ubatch_of_a_point() {
 }
 
 static void test_prompt_points() {
-    const server_prompt_points points = shared_at(11000, 12500, { 6000, 7000, 12400 });
+    const server_prompt_points points = shared_at(11000, 12500, { 6000, 7000, 12400 }, { 12400 });
     require(points.all() == std::vector<int64_t>({ 6000, 7000, 11000, 12400, 12500 }), "every point, sorted");
     require(points.has(7000) && points.has(12500) && !points.has(7001), "a point is one of them");
     require(points.kept(11000) && points.kept(12500) && !points.kept(7000), "the prefixes are kept, branch points not");
@@ -269,12 +271,22 @@ static void test_prompt_points() {
     server_prompt_points moved = points;
     moved.replaced(9000, 9200, -30);
     require(moved.n_shared == 10970 && moved.n_context == 12470 &&
-                moved.branch == std::vector<int64_t>({ 6000, 7000, 12370 }),
+                moved.branch == std::vector<int64_t>({ 6000, 7000, 12370 }) &&
+                moved.context_branch == std::vector<int64_t>({ 12370 }),
             "points after the replaced tokens move with them");
     server_prompt_points inside = points;
     inside.replaced(6500, 11500, 10);
-    require(inside.n_shared == 0 && inside.n_context == 12510 && inside.branch == std::vector<int64_t>({ 6000, 12410 }),
+    require(inside.n_shared == 0 && inside.n_context == 12510 &&
+                inside.branch == std::vector<int64_t>({ 6000, 12410 }) &&
+                inside.context_branch == std::vector<int64_t>({ 12410 }),
             "points inside the replaced tokens are lost");
+
+    // where a memory that cannot save an earlier state keeps one inside a batch: the user's context's point, not the
+    // tools', also once a replaced part of the prompt has taken the shared prefix before them
+    require(points.context_branch_in(11000, 12500) == 12400 && points.context_branch_in(0, 11000) == 0 &&
+                points.context_branch_in(12400, 12500) == 0,
+            "a batch keeps the state at the context's point inside it");
+    require(inside.context_branch_in(0, 12510) == 12410, "a tool group's end stays one without the shared prefix");
 }
 
 static void test_checkpoints_at_points_are_kept_by_count() {

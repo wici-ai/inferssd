@@ -114,12 +114,14 @@ int64_t server_prompt_reuse_full(
 // the environment Claude's apps send, up to the date that ends it or else the user's words), whose states go to the
 // prompt cache, and the branch points inside them, where the prompt of another user or setup is likely to part from
 // this one (where a group of tools ends, where the data in the user's context starts), which the slot keeps
-// checkpoints at when the memory can save an earlier state after a batch, and the states kept in the prompt cache
-// carry. 0 for none.
+// checkpoints at when the memory can save an earlier state after a batch (a memory that cannot, a recurrent one, keeps
+// those in the user's context inside the batch when it can: llama_state_seq_keep_at), and the states kept in the
+// prompt cache carry. 0 for none.
 struct server_prompt_points {
     int64_t              n_shared  = 0;
     int64_t              n_context = 0;
-    std::vector<int64_t> branch; // sorted, each inside the shared or the context prefix
+    std::vector<int64_t> branch;         // sorted, each inside the shared or the context prefix
+    std::vector<int64_t> context_branch; // those of branch in the user's context (where its data starts), sorted
 
     // every point, sorted
     std::vector<int64_t> all() const {
@@ -146,6 +148,17 @@ struct server_prompt_points {
         return at(n_shared) || at(n_context);
     }
 
+    // the first branch point in the user's context in (n0, n1), the tokens of a batch past its first: where a memory
+    // that cannot save an earlier state keeps one inside the batch; 0 for none
+    int64_t context_branch_in(int64_t n0, int64_t n1) const {
+        for (const int64_t n : context_branch) {
+            if (n > n0 && n < n1) {
+                return n;
+            }
+        }
+        return 0;
+    }
+
     // The prompt's tokens [n_before, replaced_end) became others, delta more (server_tokens_reuse_text): a point after
     // them moves with them, one inside them is lost.
     void replaced(int64_t n_before, int64_t replaced_end, int64_t delta) {
@@ -158,10 +171,12 @@ struct server_prompt_points {
         };
         move(n_shared);
         move(n_context);
-        for (int64_t & n : branch) {
-            move(n);
+        for (auto * points : { &branch, &context_branch }) {
+            for (int64_t & n : *points) {
+                move(n);
+            }
+            points->erase(std::remove(points->begin(), points->end(), 0), points->end());
         }
-        branch.erase(std::remove(branch.begin(), branch.end(), 0), branch.end());
     }
 };
 
@@ -179,7 +194,8 @@ inline bool server_prompt_save_before_switch(float f_keep, common_context_seq_rm
 // n_prompt tokens, so that a checkpoint can be taken there. It stops at the end of the shared and of the context prefix
 // and 4 tokens before the end of the prompt (the generation prompt may be rendered differently in the next turn). It
 // does not stop at the branch points: each stop reads the model's weights once more, a cost every new prompt pays for
-// a state that serves only some later ones; a memory that can save an earlier state keeps them after the batch.
+// a state that serves only some later ones; a memory that can save an earlier state keeps them after the batch, and a
+// recurrent one keeps those in the user's context inside it when it can (llama_state_seq_keep_at).
 inline bool server_prompt_batch_stops(int64_t n_done, int64_t n_prompt, const server_prompt_points & points,
                                       int64_t n_batch) {
     const int64_t n_end = n_prompt - std::min<int64_t>(n_batch, 4);

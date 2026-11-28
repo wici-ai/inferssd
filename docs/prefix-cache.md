@@ -88,6 +88,12 @@ cache: the server saves the state after the shared prefix. The request is the on
 the configuration the desktop app gives it, with the user's identifiers already replaced by the server's stand-ins
 (`tools/server/inferssd/identifiers.h`), so the tokens are the ones every user's server renders.
 
+The state carries checkpoints where the prompts of other users or setups are likely to part. A sliding-window model,
+such as Gemma 4, keeps one at each group of tools and where the data in the user's context starts. A recurrent or
+hybrid model, such as Qwen3.6, keeps the one where that data starts, from inside the prompt pass that goes past it. A
+request of the same app and setup that parts there, in the app's other mode or with commands the user approved,
+restores it instead of the shared prefix.
+
 The stand-ins are those of the system the server runs on, so a server renders another system's requests as that
 system's servers do only when told which system they come from. With `INFERSSD_IDENTIFIERS_OS` set to `macos`,
 `windows` or `linux`, the server uses that system's stand-ins and spellings for the home directory in `HOME`
