@@ -114,17 +114,22 @@ held; a gap that ends during the read costs the share of it left, and one that e
 before the read is issued costs nothing. A plan keeps the run of reads worth the
 most, since the gaps differ from layer to layer. The next layer takes what landed
 as RAM hits instead of reading them. A read takes a free slot of the layer first, else the layer's coldest
-entry of an expert the prediction does not name. When the layer's own slots are all
-taken, it borrows slots of the other layers, except the one the pass is computing:
+entry of an expert the prediction does not name, else a slot of the layer that holds
+no memory yet: the RAM cache commits a slot's memory when decode first admits an
+expert into it, and on unified memory beside a GPU tier it has no slots before the
+first decode token. The read-ahead commits such a slot as a decode admission does,
+after the same host-memory check, and reads nothing into it when the check finds no
+room. When the layer's own slots are all taken, it borrows slots of the other
+layers, except the one the pass is computing:
 an empty slot first, then the RAM copy of an expert the GPU tier also holds, then
 the coldest entry of a layer the pass has computed, and last the coldest entry of a
 layer it has yet to reach, which the pass would have used as often as its calls so
 far used the entries they held. A borrowed slot serves that one layer's read and
 comes back empty, so a pass cycles a few slots instead of emptying other layers. The
-read-ahead holds no memory of its own: what it read into the layer's own slots stays
-cached. It reads until the next layer's call starts, and a slot's entry goes only
-once a read into it is issued. It needs a RAM cache that a prompt pass reads. `0`
-turns this off, for A/B timing.
+read-ahead holds no memory beside the RAM cache's slots: what it read into the
+layer's own slots stays cached. It reads until the next layer's call starts, and a
+slot's entry goes only once a read into it is issued. It needs a RAM cache that a
+prompt pass reads. `0` turns this off, for A/B timing.
 
 At load, once the server's first pass is done and before any request, the expert
 caches take their experts from the drive. No request has named an expert yet, so
