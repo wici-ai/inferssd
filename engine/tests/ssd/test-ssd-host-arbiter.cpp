@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "../../ggml/src/ggml-ssd/host/arbiter.h"
+#include "../../ggml/src/ggml-ssd/host/expert-cache.h"
 #include "../../ggml/src/ggml-ssd/host/ledger.h"
 #include <atomic>
 #include <condition_variable>
@@ -594,12 +595,39 @@ static void zero_takes_measure_nothing() {
     require(f.reads > before, "a take of something did not measure the room");
 }
 
+// The RAM cache's load step on unified memory (expert-cache.h reserve_at_load): one take admits all of its slots, and
+// it measures MemAvailable at the full watermark boost, so the slots are sized from that room. Sized from MemAvailable
+// as it is, the step also asked for the boost's headroom and was refused whole, and the cache started empty, every
+// expert read from the drive first: a DGX Spark (GB10) whenever its zones were not boosted at load.
+static void cache_load_at_full_boost() {
+    machine m; m.zoneinfo = spark_zones(0, 0); m.limit = 100*GiB; m.current = 1*GiB; m.available = 64*GiB;
+    auto owner = std::make_shared<process_arbiter>(m.reader());
+    auto client = checked(owner->make_client());
+    expert_cache_options options;
+    options.host = client.get(); options.budget = config(true);
+    options.cache_policy = "lru"; options.cache_allocation = "uniform"; options.cache_keep = true;
+    options.cache_partial_reclaim = true;
+    expert_cache cache(options); // configures the client
+    const room plain = checked(client->measure(0)), boosted = checked(client->measure(0, true));
+    require(plain.boost_headroom == 0 && boosted.boost_headroom > 256*MiB, "load step: the zones' boost headroom");
+    // 32 MiB of room at the full boost; MemAvailable as it is also holds the headroom
+    m.available = plain.floor + boosted.boost_headroom + 32*MiB;
+    const int32_t layers[2] = { 1, 2 };
+    const uint64_t read[3] = { 64*1024, 64*1024, 64*1024 };
+    cache.configure(expert_cache::auto_budget, layers, 2, 256, read, 256);
+    double us = 0;
+    const size_t loaded = cache.reserve_at_load(8, 1, us);
+    require(loaded > 0 && cache.stats.committed_bytes == loaded * cache.stride,
+        "load step: the take at the full boost refused the slots");
+    require(loaded * cache.stride <= 32*MiB, "load step: the slots took the boost's headroom");
+}
+
 int main() {
     try {
         serial_equivalence(); holds_and_pending(); races_and_reclaim(); process_reserves_and_rollback();
         interval_isolation_and_close(); close_waits_for_reclaimer();
         result_errors_and_tracked_allocations(); unified_device_held(); reclaim_order(); needed_allocations();
-        margin_learning(); zero_takes_measure_nothing();
-        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim order, needed allocations, margin learning, interval, close, unified device gates and unmeasured takes of nothing passed\n";
+        margin_learning(); zero_takes_measure_nothing(); cache_load_at_full_boost();
+        std::cout << "host arbiter: serial equations, holds, atomic tickets, reclaim order, needed allocations, margin learning, interval, close, unified device gates, unmeasured takes of nothing and the cache's load step at the full boost passed\n";
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }
 }

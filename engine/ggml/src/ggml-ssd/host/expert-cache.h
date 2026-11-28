@@ -689,10 +689,11 @@ struct expert_cache {
         if (budget == auto_budget) {
             // With a GPU tier on a unified-memory GPU the tier keeps the same experts in the same DRAM and
             // computes them faster, so the RAM cache keeps only the slots the next-layer prefetch lands in.
-            // Otherwise, a unified GPU without a tier included, it takes what the cgroup guard would admit now.
+            // Otherwise, a unified GPU without a tier included, it takes what the guard would admit now: the room at
+            // the full watermark boost, as the take that admits its slots measures it (budget-linux.h).
             // The receipt names both terms: on a discrete GPU the cgroup term should be the smaller one.
             uint64_t surplus = 0;
-            const room_state state = check_room(0, nullptr, &surplus);
+            const room_state state = check_room(0, nullptr, &surplus, true);
             budget = tier_caches
                     ? multiply(multiply(layers.size(), uint64_t(std::max(1, staging_per_layer))), next_stride)
                     : (state == room_ok ? surplus : 0);
@@ -1060,8 +1061,10 @@ struct expert_cache {
         const uint64_t slot_pages = add(ceil_div(stride, page_size), stride % page_size != 0);
         const uint64_t payload_pages = multiply(slot_pages, page_size), tables = page_tables(payload_pages);
         auto cost = [&](size_t n) { return add(multiply(n, add(payload_pages, tables)), 64 * 1024); };
+        // The room as the one take below for all of these slots measures it, at the full watermark boost: sized from
+        // MemAvailable as it is, they would ask for the boost's headroom too, and the take would refuse them all.
         uint64_t surplus = 0;
-        if (check_room(0, nullptr, &surplus) == room_unreadable) { return 0; }
+        if (check_room(0, nullptr, &surplus, true) == room_unreadable) { return 0; }
         size_t n = std::min<size_t>(entries.size(), surplus > 64 * 1024 ? (surplus - 64 * 1024) / add(payload_pages, tables) : 0);
         // The slots committed, as runs [first, first + count): the first n, or for a room-sized cache the first of
         // each layer's enabled slots, n in all.
@@ -1080,10 +1083,22 @@ struct expert_cache {
             runs.emplace_back(0, n);
         }
         if (!n) { return 0; }
+        // A step that does not load says why: the cache then starts empty at the first decode token, and every
+        // expert it holds is read from the drive first.
+        const auto skipped = [&](const char * why, const room & r) {
+            std::fprintf(stderr, "[ssd_cpu_sink_cache] reason=load_skipped why=%s slots=%zu bytes=%llu available=%llu"
+                    " boost_headroom=%llu floor=%llu system_shortage=%llu cgroup_shortage=%llu\n",
+                    why, n, (unsigned long long) cost(n), (unsigned long long) r.available,
+                    (unsigned long long) r.boost_headroom, (unsigned long long) r.floor,
+                    (unsigned long long) r.system_shortage, (unsigned long long) r.cgroup_shortage);
+            return size_t(0);
+        };
         auto load_ticket = take_guard(cost(n));
-        if (!load_ticket) { return 0; }
-        if (map_arena()) { release(); return 0; }
-        for (const auto & run : runs) { if (!commit_slots(run.first, run.second)) { release(); return 0; } }
+        if (!load_ticket) { return skipped(load_ticket.error.c_str(), load_ticket.value.observation()); }
+        if (const char * failed = map_arena()) { release(); return skipped(failed, last_room); }
+        for (const auto & run : runs) {
+            if (!commit_slots(run.first, run.second)) { release(); return skipped("commit_failed", last_room); }
+        }
         const auto start = detail::cache_clock::now();
         const size_t workers = size_t(std::max(1, std::min(threads, int(n))));
         std::atomic<bool> touched{false};
@@ -1143,7 +1158,8 @@ struct expert_cache {
         uint64_t more = entries.size() - before, surplus = 0, owed = 0;
         if (!more) { return; }
         if (stats.budget_bytes == auto_budget) {
-            if (check_room(0, nullptr, &surplus) == room_unreadable || !slot_cost_bytes) { return; }
+            // at the full watermark boost, as the slots' admissions take their room
+            if (check_room(0, nullptr, &surplus, true) == room_unreadable || !slot_cost_bytes) { return; }
             for (const auto & e : entries) { owed += e.enabled && !e.resident; }
             const uint64_t room = surplus > metadata_bytes ? (surplus - metadata_bytes) / slot_cost_bytes : 0;
             more = std::min<uint64_t>(more, room > owed + 1 ? room - owed - 1 : 0);
