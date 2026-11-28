@@ -6,6 +6,9 @@
 #include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
+#include <set>
+#include <sstream>
 #include <string_view>
 
 #if defined(__APPLE__)
@@ -27,41 +30,143 @@ bool is_separator(char c) {
     return c == '/' || c == '\\';
 }
 
-// Replaces each text of one side of the pairs (the identifiers, or with reverse the stand-ins) by the other side,
-// left to right, the longest first. A match starts after a byte that is not a name byte and ends before one. With
-// partial, the text is still growing: it stops where a longer text could still match, or where the byte after a match
-// is not there yet.
-std::string replace(const std::string & text, const pair_list & pairs, bool reverse, bool partial) {
-    std::vector<const std::pair<std::string, std::string> *> order;
-    std::array<bool, 256> first {};
-    for (const auto & p : pairs) {
-        const std::string & from = reverse ? p.second : p.first;
-        if (!from.empty()) {
-            order.push_back(&p);
-            first[(unsigned char) from[0]] = true;
+// Where the folder `names` and `version` after it end in text from i: each name and the version after a separator
+// ('/', '\' or "\\"), and the version before a byte that is not a name byte nor a '.', '-' or '+' that a name byte
+// follows (2.4.1 is not the start of 2.4.1-beta). 0 if they are not there; *names_end is where the version starts.
+// With partial, *hold when the text ends before that is known.
+size_t folder_version_end(const std::string & text, size_t i, const std::vector<std::string> & names,
+                          const std::string & version, bool partial, bool & hold, size_t & names_end) {
+    const size_t n = text.size();
+    const auto part = [&](size_t k, const std::string & s) {  // s at k; with partial, hold where the text ends in s
+        if (text.compare(k, s.size(), s) == 0) {
+            return true;
+        }
+        hold = hold || (partial && n - k < s.size() && text.compare(k, n - k, s, 0, n - k) == 0);
+        return false;
+    };
+    size_t k = i;
+    for (const auto & name : names) {
+        if (!part(k, name)) {
+            return 0;
+        }
+        k += name.size();
+        if (k < n && text[k] == '/') {
+            k += 1;
+        } else if (k < n && text[k] == '\\') {
+            if (k + 1 == n) {
+                hold = hold || partial;
+                return 0;
+            }
+            k += text[k + 1] == '\\' ? 2 : 1;
+        } else {
+            hold = hold || (partial && k == n);
+            return 0;
         }
     }
-    const auto from_of = [reverse](const std::pair<std::string, std::string> * p) -> const std::string & {
-        return reverse ? p->second : p->first;
-    };
-    std::stable_sort(order.begin(), order.end(), [&](const auto * a, const auto * b) {
-        return from_of(a).size() > from_of(b).size();
-    });
+    if (!part(k, version)) {
+        return 0;
+    }
+    names_end = k;
+    const size_t end = k + version.size();
+    if (end == n) {
+        hold = hold || partial;
+        return partial ? 0 : end;
+    }
+    if (is_name_byte(text[end])) {
+        return 0;
+    }
+    if (text[end] == '.' || text[end] == '-' || text[end] == '+') {
+        if (end + 1 == n && partial) {
+            hold = true;
+            return 0;
+        }
+        if (end + 1 < n && is_name_byte(text[end + 1])) {
+            return 0;
+        }
+    }
+    return end;
+}
 
+const char * const version_stand_in = "0.0.0";
+constexpr int plugin_version_kind = 7;
+
+server_identifier_map::order make_order(const pair_list & pairs, const std::vector<server_plugin_version> & versions,
+                                        bool reverse) {
+    server_identifier_map::order o;
+    for (size_t k = 0; k < versions.size(); ++k) {
+        for (size_t j = 0; j < versions[k].folders.size(); ++j) {
+            const auto & names = versions[k].folders[j];
+            if (names.empty() || names[0].empty()) {
+                continue;
+            }
+            auto head = std::find_if(o.folders.begin(), o.folders.end(),
+                                     [&](const auto & h) { return h.first == names[0]; });
+            if (head == o.folders.end()) {
+                head = o.folders.insert(o.folders.end(), {names[0], {}});
+            }
+            head->second.emplace_back(k, j);
+            o.folder_first[(unsigned char) names[0][0]] = true;
+        }
+    }
+    for (size_t k = 0; k < pairs.size(); ++k) {
+        const std::string & from = reverse ? pairs[k].second : pairs[k].first;
+        if (!from.empty()) {
+            o.pairs.push_back(k);
+            o.first[(unsigned char) from[0]] = true;
+        }
+    }
+    const auto from = [&](size_t k) -> const std::string & { return reverse ? pairs[k].second : pairs[k].first; };
+    std::stable_sort(o.pairs.begin(), o.pairs.end(),
+                     [&](size_t a, size_t b) { return from(a).size() > from(b).size(); });
+    return o;
+}
+
+}  // namespace
+
+void server_identifier_map::order_pairs() {
+    orders[0]        = make_order(pairs, versions, false);
+    orders[1]        = make_order(pairs, versions, true);
+    ordered_pairs    = pairs.size();
+    ordered_versions = versions.size();
+}
+
+const server_identifier_map::order & server_identifier_map::ordered(bool reverse, order & scratch) const {
+    if (ordered_pairs == pairs.size() && ordered_versions == versions.size()) {
+        return orders[reverse];
+    }
+    scratch = make_order(pairs, versions, reverse);
+    return scratch;
+}
+
+namespace {
+
+// Replaces each text of one side of the pairs (the identifiers, or with reverse the stand-ins) by the other side,
+// left to right, the longest first, and each plugin version where its folder is named (folder_version_end) by 0.0.0,
+// or with reverse 0.0.0 by the version. A match starts after a byte that is not a name byte and ends before one; a
+// pair whose stand-in is a plugin's version 0.0.0 ends as a version does. With partial, the text is still growing: it
+// stops where a longer text could still match, or where the byte after a match is not there yet.
+std::string replace(const std::string & text, const server_identifier_map & map, bool reverse, bool partial) {
+    const auto & pairs = map.pairs;
+    server_identifier_map::order scratch;
+    const auto &                 o = map.ordered(reverse, scratch);
+    static const std::vector<std::pair<std::string, std::vector<std::pair<size_t, size_t>>>> no_folders;
+    static const std::vector<size_t>                                                       no_pairs;
     std::string out;
     out.reserve(text.size());
     const size_t n = text.size();
     size_t i = 0;
     while (i < n) {
-        if (!first[(unsigned char) text[i]] || (i > 0 && is_name_byte(text[i - 1]))) {
+        const unsigned char c = (unsigned char) text[i];
+        if ((!o.first[c] && !o.folder_first[c]) || (i > 0 && is_name_byte(text[i - 1]))) {
             out += text[i++];
             continue;
         }
         const std::string * to   = nullptr;
         size_t              len  = 0;
         bool                hold = false;
-        for (const auto * p : order) {
-            const std::string & from = from_of(p);
+        for (const size_t k : o.first[c] ? o.pairs : no_pairs) {
+            const auto &        p    = pairs[k];
+            const std::string & from = reverse ? p.second : p.first;
             if (from.size() > n - i) {
                 if (partial && text.compare(i, n - i, from, 0, n - i) == 0) {
                     hold = true;
@@ -80,14 +185,55 @@ std::string replace(const std::string & text, const pair_list & pairs, bool reve
             if (end < n && is_name_byte(text[end])) {
                 continue;
             }
-            to  = reverse ? &p->first : &p->second;
+            // a plugin's version (with the stand-in 0.0.0) also goes on with a '.', '-' or '+' before a name byte
+            const std::string & stand_in = p.second;
+            if (end < n && (text[end] == '.' || text[end] == '-' || text[end] == '+') && stand_in.size() >= 5 &&
+                    stand_in.compare(stand_in.size() - 5, 5, version_stand_in) == 0) {
+                if (end + 1 == n && partial) {
+                    hold = true;
+                    break;
+                }
+                if (end + 1 < n && is_name_byte(text[end + 1])) {
+                    continue;
+                }
+            }
+            to  = reverse ? &p.first : &p.second;
             len = from.size();
             break;
+        }
+        // a plugin's folder with its version, kept as written but for the version, if longer
+        static const std::string stand_in  = version_stand_in;
+        const std::string *      version   = nullptr;
+        size_t                   names_end = 0;
+        for (const auto & [name, folders] : o.folder_first[c] ? o.folders : no_folders) {
+            if (hold || text.compare(i, name.size(), name) != 0) {
+                hold = hold || (partial && n - i < name.size() && text.compare(i, n - i, name, 0, n - i) == 0);
+                continue;
+            }
+            for (const auto & [k, j] : folders) {
+                const auto & v   = map.versions[k];
+                size_t       at  = 0;
+                const size_t end = folder_version_end(text, i, v.folders[j], reverse ? stand_in : v.version, partial,
+                                                      hold, at);
+                if (hold) {
+                    break;
+                }
+                if (end > i + len) {
+                    len       = end - i;
+                    names_end = at;
+                    version   = reverse ? &v.version : &stand_in;
+                    to        = nullptr;
+                }
+            }
         }
         if (hold) {
             break;
         }
-        if (to) {
+        if (version) {
+            out.append(text, i, names_end - i);
+            out += *version;
+            i += len;
+        } else if (to) {
             out += *to;
             i += len;
         } else {
@@ -133,6 +279,7 @@ void add_pair(pair_list & pairs, const std::string & id, const std::string & sta
     std::vector<std::pair<std::string, std::string>> forms = {
         {id_back, stand_in_back},
         {id_fwd, stand_in_fwd},
+        {replace_char(id, '\\', "\\\\"), replace_char(stand_in, '\\', "\\\\")},
         {replace_char(id_back, '\\', "\\\\"), replace_char(stand_in_back, '\\', "\\\\")},
     };
     const auto drive = [](const std::string & s) {
@@ -200,6 +347,132 @@ bool is_hex_or_dash(unsigned char c) {
 // a byte of a folder name as the apps write it: not a separator, a space, a quote or a control byte
 bool is_folder_byte(unsigned char c) {
     return c > ' ' && !is_separator((char) c) && c != '"' && c != '\'' && c != '`' && c != '<' && c != '>' && c != '|';
+}
+
+// Read the version component at plugins/cache/<source>/<plugin>/<version>.
+bool plugin_version(const std::string & path, size_t at, size_t & begin, size_t & end) {
+    begin = literal_end(path, at, "plugins/cache/");
+    if (begin == std::string::npos) { return false; }
+    for (int k = 0; k < 2; ++k) {
+        end = run_end(path, begin, is_folder_byte);
+        if (end == begin || end >= path.size() || !is_separator(path[end])) { return false; }
+        begin = end + 1;
+    }
+    if (begin >= path.size() || !std::isdigit((unsigned char) path[begin])) { return false; }
+    end = run_end(path, begin, [](unsigned char c) {
+        return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '+';
+    });
+    return end == path.size() || is_separator(path[end]) || !is_folder_byte((unsigned char) path[end]);
+}
+
+// The names of the folders of a path, split at '/' and '\'.
+std::vector<std::string> folder_names(const std::string & path) {
+    std::vector<std::string> names;
+    size_t                   k = 0;
+    while (k < path.size()) {
+        const size_t end = std::min(path.find_first_of("/\\", k), path.size());
+        if (end > k) {
+            names.push_back(path.substr(k, end - k));
+        }
+        k = end + 1;
+    }
+    return names;
+}
+
+// What a request says of plugins' versions, for server_plugin_version: the versions each plugin's folder is named with
+// (its names from plugins/cache on), anywhere in the request, and the skills that skill lists give from a root with a
+// plugin's version after the root, by the names they reach the plugin's folder with: the root's and those after it.
+// Codex and the ChatGPT desktop app list the roots ("- `r1` = `<home>/.codex/plugins/cache/openai-bundled`") and give
+// each skill's file from one ("(file: r1/computer-use/26.1120.41243/skills/computer-use/SKILL.md)"), so the version
+// is then in the skill's line and not in a path learn_identifiers sees.
+struct plugin_versions {
+    std::map<std::vector<std::string>, std::set<std::string>> seen;  // a plugin's folder: its versions
+    std::map<std::string, std::set<std::string>> root_paths;  // declarations across skill lists in this request
+    std::set<std::vector<std::string>> literal_zero;  // an aliased skill actually installed under 0.0.0
+    std::map<std::vector<std::string>, std::vector<std::string>> behind_roots;  // r1, doc: the plugin's folder, or
+                                                                                // nothing if they reach two
+    void add(const std::vector<std::string> & names, const std::vector<std::string> & folder) {
+        const auto entry = behind_roots.emplace(names, folder);
+        if (!entry.second && entry.first->second != folder) {
+            entry.first->second.clear();
+        }
+    }
+};
+
+// the versions of the plugins' folders that text names (.../plugins/cache/<source>/<plugin>/<version>)
+void learn_plugin_paths(const std::string & input, plugin_versions & out) {
+    if (input.find("plugins") == std::string::npos) { return; }
+    // A previous tool call carries its arguments as JSON text, with each Windows separator escaped.
+    std::string unescaped;
+    if (input.find("\\\\") != std::string::npos) {
+        unescaped.reserve(input.size());
+        for (size_t i = 0; i < input.size(); ++i) {
+            unescaped += input[i];
+            if (input[i] == '\\' && i + 1 < input.size() && input[i + 1] == '\\') { ++i; }
+        }
+    }
+    const std::string & text = unescaped.empty() ? input : unescaped;
+    for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
+        size_t begin, end;
+        if (plugin_version(text, at, begin, end)) {
+            out.seen[folder_names(text.substr(at, begin - at))].insert(text.substr(begin, end - begin));
+        }
+    }
+}
+
+// the skills a skill list in text gives from a root, with their plugins' versions
+void learn_listed_skills(const std::string & text, plugin_versions & out) {
+    if (text.find("<skills_instructions>") == std::string::npos) { return; }
+    std::map<std::string, std::string> roots;
+    enum { outside, instructions, declarations, catalog } section = outside;
+    std::istringstream lines(text);
+    std::string line;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') { line.pop_back(); }
+        if (line == "<skills_instructions>") { roots.clear(); section = instructions; continue; }
+        if (line == "</skills_instructions>") { section = outside; continue; }
+        if (section == outside) { continue; }
+        if (line == "### Skill roots") { section = declarations; continue; }
+        if (line == "### Available skills") { section = catalog; continue; }
+        if (section == declarations && line.compare(0, 4, "- `r") == 0 && line.back() == '`') {
+            const size_t end = run_end(line, 4, [](unsigned char c) { return std::isdigit(c); });
+            if (end == 4 || line.compare(end, 5, "` = `") != 0 || end + 5 >= line.size() - 1) { continue; }
+            const std::string alias = line.substr(3, end - 3);
+            std::string root = line.substr(end + 5, line.size() - end - 6);
+            while (!root.empty() && is_separator(root.back())) { root.pop_back(); }
+            std::replace(root.begin(), root.end(), '\\', '/');
+            out.root_paths[alias].insert(root);
+            auto entry = roots.emplace(alias, root);
+            if (!entry.second && entry.first->second != root) { entry.first->second.clear(); }
+        }
+        const size_t marker = line.rfind(" (file: ");
+        if (section != catalog || line.compare(0, 2, "- ") != 0 || marker == std::string::npos || line.back() != ')') {
+            continue;
+        }
+        const std::string ref = line.substr(marker + 8, line.size() - marker - 9);
+        const size_t sep = ref.find_first_of("/\\");
+        if (sep == std::string::npos) { continue; }
+        const auto it = roots.find(ref.substr(0, sep));
+        if (it == roots.end() || it->second.empty()) { continue; }
+        const std::string & root = it->second;
+        const std::string path = root + ref.substr(sep);
+        // A root can name the plugin source, the cache itself, or the plugin. A root that names the version itself
+        // is a path learn_plugin_paths sees.
+        std::string normalized = path;
+        std::replace(normalized.begin(), normalized.end(), '\\', '/');
+        const size_t cache = normalized.rfind("/plugins/cache/", root.size());
+        size_t begin, end;
+        if (cache == std::string::npos || normalized.find("/../") != std::string::npos ||
+                normalized.find("/./") != std::string::npos || !plugin_version(path, cache + 1, begin, end) ||
+                begin <= root.size() || end == path.size() || !is_separator(path[end])) {
+            continue;
+        }
+        const std::vector<std::string> folder = folder_names(path.substr(cache + 1, begin - cache - 1));
+        const std::string version = path.substr(begin, end - begin);
+        out.seen[folder].insert(version);
+        if (version == version_stand_in) { out.literal_zero.insert(folder); }
+        out.add(folder_names(ref.substr(0, sep + begin - root.size())), folder);
+    }
 }
 
 struct learned_identifier {
@@ -379,32 +652,19 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
     }
 
     // the folder of a version of a plugin in an app's plugin cache: .../plugins/cache/<source>/<plugin>/<version>
-    // (Codex and the ChatGPT desktop app list the skills of their plugins there; Claude Code keeps its plugins the
-    // same way). Every update of a plugin changes it. The model sees the version 0.0.0 for each plugin, which names
-    // the plugin's folder alone, so that its stand-in does not depend on the other plugins installed.
-    static const std::string cache = "plugins/cache/";
+    // (Codex and the ChatGPT desktop app list the skills of their plugins there, or behind a skill root:
+    // learn_listed_skills; Claude Code keeps its plugins the same way). Every update of a plugin changes it.
+    // The model sees the version 0.0.0 for each plugin, which names the plugin's folder alone, so that its stand-in
+    // does not depend on the other plugins installed.
     for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
-        size_t i = literal_end(text, at, cache);
-        bool   ok = i != std::string::npos;
-        for (int k = 0; k < 2 && ok; ++k) {
-            const size_t end = run_end(text, i, is_folder_byte);
-            ok = end > i && sep_at(end);
-            i  = end + 1;
-        }
-        if (!ok || i >= text.size() || !std::isdigit((unsigned char) text[i])) {
-            continue;
-        }
-        const size_t end = run_end(text, i, [](unsigned char c) {
-            return std::isalnum(c) || c == '.' || c == '-' || c == '_' || c == '+';
-        });
-        if (end < text.size() && !is_separator(text[end]) && is_folder_byte((unsigned char) text[end])) {
-            continue;
-        }
+        size_t i, end;
+        if (!plugin_version(text, at, i, end)) { continue; }
         const std::string version = text.substr(i, end - i);
         if (version == "0.0.0") {
             continue;
         }
-        found(7, text.substr(at, end - at), text.substr(at, i - at) + "0.0.0", /* numbered = */ false);
+        found(plugin_version_kind, text.substr(at, end - at), text.substr(at, i - at) + version_stand_in,
+              /* numbered = */ false);
     }
 }
 
@@ -557,17 +817,21 @@ template <typename F> void for_each_text(json & value, F & f) {
 } // namespace
 
 std::string server_identifier_map::to_stand_ins(const std::string & text) const {
-    return pairs.empty() ? text : replace(text, pairs, false, false);
+    return empty() ? text : replace(text, *this, false, false);
 }
 
 std::string server_identifier_map::to_identifiers(const std::string & text, bool partial) const {
-    return pairs.empty() ? text : replace(text, pairs, true, partial);
+    return empty() ? text : replace(text, *this, true, partial);
 }
 
 json server_identifier_map::to_json() const {
     json out = json::array();
     for (const auto & [id, stand_in] : pairs) {
         out.push_back(json::array({id, stand_in}));
+    }
+    // a plugin's version: {"version": "2.4.1", "folders": [["plugins", "cache", "team", "doc"], ["r1", "doc"]]}
+    for (const auto & v : versions) {
+        out.push_back(json{{"version", v.version}, {"folders", v.folders}});
     }
     return out;
 }
@@ -580,8 +844,16 @@ server_identifier_map server_identifier_map::from_json(const json & value) {
     for (const auto & p : value) {
         if (p.is_array() && p.size() == 2 && p[0].is_string() && p[1].is_string()) {
             map.pairs.emplace_back(p[0].get<std::string>(), p[1].get<std::string>());
+        } else if (p.is_object() && p.contains("version") && p.at("version").is_string() && p.contains("folders")) {
+            try {
+                map.versions.push_back({p.at("folders").get<std::vector<std::vector<std::string>>>(),
+                                        p.at("version").get<std::string>()});
+            } catch (const std::exception &) {
+                // not a list of lists of names: left out
+            }
         }
     }
+    map.order_pairs();
     return map;
 }
 
@@ -650,12 +922,18 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
 
     json messages = body.contains("messages") ? body.at("messages") : json();
     std::vector<learned_identifier> learned;
+    plugin_versions plugins;
     if (messages.is_array()) {
         for (auto & msg : messages) {
             const std::string role = msg.is_object() && msg.contains("role") && msg.at("role").is_string() ?
                                          msg.at("role").get<std::string>() : std::string();
             const bool app_message = role == "system" || role == "developer";
-            auto learn = [&](std::string & text) { learn_identifiers(text, env, learned, app_message); };
+            auto learn = [&](std::string & text) {
+                learn_identifiers(text, env, learned, app_message);
+                if (app_message) {
+                    learn_listed_skills(text, plugins);
+                }
+            };
             if (msg.contains("content")) {
                 for_each_text(msg.at("content"), learn);
             }
@@ -671,16 +949,44 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
         }
     }
     for (const auto & l : learned) {
+        // An expanded aliased path to the literal version must also survive the older full-path matcher.
+        if (l.kind == plugin_version_kind && !plugins.literal_zero.empty() &&
+                plugins.literal_zero.count(folder_names(l.id.substr(0, l.id.find_last_of("/\\"))))) {
+            continue;
+        }
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
 
+    json tools = body.contains("tools") ? body.at("tools") : json();
+    if (!plugins.behind_roots.empty()) {
+        auto learn_paths = [&](std::string & text) { learn_plugin_paths(text, plugins); };
+        for_each_text(messages, learn_paths);
+        for_each_text(tools, learn_paths);
+    }
     server_identifier_map map;
     map.pairs = std::move(pairs);
+    // A plugin that skills are given of from a root, with one version in the whole request, not 0.0.0, shows the model
+    // 0.0.0 where the request names its folder, behind those roots or from plugins/cache on. A plugin named with two
+    // versions, or with 0.0.0, which would read back as the other, stays as sent, as do names that reach two plugins.
+    std::map<std::vector<std::string>, size_t> entries;  // a plugin's folder: its entry in map.versions
+    for (const auto & [names, folder] : plugins.behind_roots) {
+        const auto seen = plugins.seen.find(folder);
+        if (folder.empty() || plugins.root_paths.at(names.front()).size() != 1 ||
+                seen == plugins.seen.end() || seen->second.size() != 1 ||
+                *seen->second.begin() == version_stand_in) {
+            continue;
+        }
+        const auto entry = entries.emplace(folder, map.versions.size());
+        if (entry.second) {
+            map.versions.push_back({{folder}, *seen->second.begin()});
+        }
+        map.versions[entry.first->second].folders.push_back(names);
+    }
     if (map.empty()) {
         return map;
     }
+    map.order_pairs();
 
-    json tools   = body.contains("tools") ? body.at("tools") : json();
     bool changed = false;
     bool exact   = true;
     auto apply   = [&](std::string & text) {
