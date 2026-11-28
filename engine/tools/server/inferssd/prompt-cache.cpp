@@ -566,6 +566,10 @@ void server_prompt_cache::save(
     if (!prompt.adapter_key) {
         return;
     }
+    if (!prompt.rows_in_place()) {
+        SRV_WRN("%s", " - not saving a state whose rows a context shift or a reused chunk moved\n");
+        return;
+    }
     server_ssd_memory_change budget_changes(ctx);
     const int32_t n_state = current ? -1 : prompt.n_tokens();
 
@@ -835,6 +839,7 @@ bool server_prompt_cache::load(
         llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
         prompt.tokens.clear();
         prompt.checkpoints.clear();
+        prompt.n_in_place = -1;
         n_reuse_slot = 0;
     }
 }

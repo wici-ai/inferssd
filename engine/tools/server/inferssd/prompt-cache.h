@@ -65,6 +65,16 @@ struct server_prompt {
     // file and never written, removed or counted against the cache's limits
     bool read_only = false;
 
+    // After a context shift moved rows of the state, or a reused chunk did (n_cache_reuse): the first tokens whose rows
+    // are where they were computed, -1 when none moved. A moved row depends on tokens the state no longer holds, so
+    // the state is saved nowhere, and a later prompt reuses no more of it than these tokens.
+    int64_t n_in_place = -1;
+
+    // whether every row is where its tokens computed it
+    bool rows_in_place() const {
+        return n_in_place < 0 || n_in_place >= n_tokens();
+    }
+
     // Empty for the base model. No key means the slot's state cannot be shared.
     std::optional<std::string> adapter_key = std::string();
     std::optional<ssd::platform::file_identity> prefix_identity;
@@ -93,6 +103,7 @@ struct server_prompt {
             file_data_size,
             n_conversation,
             read_only,
+            n_in_place,
             adapter_key,
             prefix_identity,
         };

@@ -56,6 +56,12 @@ attention off) takes no prefix cache and keeps no prompt cache or context checkp
 every token of the batch that computed it, the tokens after the row too, so the state serves no other request. Its
 slots evaluate every prompt in full, in the ids it was sent in.
 
+A context shift (`--context-shift`) moves the rows after the tokens it discards to their places, and those rows still
+depend on the discarded tokens; so do the chunks `--cache-reuse` moves into place. The server saves no state with
+moved rows, in its prompt cache or as a prefix, drops the slot's checkpoints at a shift, and a later prompt on the slot
+reuses none of the moved rows, nor takes their ids for its text. An explicit slot save of such a state is restored
+without reuse.
+
 `inferssd serve` passes `<cache directory>/prefix-cache/<model>`, beside the prompt caches
 (`<cache directory>/prompts/<model>`), `<model>` being the model's first file name without the shard suffix and
 `.gguf`. The cache directory is `~/Library/Caches/inferssd` on macOS and `%LOCALAPPDATA%\inferssd` on Windows.

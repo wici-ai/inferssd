@@ -265,6 +265,38 @@ static completion first_token(server_context & server, const llama_tokens & prom
     return {done->n_prompt_tokens_cache, done->tokens.front(), done->probs_output.front().prob};
 }
 
+// Saves slot 0 to `path` or restores it from there; the number of tokens of the state.
+static size_t slot_action(server_context & server, server_task_type type, const fs::path & path) {
+    auto reader = server.get_response_reader();
+    server_task task(type);
+    task.id = reader.get_new_id();
+    task.slot_action = {0, path.filename().string(), path.string()};
+    reader.post_task(std::move(task));
+    const auto result = receive(reader);
+    const auto * receipt = dynamic_cast<const server_task_result_slot_save_load *>(result.get());
+    require(receipt != nullptr, "the slot was not saved or restored");
+    return receipt->n_tokens;
+}
+
+// The tokens a request generates, which may shift the context to make room: n_discard tokens after the first go.
+static llama_tokens generate(server_context & server, const llama_tokens & prompt, int n_predict, int n_discard) {
+    auto reader = server.get_response_reader();
+    server_task task(SERVER_TASK_TYPE_COMPLETION);
+    task.id = reader.get_new_id();
+    task.id_slot = 0;
+    task.tokens = server_tokens(prompt, false);
+    task.params.n_predict = n_predict;
+    task.params.n_discard = n_discard;
+    task.params.stream = false;
+    task.params.return_tokens = true;
+    task.params.sampling.temp = 0;
+    reader.post_task(std::move(task));
+    const auto result = receive(reader);
+    const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
+    require(done && (int) done->tokens.size() == n_predict, "the request did not generate every token");
+    return done->tokens;
+}
+
 static void set_env(const char * name, const char * value) {
 #if defined(_WIN32)
     _putenv_s(name, value ? value : "");
@@ -606,6 +638,129 @@ static std::vector<fs::path> prompt_files(const fs::path & dir) {
     return files;
 }
 
+// A context shift moves the rows after the tokens it discards, and those rows still depend on them: the state then
+// serves only its own generation. It is not saved, from the shift on, and a later prompt on the slot reuses none of
+// it past the tokens the shift kept, though it starts with the tokens the state now lists. The same tokens computed
+// without a shift serve such a prompt as before.
+static void test_sliding_window_context_shift(common_params params, const fs::path & work) {
+    params.n_ctx = 256;
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    // the suffix marker in the 16 tokens before the moved rows, which the window of the first of them holds
+    llama_tokens written(140, base_token);
+    written.resize(161, adapted_token);
+    written.resize(250, base_token);
+    // a text that another prompt spells with one token, in the rows the shift moves
+    written[200] = written[201] = 3 + 'y';
+    const int n_discard = 160;
+    auto shift_writer = params;
+    shift_writer.ctx_shift = true;
+    // what the slot lists after the shift: the tokens it keeps, the rest of the prompt and the generated tokens
+    llama_tokens shifted;
+    const auto shift = [&](server_context & server) {
+        const auto generated = generate(server, written, 12, n_discard);
+        // the server keeps the first token, which the tokenizer adds
+        const int n_keep = llama_vocab_get_add_bos(llama_model_get_vocab(llama_get_model(server.get_llama_context())));
+        llama_tokens tokens(written.begin(), written.begin() + n_keep);
+        tokens.insert(tokens.end(), written.begin() + n_keep + n_discard, written.end());
+        tokens.insert(tokens.end(), generated.begin(), generated.end());
+        require(shifted.empty() || shifted == tokens, "the same prompt must generate the same tokens");
+        shifted = tokens;
+        return n_keep;
+    };
+    {
+        // the slot itself, and the slot saved explicitly and restored
+        auto config = shift_writer;
+        config.cache_ram_mib = 0;
+        config.slot_save_path = work.string();
+        const auto saved_slot = work / "shifted.slot";
+        server_run live(config);
+        const int n_keep = shift(live.server);
+        require(slot_action(live.server, SERVER_TASK_TYPE_SLOT_SAVE, saved_slot) >= shifted.size() - 1,
+                "the shifted slot was not saved");
+        llama_tokens parted(shifted.begin(), shifted.begin() + 32);
+        parted.push_back(3 + 'y');
+        const auto cold = [&] {
+            server_run server(config);
+            return first_token(server.server, parted, {}, 0, 0, 0);
+        }();
+        const auto actual = first_token(live.server, parted, {}, 0, 0, 0);
+        require(actual.cached <= n_keep, "a slot reused rows that a context shift moved");
+        require_completion(actual, actual.cached, cold.token, "a slot reused rows that a context shift moved");
+        require_cold_probability(actual, cold);
+        live.stop();
+        server_run restored(config);
+        slot_action(restored.server, SERVER_TASK_TYPE_SLOT_RESTORE, saved_slot);
+        require_completion(first_token(restored.server, parted, {}, 0, 0, 0), 0, cold.token,
+                           "a slot restored from a save after a context shift reused its rows");
+    }
+    // A prompt that ends by spelling the text of moved rows otherwise keeps its own ids, as the slot reuses none of
+    // those rows: its last token is the one it sent.
+    for (const int id_slot : { -1, 0 }) {
+        auto config = shift_writer;
+        config.cache_ram_mib = 0;
+        const size_t at = std::find(shifted.begin(), shifted.end(), 3 + 'y') - shifted.begin();
+        require(at + 1 < shifted.size() && shifted[at + 1] == 3 + 'y', "expected the two-token text after the shift");
+        llama_tokens respelled(shifted.begin(), shifted.begin() + at);
+        respelled.push_back(merged_token);
+        const auto cold = [&] {
+            server_run server(config);
+            return first_token(server.server, respelled, {}, id_slot, 0, 0);
+        }();
+        server_run live(config);
+        shift(live.server);
+        const auto actual = first_token(live.server, respelled, {}, id_slot, 0, 0);
+        require_completion(actual, actual.cached, cold.token, "a slot rewrote a prompt's ids to rows a shift moved");
+        require_cold_probability(actual, cold);
+    }
+    shift_writer.cache_disk = (work / "shifted-writer").string();
+    require(fs::create_directory(shift_writer.cache_disk), "could not create prompt-cache directory");
+    {
+        server_run writer(shift_writer);
+        shift(writer.server);
+        // a disjoint prompt takes the slot, whose state goes to the prompt cache if it can serve another prompt
+        first_token(writer.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
+    }
+
+    auto extended = shifted;
+    extended.push_back(3 + 'y');
+    const auto request = [&](const common_params & config, const llama_tokens & prompt) {
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    };
+    const auto cold_extended = request(params, extended);
+    require(cold_extended.cached == 0, "a cold request must evaluate every token");
+
+    // the same tokens without a shift: the extended prompt reuses the whole state
+    auto writer = params;
+    writer.cache_disk = (work / "unshifted-writer").string();
+    save_completed_prefix(writer, {}, shifted);
+    for (const auto & config : { shift_writer, writer }) {
+        const bool moved = config.ctx_shift;
+        for (bool imported : { true, false }) {
+            // each reader starts from the writer's files alone
+            int n_readers = 0;
+            const auto reader = [&] {
+                const auto copy = config.cache_disk + "-reader-" + std::to_string(imported) +
+                                  std::to_string(n_readers++);
+                fs::copy(config.cache_disk, copy);
+                auto out = params;
+                out.prefix_cache = imported ? copy : "";
+                out.cache_disk = imported ? "" : copy;
+                return out;
+            };
+            const auto actual_extended = request(reader(), extended);
+            require_completion(actual_extended, moved ? 0 : (int) shifted.size(), cold_extended.token,
+                               moved ? "a state saved after a context shift was reused" : "incorrect exact reuse");
+            require_cold_probability(actual_extended, cold_extended);
+        }
+    }
+    for (const auto & path : prompt_files(shift_writer.cache_disk)) {
+        const auto tokens = read_prompt_header(path).tokens;
+        require(tokens.empty() || tokens.front() != base_token, "a state was saved after a context shift");
+    }
+}
+
 // Without causal attention a slot keeps the ids a prompt spells its text with as well: the same text in other ids is
 // other rows. A prompt that ends in "yy" as one token after one that ended in two "y" tokens is evaluated as on a
 // fresh slot, whether it picks the slot or names it.
@@ -741,6 +896,7 @@ static void test_sliding_window(common_params params, const fs::path & work) {
     test_sliding_window_non_causal_slot(params);
     test_sliding_window_non_causal_cache(params, work);
     test_sliding_window_non_causal_text(params);
+    test_sliding_window_context_shift(params, work);
 
     // The attention type of a request: only a causal slot is cut back to the tokens a prompt shares with it, and only
     // a causal server keeps a state.
@@ -808,6 +964,33 @@ static void test_long_rope(common_params params, const fs::path & work) {
     }
 }
 
+// A slot saved explicitly after a context shift moved its rows is restored to go on with its own generation only: no
+// prompt reuses the moved rows, on a model without a sliding window too, whose slot is cut back to any shared prefix.
+static void test_shifted_slot_file(common_params params, const fs::path & work) {
+    params.n_ctx = 256;
+    params.ctx_shift = true;
+    params.cache_disk.clear();
+    params.cache_ram_mib = 0;
+    params.slot_save_path = work.string();
+    const auto path = work / "shifted-llama.slot";
+    const llama_tokens written(250, base_token);
+    {
+        server_run server(params);
+        const auto generated = generate(server.server, written, 12, 160);
+        require(std::all_of(generated.begin(), generated.end(), [](llama_token t) { return t == base_token; }),
+                "the fixture generates base tokens after base tokens");
+        const auto n_tokens = slot_action(server.server, SERVER_TASK_TYPE_SLOT_SAVE, path);
+        require(n_tokens > 32 && n_tokens < written.size(), "expected a shifted slot");
+    }
+    server_run restored(params);
+    slot_action(restored.server, SERVER_TASK_TYPE_SLOT_RESTORE, path);
+    // the restored slot lists only base tokens: this prompt shares its first 32
+    llama_tokens prompt(32, base_token);
+    prompt.push_back(3 + 'y');
+    require_completion(first_token(restored.server, prompt, {}, 0, 0, 0), 0, base_token,
+                       "a slot restored from a save after a context shift reused its rows");
+}
+
 static void test_restart(const fs::path & work) {
     const fs::path model = work / "model.gguf";
     const fs::path cache = work / "cache";
@@ -828,6 +1011,7 @@ static void test_restart(const fs::path & work) {
 
     test_sliding_window(params, work);
     test_long_rope(params, work);
+    test_shifted_slot_file(params, work);
 
     // The rows of a server with other settings are not this server's on any model: not even the exact shared prefix
     // of a writer with another RoPE base is reused, after a restart or as a prefix cache.
