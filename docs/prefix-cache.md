@@ -62,6 +62,10 @@ directory changes, so a file that arrives while the server runs serves the next 
 A server that wakes from sleep loads the model again and derives its cache from that load, as a server that starts
 does: its fingerprint, its settings, its attention mode and its checkpoints, and a prompt cache of that fingerprint.
 
+Every restore reads the fingerprint and the layout of the file it opened, from that file: one that another server,
+with this directory or another fingerprint, wrote or replaced since the server indexed it is a miss. A server writes
+its states under names of its fingerprint, and each file under a name of its own until it renames it into place.
+
 A server whose attention is not causal (`--attention non-causal`, or a model or metadata override that turns causal
 attention off) takes no prefix cache and keeps no prompt cache or context checkpoints: each row of its state depends on
 every token of the batch that computed it, the tokens after the row too, so the state serves no other request. Its

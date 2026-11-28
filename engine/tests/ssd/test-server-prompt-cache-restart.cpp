@@ -1108,7 +1108,8 @@ static void test_sliding_window(common_params params, const fs::path & work) {
 
 // A model with long and short RoPE factors (LongRoPE) rotates its keys by the long ones when a sequence's context is
 // past the model's original one and by the short ones otherwise: a writer whose context selects the other factors
-// serves no reader, one whose context selects the same ones serves it, from its prefix caches and its own cache alike.
+// serves no reader, one whose context selects the same ones serves it, from its prefix caches and its own cache alike,
+// and a server that shares its cache directory with one of the other factors takes none of its rows.
 static void test_long_rope(common_params params, const fs::path & work) {
     const auto model = work / "long-rope.gguf";
     write_model(model, false, true);
@@ -1152,6 +1153,43 @@ static void test_long_rope(common_params params, const fs::path & work) {
             require_cold_probability(actual, cold);
         }
     }
+
+    // Two servers with one cache directory, the second at the other factors, write the same tokens: the first takes
+    // no row of the second's, not even from a file put under the name of one of its own.
+    const auto shared = work / "long-rope-shared";
+    require(fs::create_directory(shared), "could not create the shared cache directory");
+    auto first = params;
+    first.cache_disk = shared.string();
+    auto second = first;
+    second.n_ctx = 256;
+    const auto saved_state = [&](const fs::path & dir) {
+        for (const auto & path : prompt_files(dir)) {
+            const auto tokens = read_prompt_header(path).tokens;
+            if (tokens.size() >= saved_prompt.size() &&
+                    std::equal(saved_prompt.begin(), saved_prompt.end(), tokens.begin())) {
+                return path;
+            }
+        }
+        return fs::path();
+    };
+    server_run reader(first);
+    first_token(reader.server, saved_prompt, {}, -1, 0, 0);
+    first_token(reader.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
+    const auto own = saved_state(shared);
+    require(!own.empty(), "expected the first server's state");
+    {
+        server_run writer(second);
+        first_token(writer.server, saved_prompt, {}, -1, 0, 0);
+        first_token(writer.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
+    }
+    const auto other = saved_state(shared);
+    require(!other.empty(), "expected the second server's state");
+    if (other != own) {
+        fs::copy_file(other, own, fs::copy_options::overwrite_existing);
+    }
+    const auto actual = first_token(reader.server, prompt, {}, -1, 0, 0);
+    require_completion(actual, 0, cold.token, "a server took the rows of another server's file");
+    require_cold_probability(actual, cold);
 }
 
 // A slot saved explicitly after a context shift moved its rows is restored to go on with its own generation only: no

@@ -459,11 +459,20 @@ static void test_prefix_dir_takes_unproven_files_only_when_published() {
         require(files(cache) == std::vector<std::string>{ "new.prompt", "other.prompt", "published.prompt" },
                 "a file without the provenance is indexed by the size of a published file");
         require(server_prompt_cache_testing::published_hashes(cache) == 0, "reading the directory hashes no file");
+        // nor are the files it has not verified copies of their prompts, which a save could leave to them
+        require(!server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3, 4 }),
+                                                       COMMON_CONTEXT_SEQ_RM_TYPE_FULL) &&
+                !server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3, 5 }),
+                                                       COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+                "a file not verified is no copy of its prompt");
         const auto path = [&](const char * name) { return (dir / name).string(); };
         require(server_prompt_cache_testing::verify_published(cache, path("published.prompt")) &&
                 server_prompt_cache_testing::verify_published(cache, path("published.prompt")) &&
                 server_prompt_cache_testing::published_hashes(cache) == 1,
                 "a published file is verified when it is restored, once");
+        require(server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3, 4 }),
+                                                      COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
+                "a verified file is a copy of its prompt");
         // the directory's reading remembered the file of no published size, the restore remembers this one
         const size_t n_unusable = server_prompt_cache_testing::unusable_prefixes(cache);
         require(!server_prompt_cache_testing::verify_published(cache, path("other.prompt")) &&

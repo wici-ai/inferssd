@@ -323,7 +323,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 // The index is a lookup hint. A replacement may have different tokens or
 // checkpoints, so its state cannot be restored using the previous match.
 static bool server_prompt_same_layout(const server_prompt & indexed, const server_prompt & opened) {
-    return indexed.tokens.get_tokens() == opened.tokens.get_tokens() &&
+    return indexed.tokens.get_tokens() == opened.tokens.get_tokens() && indexed.adapter_key == opened.adapter_key &&
            indexed.file_data_offset == opened.file_data_offset &&
            indexed.file_data_size == opened.file_data_size &&
            std::equal(indexed.checkpoints.begin(), indexed.checkpoints.end(),
@@ -515,7 +515,8 @@ void server_prompt_cache::scan_prefix_dir() {
 
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (!prompt.adapter_key || it->adapter_key != prompt.adapter_key) {
+        // a prefix cache not yet verified is no copy of the prompt: its restore may refuse it
+        if (!prompt.adapter_key || it->adapter_key != prompt.adapter_key || it->unverified) {
             continue;
         }
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
@@ -687,10 +688,17 @@ void server_prompt_cache::save(
         server_fnv1a(hash, prompt.adapter_key->data(), prompt.adapter_key->size());
         file_fingerprint += SERVER_PROMPT_ADAPTER_TAG + *prompt.adapter_key;
     }
+    // and the fingerprint: a server with other settings sharing the directory writes its states under other names
+    server_fnv1a(hash, fingerprint.data(), fingerprint.size());
     char name[32];
     std::snprintf(name, sizeof(name), "%016" PRIx64 ".prompt", hash);
     const std::string path = (std::filesystem::path(dir) / name).string();
-    const std::string tmp  = path + ".tmp";
+    // a file of this process alone until it is renamed: another server with the directory writes its own
+    static const std::string writer = [] {
+        std::random_device random;
+        return string_format("%08x%08x", random(), random());
+    }();
+    const std::string tmp  = path + "." + writer + ".tmp";
 
     server_prompt entry;
     entry.tokens = prompt.tokens.clone();
@@ -893,14 +901,19 @@ server_prompt_cache::take_result server_prompt_cache::take(
                                       : std::fopen(it_best->file.c_str(), "rb"));
     }
     server_prompt opened;
-    if (it_best->read_only) {
-        // Bind validation and every read to this handle. The directory index can
-        // be stale even after a scan if the pathname is replaced concurrently.
-        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, opened, true, published) ||
-            !server_prompt_same_layout(*it_best, opened)) {
-            SRV_WRN(" - prefix cache changed since indexing: %s\n", it_best->file.c_str());
+    if (!it_best->file.empty()) {
+        // Bind validation and every read to this handle. The index can be stale even after a scan: another server
+        // with this cache directory, or with other settings and so another fingerprint, may have replaced the file
+        // since, or the pathname may be replaced concurrently. Such a file is a miss.
+        const bool valid = file && (it_best->read_only
+            ? server_prompt_read_header(file.get(), prefix_fingerprint, opened, true, published)
+            : server_prompt_read_header(file.get(), fingerprint, opened));
+        if (!valid || !server_prompt_same_layout(*it_best, opened)) {
+            SRV_WRN(" - cached prompt changed since indexing: %s\n", it_best->file.c_str());
+            if (it_best->read_only) {
+                prefix_dir_time = -1;
+            }
             states.erase(it_best);
-            prefix_dir_time = -1;
             return take_result::stale_index;
         }
         if (opened.unverified && !verify_published(it_best, file.get())) {
@@ -908,7 +921,7 @@ server_prompt_cache::take_result server_prompt_cache::take(
         }
         opened.file = it_best->file;
     }
-    const server_prompt & entry = it_best->read_only ? opened : *it_best;
+    const server_prompt & entry = it_best->file.empty() ? *it_best : opened;
 
     SRV_WRN(" - found a better prompt%s%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "",
             it_best->read_only ? " (prefix cache)" : "", n_tokens_best);
