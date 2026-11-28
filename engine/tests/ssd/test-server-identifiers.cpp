@@ -5,10 +5,12 @@
 #include "server-task.h"
 #include "inferssd/identifiers.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <vector>
 
 // Home directories are built from parts: written out, a home directory is a personal path to the repository's public
 // scan (scripts/public-scan.py).
@@ -646,12 +648,155 @@ static void test_desktop_skill_alias_versions() {
     auto ambiguous = request("2.4.1");
     auto & text = ambiguous["messages"][0]["content"].get_ref<std::string &>();
     text.insert(text.find("</skills_instructions>"), "- previous (file: r3/doc/2.3.4/skills/doc/SKILL.md)\n");
-    const auto ambiguous_map = server_identifiers_apply(ambiguous, env);
+    server_identifiers_apply(ambiguous, env);
     const std::string ambiguous_text = text_of(ambiguous["messages"][0]);
-    require(ambiguous_text.find("r3/doc/0.0.0/") != std::string::npos &&
+    require(ambiguous_text.find("r3/doc/2.4.1/") != std::string::npos &&
             ambiguous_text.find("r3/doc/2.3.4/") != std::string::npos &&
-            ambiguous_map.to_identifiers(root + "/doc/0.0.0/skills", false) == root + "/doc/2.4.1/skills",
-            "of two versions of one plugin, the first takes the stand-in and the other stays as sent");
+            ambiguous_text.find("0.0.0") == std::string::npos,
+            "a plugin named with two versions stays as sent");
+}
+
+// a skill list as Codex sends it, with these roots and skills ("name (file: rN/...)"), in a developer message
+static json skill_list(const std::vector<std::string> & roots, const std::vector<std::string> & skills) {
+    std::string text = "<skills_instructions>\n### Skill roots\n";
+    for (size_t k = 0; k < roots.size(); ++k) {
+        text += "- `r" + std::to_string(k + 1) + "` = `" + roots[k] + "`\n";
+    }
+    text += "### Available skills\n";
+    for (const auto & skill : skills) {
+        text += "- " + skill + "\n";
+    }
+    text += "</skills_instructions>";
+    return {{"messages", json::array({{{"role", "developer"}, {"content", text}}})}};
+}
+
+// what the client gets for the path of a tool call in which the model opens a skill's file (or with `cut`, the folder
+// up to that many bytes of the reference) by the root and reference it sees in the request, written as it is, or with
+// '/' only
+static std::string opened(const server_identifier_map & map, const json & request, const std::string & skill,
+                          bool forward, size_t cut = std::string::npos) {
+    const std::string text = text_of(request["messages"][0]);
+    const size_t at = text.find("- " + skill + " (file: ");
+    require(at != std::string::npos, "the list names " + skill);
+    const size_t begin = text.find("(file: ", at) + 7;
+    std::string ref = text.substr(begin, text.find(')', begin) - begin);
+    ref = ref.substr(0, cut);
+    const size_t sep = ref.find('/');
+    const std::string decl = "- `" + ref.substr(0, sep) + "` = `";
+    const size_t r = text.find(decl) + decl.size();
+    std::string path = text.substr(r, text.find('`', r) - r) + ref.substr(sep);
+    if (forward) {
+        std::replace(path.begin(), path.end(), '\\', '/');
+    }
+    return json::parse(map.to_identifiers(json{{"path", path}}.dump(), false)).at("path").get<std::string>();
+}
+
+// skills from two roots that reach one plugin, the cache and its source: each skill's file opens at the version the
+// list names, whichever way the model spells the path, also when one of the versions is 0.0.0
+static void test_skill_versions_across_roots() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    for (const std::string second : {"2.3.4", "0.0.0"}) {
+        auto r = skill_list({R"(D:\Apps\plugins\cache\team)", R"(D:\Apps\plugins\cache)"},
+                            {"doc (file: r1/doc/2.4.1/skills/doc/SKILL.md)",
+                             "second (file: r2/team/doc/" + second + "/skills/second/SKILL.md)"});
+        const auto map = server_identifiers_apply(r, env);
+        for (const bool forward : {false, true}) {
+            const std::string root = forward ? "D:/Apps/plugins/cache" : R"(D:\Apps\plugins\cache)";
+            const std::string doc = root + (forward ? "/" : "\\") + "team/doc/2.4.1/skills/doc/SKILL.md";
+            require(opened(map, r, "doc", forward) == doc &&
+                    opened(map, r, "second", forward) == root + "/team/doc/" + second + "/skills/second/SKILL.md",
+                    "each skill opens at its own version, second " + second + (forward ? ", with '/'" : ""));
+        }
+    }
+}
+
+// a root that names a plugin's version, which the server gives a stand-in already, beside a skill of another version
+// of the plugin behind another root: the root keeps its stand-in and each skill opens at its own version
+static void test_skill_versions_beside_full_roots() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    for (const std::string tail : {"", R"(\skills)"}) {
+        auto r = skill_list({R"(D:\Apps\plugins\cache\team\doc\2.3.4)" + tail, R"(D:\Apps\plugins\cache\team)"},
+                            {"guide (file: r1/guide/SKILL.md)", "new (file: r2/doc/2.4.1/skills/new/SKILL.md)"});
+        const auto map = server_identifiers_apply(r, env);
+        require(!map.empty() && text_of(r["messages"][0]).find(R"(\doc\0.0.0)" + tail + "`") != std::string::npos,
+                "the root that names a version keeps its stand-in" + tail);
+        for (const bool forward : {false, true}) {
+            const std::string root = R"(D:\Apps\plugins\cache\team\doc\2.3.4)" + tail;
+            require(opened(map, r, "guide", forward) ==
+                        (forward ? "D:/Apps/plugins/cache/team/doc/2.3.4" + std::string(tail.empty() ? "" : "/skills")
+                                 : root) + "/guide/SKILL.md" &&
+                    opened(map, r, "new", forward) ==
+                        (forward ? "D:/Apps/plugins/cache/team" : R"(D:\Apps\plugins\cache\team)") +
+                            std::string("/doc/2.4.1/skills/new/SKILL.md"),
+                    "each skill opens at its own version" + tail + (forward ? ", with '/'" : ""));
+        }
+    }
+}
+
+// a version that begins like another one: both stay as sent; in a text that only names the first one's folder by
+// the root, the other stays as sent too
+static void test_skill_version_prefixes() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    auto r = skill_list({R"(D:\Apps\plugins\cache\team)"},
+                        {"doc (file: r1/doc/2.4.1/skills/doc/SKILL.md)",
+                         "beta (file: r1/doc/2.4.1-beta/skills/beta/SKILL.md)"});
+    const auto map = server_identifiers_apply(r, env);
+    const std::string text = text_of(r["messages"][0]);
+    require(text.find("(file: r1/doc/2.4.1/skills/doc/SKILL.md)") != std::string::npos &&
+            text.find("(file: r1/doc/2.4.1-beta/skills/beta/SKILL.md)") != std::string::npos,
+            "two versions, one beginning like the other, stay as sent: " + text);
+    for (const bool forward : {false, true}) {
+        const std::string root = forward ? "D:/Apps/plugins/cache/team" : R"(D:\Apps\plugins\cache\team)";
+        require(opened(map, r, "doc", forward) == root + "/doc/2.4.1/skills/doc/SKILL.md" &&
+                opened(map, r, "beta", forward) == root + "/doc/2.4.1-beta/skills/beta/SKILL.md",
+                std::string("each skill opens at its version") + (forward ? ", with '/'" : ""));
+    }
+    auto one = skill_list({R"(D:\Apps\plugins\cache\team)"}, {"doc (file: r1/doc/2.4.1/skills/doc/SKILL.md)"});
+    one["messages"].push_back({{"role", "user"}, {"content", "Try r1/doc/2.4.1-beta, or r1/doc/2.4.1."}});
+    const auto one_map = server_identifiers_apply(one, env);
+    require(text_of(one["messages"][1]) == "Try r1/doc/2.4.1-beta, or r1/doc/0.0.0." &&
+            one_map.to_identifiers(text_of(one["messages"][1]), false) == "Try r1/doc/2.4.1-beta, or r1/doc/2.4.1.",
+            "the version's stand-in ends where the version does: " + text_of(one["messages"][1]));
+}
+
+// the plugin's folder opens at its version also where the model's path ends at the version
+static void test_skill_version_folders() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    auto r = skill_list({R"(D:\Apps\plugins\cache\team)"}, {"doc (file: r1/doc/2.4.1/skills/doc/SKILL.md)"});
+    const auto map = server_identifiers_apply(r, env);
+    require(text_of(r["messages"][0]).find("(file: r1/doc/0.0.0/skills/doc/SKILL.md)") != std::string::npos,
+            "one version takes the stand-in");
+    for (const bool forward : {false, true}) {
+        const std::string root = forward ? "D:/Apps/plugins/cache/team" : R"(D:\Apps\plugins\cache\team)";
+        require(opened(map, r, "doc", forward) == root + "/doc/2.4.1/skills/doc/SKILL.md" &&
+                opened(map, r, "doc", forward, std::string("r1/doc/0.0.0").size()) == root + "/doc/2.4.1",
+                std::string("the skill and the plugin's folder open at its version") + (forward ? ", with '/'" : ""));
+    }
+    require(map.to_identifiers("r1/doc/0.0.0", false) == "r1/doc/2.4.1" &&
+            map.to_identifiers("see `r1/doc/0.0.0`.", false) == "see `r1/doc/2.4.1`." &&
+            map.to_identifiers("open r1/doc/0.0.0", true) == "open ",
+            "the folder restores before a quote and at the end of the text, and waits while the text grows");
+}
+
+// the model joins the root, as listed with '/', and the rest of the reference with '\', as Windows joins paths
+static void test_skill_version_native_join() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    auto r = skill_list({"D:/Apps/plugins/cache/team"}, {"guide (file: r1/doc/2.4.1/skills/guide/SKILL.md)"});
+    const auto map = server_identifiers_apply(r, env);
+    const std::string text = text_of(r["messages"][0]);
+    require(text.find("(file: r1/doc/0.0.0/skills/guide/SKILL.md)") != std::string::npos,
+            "the skill takes the stand-in");
+    for (const std::string join : {"\\", "/"}) {
+        // as the client gets the tool-call arguments: JSON, a '\' written "\\"
+        const std::string args =
+            json{{"path", "D:/Apps/plugins/cache/team" + join + "doc/0.0.0/skills/guide/SKILL.md"}}.dump();
+        require(json::parse(map.to_identifiers(args, false)).at("path") ==
+                    "D:/Apps/plugins/cache/team" + join + "doc/2.4.1/skills/guide/SKILL.md",
+                "a path joined with " + join + " opens at the version, keeping the model's separators");
+    }
+    require(map.to_identifiers(R"(D:\Apps/plugins\cache/team\doc\0.0.0/skills)", false) ==
+                R"(D:\Apps/plugins\cache/team\doc\2.4.1/skills)",
+            "any mix of separators between the folder's names");
 }
 
 // a Codex request as the Responses API conversion leaves it: the permission instructions, with the writable roots in
@@ -871,6 +1016,11 @@ int main() {
     test_chatgpt_visualizations_share_their_context();
     test_plugin_versions_share_their_context();
     test_desktop_skill_alias_versions();
+    test_skill_versions_across_roots();
+    test_skill_versions_beside_full_roots();
+    test_skill_version_prefixes();
+    test_skill_version_folders();
+    test_skill_version_native_join();
     test_codex_projects_share_their_context();
     test_identifiers_of_a_system();
     test_matches_stop_at_name_boundaries();

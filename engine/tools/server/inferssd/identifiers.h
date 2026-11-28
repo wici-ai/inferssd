@@ -3,6 +3,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <array>
 #include <string>
 #include <utility>
 #include <vector>
@@ -33,11 +34,21 @@
 // must start and end at a name boundary. A request whose text the stand-ins cannot be taken back out of exactly (one
 // that has a stand-in in it already, or names a folder project in the home that is not the working directory) is left
 // as it is.
-struct server_identifier_map {
-    // (identifier, stand-in), every spelling; empty: the request is left as it is
-    std::vector<std::pair<std::string, std::string>> pairs;
+// A plugin's version that the model sees as 0.0.0 where the request names the plugin's folder: from plugins/cache
+// on, or behind a root of a skill list (see identifiers.cpp). The names of a folder match joined by '/', '\' or "\\"
+// (inside JSON text), in any mix, as the model may join a root and what follows it; only the version changes.
+struct server_plugin_version {
+    std::vector<std::vector<std::string>> folders;  // the names of each spelling of the folder, e.g. plugins, cache,
+                                                    // <source>, <plugin>, or r1, <plugin>
+    std::string                           version;
+};
 
-    bool empty() const { return pairs.empty(); }
+struct server_identifier_map {
+    // (identifier, stand-in), every spelling; empty with no versions: the request is left as it is
+    std::vector<std::pair<std::string, std::string>> pairs;
+    std::vector<server_plugin_version>               versions;
+
+    bool empty() const { return pairs.empty() && versions.empty(); }
 
     // the text with stand-ins in place of the identifiers
     std::string to_stand_ins(const std::string & text) const;
@@ -48,6 +59,24 @@ struct server_identifier_map {
 
     nlohmann::ordered_json to_json() const;
     static server_identifier_map from_json(const nlohmann::ordered_json & value);
+
+    // The pairs in the order a text is matched against them (the longest first), for each direction, and the
+    // plugins' folders by their first name (versions[k].folders[j] as (k, j)), with the bytes a match of each can
+    // start with. order_pairs makes them once for the pairs and versions there are; ordered gives them, or makes them
+    // into scratch if those have changed since.
+    struct order {
+        std::vector<size_t>   pairs;
+        std::array<bool, 256> first {};
+        std::vector<std::pair<std::string, std::vector<std::pair<size_t, size_t>>>> folders;
+        std::array<bool, 256> folder_first {};
+    };
+    void          order_pairs();
+    const order & ordered(bool reverse, order & scratch) const;
+
+  private:
+    order  orders[2];
+    size_t ordered_pairs    = (size_t) -1;
+    size_t ordered_versions = (size_t) -1;
 };
 
 // The identifiers of the machine the server runs on, and the stand-ins for them.
