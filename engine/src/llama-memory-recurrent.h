@@ -67,6 +67,29 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) override;
 
+    // A state kept inside a ubatch (state_keep_at): the graph of the ubatch that goes past the requested place runs
+    // the recurrence up to it and on from it, and copies the state there into the r_keep and s_keep rows, so the
+    // prompt is checkpointed there without ending a batch. Only where the model's graph does it (keep_supported).
+    bool state_keep_at(llama_seq_id seq_id, llama_pos n_tokens) override;
+    bool state_can_write_at(llama_seq_id seq_id, llama_pos n_tokens) const override;
+    void state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const override;
+
+    // Where the ubatch keeps the requested state: the number of its tokens before that place (1 .. n_seq_tokens), -1
+    // if it keeps none (no request, another sequence, a ubatch of several sequences or one that writes the planes, or
+    // positions that do not reach the place one token at a time).
+    int64_t keep_index(const llama_ubatch & ubatch) const;
+
+    struct keep_request {
+        llama_seq_id seq_id   = -1;
+        llama_pos    n_tokens = 0;
+        bool         kept     = false; // a ubatch's graph writes it
+    };
+    keep_request keep;
+
+    // per layer, one row each: the kept conv and recurrent states (allocated at the first request)
+    std::vector<ggml_tensor *> r_keep;
+    std::vector<ggml_tensor *> s_keep;
+
     uint32_t head = 0; // the location where the batch will be placed in the cache (see find_slot())
     uint32_t size = 0; // total number of cells, shared across all sequences
     uint32_t used = 0; // used cells (i.e. at least one seq_id)
@@ -126,6 +149,7 @@ public:
         int32_t  rs_z = -1;
         std::vector<mem_cell> cells;
         std::vector<uint32_t> rs_idx;
+        keep_request keep;
     };
 
     std::unique_ptr<metadata_undo> save_metadata() const;
@@ -143,8 +167,16 @@ private:
 
     const uint32_t n_seq_max = 1;
 
+    // the graphs of the model keep a requested state inside a ubatch: the gated delta net layers of Qwen3-Next and
+    // Qwen3.6, without the conv history of per-layer embeddings or an MTP head's hidden state, which they do not keep
+    bool keep_supported = false;
+
     // ggml contexts for the KV cache along with the allocated backend buffers:
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs;
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> keep_bufs;
+
+    bool alloc_keep();
+    void drop_keep(llama_seq_id seq_id, llama_pos p0);
 
     size_t total_size() const;
 
@@ -153,6 +185,8 @@ private:
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
     void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<ggml_tensor *> & r, const std::vector<ggml_tensor *> & s) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -197,6 +231,12 @@ public:
     int32_t  get_rs_z() const;
     uint32_t get_size() const;
 
+    // where the current ubatch keeps the requested state (llama_memory_recurrent::keep_index), -1 for none, and the
+    // rows it keeps it in
+    int64_t       get_keep() const;
+    ggml_tensor * get_r_keep(int32_t il) const;
+    ggml_tensor * get_s_keep(int32_t il) const;
+
     ggml_tensor * get_p_l(int32_t il) const;
     ggml_tensor * get_h_l(int32_t il) const;
     ggml_tensor * get_r_l(int32_t il) const;
@@ -214,6 +254,8 @@ private:
     std::vector<llama_ubatch> ubatches;
 
     std::unique_ptr<llama_memory_recurrent::metadata_undo> precompute_undo;
+
+    int64_t keep_cur = -1; // the current ubatch's keep_index, taken when it is applied
 
     //
     // data needed for building the compute graph for the current ubatch:

@@ -4,6 +4,9 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <limits>
+#include <stdexcept>
+
 //
 // llama_memory_hybrid
 //
@@ -193,6 +196,47 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         mem_attn->state_read(io, seq_id, flags);
     }
     mem_recr->state_read(io, seq_id, flags);
+}
+
+bool llama_memory_hybrid::state_keep_at(llama_seq_id seq_id, llama_pos n_tokens) {
+    return mem_recr->state_keep_at(seq_id, n_tokens);
+}
+
+bool llama_memory_hybrid::state_can_write_at(llama_seq_id seq_id, llama_pos n_tokens) const {
+    if (seq_id < 0) {
+        return false;
+    }
+    // the current state, or one the recurrent memory kept
+    if (n_tokens != seq_pos_max(seq_id) + 1 &&
+            (!mem_recr->state_can_write_at(seq_id, n_tokens) || n_tokens > mem_attn->seq_pos_max(seq_id) + 1)) {
+        return false;
+    }
+    // The recurrent state is the one after position n_tokens - 1 and the attention half the cells below n_tokens:
+    // both are the sequence's first n_tokens tokens only where its positions are 0 .. n_tokens - 1, one token each
+    // (M-RoPE positions can jump, and an image's repeat), also for the current state.
+    const auto & cells = mem_attn->get_cells(seq_id).seq_pos_get(seq_id);
+    llama_pos expected = 0;
+    for (auto it = cells.begin(); it != cells.end() && it->first < n_tokens; ++it, ++expected) {
+        if (it->first != expected) {
+            return false;
+        }
+    }
+    return expected == n_tokens;
+}
+
+void llama_memory_hybrid::state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const {
+    if (!state_can_write_at(seq_id, n_tokens)) {
+        throw std::runtime_error("the hybrid memory cannot save this earlier state of the sequence");
+    }
+    if (n_tokens == seq_pos_max(seq_id) + 1) {
+        state_write(io, seq_id, flags);
+        return;
+    }
+    // the layout of state_write()
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        mem_attn->state_write_range(io, seq_id, flags, std::numeric_limits<llama_pos>::min(), n_tokens - 1);
+    }
+    mem_recr->state_write_at(io, seq_id, flags, n_tokens);
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {

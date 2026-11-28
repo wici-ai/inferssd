@@ -288,6 +288,8 @@ public:
     // used in view offsets, need to match for valid graph reuse
     uint32_t head;
     int32_t rs_z;
+    // where the ubatch keeps a requested state (llama_memory_recurrent_context::get_keep), -1 for none
+    int64_t keep = -1;
 };
 
 class llm_graph_input_cross_embd : public llm_graph_input_i {

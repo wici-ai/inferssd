@@ -4063,6 +4063,10 @@ uint32_t llama_context::state_seq_at_align() {
     return memory ? memory->state_write_at_align() : 0;
 }
 
+bool llama_context::state_seq_keep_at(llama_seq_id seq_id, int32_t n_tokens) {
+    return memory && n_tokens > 0 && memory->state_keep_at(seq_id, n_tokens);
+}
+
 bool llama_context::state_seq_can_save_at(llama_seq_id seq_id, int32_t n_tokens) {
     return n_tokens < 0 || (memory && memory->state_can_write_at(seq_id, n_tokens));
 }
@@ -5174,6 +5178,10 @@ uint32_t llama_state_seq_at_align(llama_context * ctx) {
 
 bool llama_state_seq_can_save_at(llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {
     return ctx->state_seq_can_save_at(seq_id, n_tokens);
+}
+
+bool llama_state_seq_keep_at(llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {
+    return ctx->state_seq_keep_at(seq_id, n_tokens);
 }
 
 llama_pos llama_state_seq_pos_min_at(llama_context * ctx, llama_seq_id seq_id, int32_t n_tokens) {

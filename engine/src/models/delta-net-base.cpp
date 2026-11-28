@@ -531,3 +531,59 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
     }
     return { output, state };
 }
+
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_net_keep(
+        llm_graph_input_rs * inp,
+               ggml_tensor * q,
+               ggml_tensor * k,
+               ggml_tensor * v,
+               ggml_tensor * g,
+               ggml_tensor * b,
+               ggml_tensor * s,
+                       int   il) {
+    const int64_t n_keep   = inp->keep;
+    const int64_t n_tokens = q->ne[2];
+    if (n_keep < 0) {
+        return build_delta_net(q, k, v, g, b, s, il);
+    }
+    GGML_ASSERT(q->ne[3] == 1 && n_keep > 0 && n_keep <= n_tokens);
+    ggml_tensor * kept = inp->mctx->get_s_keep(il);
+    GGML_ASSERT(kept != nullptr);
+    if (n_keep == n_tokens) {
+        const auto res = build_delta_net(q, k, v, g, b, s, il);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, res.second, kept));
+        return res;
+    }
+    // tokens [t0, t0 + nt) of a [*, *, n_tokens, 1] tensor
+    const auto part = [&](ggml_tensor * x, int64_t t0, int64_t nt) {
+        return ggml_view_4d(ctx0, x, x->ne[0], x->ne[1], nt, x->ne[3], x->nb[1], x->nb[2], x->nb[3], t0 * x->nb[2]);
+    };
+    const auto first = build_delta_net(part(q, 0, n_keep), part(k, 0, n_keep), part(v, 0, n_keep),
+                                       part(g, 0, n_keep), part(b, 0, n_keep), s, il);
+    ggml_tensor * state = ggml_is_contiguous(first.second) ? first.second : ggml_cont(ctx0, first.second);
+    cb(state, "kept_state", il);
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, state, kept));
+    const int64_t n_rest = n_tokens - n_keep;
+    const auto second = build_delta_net(part(q, n_keep, n_rest), part(k, n_keep, n_rest), part(v, n_keep, n_rest),
+                                        part(g, n_keep, n_rest), part(b, n_keep, n_rest), state, il);
+    ggml_tensor * output = ggml_concat(ctx0, first.first, second.first, 2);
+    return { output, second.second };
+}
+
+void llm_build_delta_net_base::build_conv_keep(
+        llm_graph_input_rs * inp,
+               ggml_tensor * conv_input,
+                   int64_t   state_cols,
+                   int64_t   channels,
+                       int   il) const {
+    const int64_t n_keep = inp->keep;
+    if (n_keep < 0) {
+        return;
+    }
+    GGML_ASSERT(conv_input->ne[2] == 1 && n_keep + state_cols <= conv_input->ne[0]);
+    ggml_tensor * kept = inp->mctx->get_r_keep(il);
+    GGML_ASSERT(kept != nullptr);
+    ggml_tensor * window = ggml_view_3d(ctx0, conv_input, state_cols, channels, 1, conv_input->nb[1], conv_input->nb[2],
+            ggml_row_size(conv_input->type, n_keep));
+    ggml_build_forward_expand(gf, ggml_cpy(ctx0, window, kept));
+}

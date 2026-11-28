@@ -103,6 +103,30 @@ struct llm_build_delta_net_base : public llm_graph_context {
                ggml_tensor * b,
                ggml_tensor * s,
                        int   il);
+
+    // For a ubatch that keeps a requested state (llm_graph_input_rs::keep, the number k of its tokens before the
+    // requested place, see llama_state_seq_keep_at): the delta net on tokens [0, k) from the state the ubatch starts
+    // with, the state after them copied into the memory's kept row, and the delta net on [k, n) from that state, the
+    // outputs joined. The layers around it take the whole ubatch, so its experts are read once. Otherwise
+    // build_delta_net. The ubatch holds one sequence.
+    std::pair<ggml_tensor *, ggml_tensor *> build_delta_net_keep(
+        llm_graph_input_rs * inp,
+               ggml_tensor * q,
+               ggml_tensor * k,
+               ggml_tensor * v,
+               ggml_tensor * g,
+               ggml_tensor * b,
+               ggml_tensor * s,
+                       int   il);
+
+    // For such a ubatch, the conv history after its first k tokens, the last state_cols inputs before token k (columns
+    // k .. k + state_cols - 1 of conv_input), copied into the memory's kept row.
+    void build_conv_keep(
+        llm_graph_input_rs * inp,
+               ggml_tensor * conv_input,
+                   int64_t   state_cols,
+                   int64_t   channels,
+                       int   il) const;
 };
 
 struct llm_build_rwkv6_base : public llm_graph_context {

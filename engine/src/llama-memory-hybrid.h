@@ -92,6 +92,12 @@ public:
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
     void state_read (llama_io_read_i  & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0)       override;
 
+    // the state the recurrent memory kept inside a ubatch (llama_memory_recurrent::state_keep_at), with the attention
+    // cache up to its place
+    bool state_keep_at(llama_seq_id seq_id, llama_pos n_tokens) override;
+    bool state_can_write_at(llama_seq_id seq_id, llama_pos n_tokens) const override;
+    void state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const override;
+
     //
     // llama_memory_hybrid specific API
     //
