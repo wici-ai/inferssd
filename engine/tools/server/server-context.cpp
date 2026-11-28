@@ -56,6 +56,8 @@ constexpr int HTTP_POLLING_SECONDS = 1;
 // native reader leaves trailing bytes unread, so its state format stays intact.
 static constexpr char SLOT_STATE_MAGIC[] = "LSSLOT01";
 static constexpr size_t SLOT_STATE_TRAILER_SIZE = sizeof(uint32_t) + sizeof(SLOT_STATE_MAGIC) - 1;
+// after the fingerprint of a slot saved after a context shift moved its rows
+static constexpr char SLOT_STATE_ROWS_MOVED[] = "|rows-moved=1";
 
 struct slot_state_metadata {
     std::string adapter_key;
@@ -335,11 +337,15 @@ struct server_slot {
     // how many tokens of `tokens` the slot's own state lets it skip (a state that cannot be rolled back is reused up
     // to its end or one of its checkpoints)
     int64_t prompt_reuse(const server_tokens & tokens) const {
+        int64_t n_reuse = 0;
         if (cache_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
-            return prompt.tokens.get_common_prefix(tokens);
+            n_reuse = prompt.tokens.get_common_prefix(tokens);
+        } else {
+            const server_prompt_checkpoint * checkpoint = nullptr;
+            n_reuse = std::max<int64_t>(0, server_prompt_reuse_full(prompt, tokens, &checkpoint));
         }
-        const server_prompt_checkpoint * checkpoint = nullptr;
-        return std::max<int64_t>(0, server_prompt_reuse_full(prompt, tokens, &checkpoint));
+        // no further than rows a context shift left in place (update_slots)
+        return prompt.rows_in_place() ? n_reuse : std::min(n_reuse, prompt.n_in_place);
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
@@ -361,6 +367,7 @@ struct server_slot {
 
         llama_memory_seq_rm(llama_get_memory(ctx), id, -1, -1);
         prompt.tokens.clear();
+        prompt.n_in_place = -1;
     }
 
     std::vector<common_adapter_lora_info> lora;
@@ -986,6 +993,8 @@ private:
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
+    // the model's window, with swa_full too: the rows a restored state needs (update_slots)
+    int32_t n_swa_model = 0;
 
     // slots / clients
     std::vector<server_slot> slots;
@@ -1002,6 +1011,19 @@ private:
 
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
+
+    // What was asked of the server for what a load turns off or fills in when its model or context cannot have it
+    // or leaves it to the model: every load, a wake from sleep included, decides it again from this (load_model).
+    struct {
+        bool    ctx_shift;
+        int32_t n_cache_reuse;
+        bool    swa_full;
+        int32_t n_ctx_checkpoints;
+        bool    cache_idle_slots;
+        int32_t control_vector_layer_start;
+        int32_t control_vector_layer_end;
+        common_params_sampling sampling;
+    } requested = {};
 
 
 
@@ -1080,28 +1102,44 @@ private:
         return true;
     }
 
-    // What a cached state on disk depends on besides its tokens: the model and the build that computed it. A file of
-    // the cache is a prefix cache for another build (prefix_cache_fingerprint is the start of its fingerprint).
-    std::string prompt_cache_fingerprint(const std::string & model_fp) const {
-        // Legacy writable states did not identify their adapters, including
-        // states from a binary with an unknown build revision.
-        constexpr char cache_revision[] = "|adapter-cache=1";
+    // The settings that change what the model computes, as a field of the fingerprints; empty when the server runs
+    // the model as its files describe it and its RoPE factors do not depend on the context
+    // (server_prompt_settings_identity).
+    std::string prompt_cache_settings() const {
+        const std::string settings = server_prompt_settings_identity(params_base, llama_rope_factors_long(ctx));
+        return settings.empty() ? "" : "settings=" + settings + "|";
+    }
+
+    // What every fingerprint of this server's cached states on disk starts with, whatever build computed them: the
+    // model and the settings that change what it computes.
+    std::string prompt_cache_configuration(const std::string & model_fp) const {
         if (!model_fp.empty()) {
-            return model_fp + "|" + llama_build_info() + cache_revision;
+            return model_fp + "|";
         }
         // the model files cannot be read as GGUF files: by the first file's path, size and time
-        std::string fp = std::string(llama_build_info()) + "|" + params_base.model.path;
+        std::string fp = prompt_cache_settings() + params_base.model.path;
         std::error_code ec;
         const auto size  = std::filesystem::file_size(params_base.model.path, ec);
         const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
         fp += "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long) mtime.time_since_epoch().count());
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
-        return fp + "|" + desc + cache_revision;
+        return fp + "|" + desc + "|";
+    }
+
+    // What a cached state on disk depends on besides its tokens: the model, the settings that change what it
+    // computes, and the build that computed it. A file of the cache is a prefix cache for another build
+    // (prefix_cache_fingerprint is the start of its fingerprint).
+    std::string prompt_cache_fingerprint(const std::string & model_fp) const {
+        // Legacy writable states did not identify their adapters, or the settings that change their values, including
+        // states from a binary with an unknown build revision.
+        constexpr char cache_revision[] = "|settings-cache=1|adapter-cache=1";
+        return prompt_cache_configuration(model_fp) + llama_build_info() + cache_revision;
     }
 
     // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
-    // headers of its files, not where they are or when they were written. Not the build: a prefix cache is published
+    // headers of its files, not where they are or when they were written, and the settings that change what it
+    // computes. Not the build: a prefix cache is published
     // for the builds that compute it the same, up to rounding (docs/prefix-cache.md). A prefix cache is a file of a
     // server's prompt cache on disk, whose fingerprint is this and the build.
     std::string prefix_cache_fingerprint() const {
@@ -1111,7 +1149,7 @@ private:
         }
         char desc[256];
         llama_model_desc(model, desc, sizeof(desc));
-        return "prefix-cache 1|" + files + "|" + desc;
+        return "prefix-cache 1|" + prompt_cache_settings() + files + "|" + desc;
     }
 
     void slot_save_and_clear(server_slot & slot) {
@@ -1170,7 +1208,24 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
+        // A wake from sleep loads the model again from the active parameters, those set since the start included,
+        // such as adapter scales. What an earlier load turned off or filled in for its model or context, this load
+        // decides again from what was asked: the settings, the attention mode, the checkpoints and the cache are
+        // this load's.
+        if (!is_resume) {
+            requested = { params.ctx_shift, params.n_cache_reuse, params.swa_full, params.n_ctx_checkpoints,
+                          params.cache_idle_slots, params.control_vector_layer_start, params.control_vector_layer_end,
+                          params.sampling };
+        }
         params_base = params;
+        params_base.ctx_shift                  = requested.ctx_shift;
+        params_base.n_cache_reuse              = requested.n_cache_reuse;
+        params_base.swa_full                   = requested.swa_full;
+        params_base.n_ctx_checkpoints          = requested.n_ctx_checkpoints;
+        params_base.cache_idle_slots           = requested.cache_idle_slots;
+        params_base.control_vector_layer_start = requested.control_vector_layer_start;
+        params_base.control_vector_layer_end   = requested.control_vector_layer_end;
+        params_base.sampling                   = requested.sampling;
 
         adapter_identities.clear();
         if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0 || !params_base.slot_save_path.empty()) {
@@ -1299,7 +1354,8 @@ private:
             }
         }
 
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
+        n_swa_model = llama_model_n_swa(model);
+        n_swa = params_base.swa_full ? 0 : n_swa_model;
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -1392,19 +1448,33 @@ private:
                 n_swa == 0) {
             checkpoint_at_align = 0;
         }
+        // Without causal attention a row depends on every token of the batch that computed it, the ones after it
+        // too, so a state serves no other prompt: the server keeps no prompt cache, prefix caches or checkpoints, and
+        // a slot evaluates every prompt anew (update_slots).
+        const bool causal_attn = llama_get_causal_attn(ctx);
+        if (!causal_attn) {
+            SRV_WRN("%s", "prompt caching and context checkpoints are disabled: the attention is not causal\n");
+            params_base.n_ctx_checkpoints = 0;
+            checkpoint_at_align = 0;
+        }
         if (checkpoint_at_align > 0) {
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
+        // the states of an earlier load are not this one's: a cache of this load's fingerprint takes those it can
+        prompt_cache.reset();
         const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ||
                 !params_base.slot_save_path.empty() ?
                 prefix_cache_fingerprint() : "";
         slot_state_fingerprint = params_base.slot_save_path.empty() ? "" : prompt_cache_fingerprint(model_fp);
-        if (!params_base.cache_disk.empty()) {
+        if (!causal_attn) {
+            // no prompt cache
+        } else if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
-            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp));
+            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp),
+                                  prompt_cache_configuration(model_fp));
         } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");
@@ -1420,12 +1490,30 @@ private:
         if (!params_base.prefix_cache.empty()) {
             if (!prompt_cache || model_fp.empty()) {
                 SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
-                        prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
+                        prompt_cache ? "the model files cannot be read" :
+                        causal_attn  ? "the prompt cache is disabled" : "the attention is not causal");
             } else {
                 prompt_cache->use_prefix_dir(params_base.prefix_cache, model_fp);
             }
         }
         SRV_WRN("%s", "for more info see https://github.com/ggml-org/llama.cpp/pull/16391\n");
+
+        // on every load: a wake whose load has no prompt cache keeps the idle slots
+        if (params_base.cache_idle_slots) {
+            if (!params_base.kv_unified) {
+                SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (params_base.cache_ram_mib == 0) {
+                SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (!prompt_cache) {
+                SRV_WRN("%s: --cache-idle-slots requires the prompt cache, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else {
+                SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
+                SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
+            }
+        }
 
         if (!params_base.model_alias.empty()) {
             // backward compat: use first alias as model name
@@ -1469,19 +1557,6 @@ private:
         });
 
         metrics.init();
-
-        if (params_base.cache_idle_slots) {
-            if (!params_base.kv_unified) {
-                SRV_WRN("%s: --cache-idle-slots requires --kv-unified, disabling\n", __func__);
-                params_base.cache_idle_slots = false;
-            } else if (params_base.cache_ram_mib == 0) {
-                SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
-                params_base.cache_idle_slots = false;
-            } else {
-                SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
-                SRV_DBG("%s", "__TEST_TAG_CACHE_IDLE_SLOTS_ENABLED__\n");
-            }
-        }
 
         // populate webui settings
         {
@@ -1564,9 +1639,12 @@ private:
     // The prompt takes the slot's cached token ids where its text continues them (server_tokens_reuse_text): a
     // follow-up whose history renders the previous reply back into other tokens then extends the slot's prompt
     // instead of parting from it inside the reply and prefilling the reply again.
+    // It serves only a slot whose state a later prompt reuses: not one without causal attention (load_model), nor
+    // one whose rows a context shift moved, which keeps the prompt's own ids.
     void reuse_cached_text(const server_slot & slot, server_task & task) {
         if (task.type != SERVER_TASK_TYPE_COMPLETION || !task.params.cache_prompt || task.tokens.has_mtmd ||
-                slot.prompt.tokens.has_mtmd || slot.prompt.tokens.empty()) {
+                slot.prompt.tokens.has_mtmd || slot.prompt.tokens.empty() || !llama_get_causal_attn(ctx) ||
+                !slot.prompt.rows_in_place()) {
             return;
         }
         const size_t n_before = slot.prompt.tokens.get_common_prefix(task.tokens);
@@ -2473,6 +2551,7 @@ private:
         prefix.adapter_key = slot.prompt.adapter_key;
         prefix.tokens = slot.prompt.tokens.clone();
         prefix.tokens.keep_first(n);
+        prefix.n_in_place = slot.prompt.n_in_place;
         // the checkpoints before n, which come first (the slot takes them in order), lent for the save
         auto & checkpoints = slot.prompt.checkpoints;
         const auto lent_end = std::find_if(checkpoints.begin(), checkpoints.end(),
@@ -2780,8 +2859,11 @@ private:
                         send_error(task, "Unable to save slot without stable model and adapter provenance", ERROR_TYPE_INVALID_REQUEST);
                         break;
                     }
+                    // a slot whose rows a context shift moved is saved as such: its restore reuses none of it
                     const size_t nwrite = save_slot_state(ctx, filepath, slot->id, slot->prompt.tokens.get_tokens(),
-                            slot_state_fingerprint, *slot->prompt.adapter_key);
+                            slot->prompt.rows_in_place() ? slot_state_fingerprint
+                                                         : slot_state_fingerprint + SLOT_STATE_ROWS_MOVED,
+                            *slot->prompt.adapter_key);
                     if (nwrite == 0) {
                         send_error(task, "Unable to save slot state", ERROR_TYPE_SERVER);
                         break;
@@ -2823,7 +2905,13 @@ private:
                     std::string filepath = task.slot_action.filepath;
 
                     std::unique_ptr<FILE, decltype(&std::fclose)> file(ggml_fopen(filepath.c_str(), "rb"), std::fclose);
-                    const auto metadata = read_slot_state_metadata(file.get(), slot_state_fingerprint);
+                    // a slot saved after a context shift holds rows that its tokens do not compute (n_in_place)
+                    auto metadata = read_slot_state_metadata(file.get(), slot_state_fingerprint);
+                    bool rows_moved = false;
+                    if (!metadata) {
+                        metadata = read_slot_state_metadata(file.get(), slot_state_fingerprint + SLOT_STATE_ROWS_MOVED);
+                        rows_moved = metadata.has_value();
+                    }
                     if (!metadata) {
                         send_error(task, "Unable to restore slot: incompatible model or missing adapter provenance",
                                 ERROR_TYPE_INVALID_REQUEST);
@@ -2840,6 +2928,7 @@ private:
                     }
                     slot->prompt.tokens.clear();
                     slot->prompt.tokens.insert(tokens);
+                    slot->prompt.n_in_place = rows_moved ? 0 : -1;
                     slot->prompt.adapter_key = metadata->adapter_key;
                     slot->prompt_alora_invocation_start = -1;
                     slot->prompt.checkpoints.clear();
@@ -2996,6 +3085,14 @@ private:
 
                 llama_memory_seq_rm (llama_get_memory(ctx), slot.id, n_keep            , n_keep + n_discard);
                 llama_memory_seq_add(llama_get_memory(ctx), slot.id, n_keep + n_discard, slot.prompt.n_tokens(), -n_discard);
+
+                // The moved rows depend on the discarded tokens: the state goes on with this generation only. Its
+                // checkpoints hold rows at positions the moved ones now take.
+                slot.prompt.n_in_place = slot.prompt.rows_in_place() ? n_keep : std::min<int64_t>(slot.prompt.n_in_place, n_keep);
+                if (!slot.prompt.checkpoints.empty()) {
+                    slot.prompt.checkpoints.clear();
+                    llama_ssd_host_note_memory_change(ctx);
+                }
 
                 // add generated tokens to cache
                 // ref: https://github.com/ggml-org/llama.cpp/pull/16818#discussion_r2473269481
@@ -3160,9 +3257,14 @@ private:
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // without causal attention the slot's state serves no other prompt (load_model)
+                            if (slot.task->params.cache_prompt && llama_get_causal_attn(ctx)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                // but not rows a context shift moved: they depend on tokens the slot no longer holds
+                                if (!slot.prompt.rows_in_place()) {
+                                    n_past = std::min<int>(n_past, slot.prompt.n_in_place);
+                                }
 
                                 // An aLoRA can only reuse tokens before both the old and new invocations.
                                 if (slot.alora_invocation_start >= 0) {
@@ -3178,7 +3280,7 @@ private:
                                 const bool can_cache_reuse =
                                     llama_memory_can_shift(llama_get_memory(ctx)) &&
                                     slot.alora_invocation_start < 0 &&
-                                    !slot.prompt.tokens.has_mtmd;
+                                    !slot.prompt.tokens.has_mtmd && slot.prompt.rows_in_place();
 
                                 if (!can_cache_reuse && n_cache_reuse > 0) {
                                     SLT_WRN(slot, "cache reuse is not supported - ignoring n_cache_reuse = %d\n", n_cache_reuse);
@@ -3190,6 +3292,7 @@ private:
 
                                     size_t head_c = n_past; // cache
                                     size_t head_p = n_past; // current prompt
+                                    const int n_past_common = n_past;
 
                                     if (mctx) {
                                         // we should never reach this
@@ -3231,6 +3334,10 @@ private:
                                         }
                                     }
 
+                                    // the reused chunks' rows depend on the tokens before them in the slot's earlier prompt
+                                    if (n_past > n_past_common) {
+                                        slot.prompt.n_in_place = n_past_common;
+                                    }
                                     SLT_DBG(slot, "after context reuse, new n_past = %d\n", n_past);
                                 }
                             } else {
@@ -3295,7 +3402,26 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // A full-size window (--swa-full) holds every row this server computes, but a state
+                                // restored from a cached prompt may be of a writer that kept only the model's window.
+                                // The first token evaluated, at pos_eval, attends in a sliding layer to the positions
+                                // after pos_eval - n_swa_model (llama_hparams::is_masked_swa), back to pos_min_need,
+                                // and the state holds those from pos_min on.
+                                bool rows_missing = false;
+                                if (n_swa == 0 && n_swa_model > 0) {
+                                    // [TAG_PROMPT_LOGITS] evaluates the last prompt token again
+                                    const int32_t n_eval = n_past == slot.task->n_tokens() ? n_past - 1 : n_past;
+                                    const llama_pos pos_eval = slot.prompt.tokens.pos_next(n_eval);
+                                    const llama_pos pos_min_need = std::max(0, pos_eval - n_swa_model + 1);
+                                    rows_missing = pos_min > pos_min_need;
+                                }
+
+                                if (rows_missing) {
+                                    SLT_WRN(slot, "n_past = %d, seq_id = %d, pos_min = %d: the restored state lacks rows of the model's window (%d)\n", n_past, slot.id, pos_min, n_swa_model);
+                                    SLT_WRN(slot, "%s", "forcing full prompt re-processing\n");
+                                    pos_next = 0;
+                                    n_past = 0;
+                                } else if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint
@@ -3370,6 +3496,9 @@ private:
                         slot.n_prompt_tokens_processed = 0;
 
                         slot.prompt.tokens.keep_first(n_past);
+                        if (slot.prompt.rows_in_place()) {
+                            slot.prompt.n_in_place = -1;
+                        }
                         slot.prompt.adapter_key = server_prompt_adapter_key(adapter_identities, slot.lora);
                         slot.prompt_alora_invocation_start = slot.alora_invocation_start;
 
@@ -3412,6 +3541,9 @@ private:
 
                                 if (n == checkpoint_size) {
                                     slot.prompt.tokens.keep_first(checkpoint->n_tokens);
+                                    if (slot.prompt.rows_in_place()) {
+                                        slot.prompt.n_in_place = -1;
+                                    }
                                     slot.n_prompt_tokens_cache = checkpoint->n_tokens;
                                     restored = true;
                                     SLT_WRN(slot, "restored context checkpoint after failed memory_seq_rm (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",

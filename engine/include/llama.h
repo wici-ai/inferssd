@@ -1032,6 +1032,15 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Whether the context uses causal attention. Only then does a token's state depend on the tokens before it alone,
+    // so that a sequence cut back to its first tokens holds what those tokens compute.
+    LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
+
+    // The RoPE frequency factors the context rotates by, for a model with long and short ones (LongRoPE): 1 for the
+    // long factors, which a sequence's context past the model's original one selects, 0 for the short ones, and -1 for
+    // a model whose factors do not depend on the context.
+    LLAMA_API int32_t llama_rope_factors_long(const struct llama_context * ctx);
+
     // Set whether the model is in warmup mode or not
     // If true, all model tensors are activated during llama_decode() to load and cache their weights.
     LLAMA_API void llama_set_warmup(struct llama_context * ctx, bool warmup);

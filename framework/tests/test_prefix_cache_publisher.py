@@ -21,8 +21,8 @@ def publisher():
     return module
 
 
-def prepare(tmp_path, monkeypatch, suffix):
-    fingerprint = ("prefix-cache 1|this model|old-build" + suffix).encode()
+def prepare(tmp_path, monkeypatch, suffix, head="prefix-cache 1|"):
+    fingerprint = (head + "this model|old-build" + suffix).encode()
     prompt = (
         struct.pack("<III", 0x4643504C, 1, len(fingerprint)) + fingerprint + struct.pack("<I", 96)
     )
@@ -53,6 +53,19 @@ def test_rejects_adapted_file_before_contacting_service(publisher, tmp_path, mon
         publisher, "call", lambda *_args: pytest.fail("unexpected release service request")
     )
     with pytest.raises(SystemExit, match="computed with LoRA adapters"):
+        publisher.main()
+
+
+PROVENANCE = "|settings-cache=1|adapter-cache=1"
+
+
+def test_rejects_file_computed_with_other_settings(publisher, tmp_path, monkeypatch):
+    head = "prefix-cache 1|settings=0123456789abcdef|"
+    prepare(tmp_path, monkeypatch, PROVENANCE, head=head)
+    monkeypatch.setattr(
+        publisher, "call", lambda *_args: pytest.fail("unexpected release service request")
+    )
+    with pytest.raises(SystemExit, match="computed with settings"):
         publisher.main()
 
 
@@ -98,17 +111,36 @@ def test_rejects_unproven_file_missing_exact_published_match(
         return 200, json.dumps({"schema": publisher.SCHEMA, "files": [entry]}).encode()
 
     monkeypatch.setattr(publisher, "call", call)
-    with pytest.raises(SystemExit, match="lacks base-model provenance"):
+    with pytest.raises(SystemExit, match="lacks provenance"):
         publisher.main()
     assert calls == [("GET", listing_url)]
 
 
-def test_base_marker_allows_new_publication(publisher, tmp_path, monkeypatch, capsys):
-    prompt = prepare(tmp_path, monkeypatch, "|adapter-cache=1")
+def test_provenance_allows_new_publication(publisher, tmp_path, monkeypatch, capsys):
+    prompt = prepare(tmp_path, monkeypatch, PROVENANCE)
     monkeypatch.setattr(publisher, "call", lambda *_args: (404, b""))
     publisher.main()
     name = f"prefix-cache-{hashlib.sha256(prompt).hexdigest()}.prompt"
     assert f"would upload {name} ({len(prompt)} bytes, 96 tokens)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("listed", [False, True])
+def test_rejects_new_file_without_settings_provenance(publisher, tmp_path, monkeypatch, listed):
+    # A file of an engine before the settings provenance may have been computed with other settings.
+    entry = published_entry(prepare(tmp_path, monkeypatch, "|adapter-cache=1"))
+    entry["sha256"] = "0" * 64
+    calls = []
+
+    def call(method, url, *_args):
+        calls.append((method, url))
+        if not listed:
+            return 404, b""
+        return 200, json.dumps({"schema": publisher.SCHEMA, "files": [entry]}).encode()
+
+    monkeypatch.setattr(publisher, "call", call)
+    with pytest.raises(SystemExit, match="lacks provenance"):
+        publisher.main()
+    assert calls == [("GET", f"{publisher.SERVICE}/config/{publisher.LIST}")]
 
 
 @pytest.mark.parametrize("dry_run", [True, False])
@@ -116,10 +148,12 @@ def test_base_marker_allows_new_publication(publisher, tmp_path, monkeypatch, ca
     "other_identity",
     [None, {"os": "macos"}, {"app_version": "2.1.327"}, {"os": "macos", "app_version": "2.1.327"}],
 )
+@pytest.mark.parametrize("suffix", ["", "|adapter-cache=1"])
 def test_adds_engine_to_verified_legacy_entry_without_uploading(
-    publisher, tmp_path, monkeypatch, capsys, dry_run, other_identity
+    publisher, tmp_path, monkeypatch, capsys, dry_run, other_identity, suffix
 ):
-    prompt = prepare(tmp_path, monkeypatch, "")
+    # without the settings provenance, with or without the adapter provenance
+    prompt = prepare(tmp_path, monkeypatch, suffix)
     entry = published_entry(prompt)
     set_legacy_inventory(publisher, monkeypatch, entry)
     other_rows = (

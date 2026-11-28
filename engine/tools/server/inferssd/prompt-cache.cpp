@@ -18,17 +18,21 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <random>
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -114,6 +118,8 @@ static constexpr uint32_t SERVER_PROMPT_FILE_MAGIC   = 0x4643504c; // "LPCF"
 static constexpr uint32_t SERVER_PROMPT_FILE_VERSION = 1;
 static constexpr char SERVER_PROMPT_ADAPTER_TAG[] = "|lora=";
 static constexpr char SERVER_PROMPT_BASE_PROVENANCE[] = "|adapter-cache=1";
+// the settings provenance before it: the writer named the settings that change its states' values (settings=<hash>|)
+static constexpr char SERVER_PROMPT_PROVENANCE[] = "|settings-cache=1|adapter-cache=1";
 static void server_fnv1a(uint64_t & hash, const char * data, size_t size);
 
 static bool server_prompt_fwrite(FILE * f, const void * src, size_t size) {
@@ -157,20 +163,52 @@ static void server_prompt_file_close(FILE * f) {
 
 using server_prompt_file = std::unique_ptr<FILE, decltype(&server_prompt_file_close)>;
 
+// A file a server writes is its own until it renames it into place, and another server that opens the directory
+// meanwhile leaves it: on POSIX systems the writer holds a lock on it, and on Windows an open file cannot be removed.
+// False if another server holds it already. On a file system without locks the file stays unlocked, and a server that
+// opens the directory, which cannot lock it either, leaves it.
+static bool server_prompt_file_hold(FILE * f) {
+#if defined(_WIN32)
+    (void) f;
+    return true;
+#else
+    return flock(fileno(f), LOCK_EX | LOCK_NB) == 0 || errno != EWOULDBLOCK;
+#endif
+}
+
+// removes a temporary file unless its writer still holds it: one that no writer holds is left by a server that stopped
+static void server_prompt_remove_left_file(const std::filesystem::path & path) {
+    std::error_code ec;
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        std::filesystem::remove(path, ec);
+    }
+    close(fd);
+#else
+    std::filesystem::remove(path, ec);
+#endif
+}
+
 static void server_prompt_file_touch(const std::string & path) {
     std::error_code ec;
     std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
 }
 
-// Files already published before the adapter provenance marker have immutable
-// sizes and SHA-256 digests in the official prefix-cache.json listing.
-static bool server_prompt_is_published_legacy(FILE * f, uint64_t size) {
-    static constexpr struct {
-        uint64_t size;
-        const char * sha256;
-    } legacy[] = {
+const std::vector<server_prompt_published_file> & server_prompt_published_files() {
+    static const std::vector<server_prompt_published_file> published = {
 #include "prompt-cache-legacy.inc"
     };
+    return published;
+}
+
+// Files already published before the provenance markers have immutable sizes and SHA-256 digests in the official
+// prefix-cache.json listing. The whole file is hashed when its size is one of them.
+static bool server_prompt_is_published_legacy(FILE * f, uint64_t size,
+                                              const std::vector<server_prompt_published_file> & legacy) {
     if (std::none_of(std::begin(legacy), std::end(legacy), [=](const auto & entry) {
             return entry.size == size;
         })) {
@@ -209,9 +247,15 @@ static bool server_prompt_is_published_legacy(FILE * f, uint64_t size) {
 
 // read the header of a cached prompt file into `prompt` (tokens, checkpoint and state locations); false if the
 // file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
-// prefix cache: the model's fingerprint, then the build that saved it)
+// prefix cache: the model's fingerprint, then the build that saved it) whose writer recorded its provenance or whose
+// size is a `published` file's. Only the header is read: such a file is unverified until its content is hashed.
+// With `other`, a well-formed file of another fingerprint, or of another version of the format, is another server's:
+// false, and `other` says what it is of, its fingerprint or the format version. It stays empty for a file that no
+// server reads.
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
-                                      bool prefix = false) {
+                                      bool prefix = false,
+                                      const std::vector<server_prompt_published_file> * published = nullptr,
+                                      std::string * other = nullptr) {
     if (server_prompt_file_seek(f, 0, SEEK_END) != 0) {
         return false;
     }
@@ -222,8 +266,16 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
-        !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
-        !server_prompt_fread(f, &n_fp, sizeof(n_fp)) || n_fp > 4096) {
+        !server_prompt_fread(f, &version, sizeof(version))) {
+        return false;
+    }
+    if (version != SERVER_PROMPT_FILE_VERSION) {
+        if (other) {
+            *other = "format " + std::to_string(version);
+        }
+        return false;
+    }
+    if (!server_prompt_fread(f, &n_fp, sizeof(n_fp)) || n_fp > 4096) {
         return false;
     }
     std::string fp(n_fp, '\0');
@@ -242,8 +294,16 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     }
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
-    if (!same || (prefix && !string_ends_with(fp, SERVER_PROMPT_BASE_PROVENANCE) &&
-                  !server_prompt_is_published_legacy(f, file_size))) {
+    if (!same && !other) {
+        return false;
+    }
+    // A file of a writer before the settings provenance says nothing about the settings that computed it, which
+    // may have changed its values: it serves only when it is one of the published files, which are of the
+    // model's own settings. Its size tells here; its content when a request first restores it.
+    prompt.unverified = prefix && !string_ends_with(fp, SERVER_PROMPT_PROVENANCE);
+    if (prompt.unverified && (!published || std::none_of(published->begin(), published->end(), [&](const auto & file) {
+            return file.size == uint64_t(file_size);
+        }))) {
         return false;
     }
 
@@ -295,6 +355,10 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     if (data_size == 0 || data_size != size_t(file_size) - offset) {
         return false;
     }
+    if (!same) {
+        *other = fp;
+        return false;
+    }
 
     prompt.tokens           = server_tokens(tokens, false);
     prompt.checkpoints      = std::move(checkpoints);
@@ -307,7 +371,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 // The index is a lookup hint. A replacement may have different tokens or
 // checkpoints, so its state cannot be restored using the previous match.
 static bool server_prompt_same_layout(const server_prompt & indexed, const server_prompt & opened) {
-    return indexed.tokens.get_tokens() == opened.tokens.get_tokens() &&
+    return indexed.tokens.get_tokens() == opened.tokens.get_tokens() && indexed.adapter_key == opened.adapter_key &&
            indexed.file_data_offset == opened.file_data_offset &&
            indexed.file_data_size == opened.file_data_size &&
            std::equal(indexed.checkpoints.begin(), indexed.checkpoints.end(),
@@ -364,7 +428,8 @@ static bool server_prompt_restore(
     return true;
 }
 
-void server_prompt_cache::use_dir(const std::string & dir, const std::string & fingerprint) {
+void server_prompt_cache::use_dir(const std::string & dir, const std::string & fingerprint,
+                                  const std::string & configuration) {
     this->dir         = dir;
     this->fingerprint = fingerprint;
     limit_tokens      = 0;
@@ -379,21 +444,30 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
     for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
         const std::string path = entry.path().string();
         if (entry.path().extension() == ".tmp") {
-            std::filesystem::remove(entry.path(), ec);
+            server_prompt_remove_left_file(entry.path());
             continue;
         }
         if (entry.path().extension() != ".prompt") {
             continue;
         }
         server_prompt prompt;
+        std::string other;
         bool ok = false;
         if (FILE * f = std::fopen(path.c_str(), "rb")) {
-            ok = server_prompt_read_header(f, fingerprint, prompt);
+            ok = server_prompt_read_header(f, fingerprint, prompt, false, nullptr, &other);
             std::fclose(f);
         }
         if (!ok) {
-            SRV_WRN(" - removing cached prompt %s: other model, build or format\n", path.c_str());
-            std::filesystem::remove(entry.path(), ec);
+            // A file of another fingerprint is another server's, of other settings or another model, which may share
+            // the directory: it stays, and is not this cache's to count or evict. One of this server's model and
+            // settings from another build serves no server of them now, and goes, as one that no server reads.
+            const bool stale = !other.empty() && !configuration.empty() &&
+                other.compare(0, configuration.size(), configuration) == 0;
+            if (other.empty() || stale) {
+                SRV_WRN(" - removing cached prompt %s: %s\n", path.c_str(),
+                        stale ? "another build of this model and settings" : "not a cached prompt of any server");
+                std::filesystem::remove(entry.path(), ec);
+            }
             continue;
         }
         prompt.file = path;
@@ -462,7 +536,8 @@ void server_prompt_cache::scan_prefix_dir() {
         }
         server_prompt prompt;
         server_prompt_file validated(file.release(), server_prompt_file_close);
-        const bool valid = validated && server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true);
+        const bool valid = validated && server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true,
+                                                                  published);
         if (identified) {
             ssd::platform::file_identity after;
             if (!ssd::platform::identity(ssd::platform::stream_fd(validated.get()), after) || identity != after) {
@@ -498,7 +573,8 @@ void server_prompt_cache::scan_prefix_dir() {
 
 bool server_prompt_cache::contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type) {
     for (auto it = states.begin(); it != states.end(); ++it) {
-        if (!prompt.adapter_key || it->adapter_key != prompt.adapter_key) {
+        // a prefix cache not yet verified is no copy of the prompt: its restore may refuse it
+        if (!prompt.adapter_key || it->adapter_key != prompt.adapter_key || it->unverified) {
             continue;
         }
         const int lcp = it->tokens.get_common_prefix(prompt.tokens);
@@ -511,6 +587,26 @@ bool server_prompt_cache::contains(const server_prompt & prompt, common_context_
         }
     }
     return false;
+}
+
+bool server_prompt_cache::verify_published(std::list<server_prompt>::iterator it, FILE * f) {
+    ssd::platform::file_identity identity;
+    const bool same_version = it->prefix_identity && ssd::platform::identity(ssd::platform::stream_fd(f), identity) &&
+                              identity == *it->prefix_identity;
+    if (same_version && !it->unverified) {
+        return true;
+    }
+    ++n_published_hashes;
+    if (!server_prompt_is_published_legacy(f, it->file_data_offset + it->file_data_size, *published)) {
+        SRV_WRN(" - prefix cache is not a published file, and says nothing of its settings: %s\n", it->file.c_str());
+        remove(it);
+        return false;
+    }
+    // the version the scan read, once
+    if (same_version) {
+        it->unverified = false;
+    }
+    return true;
 }
 
 void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
@@ -563,6 +659,10 @@ void server_prompt_cache::save(
         int32_t                      id_slot,
         common_context_seq_rm_type   seq_rm_type) {
     if (!prompt.adapter_key) {
+        return;
+    }
+    if (!prompt.rows_in_place()) {
+        SRV_WRN("%s", " - not saving a state whose rows a context shift or a reused chunk moved\n");
         return;
     }
     server_ssd_memory_change budget_changes(ctx);
@@ -646,10 +746,17 @@ void server_prompt_cache::save(
         server_fnv1a(hash, prompt.adapter_key->data(), prompt.adapter_key->size());
         file_fingerprint += SERVER_PROMPT_ADAPTER_TAG + *prompt.adapter_key;
     }
+    // and the fingerprint: a server with other settings sharing the directory writes its states under other names
+    server_fnv1a(hash, fingerprint.data(), fingerprint.size());
     char name[32];
     std::snprintf(name, sizeof(name), "%016" PRIx64 ".prompt", hash);
     const std::string path = (std::filesystem::path(dir) / name).string();
-    const std::string tmp  = path + ".tmp";
+    // a file of this process alone until it is renamed: another server with the directory writes its own
+    static const std::string writer = [] {
+        std::random_device random;
+        return string_format("%08x%08x", random(), random());
+    }();
+    const std::string tmp  = path + "." + writer + ".tmp";
 
     server_prompt entry;
     entry.tokens = prompt.tokens.clone();
@@ -658,12 +765,15 @@ void server_prompt_cache::save(
     entry.adapter_key = prompt.adapter_key;
 
     bool ok = false;
+    bool renamed = false;
+    std::error_code ec;
     if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
         server_prompt_file source(nullptr, server_prompt_file_close);
         const uint32_t magic = SERVER_PROMPT_FILE_MAGIC, version = SERVER_PROMPT_FILE_VERSION;
         const uint32_t n_fp = file_fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
         const uint64_t data_size = state_size;
-        ok = server_prompt_fwrite(f, &magic, sizeof(magic)) && server_prompt_fwrite(f, &version, sizeof(version)) &&
+        ok = server_prompt_file_hold(f) &&
+             server_prompt_fwrite(f, &magic, sizeof(magic)) && server_prompt_fwrite(f, &version, sizeof(version)) &&
              server_prompt_fwrite(f, &n_fp, sizeof(n_fp)) && server_prompt_fwrite(f, file_fingerprint.data(), n_fp) &&
              server_prompt_fwrite(f, &n_tokens, sizeof(n_tokens)) &&
              server_prompt_fwrite(f, tokens.data(), n_tokens*sizeof(llama_token)) &&
@@ -716,16 +826,22 @@ void server_prompt_cache::save(
         ok = ok && fdatasync(fileno(f)) == 0;
 #endif
         server_prompt_file_drop_cache(f);
+#if !defined(_WIN32)
+        // into place while the writer still holds it
+        if (ok) {
+            std::filesystem::rename(tmp, path, ec);
+            ok = renamed = !ec;
+        }
+#endif
         ok = std::fclose(f) == 0 && ok;
     }
-    std::error_code ec;
-    if (ok) {
+    if (ok && !renamed) {
         std::filesystem::rename(tmp, path, ec);
         ok = !ec;
     }
     if (!ok) {
         SRV_WRN(" - failed to write cached prompt %s\n", path.c_str());
-        std::filesystem::remove(tmp, ec);
+        std::filesystem::remove(renamed ? path : tmp, ec);
         return;
     }
 
@@ -834,6 +950,7 @@ bool server_prompt_cache::load(
         llama_memory_seq_rm(llama_get_memory(ctx), id_slot, -1, -1);
         prompt.tokens.clear();
         prompt.checkpoints.clear();
+        prompt.n_in_place = -1;
         n_reuse_slot = 0;
     }
 }
@@ -851,19 +968,27 @@ server_prompt_cache::take_result server_prompt_cache::take(
                                       : std::fopen(it_best->file.c_str(), "rb"));
     }
     server_prompt opened;
-    if (it_best->read_only) {
-        // Bind validation and every read to this handle. The directory index can
-        // be stale even after a scan if the pathname is replaced concurrently.
-        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, opened, true) ||
-            !server_prompt_same_layout(*it_best, opened)) {
-            SRV_WRN(" - prefix cache changed since indexing: %s\n", it_best->file.c_str());
+    if (!it_best->file.empty()) {
+        // Bind validation and every read to this handle. The index can be stale even after a scan: another server
+        // with this cache directory, or with other settings and so another fingerprint, may have replaced the file
+        // since, or the pathname may be replaced concurrently. Such a file is a miss.
+        const bool valid = file && (it_best->read_only
+            ? server_prompt_read_header(file.get(), prefix_fingerprint, opened, true, published)
+            : server_prompt_read_header(file.get(), fingerprint, opened));
+        if (!valid || !server_prompt_same_layout(*it_best, opened)) {
+            SRV_WRN(" - cached prompt changed since indexing: %s\n", it_best->file.c_str());
+            if (it_best->read_only) {
+                prefix_dir_time = -1;
+            }
             states.erase(it_best);
-            prefix_dir_time = -1;
+            return take_result::stale_index;
+        }
+        if (opened.unverified && !verify_published(it_best, file.get())) {
             return take_result::stale_index;
         }
         opened.file = it_best->file;
     }
-    const server_prompt & entry = it_best->read_only ? opened : *it_best;
+    const server_prompt & entry = it_best->file.empty() ? *it_best : opened;
 
     SRV_WRN(" - found a better prompt%s%s: reuses %" PRId64 " tokens\n", checkpoint_best ? " checkpoint" : "",
             it_best->read_only ? " (prefix cache)" : "", n_tokens_best);
@@ -970,6 +1095,80 @@ static void server_fnv1a(uint64_t & hash, const char * data, size_t size) {
     for (size_t i = 0; i < size; ++i) {
         hash = (hash ^ (uint8_t) data[i])*1099511628211ull;
     }
+}
+
+std::string server_prompt_settings_identity(const common_params & params, int32_t rope_factors_long) {
+    const common_params unset {};
+    std::string settings;
+    const auto add = [&](const std::string & setting) {
+        settings += setting + "\n";
+    };
+    const auto integer = [&](const char * name, int64_t value, int64_t value_unset) {
+        if (value != value_unset) {
+            add(string_format("%s %" PRId64, name, value));
+        }
+    };
+    // a number by its bits, as an adapter's scale: the same on every system
+    const auto bits = [](float value) {
+        uint32_t out;
+        std::memcpy(&out, &value, sizeof(out));
+        return out;
+    };
+    const auto real = [&](const char * name, float value, float value_unset) {
+        if (bits(value) != bits(value_unset)) {
+            add(string_format("%s %08" PRIx32, name, bits(value)));
+        }
+    };
+    for (const auto & kv : params.kv_overrides) {
+        if (!kv.key[0]) {
+            break;
+        }
+        uint64_t f64 = 0;
+        switch (kv.tag) {
+            case LLAMA_KV_OVERRIDE_TYPE_INT:   add(string_format("kv %s int %" PRId64, kv.key, kv.val_i64)); break;
+            case LLAMA_KV_OVERRIDE_TYPE_FLOAT:
+                std::memcpy(&f64, &kv.val_f64, sizeof(f64));
+                add(string_format("kv %s float %016" PRIx64, kv.key, f64));
+                break;
+            case LLAMA_KV_OVERRIDE_TYPE_BOOL:  add(string_format("kv %s bool %d", kv.key, kv.val_bool ? 1 : 0)); break;
+            case LLAMA_KV_OVERRIDE_TYPE_STR:   add(string_format("kv %s str %s", kv.key, kv.val_str)); break;
+        }
+    }
+    integer("rope-scaling", params.rope_scaling_type, unset.rope_scaling_type);
+    real("rope-freq-base", params.rope_freq_base, unset.rope_freq_base);
+    real("rope-freq-scale", params.rope_freq_scale, unset.rope_freq_scale);
+    real("yarn-ext-factor", params.yarn_ext_factor, unset.yarn_ext_factor);
+    real("yarn-attn-factor", params.yarn_attn_factor, unset.yarn_attn_factor);
+    real("yarn-beta-fast", params.yarn_beta_fast, unset.yarn_beta_fast);
+    real("yarn-beta-slow", params.yarn_beta_slow, unset.yarn_beta_slow);
+    integer("yarn-orig-ctx", params.yarn_orig_ctx, unset.yarn_orig_ctx);
+    integer("attention", params.attention_type, unset.attention_type);
+    // what the context selects, not a setting: a sequence's context past the original one takes the long factors
+    if (rope_factors_long >= 0) {
+        add(rope_factors_long ? "rope-factors long" : "rope-factors short");
+    }
+    // A quantized KV cache stores its rows Hadamard-rotated unless LLAMA_ATTN_ROT_DISABLE turns the rotation off
+    // (llama_kv_cache): the same layout in another basis.
+    const char * rot_disable = std::getenv("LLAMA_ATTN_ROT_DISABLE");
+    if (rot_disable && std::atoi(rot_disable) != 0 &&
+            (ggml_is_quantized(params.cache_type_k) || ggml_is_quantized(params.cache_type_v))) {
+        add("kv-rotation off");
+    }
+    // The control vector the server applied (common_init_from_params), not its files as they are now. One whose
+    // identity is unknown is this process's alone.
+    if (!params.control_vectors.empty()) {
+        std::random_device random;
+        static const std::string unknown = string_format("unknown %08x%08x", random(), random());
+        add("control-vector " + (params.control_vector_identity.empty() ? unknown : params.control_vector_identity));
+    }
+    if (settings.empty()) {
+        return "";
+    }
+    uint64_t hash = 1469598103934665603ull;
+    server_fnv1a(hash, settings.data(), settings.size());
+    char out[17];
+    std::snprintf(out, sizeof(out), "%016" PRIx64, hash);
+    return out;
 }
 
 std::string server_adapter_file_identity(const std::string & path) {

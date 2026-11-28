@@ -1288,6 +1288,8 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         params.ctx_shift = false;
     }
 
+    // this load's, set once the vector is applied: a failed one leaves no identity, not an earlier load's
+    params.control_vector_identity.clear();
     if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
@@ -1307,6 +1309,18 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         if (err) {
             return res;
         }
+
+        // FNV-1a over what was applied
+        uint64_t hash = 1469598103934665603ull;
+        const auto mix = [&](const void * data, size_t size) {
+            for (size_t i = 0; i < size; ++i) {
+                hash = (hash ^ static_cast<const uint8_t *>(data)[i]) * 1099511628211ull;
+            }
+        };
+        const int32_t layers[3] = { cvec.n_embd, params.control_vector_layer_start, params.control_vector_layer_end };
+        mix(layers, sizeof(layers));
+        mix(cvec.data.data(), cvec.data.size() * sizeof(float));
+        params.control_vector_identity = string_format("%016" PRIx64, hash);
     }
 
     if (llama_pooling_type(lctx) == LLAMA_POOLING_TYPE_RANK) {

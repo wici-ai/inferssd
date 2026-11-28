@@ -64,6 +64,19 @@ struct server_prompt {
     // a prefix cache (server_prompt_cache::use_prefix_dir): made by another server for this model, read from its
     // file and never written, removed or counted against the cache's limits
     bool read_only = false;
+    // a prefix cache without provenance whose size is a published file's, until its content is hashed: when a request
+    // first restores it (server_prompt_cache::verify_published)
+    bool unverified = false;
+
+    // After a context shift moved rows of the state, or a reused chunk did (n_cache_reuse): the first tokens whose rows
+    // are where they were computed, -1 when none moved. A moved row depends on tokens the state no longer holds, so
+    // the state is saved nowhere, and a later prompt reuses no more of it than these tokens.
+    int64_t n_in_place = -1;
+
+    // whether every row is where its tokens computed it
+    bool rows_in_place() const {
+        return n_in_place < 0 || n_in_place >= n_tokens();
+    }
 
     // Empty for the base model. No key means the slot's state cannot be shared.
     std::optional<std::string> adapter_key = std::string();
@@ -93,6 +106,8 @@ struct server_prompt {
             file_data_size,
             n_conversation,
             read_only,
+            unverified,
+            n_in_place,
             adapter_key,
             prefix_identity,
         };
@@ -237,6 +252,16 @@ inline const server_prompt_checkpoint * server_prompt_find_checkpoint_before_pos
     return nullptr;
 }
 
+// a file of the published prefix caches, by size and SHA-256 (lowercase hex)
+struct server_prompt_published_file {
+    uint64_t     size;
+    const char * sha256;
+};
+
+// The published prefix caches from before the provenance markers (prompt-cache-legacy.inc): their writers did not
+// say which settings computed them, and they serve as files of the model's own settings.
+const std::vector<server_prompt_published_file> & server_prompt_published_files();
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -244,9 +269,12 @@ struct server_prompt_cache {
     }
 
     // Keep the prompts in files under `dir` instead of in memory. They outlive the server: prompts saved by a server
-    // with the same fingerprint (model file, build) are found again on start, other files are removed. Loading a
-    // prompt leaves its file in place, so a shared prefix serves every conversation that starts with it.
-    void use_dir(const std::string & dir, const std::string & fingerprint);
+    // with the same fingerprint (model file, settings, build) are found again on start. Files of other fingerprints
+    // are other servers' that may share the directory, and stay, uncounted; those of another build whose fingerprint
+    // starts with `configuration` (this server's model and settings, empty for none), and files no server reads, are
+    // removed. Loading a prompt leaves its file in place, so a shared prefix serves every conversation that starts
+    // with it.
+    void use_dir(const std::string & dir, const std::string & fingerprint, const std::string & configuration = "");
 
     bool on_disk() const {
         return !dir.empty();
@@ -273,6 +301,8 @@ struct server_prompt_cache {
 
     std::string prefix_dir;
     std::string prefix_fingerprint;
+    // the prefix caches it takes without a provenance marker
+    const std::vector<server_prompt_published_file> * published = &server_prompt_published_files();
 
     // of the cache's own states, not the prefix caches
     size_t size() const;
@@ -319,6 +349,10 @@ private:
     void remove_superseded(const server_prompt & prompt, const server_prompt * saved);
     bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     void remove(std::list<server_prompt>::iterator it);
+    // Whether the prefix cache `it`, open as `f`, is a published file, by its SHA-256, once a version: a file that is
+    // not goes as unusable.
+    bool verify_published(std::list<server_prompt>::iterator it, FILE * f);
+    size_t n_published_hashes = 0; // the files verify_published hashed
     // reads the prefix cache directory again if it changed since the last read
     void scan_prefix_dir();
     int64_t prefix_dir_time = -1;
@@ -330,6 +364,13 @@ private:
 // file it loads from, the files of a split model included. Neither the path nor the time of a file is in it.
 std::string server_model_files_identity(const std::vector<std::string> & paths);
 
+// The settings a state's values depend on besides the model's files and its adapters, as a hash: the GGUF metadata
+// the server overrides, its RoPE and YaRN settings, its attention type, its control vectors, a quantized KV cache's
+// rows stored without their rotation (LLAMA_ATTN_ROT_DISABLE), and for a model with long and short RoPE factors the
+// ones its context selects (rope_factors_long, llama_rope_factors_long). Empty when none is set and the factors do
+// not depend on the context, so the states of servers that run such a model as its files describe it, prefix caches
+// among them, keep their fingerprint.
+std::string server_prompt_settings_identity(const common_params & params, int32_t rope_factors_long = -1);
 std::string server_adapter_file_identity(const std::string & path);
 std::optional<std::string> server_prompt_adapter_key(const std::vector<std::string> & identities,
         const std::vector<common_adapter_lora_info> & adapters);
