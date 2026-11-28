@@ -88,6 +88,7 @@ size_t folder_version_end(const std::string & text, size_t i, const std::vector<
 }
 
 const char * const version_stand_in = "0.0.0";
+constexpr int plugin_version_kind = 7;
 
 server_identifier_map::order make_order(const pair_list & pairs, const std::vector<server_plugin_version> & versions,
                                         bool reverse) {
@@ -386,6 +387,8 @@ std::vector<std::string> folder_names(const std::string & path) {
 // is then in the skill's line and not in a path learn_identifiers sees.
 struct plugin_versions {
     std::map<std::vector<std::string>, std::set<std::string>> seen;  // a plugin's folder: its versions
+    std::map<std::string, std::set<std::string>> root_paths;  // declarations across skill lists in this request
+    std::set<std::vector<std::string>> literal_zero;  // an aliased skill actually installed under 0.0.0
     std::map<std::vector<std::string>, std::vector<std::string>> behind_roots;  // r1, doc: the plugin's folder, or
                                                                                 // nothing if they reach two
     void add(const std::vector<std::string> & names, const std::vector<std::string> & folder) {
@@ -397,7 +400,18 @@ struct plugin_versions {
 };
 
 // the versions of the plugins' folders that text names (.../plugins/cache/<source>/<plugin>/<version>)
-void learn_plugin_paths(const std::string & text, plugin_versions & out) {
+void learn_plugin_paths(const std::string & input, plugin_versions & out) {
+    if (input.find("plugins") == std::string::npos) { return; }
+    // A previous tool call carries its arguments as JSON text, with each Windows separator escaped.
+    std::string unescaped;
+    if (input.find("\\\\") != std::string::npos) {
+        unescaped.reserve(input.size());
+        for (size_t i = 0; i < input.size(); ++i) {
+            unescaped += input[i];
+            if (input[i] == '\\' && i + 1 < input.size() && input[i + 1] == '\\') { ++i; }
+        }
+    }
+    const std::string & text = unescaped.empty() ? input : unescaped;
     for (size_t at = text.find("plugins"); at != std::string::npos; at = text.find("plugins", at + 1)) {
         size_t begin, end;
         if (plugin_version(text, at, begin, end)) {
@@ -426,6 +440,8 @@ void learn_listed_skills(const std::string & text, plugin_versions & out) {
             const std::string alias = line.substr(3, end - 3);
             std::string root = line.substr(end + 5, line.size() - end - 6);
             while (!root.empty() && is_separator(root.back())) { root.pop_back(); }
+            std::replace(root.begin(), root.end(), '\\', '/');
+            out.root_paths[alias].insert(root);
             auto entry = roots.emplace(alias, root);
             if (!entry.second && entry.first->second != root) { entry.first->second.clear(); }
         }
@@ -452,7 +468,9 @@ void learn_listed_skills(const std::string & text, plugin_versions & out) {
             continue;
         }
         const std::vector<std::string> folder = folder_names(path.substr(cache + 1, begin - cache - 1));
-        out.seen[folder].insert(path.substr(begin, end - begin));
+        const std::string version = path.substr(begin, end - begin);
+        out.seen[folder].insert(version);
+        if (version == version_stand_in) { out.literal_zero.insert(folder); }
         out.add(folder_names(ref.substr(0, sep + begin - root.size())), folder);
     }
 }
@@ -645,7 +663,8 @@ void learn_identifiers(const std::string & text, const server_identifier_env & e
         if (version == "0.0.0") {
             continue;
         }
-        found(7, text.substr(at, end - at), text.substr(at, i - at) + "0.0.0", /* numbered = */ false);
+        found(plugin_version_kind, text.substr(at, end - at), text.substr(at, i - at) + version_stand_in,
+              /* numbered = */ false);
     }
 }
 
@@ -911,7 +930,6 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
             const bool app_message = role == "system" || role == "developer";
             auto learn = [&](std::string & text) {
                 learn_identifiers(text, env, learned, app_message);
-                learn_plugin_paths(text, plugins);
                 if (app_message) {
                     learn_listed_skills(text, plugins);
                 }
@@ -931,12 +949,20 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
         }
     }
     for (const auto & l : learned) {
+        // An expanded aliased path to the literal version must also survive the older full-path matcher.
+        if (l.kind == plugin_version_kind && !plugins.literal_zero.empty() &&
+                plugins.literal_zero.count(folder_names(l.id.substr(0, l.id.find_last_of("/\\"))))) {
+            continue;
+        }
         add_pair(pairs, l.id, l.stand_in, env.windows);
     }
 
     json tools = body.contains("tools") ? body.at("tools") : json();
-    auto learn_tools = [&](std::string & text) { learn_plugin_paths(text, plugins); };
-    for_each_text(tools, learn_tools);
+    if (!plugins.behind_roots.empty()) {
+        auto learn_paths = [&](std::string & text) { learn_plugin_paths(text, plugins); };
+        for_each_text(messages, learn_paths);
+        for_each_text(tools, learn_paths);
+    }
     server_identifier_map map;
     map.pairs = std::move(pairs);
     // A plugin that skills are given of from a root, with one version in the whole request, not 0.0.0, shows the model
@@ -945,7 +971,8 @@ server_identifier_map server_identifiers_apply(json & body, const server_identif
     std::map<std::vector<std::string>, size_t> entries;  // a plugin's folder: its entry in map.versions
     for (const auto & [names, folder] : plugins.behind_roots) {
         const auto seen = plugins.seen.find(folder);
-        if (folder.empty() || seen == plugins.seen.end() || seen->second.size() != 1 ||
+        if (folder.empty() || plugins.root_paths.at(names.front()).size() != 1 ||
+                seen == plugins.seen.end() || seen->second.size() != 1 ||
                 *seen->second.begin() == version_stand_in) {
             continue;
         }

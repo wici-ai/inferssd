@@ -731,6 +731,37 @@ static void test_skill_versions_beside_full_roots() {
                     "each skill opens at its own version" + tail + (forward ? ", with '/'" : ""));
         }
     }
+    auto r = skill_list({"D:/Apps/plugins/cache/team/doc/2.3.4", "D:/Apps/plugins/cache/team"},
+                        {"guide (file: r1/guide/SKILL.md)", "zero (file: r2/doc/0.0.0/skills/zero/SKILL.md)"});
+    const auto map = server_identifiers_apply(r, env);
+    require(opened(map, r, "guide", true) == "D:/Apps/plugins/cache/team/doc/2.3.4/guide/SKILL.md" &&
+            opened(map, r, "zero", true) == "D:/Apps/plugins/cache/team/doc/0.0.0/skills/zero/SKILL.md",
+            "a versioned root beside an aliased literal 0.0.0 leaves both versions accessible");
+}
+
+static void test_skill_root_rebound_in_another_catalog() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    auto r = skill_list({"D:/Apps/plugins/cache/team"}, {"doc (file: r1/doc/2.4.1/skills/guide/SKILL.md)"});
+    auto local = skill_list({"D:/Other"}, {"local (file: r1/doc/2.4.1/skills/local/SKILL.md)"});
+    r["messages"].push_back(local["messages"][0]);
+    const auto map = server_identifiers_apply(r, env);
+    local["messages"][0] = r["messages"][1];
+    require(opened(map, r, "doc", true) == "D:/Apps/plugins/cache/team/doc/2.4.1/skills/guide/SKILL.md" &&
+            opened(map, local, "local", true) == "D:/Other/doc/2.4.1/skills/local/SKILL.md",
+            "a repeated alias opens each catalog's own file");
+}
+
+static void test_skill_version_in_tool_history() {
+    const auto env = server_identifier_env::of_system("windows", "D:/Fixture", "");
+    for (const std::string path : {"D:/Apps/plugins/cache/team/doc/2.3.4/guide.md",
+                                   R"(D:\Apps\plugins\cache\team\doc\2.3.4\guide.md)"}) {
+        auto r = skill_list({"D:/Apps/plugins/cache/team"}, {"doc (file: r1/doc/2.4.1/skills/guide/SKILL.md)"});
+        const json call = tool_call("c", "open", {{"path", path}});
+        r["messages"].push_back({{"role", "assistant"}, {"tool_calls", json::array({call})}});
+        server_identifiers_apply(r, env);
+        require(text_of(r["messages"][0]).find("r1/doc/2.4.1/") != std::string::npos,
+                "the previous tool call names a second version of the listed plugin");
+    }
 }
 
 // a version that begins like another one: both stay as sent; in a text that only names the first one's folder by
@@ -1018,6 +1049,8 @@ int main() {
     test_desktop_skill_alias_versions();
     test_skill_versions_across_roots();
     test_skill_versions_beside_full_roots();
+    test_skill_root_rebound_in_another_catalog();
+    test_skill_version_in_tool_history();
     test_skill_version_prefixes();
     test_skill_version_folders();
     test_skill_version_native_join();
