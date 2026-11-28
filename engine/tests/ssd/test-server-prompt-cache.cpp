@@ -3,11 +3,17 @@
 
 #include "gguf.h"
 
+extern "C" {
+#include "sha256/sha256.h"
+}
+
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <initializer_list>
 #include <list>
 #include <string>
@@ -375,11 +381,12 @@ static void test_prefix_dir_takes_only_this_models_files() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-models");
     // a file of another build's prompt cache for this model, one for another model, one whose model's fingerprint
     // only starts the same
-    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2|adapter-cache=1",
+    const std::string provenance = "|settings-cache=1|adapter-cache=1";
+    write_prompt_file((dir / "a.prompt").string(), "prefix-cache 1|this model|build 2" + provenance,
                       { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1|adapter-cache=1",
+    write_prompt_file((dir / "b.prompt").string(), "prefix-cache 1|another model|build 1" + provenance,
                       { 1, 2, 3, 4, 5, 6 }, 64);
-    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1|adapter-cache=1",
+    write_prompt_file((dir / "c.prompt").string(), "prefix-cache 1|this model 2|build 1" + provenance,
                       { 1, 2, 3, 4, 5, 6 }, 64);
     // An old local file has no base-model provenance, even under a release filename.
     const auto legacy = dir / "prefix-cache-09be34f60064f237dd7bc0fc70e78e5deb14c4af36b315ceab9a92e635c8ae75.prompt";
@@ -401,6 +408,74 @@ static void test_prefix_dir_takes_only_this_models_files() {
     adapted.adapter_key = "0123456789abcdef";
     require(!server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
             "a portable base prefix does not satisfy an adapted request");
+    std::filesystem::remove_all(dir);
+}
+
+static std::string file_sha256(const std::filesystem::path & path) {
+    std::ifstream in(path, std::ios::binary);
+    const std::string bytes((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    sha256_t hash;
+    sha256_init(&hash);
+    sha256_update(&hash, reinterpret_cast<const unsigned char *>(bytes.data()), bytes.size());
+    unsigned char digest[SHA256_DIGEST_SIZE];
+    sha256_final(&hash, digest);
+    char hex[2 * SHA256_DIGEST_SIZE + 1];
+    for (size_t i = 0; i < SHA256_DIGEST_SIZE; ++i) {
+        std::snprintf(hex + 2 * i, 3, "%02x", static_cast<unsigned>(digest[i]));
+    }
+    return hex;
+}
+
+// A writer before the settings provenance did not say which settings computed its states: such a file serves as a
+// prefix cache only when it is a published one, by its size and SHA-256 (prompt-cache-legacy.inc), which serves as a
+// state of the model's own settings. A file with the provenance serves as before. Reading the directory reads the
+// headers only, the size of a published file is enough there; a restore hashes the file first, once a version, and
+// a file that is not published goes as unusable.
+static void test_prefix_dir_takes_unproven_files_only_when_published() {
+    const auto dir = fresh_dir("inferssd-test-prefix-dir-published");
+    const std::string before = "prefix-cache 1|this model|build 1|adapter-cache=1";
+    write_prompt_file((dir / "new.prompt").string(),
+                      "prefix-cache 1|this model|build 2|settings-cache=1|adapter-cache=1", { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "published.prompt").string(), before, { 1, 2, 3, 4 }, 64);
+    // as large as the published file, not the same
+    write_prompt_file((dir / "other.prompt").string(), before, { 1, 2, 3, 5 }, 64);
+    write_prompt_file((dir / "unknown.prompt").string(), before, { 1, 2, 3, 4, 5 }, 64);
+    const std::string sha256 = file_sha256(dir / "published.prompt");
+    const std::vector<server_prompt_published_file> published = {
+        { (uint64_t) std::filesystem::file_size(dir / "published.prompt"), sha256.c_str() },
+    };
+    const auto files = [](const server_prompt_cache & cache) {
+        std::vector<std::string> out;
+        for (const auto & prompt : cache.states) {
+            out.push_back(std::filesystem::path(prompt.file).filename().string());
+        }
+        std::sort(out.begin(), out.end());
+        return out;
+    };
+    {
+        server_prompt_cache cache(1, 0);
+        cache.published = &published;
+        cache.use_prefix_dir(dir.string(), "prefix-cache 1|this model");
+        require(files(cache) == std::vector<std::string>{ "new.prompt", "other.prompt", "published.prompt" },
+                "a file without the provenance is indexed by the size of a published file");
+        require(server_prompt_cache_testing::published_hashes(cache) == 0, "reading the directory hashes no file");
+        const auto path = [&](const char * name) { return (dir / name).string(); };
+        require(server_prompt_cache_testing::verify_published(cache, path("published.prompt")) &&
+                server_prompt_cache_testing::verify_published(cache, path("published.prompt")) &&
+                server_prompt_cache_testing::published_hashes(cache) == 1,
+                "a published file is verified when it is restored, once");
+        // the directory's reading remembered the file of no published size, the restore remembers this one
+        const size_t n_unusable = server_prompt_cache_testing::unusable_prefixes(cache);
+        require(!server_prompt_cache_testing::verify_published(cache, path("other.prompt")) &&
+                files(cache) == std::vector<std::string>{ "new.prompt", "published.prompt" } &&
+                server_prompt_cache_testing::unusable_prefixes(cache) == n_unusable + 1,
+                "a file that is not published goes at its restore");
+        require(server_prompt_cache_testing::published_hashes(cache) == 2,
+                "a file that is not published is hashed at its restore too");
+    }
+    server_prompt_cache cache(1, 0);
+    cache.use_prefix_dir(dir.string(), "prefix-cache 1|this model");
+    require(files(cache) == std::vector<std::string>{ "new.prompt" }, "the published files are those the inventory names");
     std::filesystem::remove_all(dir);
 }
 
@@ -426,7 +501,8 @@ static void test_writable_adapter_fingerprint() {
 
 static void test_prefix_cache_outlives_the_cache_limits_and_newer_states() {
     const auto dir = fresh_dir("inferssd-test-prefix-dir-limits");
-    write_prompt_file((dir / "p.prompt").string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5, 6 }, 64);
+    write_prompt_file((dir / "p.prompt").string(), "fp|build|settings-cache=1|adapter-cache=1",
+                      { 1, 2, 3, 4, 5, 6 }, 64);
 
     // a cache of 1 MiB in memory, with the prefix cache and two states of its own of 0.75 MiB each
     server_prompt_cache cache(1, 0);
@@ -461,7 +537,7 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     require(cache.states.empty(), "an empty directory has no prefix caches");
 
     // a download finishes while the server runs
-    write_prompt_file(original.string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4 }, 16);
+    write_prompt_file(original.string(), "fp|build|settings-cache=1|adapter-cache=1", { 1, 2, 3, 4 }, 16);
     touch_dir(dir, 2);
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 1, "a prefix cache put in the directory is found");
@@ -477,7 +553,7 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     };
     // This in-memory field is not serialized. Reloading the same header would reset it.
     indexed_original().n_conversation = 3;
-    write_prompt_file(neighbor.string(), "fp|build|adapter-cache=1", { 5, 6, 7 }, 16);
+    write_prompt_file(neighbor.string(), "fp|build|settings-cache=1|adapter-cache=1", { 5, 6, 7 }, 16);
     touch_dir(dir, 4);
     server_prompt_cache_testing::scan_prefix_dir(cache);
     require(count_read_only(cache) == 2, "adding a neighbor indexes the new prefix");
@@ -492,7 +568,8 @@ static void test_prefix_dir_is_read_again_when_it_changes() {
     // A download can replace a prefix while retaining the pathname, size, and modification time.
     const auto replacement = dir / "replacement.tmp";
     const auto original_time = std::filesystem::last_write_time(original);
-    write_prompt_file(replacement.string(), "fp|build|adapter-cache=1", { 1, 2, 3, 4, 5 }, 16 - sizeof(llama_token));
+    write_prompt_file(replacement.string(), "fp|build|settings-cache=1|adapter-cache=1", { 1, 2, 3, 4, 5 },
+                      16 - sizeof(llama_token));
     require(std::filesystem::file_size(replacement) == std::filesystem::file_size(original),
             "the replacement must have the same file size");
     std::filesystem::last_write_time(replacement, original_time);
@@ -525,7 +602,7 @@ static void test_rejected_prefix_versions() {
 
     std::filesystem::remove(neighbor);
     const auto replacement = dir / "replacement.tmp";
-    write_prompt_file(replacement.string(), "fp|build|adapter-cache=1", { 1, 2, 3 }, 16);
+    write_prompt_file(replacement.string(), "fp|build|settings-cache=1|adapter-cache=1", { 1, 2, 3 }, 16);
     std::filesystem::rename(replacement, prefix);
     touch_dir(dir, 4);
     server_prompt_cache_testing::scan_prefix_dir(cache);
@@ -575,6 +652,7 @@ static void test_model_identity_ignores_path_and_time() {
 int main() {
     test_prefix_dir_takes_only_this_models_files();
     test_writable_adapter_fingerprint();
+    test_prefix_dir_takes_unproven_files_only_when_published();
     test_prefix_cache_outlives_the_cache_limits_and_newer_states();
     test_prefix_dir_is_read_again_when_it_changes();
     test_rejected_prefix_versions();

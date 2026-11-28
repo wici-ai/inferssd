@@ -115,6 +115,8 @@ static constexpr uint32_t SERVER_PROMPT_FILE_MAGIC   = 0x4643504c; // "LPCF"
 static constexpr uint32_t SERVER_PROMPT_FILE_VERSION = 1;
 static constexpr char SERVER_PROMPT_ADAPTER_TAG[] = "|lora=";
 static constexpr char SERVER_PROMPT_BASE_PROVENANCE[] = "|adapter-cache=1";
+// the settings provenance before it: the writer named the settings that change its states' values (settings=<hash>|)
+static constexpr char SERVER_PROMPT_PROVENANCE[] = "|settings-cache=1|adapter-cache=1";
 static void server_fnv1a(uint64_t & hash, const char * data, size_t size);
 
 static bool server_prompt_fwrite(FILE * f, const void * src, size_t size) {
@@ -163,15 +165,17 @@ static void server_prompt_file_touch(const std::string & path) {
     std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
 }
 
-// Files already published before the adapter provenance marker have immutable
-// sizes and SHA-256 digests in the official prefix-cache.json listing.
-static bool server_prompt_is_published_legacy(FILE * f, uint64_t size) {
-    static constexpr struct {
-        uint64_t size;
-        const char * sha256;
-    } legacy[] = {
+const std::vector<server_prompt_published_file> & server_prompt_published_files() {
+    static const std::vector<server_prompt_published_file> published = {
 #include "prompt-cache-legacy.inc"
     };
+    return published;
+}
+
+// Files already published before the provenance markers have immutable sizes and SHA-256 digests in the official
+// prefix-cache.json listing. The whole file is hashed when its size is one of them.
+static bool server_prompt_is_published_legacy(FILE * f, uint64_t size,
+                                              const std::vector<server_prompt_published_file> & legacy) {
     if (std::none_of(std::begin(legacy), std::end(legacy), [=](const auto & entry) {
             return entry.size == size;
         })) {
@@ -210,9 +214,11 @@ static bool server_prompt_is_published_legacy(FILE * f, uint64_t size) {
 
 // read the header of a cached prompt file into `prompt` (tokens, checkpoint and state locations); false if the
 // file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
-// prefix cache: the model's fingerprint, then the build that saved it)
+// prefix cache: the model's fingerprint, then the build that saved it) whose writer recorded its provenance or whose
+// size is a `published` file's. Only the header is read: such a file is unverified until its content is hashed.
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
-                                      bool prefix = false) {
+                                      bool prefix = false,
+                                      const std::vector<server_prompt_published_file> * published = nullptr) {
     if (server_prompt_file_seek(f, 0, SEEK_END) != 0) {
         return false;
     }
@@ -243,8 +249,16 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     }
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
-    if (!same || (prefix && !string_ends_with(fp, SERVER_PROMPT_BASE_PROVENANCE) &&
-                  !server_prompt_is_published_legacy(f, file_size))) {
+    if (!same) {
+        return false;
+    }
+    // A file of a writer before the settings provenance says nothing about the settings that computed it, which
+    // may have changed its values: it serves only when it is one of the published files, which are of the
+    // model's own settings. Its size tells here; its content when a request first restores it.
+    prompt.unverified = prefix && !string_ends_with(fp, SERVER_PROMPT_PROVENANCE);
+    if (prompt.unverified && (!published || std::none_of(published->begin(), published->end(), [&](const auto & file) {
+            return file.size == uint64_t(file_size);
+        }))) {
         return false;
     }
 
@@ -463,7 +477,8 @@ void server_prompt_cache::scan_prefix_dir() {
         }
         server_prompt prompt;
         server_prompt_file validated(file.release(), server_prompt_file_close);
-        const bool valid = validated && server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true);
+        const bool valid = validated && server_prompt_read_header(validated.get(), prefix_fingerprint, prompt, true,
+                                                                  published);
         if (identified) {
             ssd::platform::file_identity after;
             if (!ssd::platform::identity(ssd::platform::stream_fd(validated.get()), after) || identity != after) {
@@ -512,6 +527,26 @@ bool server_prompt_cache::contains(const server_prompt & prompt, common_context_
         }
     }
     return false;
+}
+
+bool server_prompt_cache::verify_published(std::list<server_prompt>::iterator it, FILE * f) {
+    ssd::platform::file_identity identity;
+    const bool same_version = it->prefix_identity && ssd::platform::identity(ssd::platform::stream_fd(f), identity) &&
+                              identity == *it->prefix_identity;
+    if (same_version && !it->unverified) {
+        return true;
+    }
+    ++n_published_hashes;
+    if (!server_prompt_is_published_legacy(f, it->file_data_offset + it->file_data_size, *published)) {
+        SRV_WRN(" - prefix cache is not a published file, and says nothing of its settings: %s\n", it->file.c_str());
+        remove(it);
+        return false;
+    }
+    // the version the scan read, once
+    if (same_version) {
+        it->unverified = false;
+    }
+    return true;
 }
 
 void server_prompt_cache::remove(std::list<server_prompt>::iterator it) {
@@ -860,11 +895,14 @@ server_prompt_cache::take_result server_prompt_cache::take(
     if (it_best->read_only) {
         // Bind validation and every read to this handle. The directory index can
         // be stale even after a scan if the pathname is replaced concurrently.
-        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, opened, true) ||
+        if (!file || !server_prompt_read_header(file.get(), prefix_fingerprint, opened, true, published) ||
             !server_prompt_same_layout(*it_best, opened)) {
             SRV_WRN(" - prefix cache changed since indexing: %s\n", it_best->file.c_str());
             states.erase(it_best);
             prefix_dir_time = -1;
+            return take_result::stale_index;
+        }
+        if (opened.unverified && !verify_published(it_best, file.get())) {
             return take_result::stale_index;
         }
         opened.file = it_best->file;

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 #include "server-context.h"
+#include "inferssd/prompt-cache.h"
 #include "gguf.h"
 
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -638,6 +640,39 @@ static std::vector<fs::path> prompt_files(const fs::path & dir) {
     return files;
 }
 
+// Copies the cached prompts in `from` to `to` as a server before the settings provenance wrote them: their
+// fingerprints without the settings field and without the provenance, whatever settings computed them.
+static void copy_as_written_before_provenance(const fs::path & from, const fs::path & to) {
+    require(fs::create_directory(to), "could not create the directory of older files");
+    const auto files = prompt_files(from);
+    require(!files.empty(), "expected cached prompts to copy");
+    for (const auto & path : files) {
+        std::string bytes;
+        {
+            std::ifstream in(path, std::ios::binary);
+            bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        std::string fingerprint = read_prompt_header(path).fingerprint;
+        const size_t n_fp = fingerprint.size();
+        const std::string head = "prefix-cache 1|";
+        if (fingerprint.compare(head.size(), 9, "settings=") == 0) {
+            fingerprint.erase(head.size(), fingerprint.find('|', head.size()) + 1 - head.size());
+        }
+        const std::string provenance = "|settings-cache=1";
+        const size_t at = fingerprint.find(provenance + "|adapter-cache=1");
+        require(at != std::string::npos, "a new cached prompt must have the provenance");
+        fingerprint.erase(at, provenance.size());
+        const uint32_t n_older = fingerprint.size();
+        std::string older = bytes.substr(0, 2 * sizeof(uint32_t));
+        older.append(reinterpret_cast<const char *>(&n_older), sizeof(n_older));
+        older += fingerprint;
+        older += bytes.substr(3 * sizeof(uint32_t) + n_fp);
+        std::ofstream out(to / path.filename(), std::ios::binary);
+        out.write(older.data(), older.size());
+        require(bool(out), "could not write an older cached prompt");
+    }
+}
+
 // A context shift moves the rows after the tokens it discards, and those rows still depend on them: the state then
 // serves only its own generation. It is not saved, from the shift on, and a later prompt on the slot reuses none of
 // it past the tokens the shift kept, though it starts with the tokens the state now lists. The same tokens computed
@@ -790,8 +825,52 @@ static void test_sliding_window_non_causal_text(common_params params) {
     }
 }
 
+// A copy of the cached prompt `from`, of a server before the settings provenance, as large as the smallest published
+// file: an unused checkpoint fills it up. Its size is a published file's, its content not.
+static void copy_to_published_size(const fs::path & from, const fs::path & to) {
+    std::string bytes;
+    {
+        std::ifstream in(from, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    const auto header = read_prompt_header(from);
+    size_t at = 3 * sizeof(uint32_t) + header.fingerprint.size() + sizeof(uint32_t) +
+                header.tokens.size() * sizeof(llama_token);
+    uint32_t n_checkpoints = 0;
+    std::memcpy(&n_checkpoints, bytes.data() + at, sizeof(n_checkpoints));
+    require(n_checkpoints == 0, "expected a cached prompt without checkpoints");
+    at += sizeof(n_checkpoints);
+    const int32_t positions[2] = { 0, 0 };
+    const int64_t n_tokens = int64_t(1) << 40; // after every prompt: never restored
+    const uint64_t meta_size = sizeof(positions) + sizeof(n_tokens) + sizeof(uint64_t);
+    uint64_t target = UINT64_MAX;
+    for (const auto & file : server_prompt_published_files()) {
+        if (file.size >= bytes.size() + meta_size) {
+            target = std::min(target, file.size);
+        }
+    }
+    require(target != UINT64_MAX, "expected a published file larger than the fixture");
+    const uint64_t pad = target - bytes.size() - meta_size;
+    std::string out = bytes.substr(0, at - sizeof(n_checkpoints));
+    n_checkpoints = 1;
+    out.append(reinterpret_cast<const char *>(&n_checkpoints), sizeof(n_checkpoints));
+    out.append(reinterpret_cast<const char *>(positions), sizeof(positions));
+    out.append(reinterpret_cast<const char *>(&n_tokens), sizeof(n_tokens));
+    out.append(reinterpret_cast<const char *>(&pad), sizeof(pad));
+    // the state's size, then the checkpoint's data before the state
+    out.append(bytes, at, sizeof(uint64_t));
+    out.append(pad, '\0');
+    out.append(bytes, at + sizeof(uint64_t), std::string::npos);
+    require(out.size() == target, "the copy must be as large as a published file");
+    std::ofstream file(to, std::ios::binary);
+    file.write(out.data(), out.size());
+    require(bool(file), "could not write the copy");
+}
+
 // A quantized KV cache stores its rows Hadamard-rotated, or with LLAMA_ATTN_ROT_DISABLE as they are: the same layout
 // in another basis. A writer that stored them the other way serves no reader, one that stored them the same way does.
+// The same file as a server before the settings provenance wrote it, which said nothing of the rotation, serves no
+// reader either: it is not a published file, not even when it is as large as one, which its restore hashes first.
 static void test_sliding_window_kv_rotation(common_params params, const fs::path & work) {
     // heads of 64, which the rotation needs
     const auto model = work / "sliding-window-64.gguf";
@@ -811,22 +890,46 @@ static void test_sliding_window_kv_rotation(common_params params, const fs::path
         return first_token(server.server, prompt, {}, -1, 0, 0);
     };
     const auto cold = request(params);
-    for (bool rotated : { true, false }) {
+    for (const std::string writer_kind : { "rotated", "unrotated", "unrotated-before-provenance" }) {
         auto writer = params;
-        writer.cache_disk = (work / (rotated ? "kv-rotated" : "kv-unrotated")).string();
-        set_env("LLAMA_ATTN_ROT_DISABLE", rotated ? nullptr : "1");
-        save_completed_prefix(writer, {}, saved_prompt);
-        set_env("LLAMA_ATTN_ROT_DISABLE", nullptr);
+        writer.cache_disk = (work / ("kv-" + writer_kind)).string();
+        if (writer_kind != "unrotated-before-provenance") {
+            set_env("LLAMA_ATTN_ROT_DISABLE", writer_kind == "rotated" ? nullptr : "1");
+            save_completed_prefix(writer, {}, saved_prompt);
+            set_env("LLAMA_ATTN_ROT_DISABLE", nullptr);
+        }
+        if (writer_kind == "unrotated") {
+            // before a reader's own cache drops the files of other fingerprints
+            const auto before = work / "kv-unrotated-before-provenance";
+            copy_as_written_before_provenance(writer.cache_disk, before);
+            const auto sized = work / "kv-unrotated-published-size";
+            require(fs::create_directory(sized), "could not create the directory of the sized copy");
+            int n_sized = 0;
+            for (const auto & path : prompt_files(before)) {
+                const auto tokens = read_prompt_header(path).tokens;
+                if (tokens.size() >= saved_prompt.size() &&
+                        std::equal(saved_prompt.begin(), saved_prompt.end(), tokens.begin())) {
+                    copy_to_published_size(path, sized / path.filename());
+                    ++n_sized;
+                }
+            }
+            require(n_sized == 1, "expected the saved prompt's state");
+        }
         for (bool imported : { true, false }) {
             auto reader = params;
             reader.prefix_cache = imported ? writer.cache_disk : "";
             reader.cache_disk = imported ? "" : writer.cache_disk;
             const auto actual = request(reader);
-            require_completion(actual, rotated ? (int) saved_prompt.size() : 0, cold.token,
+            require_completion(actual, writer_kind == "rotated" ? (int) saved_prompt.size() : 0, cold.token,
                                "rows stored in another basis were reused, or in the same one not");
             require_cold_probability(actual, cold);
         }
     }
+    auto reader = params;
+    reader.prefix_cache = (work / "kv-unrotated-published-size").string();
+    const auto actual = request(reader);
+    require_completion(actual, 0, cold.token, "a file of the size of a published one was taken for one");
+    require_cold_probability(actual, cold);
 }
 
 // Rows computed with other settings (an overridden window, another RoPE base, a control vector)

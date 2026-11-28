@@ -64,6 +64,9 @@ struct server_prompt {
     // a prefix cache (server_prompt_cache::use_prefix_dir): made by another server for this model, read from its
     // file and never written, removed or counted against the cache's limits
     bool read_only = false;
+    // a prefix cache without provenance whose size is a published file's, until its content is hashed: when a request
+    // first restores it (server_prompt_cache::verify_published)
+    bool unverified = false;
 
     // After a context shift moved rows of the state, or a reused chunk did (n_cache_reuse): the first tokens whose rows
     // are where they were computed, -1 when none moved. A moved row depends on tokens the state no longer holds, so
@@ -103,6 +106,7 @@ struct server_prompt {
             file_data_size,
             n_conversation,
             read_only,
+            unverified,
             n_in_place,
             adapter_key,
             prefix_identity,
@@ -248,6 +252,16 @@ inline const server_prompt_checkpoint * server_prompt_find_checkpoint_before_pos
     return nullptr;
 }
 
+// a file of the published prefix caches, by size and SHA-256 (lowercase hex)
+struct server_prompt_published_file {
+    uint64_t     size;
+    const char * sha256;
+};
+
+// The published prefix caches from before the provenance markers (prompt-cache-legacy.inc): their writers did not
+// say which settings computed them, and they serve as files of the model's own settings.
+const std::vector<server_prompt_published_file> & server_prompt_published_files();
+
 struct server_prompt_cache {
     server_prompt_cache(int32_t limit_size_mib, size_t limit_tokens) {
         this->limit_size   = 1024ull*1024ull*(limit_size_mib < 0 ? 0 : limit_size_mib);
@@ -284,6 +298,8 @@ struct server_prompt_cache {
 
     std::string prefix_dir;
     std::string prefix_fingerprint;
+    // the prefix caches it takes without a provenance marker
+    const std::vector<server_prompt_published_file> * published = &server_prompt_published_files();
 
     // of the cache's own states, not the prefix caches
     size_t size() const;
@@ -330,6 +346,10 @@ private:
     void remove_superseded(const server_prompt & prompt, const server_prompt * saved);
     bool contains(const server_prompt & prompt, common_context_seq_rm_type seq_rm_type);
     void remove(std::list<server_prompt>::iterator it);
+    // Whether the prefix cache `it`, open as `f`, is a published file, by its SHA-256, once a version: a file that is
+    // not goes as unusable.
+    bool verify_published(std::list<server_prompt>::iterator it, FILE * f);
+    size_t n_published_hashes = 0; // the files verify_published hashed
     // reads the prefix cache directory again if it changed since the last read
     void scan_prefix_dir();
     int64_t prefix_dir_time = -1;

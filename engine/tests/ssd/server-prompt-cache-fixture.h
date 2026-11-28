@@ -2,6 +2,9 @@
 
 #include "inferssd/prompt-cache.h"
 
+#include <algorithm>
+#include <cstdio>
+#include <memory>
 #include <string>
 
 // Metadata policy unit tests only: no context, serialization, host admission or
@@ -64,5 +67,21 @@ struct server_prompt_cache_testing {
 
     static size_t unusable_prefixes(const server_prompt_cache & cache) {
         return cache.prefix_unusable.size();
+    }
+
+    // verifies the indexed prefix cache `file` as a restore does before it reads the state
+    static bool verify_published(server_prompt_cache & cache, const std::string & file) {
+        const auto it = std::find_if(cache.states.begin(), cache.states.end(), [&](const server_prompt & prompt) {
+            return prompt.read_only && prompt.file == file;
+        });
+        if (it == cache.states.end()) {
+            return false;
+        }
+        std::unique_ptr<FILE, decltype(&std::fclose)> f(ssd::platform::open_stream(file.c_str()), std::fclose);
+        return f && cache.verify_published(it, f.get());
+    }
+
+    static size_t published_hashes(const server_prompt_cache & cache) {
+        return cache.n_published_hashes;
     }
 };

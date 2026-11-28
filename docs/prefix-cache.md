@@ -17,7 +17,7 @@ computes the same values up to rounding, as a GPU and a CPU do, and the server t
 them between its own prompt passes. A prefix cache is a file of a server's prompt cache on disk, whose fingerprint
 is
 
-    prefix-cache 1|[settings=<hash>|]<size>:<header hash>,...|<model description>|<build>|adapter-cache=1
+    prefix-cache 1|[settings=<hash>|]<size>:<header hash>,...|<model description>|<build>|settings-cache=1|adapter-cache=1
 
 with the size and an FNV-1a hash of the header (the metadata and the tensor list) of each file the model is loaded
 from, the other files of a split model included, and the build that saved it. A server takes a file of its own prompt
@@ -29,16 +29,24 @@ The `settings=<hash>|` field names what else a state's values depend on, so that
 compute the same: GGUF metadata overrides, RoPE or YaRN settings, an attention type, control vectors, a quantized KV
 cache stored without its rotation by `LLAMA_ATTN_ROT_DISABLE`, and for a model with long and short RoPE factors
 (LongRoPE) the factors the server's context selects, the long ones when a sequence's context is past the model's
-original one. A server that runs the model as its files describe it, without LongRoPE factors, has no field, so its
-fingerprints are those of servers before the field, and published prefix caches keep theirs. The publisher refuses a
-file with the field, and so takes no prefix cache of a LongRoPE model.
+original one. A server that runs the model as its files describe it, without LongRoPE factors, has no field. The
+publisher refuses a file with the field, and so takes no prefix cache of a LongRoPE model.
+
+`settings-cache=1` says that the writer named those settings, and is in every file of a server that does. A file
+without it, of a server before it, says nothing of the settings that computed it, which may have been others: it
+serves as a prefix cache only when it is one of the published files, which are of the model's own settings: those
+that `tools/server/inferssd/prompt-cache-legacy.inc` names by size and SHA-256, every file the published list named
+before the marker. Reading the directory reads only the headers, where the size of a published file is enough; the
+first request that would restore such a file hashes it, once for each version of it (about 2 seconds for a 1 GB file
+on an Apple M5), and a file that is not a published one goes, the request processing the prefix itself. A writable
+prompt cache takes only files of its own build, and so drops those of a server before it.
 
 Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
 matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation
 position governs reuse. Older writable files without adapter provenance are rebuilt on the first launch
-with the new cache fingerprint. New published prefixes must carry the adapter-aware base fingerprint
-(ending in `|adapter-cache=1`). Previously published base prefixes remain readable after verification
-against their published sizes and SHA-256 digests.
+with the new cache fingerprint. New published prefixes must carry the fingerprint of a server that records its
+settings and adapters (ending in `|settings-cache=1|adapter-cache=1`). Previously published prefixes remain readable
+after verification against their published sizes and SHA-256 digests.
 
 Explicit slot saves also record the model, build, and effective adapter key. Restoring a compatible
 save keeps its state available to automatic or pinned slot selection. A request with a different
@@ -119,7 +127,8 @@ more than two backends differ, the file is kept and the new engine is added to i
 is published for it. A state computed twice on one GPU is not the same bytes either, so the comparison is by size of
 difference, not equality.
 
-The publisher updates the entry for the requested system, model, app, app version, and file SHA-256. It can add an
-engine to an existing legacy entry when the size and SHA-256 match both that entry and the native import inventory
-in the named engine commit. Fetch the engine commits before publishing so the publisher can inspect their source.
+The publisher updates the entry for the requested system, model, app, app version, and file SHA-256. A new file must
+end in `|settings-cache=1|adapter-cache=1`. It can add an engine to an existing entry of a file without that when the
+size and SHA-256 match both that entry and the native import inventory in the named engine commit. Fetch the engine
+commits before publishing so the publisher can inspect their source.
 The publisher keeps the existing download and verifies the bytes it serves before writing the updated list.

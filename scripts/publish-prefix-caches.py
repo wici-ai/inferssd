@@ -11,8 +11,10 @@ ENTRIES.json is a list of the prefix caches to publish, each
 
 Each file goes to cdn.wici.ai/apps/inferssd/ as prefix-cache-<sha256>.prompt through WiCi AI's release
 service, as the engine's packages do; a file already there is skipped. Only then the list,
-prefix-cache.json, names them. Entries add engines when the system, model, app, app version and
-SHA-256 all match. Other entries are added, and each app's two latest versions for one model and
+prefix-cache.json, names them. A new file has the provenance of an engine that records the settings
+and adapters it computed with (`|settings-cache=1|adapter-cache=1`); a file without it only adds
+engines to the entry the list already has for it, when the inventory of each engine names it.
+Entries add engines when the system, model, app, app version and SHA-256 all match. Other entries are added, and each app's two latest versions for one model and
 system stay. --dry-run reads the list and prints what would be uploaded and the list that would be
 written.
 """
@@ -41,6 +43,7 @@ AGENT = "inferssd-publish"
 MAGIC, VERSION = 0x4643504C, 1
 FINGERPRINT = "prefix-cache 1|"
 BASE_PROVENANCE = "|adapter-cache=1"
+PROVENANCE = "|settings-cache=1" + BASE_PROVENANCE
 KEEP_APP_VERSIONS = 2
 LEGACY_REGISTRY = "engine/tools/server/inferssd/prompt-cache-legacy.inc"
 
@@ -62,7 +65,7 @@ def fail(message: str) -> NoReturn:
 
 
 def prompt_metadata(path: Path, data: bytes) -> tuple[int, bool]:
-    """Read the token count and adapter provenance from the supplied file."""
+    """Read the token count and the settings and adapter provenance from the supplied file."""
     if len(data) < 16:
         fail(f"{path} is not a cached prompt file")
     magic, version, n_fp = struct.unpack_from("<III", data)
@@ -76,7 +79,7 @@ def prompt_metadata(path: Path, data: bytes) -> tuple[int, bool]:
     if fingerprint.startswith(FINGERPRINT + "settings="):
         fail(f"{path} was computed with settings that change the model's values and is not a portable prefix cache")
     (n_tokens,) = struct.unpack_from("<I", data, 12 + n_fp)
-    return n_tokens, fingerprint.endswith(BASE_PROVENANCE)
+    return n_tokens, fingerprint.endswith(PROVENANCE)
 
 
 @cache
@@ -148,9 +151,9 @@ def main() -> None:
         if not str(item.get("model", "")).endswith(".gguf") or "/" in item["model"] or "\\" in item["model"]:
             fail(f"{path}: model is the model's first GGUF file name")
         data = path.read_bytes()
-        tokens, has_base_provenance = prompt_metadata(path, data)
+        tokens, has_provenance = prompt_metadata(path, data)
         digest = hashlib.sha256(data).hexdigest()
-        planned.append((path, data, has_base_provenance,
+        planned.append((path, data, has_provenance,
                         {"engines": sorted(item["engines"]), "os": item["os"], "model": item["model"],
                          "app": item["app"], "app_version": item["app_version"],
                          "tokens": tokens, "size": len(data), "sha256": digest}))
@@ -169,20 +172,20 @@ def main() -> None:
     published = {}
     for entry in current_files:
         published.setdefault(catalog_key(entry), entry)
-    for path, _, has_base_provenance, entry in planned:
-        if has_base_provenance:
+    for path, _, has_provenance, entry in planned:
+        if has_provenance:
             continue
         existing = published.get(catalog_key(entry))
         if existing is None or existing["size"] != entry["size"]:
-            fail(f"{path} lacks base-model provenance; regenerate the prefix with an adapter-aware engine")
+            fail(f"{path} lacks provenance; regenerate the prefix with an engine that records its settings and adapters")
         for engine in sorted(set(entry["engines"]) - set(existing["engines"])):
             if (entry["size"], entry["sha256"]) not in legacy_prefixes(engine):
                 fail(f"{path} is not in the legacy import inventory for engine {engine}")
 
     new = []
-    for _, data, has_base_provenance, entry in planned:
+    for _, data, has_provenance, entry in planned:
         name = f"prefix-cache-{entry['sha256']}.prompt"
-        if not has_base_provenance:
+        if not has_provenance:
             # A verified legacy file only changes the engine list of the existing entry.
             existing = published[catalog_key(entry)]
             if not dry_run:

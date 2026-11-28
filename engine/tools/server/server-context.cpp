@@ -1099,9 +1099,9 @@ private:
     // computes, and the build that computed it. A file of the cache is a prefix cache for another build
     // (prefix_cache_fingerprint is the start of its fingerprint).
     std::string prompt_cache_fingerprint(const std::string & model_fp) const {
-        // Legacy writable states did not identify their adapters, including
+        // Legacy writable states did not identify their adapters, or the settings that change their values, including
         // states from a binary with an unknown build revision.
-        constexpr char cache_revision[] = "|adapter-cache=1";
+        constexpr char cache_revision[] = "|settings-cache=1|adapter-cache=1";
         if (!model_fp.empty()) {
             return model_fp + "|" + llama_build_info() + cache_revision;
         }
