@@ -100,9 +100,12 @@ python3 -m pip install ./framework pytest
 python3 -m pytest -q bench/tests framework/tests
 python3 scripts/inferssd/check-layering.py
 python3 scripts/inferssd/check-layout.py
-python3 scripts/public-scan.py --skip upstream
-gitleaks git --log-opts="--all"
+python3 scripts/public-scan.py --skip upstream origin/main..HEAD
+gitleaks git --log-opts="origin/main..HEAD"
 ```
+
+As in CI, the last two check the branch's own commits. Without the range, `public-scan.py` checks every
+branch in the clone.
 
 On Windows, run the framework tests only, as the Windows CI job does:
 
