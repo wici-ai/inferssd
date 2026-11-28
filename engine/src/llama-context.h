@@ -194,6 +194,7 @@ struct llama_context {
     // the state after the first n_tokens tokens of the sequence; -1: the current state
     uint32_t state_seq_at_align();
     bool     state_seq_can_save_at(llama_seq_id seq_id, int32_t n_tokens);
+    bool     state_seq_keep_at(llama_seq_id seq_id, int32_t n_tokens);
     llama_pos state_seq_pos_min_at(llama_seq_id seq_id, int32_t n_tokens);
     size_t   state_seq_get_size_at(llama_seq_id seq_id, llama_state_seq_flags flags, int32_t n_tokens);
     size_t   state_seq_get_data_at(llama_seq_id seq_id, uint8_t * dst, size_t size, llama_state_seq_flags flags, int32_t n_tokens);

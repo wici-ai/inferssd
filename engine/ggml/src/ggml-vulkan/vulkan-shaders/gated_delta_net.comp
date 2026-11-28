@@ -38,7 +38,18 @@ layout(push_constant) uniform Parameters {
     // ggml_gated_delta_net_planes: the planes' steps from a plane and from a sequence to the next, in floats
     uint sp1, sp2;
 #endif
+#ifdef MISALIGN
+    // the variant for sources off the device's buffer offset alignment: each source's offset from its aligned
+    // descriptor, in floats
+    uint q_misalign, k_misalign, v_misalign, g_misalign, beta_misalign, state_misalign;
+#endif
 };
+
+#ifdef MISALIGN
+#define MISALIGNED(source, i) (source##_misalign + (i))
+#else
+#define MISALIGNED(source, i) (i)
+#endif
 
 layout(binding = 0) readonly  buffer QBuf     { FLOAT_TYPE data_q[];     };
 layout(binding = 1) readonly  buffer KBuf     { FLOAT_TYPE data_k[];     };
@@ -120,9 +131,9 @@ void main() {
 #ifdef PLANES
         // a dispatch after the first starts from the plane of the token before it
         const uint ip = (n_tokens - t_begin) * sp1 + seq_id * sp2 + head_id * state_size + col * S_V + r * LANES_PER_COLUMN + lane;
-        s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_planes[ip]) : FLOAT_TYPE(data_state[is]);
+        s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_planes[ip]) : FLOAT_TYPE(data_state[MISALIGNED(state, is)]);
 #else
-        s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_dst[s_off + is]) : FLOAT_TYPE(data_state[is]);
+        s_shard[r] = t_begin != 0 ? FLOAT_TYPE(data_dst[s_off + is]) : FLOAT_TYPE(data_state[MISALIGNED(state, is)]);
 #endif
     }
 
@@ -130,11 +141,17 @@ void main() {
 
     const uint t_end = min(t_begin + TOKENS_PER_DISPATCH, n_tokens);
     for (uint t = t_begin; t < t_end; t++) {
+#ifdef MISALIGN
+        const uint q_off = q_misalign + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const uint k_off = k_misalign + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const uint v_off = v_misalign + seq_id * sv3 + t * sv2 + head_id * sv1;
+#else
         const uint q_off = iq3 * sq3 + t * sq2 + iq1 * sq1;
         const uint k_off = q_off;
         const uint v_off = seq_id * sv3 + t * sv2 + head_id * sv1;
+#endif
         const uint gb_off = seq_id * sb3 + t * sb2 + head_id * sb1;
-        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[gb_off]);
+        const FLOAT_TYPE beta_val = FLOAT_TYPE(data_beta[MISALIGNED(beta, gb_off)]);
 
         FLOAT_TYPE k_reg[ROWS_PER_LANE];
         FLOAT_TYPE q_reg[ROWS_PER_LANE];
@@ -146,12 +163,12 @@ void main() {
 
         FLOAT_TYPE g_exp[ROWS_PER_LANE];
         if (KDA == 0) {
-            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[gb_off]));
+            const FLOAT_TYPE g_val = exp(FLOAT_TYPE(data_g[MISALIGNED(g, gb_off)]));
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 g_exp[r] = g_val;
             }
         } else {
-            const uint g_base = gb_off * S_V;
+            const uint g_base = MISALIGNED(g, gb_off * S_V);
             [[unroll]] for (uint r = 0; r < ROWS_PER_LANE; r++) {
                 const uint i = r * LANES_PER_COLUMN + lane;
                 g_exp[r] = exp(FLOAT_TYPE(data_g[g_base + i]));

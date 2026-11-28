@@ -961,6 +961,8 @@ struct vk_device_struct {
     vk_pipeline pipeline_gated_delta_net[3][2];
     // the same writing the state after each token into planes (ggml_gated_delta_net_planes)
     vk_pipeline pipeline_gated_delta_net_planes[3][2];
+    // the same for sources off the device's buffer offset alignment (ggml_vk_gated_delta_net_misaligned)
+    vk_pipeline pipeline_gated_delta_net_misalign[3][2];
     vk_pipeline pipeline_ssm_scan_f32_d128;
     vk_pipeline pipeline_ssm_scan_f32_d256;
     vk_pipeline pipeline_ssm_conv_f32;
@@ -1651,6 +1653,12 @@ struct vk_op_gated_delta_net_push_constants {
 struct vk_op_gated_delta_net_planes_push_constants {
     vk_op_gated_delta_net_push_constants base;
     uint32_t sp1, sp2;
+};
+// the variant for sources off the device's buffer offset alignment: each source's offset from its aligned
+// descriptor, in floats (get_misalign_bytes)
+struct vk_op_gated_delta_net_misalign_push_constants {
+    vk_op_gated_delta_net_push_constants base;
+    uint32_t q_misalign, k_misalign, v_misalign, g_misalign, beta_misalign, state_misalign;
 };
 
 struct vk_op_ssm_scan_push_constants {
@@ -5033,6 +5041,11 @@ static void ggml_vk_load_shaders(vk_device& device) {
             {"gated_delta_net_planes_f32_d64",  "gated_delta_net_planes_f32_d64_kda"},
             {"gated_delta_net_planes_f32_d128", "gated_delta_net_planes_f32_d128_kda"},
         };
+        const char * gdn_misalign_names[][2] = {
+            {"gated_delta_net_misalign_f32_d32",  "gated_delta_net_misalign_f32_d32_kda"},
+            {"gated_delta_net_misalign_f32_d64",  "gated_delta_net_misalign_f32_d64_kda"},
+            {"gated_delta_net_misalign_f32_d128", "gated_delta_net_misalign_f32_d128_kda"},
+        };
         const bool use_subgroup_reduce = device->subgroup_arithmetic;
         for (uint32_t si = 0; si < 3; si++) {
             const uint32_t S_V = gdn_sizes[si];
@@ -5053,21 +5066,29 @@ static void ggml_vk_load_shaders(vk_device& device) {
             const void * gdn_data;
             size_t gdn_planes_len;
             const void * gdn_planes_data;
+            size_t gdn_misalign_len;
+            const void * gdn_misalign_data;
             if (use_subgroup_reduce && need_clustered_shader) {
                 gdn_len = gated_delta_net_f32_len;
                 gdn_data = (const void *)gated_delta_net_f32_data;
                 gdn_planes_len = gated_delta_net_planes_f32_len;
                 gdn_planes_data = (const void *)gated_delta_net_planes_f32_data;
+                gdn_misalign_len = gated_delta_net_misalign_f32_len;
+                gdn_misalign_data = (const void *)gated_delta_net_misalign_f32_data;
             } else if (use_subgroup_reduce) {
                 gdn_len = gated_delta_net_f32_nocluster_len;
                 gdn_data = (const void *)gated_delta_net_f32_nocluster_data;
                 gdn_planes_len = gated_delta_net_planes_f32_nocluster_len;
                 gdn_planes_data = (const void *)gated_delta_net_planes_f32_nocluster_data;
+                gdn_misalign_len = gated_delta_net_misalign_f32_nocluster_len;
+                gdn_misalign_data = (const void *)gated_delta_net_misalign_f32_nocluster_data;
             } else {
                 gdn_len = gated_delta_net_f32_shmem_len;
                 gdn_data = (const void *)gated_delta_net_f32_shmem_data;
                 gdn_planes_len = gated_delta_net_planes_f32_shmem_len;
                 gdn_planes_data = (const void *)gated_delta_net_planes_f32_shmem_data;
+                gdn_misalign_len = gated_delta_net_misalign_f32_shmem_len;
+                gdn_misalign_data = (const void *)gated_delta_net_misalign_f32_shmem_data;
             }
 
             const uint32_t cols_per_wg = device->subgroup_size / lanes_per_column;
@@ -5079,6 +5100,9 @@ static void ggml_vk_load_shaders(vk_device& device) {
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
                 ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_planes[si][kda],
                     gdn_planes_names[si][kda], gdn_planes_len, gdn_planes_data, "main", 8, sizeof(vk_op_gated_delta_net_planes_push_constants),
+                    wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
+                ggml_vk_create_pipeline(device, device->pipeline_gated_delta_net_misalign[si][kda],
+                    gdn_misalign_names[si][kda], gdn_misalign_len, gdn_misalign_data, "main", 7, sizeof(vk_op_gated_delta_net_misalign_push_constants),
                     wg_denoms, {S_V, kda, device->subgroup_size, lanes_per_column, GGML_GATED_DELTA_NET_TOKENS_PER_DISPATCH}, 1, true, use_subgroup_reduce, device->subgroup_size);
             }
         }
@@ -9768,6 +9792,18 @@ static vk_conv_shapes ggml_vk_conv_select_shape(ggml_backend_vk_context * ctx, u
     }
 }
 
+// Whether a source of a gated delta net starts off the device's buffer offset alignment: a view at any offset, as the
+// tokens after a state kept inside a ubatch are. Such a dispatch takes the shader's MISALIGN variant, so that aligned
+// sources run the plain one.
+static bool ggml_vk_gated_delta_net_misaligned(const ggml_backend_vk_context * ctx, const ggml_tensor * dst) {
+    for (int i = 0; i < 6; i++) {
+        if (get_misalign_bytes(ctx, dst->src[i]) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, const ggml_tensor * dst, ggml_op op) {
     switch (op) {
     case GGML_OP_GET_ROWS:
@@ -10252,7 +10288,11 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
                 default: return nullptr;
             }
             // ggml_gated_delta_net_planes: the state after each token into the planes, src[6]
-            return dst->src[6] ? ctx->device->pipeline_gated_delta_net_planes[si][kda] : ctx->device->pipeline_gated_delta_net[si][kda];
+            if (dst->src[6]) {
+                return ctx->device->pipeline_gated_delta_net_planes[si][kda];
+            }
+            return ggml_vk_gated_delta_net_misaligned(ctx, dst) ? ctx->device->pipeline_gated_delta_net_misalign[si][kda] :
+                                                                  ctx->device->pipeline_gated_delta_net[si][kda];
         }
         return nullptr;
     case GGML_OP_SSM_SCAN:
@@ -11135,9 +11175,14 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
     ggml_pipeline_request_descriptor_sets(ctx, pipeline, (n_tokens + chunk - 1) / chunk);
 
     vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    // sources off the device's alignment are bound from the aligned offsets before them, and the variant of the
+    // shader that ggml_vk_op_get_pipeline took for them adds the rest
+    const bool misaligned = !dst->src[6] && ggml_vk_gated_delta_net_misaligned(ctx, dst);
     vk_subbuffer src_buf[6] = {};
+    uint32_t misalign[6] = {};
     for (int i = 0; i < 6; i++) {
-        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i]);
+        src_buf[i] = ggml_vk_tensor_subbuffer(ctx, dst->src[i], misaligned);
+        misalign[i] = misaligned ? get_misalign_bytes(ctx, dst->src[i]) / ggml_type_size(dst->src[i]->type) : 0;
     }
     // ggml_gated_delta_net_planes: the state after each token into the planes
     const ggml_tensor * planes = dst->src[6];
@@ -11179,6 +11224,13 @@ static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& s
                 {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf,
                  ggml_vk_tensor_subbuffer(ctx, planes)},
                 pc_planes, { H, n_seqs, S_v });
+        } else if (misaligned) {
+            const vk_op_gated_delta_net_misalign_push_constants pc_misalign = {
+                pc, misalign[0], misalign[1], misalign[2], misalign[3], misalign[4], misalign[5],
+            };
+            ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+                {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},
+                pc_misalign, { H, n_seqs, S_v });
         } else {
             ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
                 {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], src_buf[5], dst_buf},

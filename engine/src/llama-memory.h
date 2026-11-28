@@ -223,6 +223,15 @@ struct llama_memory_i {
         return seq_id >= 0 && n_tokens == seq_pos_max(seq_id) + 1;
     }
 
+    // A memory that cannot rebuild an earlier state can keep the one the next batch goes past when asked before it:
+    // the state after the sequence's first n_tokens tokens, which state_can_write_at() and state_write_at() then
+    // take. One at a time; false when the memory cannot (see llama_state_seq_keep_at).
+    virtual bool state_keep_at(llama_seq_id seq_id, llama_pos n_tokens) {
+        GGML_UNUSED(seq_id);
+        GGML_UNUSED(n_tokens);
+        return false;
+    }
+
     virtual void state_write_at(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags, llama_pos n_tokens) const {
         if (!state_can_write_at(seq_id, n_tokens)) {
             throw std::runtime_error("the memory cannot save this earlier state of the sequence");

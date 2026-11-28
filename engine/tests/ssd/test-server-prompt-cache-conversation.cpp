@@ -476,14 +476,17 @@ static void test_chat_request_reports_branch_points() {
         std::vector<raw_buffer> files;
         return oaicompat_chat_params_parse(body, opt, files);
     };
-    const auto points = [](const json & params) {
+    const auto points_of = [](const json & params, const char * key) {
         std::vector<std::string> out;
         const std::string prompt = params.at("prompt").get<std::string>();
-        for (const auto & p : json_value(params, "branch_points_chars", json::array())) {
+        for (const auto & p : json_value(params, key, json::array())) {
             out.push_back(prompt.substr(0, p.get<size_t>()));
         }
         return out;
     };
+    const auto points = [&](const json & params) { return points_of(params, "branch_points_chars"); };
+    // the points in the user's context, apart from the tools' (server_prompt_points::context_branch)
+    const auto context_points = [&](const json & params) { return points_of(params, "context_branch_points_chars"); };
 
     json body = {
         {"messages", json::array({{{"role", "system"}, {"content", "App."}},
@@ -499,6 +502,7 @@ static void test_chat_request_reports_branch_points() {
                 params.at("prompt").get<std::string>());
     const std::vector<std::string> tools_points = points(params);
     require(tools_points.size() == 3, "a point where each group of tools ends");
+    require(context_points(params).empty(), "none of them in the user's context");
     // where the renders part, here one byte into the next tag; the server keeps the state of the whole tokens before
     require(tools_points[0] == system + "<tool>read</tool><tool>write</tool><", "after the app's tools: " + tools_points[0]);
     require(tools_points[1] == system + "<tool>read</tool><tool>write</tool><tool>mcp__docs__search</tool><",
@@ -537,6 +541,7 @@ static void test_chat_request_reports_branch_points() {
     const json data_params = parse(with_data);
     const std::string context = "<|im_start|>system\nApp.<|im_end|>\n<|im_start|>system\n<permissions instructions>\nAsk.\n</permissions instructions>";
     require(points(data_params) == std::vector<std::string>({ context }), "a point where the data starts");
+    require(context_points(data_params) == std::vector<std::string>({ context }), "in the user's context");
     require(!data_params.contains(SERVER_USER_CONTEXT_DATA_CHARS), "the request field is not passed on");
 
     // data that names the folder of a plugin's version, which the model sees as 0.0.0 (inferssd/identifiers.h): the

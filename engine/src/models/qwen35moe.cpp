@@ -275,6 +275,8 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
     cb(state_update_target, "state_update_target", il);
 
     ggml_build_forward_expand(gf, ggml_cpy(ctx0, last_conv_states, state_update_target));
+    // a requested state inside the ubatch: the conv history there (llama_state_seq_keep_at)
+    build_conv_keep(inp, conv_input, conv_kernel_size - 1, conv_channels, il);
     // a draft's verification leaves its earlier tokens' conv states as rollback planes
     build_conv_planes(inp, conv_states_all, conv_input, conv_kernel_size - 1, conv_channels);
 
@@ -340,7 +342,7 @@ ggml_tensor * llm_build_qwen35moe ::build_layer_attn_linear(
 
     auto attn_out = keeps_planes() ?
         build_delta_net_planes(inp, ssm_states_all, q_conv, k_conv, v_conv, gate, beta, state, il) :
-        build_delta_net(q_conv, k_conv, v_conv, gate, beta, state, il);
+        build_delta_net_keep(inp, q_conv, k_conv, v_conv, gate, beta, state, il);
 
     ggml_tensor * output    = attn_out.first;
     ggml_tensor * new_state = attn_out.second;

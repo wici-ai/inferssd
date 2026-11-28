@@ -3836,6 +3836,88 @@ struct test_gated_delta_net : public test_case {
     }
 };
 
+// GGML_OP_GATED_DELTA_NET on a ubatch split where a requested state is kept (llm_build_delta_net_base::
+// build_delta_net_keep): the op on views of tokens [0, n_keep) from the state, then on [n_keep, n) from the state after
+// them, their outputs and the last state joined as the op on all the tokens gives them. One sequence. With `misalign`,
+// each source starts that many floats into a tensor of its own, so that every view the op reads starts off any
+// alignment a backend binds buffers at (Vulkan's minStorageBufferOffsetAlignment). n_keep 0 is the op on all the
+// tokens, unsplit, as a performance case of such sources.
+struct test_gated_delta_net_split : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int64_t n_seq_tokens;
+    const int64_t n_keep;
+    const int     v_repeat;
+    const int64_t misalign;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GATED_DELTA_NET";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR6(head_count, head_size, n_seq_tokens, n_keep, v_repeat, misalign);
+    }
+
+    test_gated_delta_net_split(int64_t head_count = 4, int64_t head_size = 64, int64_t n_seq_tokens = 64,
+            int64_t n_keep = 23, int v_repeat = 1, int64_t misalign = 0)
+        : head_count(head_count), head_size(head_size), n_seq_tokens(n_seq_tokens), n_keep(n_keep), v_repeat(v_repeat),
+          misalign(misalign) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t h_v = head_count * v_repeat;
+        // a [ne0, ne1, ne2, 1] source `misalign` floats into a tensor named `name`
+        const auto source = [&](const char * name, int64_t ne0, int64_t ne1, int64_t ne2) {
+            ggml_tensor * t = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne0 * ne1 * ne2 + misalign);
+            ggml_set_name(t, name);
+            const size_t nb1 = ne0 * sizeof(float);
+            return ggml_view_4d(ctx, t, ne0, ne1, ne2, 1, nb1, nb1 * ne1, nb1 * ne1 * ne2, misalign * sizeof(float));
+        };
+        ggml_tensor * q     = source("q", head_size, head_count, n_seq_tokens);
+        ggml_tensor * k     = source("k", head_size, head_count, n_seq_tokens);
+        ggml_tensor * v     = source("v", head_size, h_v, n_seq_tokens);
+        ggml_tensor * g     = source("g", 1, h_v, n_seq_tokens);
+        ggml_tensor * beta  = source("beta", 1, h_v, n_seq_tokens);
+        ggml_tensor * state = ggml_reshape_2d(ctx, source("state", head_size * head_size * h_v, 1, 1),
+                head_size * head_size * h_v, 1);
+        const auto part = [&](ggml_tensor * x, int64_t t0, int64_t nt) {
+            return ggml_view_4d(ctx, x, x->ne[0], x->ne[1], nt, x->ne[3], x->nb[1], x->nb[2], x->nb[3], t0 * x->nb[2]);
+        };
+        if (n_keep == 0) {
+            return ggml_gated_delta_net(ctx, q, k, v, g, beta, state);
+        }
+        const int64_t n_rest = n_seq_tokens - n_keep;
+        ggml_tensor * first = ggml_gated_delta_net(ctx, part(q, 0, n_keep), part(k, 0, n_keep), part(v, 0, n_keep),
+                                                   part(g, 0, n_keep), part(beta, 0, n_keep), state);
+        // rows n_keep .. n_keep + head_size of the result: the state after the first tokens
+        ggml_tensor * kept = ggml_reshape_2d(ctx,
+                ggml_view_1d(ctx, first, head_size * head_size * h_v, n_keep * first->nb[1]), head_size * head_size * h_v, 1);
+        ggml_tensor * second = ggml_gated_delta_net(ctx, part(q, n_keep, n_rest), part(k, n_keep, n_rest),
+                                                    part(v, n_keep, n_rest), part(g, n_keep, n_rest),
+                                                    part(beta, n_keep, n_rest), kept);
+        ggml_tensor * out_first = ggml_view_2d(ctx, first, first->ne[0], n_keep, first->nb[1], 0);
+        return ggml_concat(ctx, out_first, second, 1);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const float qk = sqrtf(3.0f / head_size);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->view_src != nullptr) {
+                continue; // the parts of q, k, v, g and beta: initialized with them
+            }
+            if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -1.0f, -0.01f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "q") == 0 || strcmp(t->name, "k") == 0) {
+                init_tensor_uniform(t, -qk, qk);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_DELTA_NET writing the state after each token into rollback planes (ggml_gated_delta_net_planes): the
 // planes are a view of a cache of n_seqs + 1 cells, the sequences at cells 1 .. n_seqs. The output holds the attention
 // and the planes the op wrote; with `chain`, then the attention and the states of a chain of one-token calls of the
@@ -9598,6 +9680,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1300, 1, 1, false, true));
     // KDA (vector gate)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 1, 1, false, true));
+    // a ubatch split where a requested state is kept: inside a chunk, at a chunk's end, one token before or after it,
+    // and Qwen3.6's heads over more than one dispatch
+    test_cases.emplace_back(new test_gated_delta_net_split(4, 64, 64, 23));
+    test_cases.emplace_back(new test_gated_delta_net_split(4, 64, 130, 64));
+    test_cases.emplace_back(new test_gated_delta_net_split(4, 64, 130, 1));
+    test_cases.emplace_back(new test_gated_delta_net_split(4, 64, 130, 129));
+    test_cases.emplace_back(new test_gated_delta_net_split(16, 128, 1300, 600, 2));
+    // ... with every source off any alignment, and the op unsplit on such sources
+    test_cases.emplace_back(new test_gated_delta_net_split(4, 64, 130, 23, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_split(16, 128, 1300, 601, 2, 3));
+    test_cases.emplace_back(new test_gated_delta_net_split(32, 128, 64, 0, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 1, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 16, 1, 2, 1, false, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 32, 4, 1, 1, false, true));
@@ -9899,6 +9992,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 256, 1)); // PP-256
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1)); // PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1024, 1)); // PP-1024
+    // sources aligned and off any alignment (the tokens after a state kept inside a ubatch)
+    test_cases.emplace_back(new test_gated_delta_net_split(32, 128, 64,  0, 1, 0));
+    test_cases.emplace_back(new test_gated_delta_net_split(32, 128, 64,  0, 1, 1));
+    test_cases.emplace_back(new test_gated_delta_net_split(32, 128, 512, 0, 1, 0));
+    test_cases.emplace_back(new test_gated_delta_net_split(32, 128, 512, 0, 1, 1));
     // Small model configs (fewer heads = less GPU occupancy for autoregressive)
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 64, 1));   // 4h PP-64
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 256, 1));  // 4h PP-256

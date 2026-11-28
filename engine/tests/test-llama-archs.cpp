@@ -10,6 +10,7 @@
 
 // TODO: replace with #include "llama-ext.h" in the future
 #include "../src/llama-arch.h"
+#include "../src/llama-memory.h"
 #include "../src/llama-model.h"
 #include "../src/llama-model-loader.h"
 #include "../src/ssd/dense-homes.h"
@@ -30,6 +31,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -79,7 +81,7 @@ static void set_tensor_data(struct ggml_tensor * tensor, void * userdata) {
 }
 
 static void usage(char ** argv) {
-    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts] [--dense-ssd]\n", argv[0]);
+    printf("Usage: %s [-a/--arch arch] [-s/--seed seed] [-v/--verbose] [--kv-grow] [--nextn] [--engram-layouts] [--dense-ssd] [--keep-at]\n", argv[0]);
 }
 
 static std::vector<llama_token> get_tokens(const uint32_t n_tokens, const uint32_t n_vocab, const size_t seed){
@@ -1083,6 +1085,294 @@ static std::vector<uint8_t> seq_state(llama_context * lctx) {
     return ret;
 }
 
+// A recurrent state kept inside a ubatch (llama_state_seq_keep_at): a context asked to keep the state after k of a
+// prompt's tokens decodes the prompt in one batch, its ubatches split there only for the gated delta net, and saves
+// that state afterwards. On the CPU the state is byte for byte the one of a context that stopped its batch at k, and
+// the whole checkpoint, restored in a fresh context, gives the first token after it the logits and the state that
+// context gives it. (The fixture's gated delta net adds less to the residual than its precision, so the logits alone
+// do not tell another prompt's recurrent state from this one's; the state after the token does.)
+// k inside the only ubatch, inside a later one, and at a ubatch's end. A removal the memory rejects leaves the state
+// kept. Without a request the graph is the one without kept states. Where the sequence's positions are not its token
+// indices up to k (M-RoPE positions can jump) the state is not kept; positions that jump after k do not matter. A
+// model whose graphs do not keep states refuses the request.
+static int test_keep_at(const size_t seed, const ggml_log_level log_level) {
+    struct user_data_t {
+        ggml_log_callback callback;
+        void * user_data;
+        ggml_log_level min_level;
+    };
+    user_data_t ud;
+    llama_log_get(&ud.callback, &ud.user_data);
+    ud.min_level = log_level;
+    llama_log_set([](ggml_log_level level, const char * text, void * user_data) {
+        user_data_t * ud = (user_data_t *) user_data;
+        ud->callback(level >= ud->min_level ? level : GGML_LOG_LEVEL_DEBUG, text, ud->user_data);
+    }, &ud);
+
+    const uint32_t n_ctx = 1024;
+    const uint32_t n     = 300;
+    ggml_backend_dev_t cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+
+    int failures = 0;
+    for (const llm_arch arch : { LLM_ARCH_QWEN35MOE, LLM_ARCH_QWEN3NEXT, LLM_ARCH_QWEN35, LLM_ARCH_LLAMA }) {
+        gguf_context_ptr gguf_ctx = get_gguf_ctx(arch, moe_mandatory(arch), n_ctx);
+        llama_model_params model_params = llama_model_default_params();
+        model_params.progress_callback = silent_model_load_progress;
+        std::vector<ggml_backend_dev_t> devs = { cpu, nullptr };
+        model_params.devices = devs.data();
+        size_t tmp = seed;
+        llama_model_ptr model(llama_model_init_from_user(gguf_ctx.get(), set_tensor_data, &tmp, model_params));
+        if (!model) {
+            throw std::runtime_error("failed to create llama model");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model.get()));
+        const std::vector<llama_token> tokens = get_tokens(n + 1, n_vocab, seed);
+        // another prompt of the same length
+        const std::vector<llama_token> other = get_tokens(n + 1, n_vocab, seed + 1);
+
+        const auto make_ctx = [&](uint32_t n_ubatch) {
+            llama_context_params ctx_params = llama_context_default_params();
+            ctx_params.n_ctx           = n_ctx;
+            ctx_params.n_batch         = 512;
+            ctx_params.n_ubatch        = n_ubatch;
+            ctx_params.n_seq_max       = 1;
+            ctx_params.n_threads       = 4;
+            ctx_params.n_threads_batch = 4;
+            llama_context_ptr lctx(llama_init_from_model(model.get(), ctx_params));
+            if (!lctx) {
+                throw std::runtime_error("failed to create llama context");
+            }
+            return lctx;
+        };
+        // tokens [i0, i1) of the prompt at positions pos[i0 .. i1), in one batch; the last token's logits
+        const auto decode_at = [&](llama_context * lctx, const std::vector<llama_token> & toks,
+                                   const std::vector<llama_pos> & pos, uint32_t i0, uint32_t i1) {
+            llama_batch batch = llama_batch_init(i1 - i0, 0, 1);
+            for (uint32_t i = i0; i < i1; i++) {
+                common_batch_add(batch, toks[i], pos[i], {0}, i == i1 - 1);
+            }
+            const int32_t ret = llama_decode(lctx, batch);
+            llama_batch_free(batch);
+            if (ret != 0) {
+                throw std::runtime_error("failed to decode batch");
+            }
+            const float * logits = llama_get_logits_ith(lctx, -1);
+            return std::vector<float>(logits, logits + n_vocab);
+        };
+        std::vector<llama_pos> pos_index(n + 1);
+        for (uint32_t i = 0; i <= n; i++) {
+            pos_index[i] = i;
+        }
+        const auto state_at = [](llama_context * lctx, int32_t n_tokens, llama_state_seq_flags flags) {
+            std::vector<uint8_t> ret(llama_state_seq_get_size_at(lctx, 0, flags, n_tokens));
+            if (ret.empty() || llama_state_seq_get_data_at(lctx, ret.data(), ret.size(), 0, flags, n_tokens) != ret.size()) {
+                throw std::runtime_error("failed to save the state");
+            }
+            return ret;
+        };
+        const auto restore = [](llama_context * lctx, const std::vector<uint8_t> & state, llama_state_seq_flags flags) {
+            if (llama_state_seq_set_data_ext(lctx, state.data(), state.size(), 0, flags) != state.size()) {
+                throw std::runtime_error("failed to restore the state");
+            }
+        };
+        const auto argmax = [](const std::vector<float> & v) {
+            return (int) (std::max_element(v.begin(), v.end()) - v.begin());
+        };
+        const std::string name = llm_arch_name(arch);
+        bool ok = true;
+
+        if (arch == LLM_ARCH_LLAMA) {
+            llama_context_ptr lctx = make_ctx(512);
+            ok = !llama_state_seq_keep_at(lctx.get(), 0, 177);
+            LOG_INF("%s: %s: request refused: %s\n", __func__, name.c_str(), ok ? "yes" : "no");
+            printf("%s: %s: %s\n", __func__, name.c_str(), ok ? "OK" : "FAIL");
+            failures += ok ? 0 : 1;
+            continue;
+        }
+
+        if (arch == LLM_ARCH_QWEN35MOE) {
+            llama_context_ptr lctx = make_ctx(512);
+            llama_memory_t mem = llama_get_memory(lctx.get());
+            auto total = [&]() {
+                size_t bytes = 0;
+                for (const auto & item : mem->memory_breakdown()) { bytes += item.second; }
+                return bytes;
+            };
+            // The first kept state needs a budget grant. A refusal leaves nothing allocated and can be retried.
+            bool grant = false;
+            int calls = 0;
+            size_t charged = 0;
+            mem->set_commit([&](size_t host, size_t device, const std::function<bool()> & allocate) {
+                ++calls;
+                charged = host + device;
+                return grant && allocate();
+            });
+            const size_t before = total();
+            const bool refused = !llama_state_seq_keep_at(lctx.get(), 0, 177);
+            const size_t on_refusal = total() - before;
+            grant = true;
+            const bool accepted = llama_state_seq_keep_at(lctx.get(), 0, 177);
+            const size_t growth = total() - before;
+            const bool reused = llama_state_seq_keep_at(lctx.get(), 0, 200);
+            printf("checkpoint admission: refused=%d, growth on refusal=%zu, accepted=%d, reused=%d, "
+                   "calls=%d, charged=%zu, growth=%zu\n", refused, on_refusal, accepted, reused, calls, charged, growth);
+            ok = ok && refused && on_refusal == 0 && accepted && reused && calls == 2 && charged == growth && growth > 0;
+        }
+
+        for (const auto [n_ubatch, k] : std::vector<std::pair<uint32_t, uint32_t>>{ { 512, 177 }, { 128, 177 }, { 128, 256 } }) {
+            const std::string label = name + ", ubatch " + std::to_string(n_ubatch) + ", kept after " + std::to_string(k);
+
+            // the prompt in one batch, the state after k kept
+            llama_context_ptr kept = make_ctx(n_ubatch);
+            const bool asked = llama_state_seq_keep_at(kept.get(), 0, k);
+            const std::vector<float> logits_kept = decode_at(kept.get(), tokens, pos_index, 0, n);
+            const bool can = llama_state_seq_can_save_at(kept.get(), 0, k) && !llama_state_seq_can_save_at(kept.get(), 0, k + 1);
+            ok = ok && asked && can;
+            if (!asked || !can) {
+                LOG_ERR("%s: %s: request %s, state %s\n", __func__, label.c_str(), asked ? "taken" : "refused",
+                        can ? "kept" : "not kept");
+                continue;
+            }
+            const std::vector<uint8_t> state_kept = state_at(kept.get(), k, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            const std::vector<uint8_t> full_kept  = state_at(kept.get(), k, 0);
+
+            // the reference: the batch stopped at k, then the prompt's next token on its own
+            llama_context_ptr ref = make_ctx(n_ubatch);
+            decode_at(ref.get(), tokens, pos_index, 0, k);
+            const std::vector<uint8_t> state_ref = state_at(ref.get(), k, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            const std::vector<uint8_t> full_ref  = state_at(ref.get(), k, 0);
+            const std::vector<float> next_ref = decode_at(ref.get(), tokens, pos_index, k, k + 1);
+            const std::vector<uint8_t> after_ref = state_at(ref.get(), k + 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            const std::vector<float> logits_ref = decode_at(ref.get(), tokens, pos_index, k + 1, n);
+
+            // the whole checkpoint restored in a fresh context: the first token after it
+            llama_context_ptr restored = make_ctx(n_ubatch);
+            restore(restored.get(), full_kept, 0);
+            const std::vector<float> next_restored = decode_at(restored.get(), tokens, pos_index, k, k + 1);
+            const std::vector<uint8_t> after_restored = state_at(restored.get(), k + 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            // the comparison's power: the attention half of this prompt with the recurrent state of another prompt
+            llama_context_ptr swapped = make_ctx(n_ubatch);
+            decode_at(swapped.get(), other, pos_index, 0, k);
+            const std::vector<uint8_t> state_other = state_at(swapped.get(), k, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            llama_memory_seq_rm(llama_get_memory(swapped.get()), 0, -1, -1);
+            decode_at(swapped.get(), tokens, pos_index, 0, k);
+            restore(swapped.get(), state_other, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            const std::vector<float> next_swapped = decode_at(swapped.get(), tokens, pos_index, k, k + 1);
+            const std::vector<uint8_t> after_swapped = state_at(swapped.get(), k + 1, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+            const bool same_state = state_kept == state_ref && full_kept == full_ref;
+            const bool same_next  = next_restored == next_ref && after_restored == after_ref;
+            const bool swap_seen  = after_swapped != after_ref;
+            const double e_prompt = nmse(logits_ref, logits_kept);
+            LOG_INF("%s: %s: state %s the reference's (%zu bytes, %zu with the attention half); first token after the "
+                    "restored checkpoint %s (token %d, reference %d); with another prompt's recurrent state the state "
+                    "after it %s, logits nmse %.3g; prompt logits nmse %.3g\n", __func__, label.c_str(),
+                    same_state ? "equal to" : "DIFFERS from", state_kept.size(), full_kept.size(),
+                    same_next ? "identical" : "DIFFERENT", argmax(next_restored), argmax(next_ref),
+                    swap_seen ? "differs" : "IS THE SAME", nmse(next_ref, next_swapped), e_prompt);
+            ok = ok && same_state && same_next && swap_seen && e_prompt < 1e-6;
+
+            // a removal the memory rejects (the recurrent state cannot drop its last tokens) keeps the state, and so
+            // does one past the sequence's end
+            llama_memory_t mem = llama_get_memory(kept.get());
+            const bool rejected = !llama_memory_seq_rm(mem, 0, 100, -1);
+            const bool past_end = llama_memory_seq_rm(mem, 0, n + 5, -1);
+            const bool still = llama_state_seq_can_save_at(kept.get(), 0, k) &&
+                               state_at(kept.get(), k, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state_kept;
+            LOG_INF("%s: %s: removal from 100 %s, past the end %s; state %s\n", __func__, label.c_str(),
+                    rejected ? "rejected" : "TAKEN", past_end ? "taken" : "REJECTED", still ? "kept" : "LOST");
+            ok = ok && rejected && past_end && still;
+
+            if (arch == LLM_ARCH_QWEN3NEXT) {
+                // position updates past the state's tokens keep it (an empty add and divide 33 tokens after them,
+                // the positions from 23 tokens after them on moved forward by 4: at 210 and 200 for k = 177), one
+                // from before them discards it (M-RoPE caches cannot be shifted)
+                const auto still_kept = [&]() {
+                    return llama_state_seq_can_save_at(kept.get(), 0, k) &&
+                           state_at(kept.get(), k, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == state_kept;
+                };
+                llama_memory_seq_add(mem, 0, k + 33, k + 33, 5);
+                const bool after_add = still_kept();
+                llama_memory_seq_div(mem, 0, k + 33, k + 33, 2);
+                const bool after_div = still_kept();
+                llama_memory_seq_add(mem, 0, k + 23, -1, 4);
+                const bool after_shift = still_kept();
+                llama_memory_seq_add(mem, 0, 100, -1, 4);
+                const bool dropped = !llama_state_seq_can_save_at(kept.get(), 0, k);
+                LOG_INF("%s: %s: state after an empty add %s, an empty divide %s, positions moved after it %s; "
+                        "moved from 100 %s\n", __func__, label.c_str(), after_add ? "kept" : "LOST",
+                        after_div ? "kept" : "LOST", after_shift ? "kept" : "LOST", dropped ? "discarded" : "STILL KEPT");
+                ok = ok && after_add && after_div && after_shift && dropped;
+            }
+
+            // a later request the batch does not reach keeps nothing, and the prompt's logits are those without one
+            llama_context_ptr plain = make_ctx(n_ubatch);
+            const std::vector<float> logits_plain = decode_at(plain.get(), tokens, pos_index, 0, n);
+            llama_context_ptr beyond = make_ctx(n_ubatch);
+            llama_state_seq_keep_at(beyond.get(), 0, n + 10);
+            const std::vector<float> logits_beyond = decode_at(beyond.get(), tokens, pos_index, 0, n);
+            const bool same = logits_beyond == logits_plain && !llama_state_seq_can_save_at(beyond.get(), 0, n + 10);
+            LOG_INF("%s: %s: a request past the batch: %s\n", __func__, label.c_str(), same ? "identical" : "DIFFERENT");
+            ok = ok && same;
+        }
+
+        if (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+            // M-RoPE positions that jump by 20 after token `at`: before k in the ubatch that keeps the state (the
+            // only one) or in an earlier ubatch, the state is not kept; after k, it is the reference's. Nor is the
+            // state after k tokens whose last position the tokens after them repeat, kept or current.
+            const auto jumped = [&](uint32_t at) {
+                std::vector<llama_pos> pos = pos_index;
+                for (uint32_t i = at; i <= n; i++) {
+                    pos[i] += 20;
+                }
+                return pos;
+            };
+            const auto repeated = [&](uint32_t at) {
+                std::vector<llama_pos> pos = pos_index;
+                for (uint32_t i = at; i <= n; i++) {
+                    pos[i] = at - 1;
+                }
+                return pos;
+            };
+            struct positions_case {
+                uint32_t n_ubatch;
+                std::vector<llama_pos> pos;
+                uint32_t k;
+                bool kept;
+                std::string what;
+            };
+            const std::vector<positions_case> cases = {
+                { 512, jumped(80),    177, false, "positions jump after 80" },
+                { 128, jumped(80),    197, false, "positions jump after 80" },
+                { 512, jumped(200),   177, true,  "positions jump after 200" },
+                { 512, repeated(280), 280, false, "position 279 repeated after 280 tokens" },
+            };
+            for (const auto & c : cases) {
+                const std::string label = name + ", ubatch " + std::to_string(c.n_ubatch) + ", " + c.what +
+                    ", kept after " + std::to_string(c.k);
+                llama_context_ptr lctx = make_ctx(c.n_ubatch);
+                const bool asked = llama_state_seq_keep_at(lctx.get(), 0, c.k);
+                decode_at(lctx.get(), tokens, c.pos, 0, n);
+                const bool can = llama_state_seq_can_save_at(lctx.get(), 0, c.k);
+                bool good = asked && can == c.kept;
+                if (good && can) {
+                    llama_context_ptr ref = make_ctx(c.n_ubatch);
+                    decode_at(ref.get(), tokens, pos_index, 0, c.k);
+                    good = state_at(lctx.get(), c.k, 0) == state_at(ref.get(), c.k, 0);
+                }
+                LOG_INF("%s: %s: state %s\n", __func__, label.c_str(), can ? "kept" : "not kept");
+                ok = ok && good;
+            }
+        }
+        printf("%s: %s: %s\n", __func__, name.c_str(), ok ? "OK" : "FAIL");
+        failures += ok ? 0 : 1;
+    }
+
+    llama_log_set(ud.callback, ud.user_data);
+    return failures == 0 ? 0 : 1;
+}
+
 // A KV cache allocates its cells as they are used, 8192 at a time (llama_kv_cache::n_grow_default). A context that
 // grows its cache past them while decoding gives the logits of one whose cache holds every cell from the start (two
 // sequences in streams of their own); the cells it held keep what they held as it grows; and a sequence's state
@@ -1979,6 +2269,7 @@ int main(int argc, char ** argv) {
     bool nextn = false;
     bool engram_layouts = false;
     bool dense_ssd = false;
+    bool keep_at = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--kv-grow") == 0) {
@@ -1995,6 +2286,10 @@ int main(int argc, char ** argv) {
         }
         if (strcmp(argv[i], "--dense-ssd") == 0) {
             dense_ssd = true;
+            continue;
+        }
+        if (strcmp(argv[i], "--keep-at") == 0) {
+            keep_at = true;
             continue;
         }
         if (strcmp(argv[i], "-a") == 0 || strcmp(argv[i], "--arch") == 0) {
@@ -2048,6 +2343,9 @@ int main(int argc, char ** argv) {
         }
         if (dense_ssd) {
             return test_dense_ssd(seed, log_level);
+        }
+        if (keep_at) {
+            return test_keep_at(seed, log_level);
         }
         return test_backends(arch, seed, log_level);
     } catch (const std::exception & err) {

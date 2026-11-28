@@ -1018,6 +1018,9 @@ if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     endif()
     llama_test(test-llama-archs NAME test-llama-archs-nextn ARGS --nextn -s 42)
     inferssd_ci_test(test-llama-archs test-llama-archs-nextn)
+    # a recurrent state kept inside a ubatch, on the CPU alone
+    llama_test(test-llama-archs NAME test-llama-archs-keep-at ARGS --keep-at -s 42)
+    inferssd_ci_test(test-llama-archs test-llama-archs-keep-at)
 endif()
 
 llama_build_and_test(test-chat-peg-parser.cpp peg-parser/simple-tokenize.cpp)

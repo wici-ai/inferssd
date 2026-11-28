@@ -913,6 +913,18 @@ extern "C" {
                     llama_seq_id   seq_id,
                          int32_t   n_tokens);
 
+    // For a memory that cannot rebuild an earlier state (llama_state_seq_at_align 0), such as a recurrent or hybrid
+    // model's: ask it to keep the state of the sequence after its first n_tokens tokens when the next llama_decode
+    // goes past that place, inside the ubatch that holds it, so that the prompt can be checkpointed there without
+    // ending a batch. True if it will; after that decode llama_state_seq_can_save_at holds for n_tokens, and the state
+    // is saved with llama_state_seq_get_data_at like any earlier state, if the sequence's first n_tokens tokens are at
+    // positions 0 .. n_tokens - 1 (not where M-RoPE positions jump or repeat up to the place). A memory keeps one such
+    // state at a time: a new request replaces the last one, and a change to the sequence before the place discards it.
+    LLAMA_API bool llama_state_seq_keep_at(
+            struct llama_context * ctx,
+                    llama_seq_id   seq_id,
+                         int32_t   n_tokens);
+
     // The first position of the sequence that its state after n_tokens tokens holds, once restored: the sequence can
     // be truncated to any position from there on.  A sliding-window cache holds the window the position before
     // n_tokens attends to; a memory that cannot be rolled back resumes only after its last position (n_tokens - 1).
