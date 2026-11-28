@@ -56,6 +56,10 @@ struct tier {
     static constexpr size_t elastic_block_slots=16;
     static constexpr size_t driver_margin_mib=64;
     size_t engine_held=0;
+    // The decode engines' memory (format_api), on the device and page-locked on the host: a decode step of several rows
+    // grows it (launch_rows) to its routes to the tier's experts, at most 256 rows. Recounted where an engine is made
+    // or replaced, on the thread that runs them, and read by the host ledger from any thread (policy_host_bytes).
+    std::atomic<size_t> decode_engine_device{0},decode_engine_host{0};
     static constexpr uint64_t automatic_budget=UINT64_MAX; // vram.budget=auto
     using reclaimer_callback=int (*)(void *,size_t,size_t *);
     using reclaimer_register_fn=bool (*)(int,reclaimer_callback,void *);
@@ -479,6 +483,11 @@ struct tier {
         for(const auto & x:formats)if(x.engine)n+=device_side?format_api->device_scratch_bytes(x.engine):format_api->host_scratch_bytes(x.engine);
         return n;
     }
+    // After a decode engine is made or replaced: its memory counted where the prefill engine's is.
+    void count_decode_engines(){
+        decode_engine_device=engine_scratch(true);decode_engine_host=engine_scratch(false);
+        publish_engine_held();
+    }
     // The format of the layer being prepared, of a layer the declaration lists (null for any other), the largest.
     const expert_format & now() const{return formats.at(cur);}
     const expert_format * format_of(int layer) const{
@@ -723,9 +732,10 @@ struct tier {
         ggml_memory_query::instance().release(device, ssd::gpu::device_pages(bytes));
         return cudaFree(data);
     }
-    // The prefill engines' device memory, which grows and goes with each pass, is part of what this process holds.
+    // The engines' device memory is part of what this process holds: the prefill engine's, which grows and goes with
+    // each pass, and the decode engines', which a decode step of several rows grows.
     void publish_engine_held() {
-        const size_t now = group ? group_api->device_bytes(group) : 0;
+        const size_t now = (group ? group_api->device_bytes(group) : 0) + decode_engine_device.load();
         const auto & q = ggml_memory_query::instance();
         if (now > engine_held) { q.hold(device, now - engine_held); }
         else if (now < engine_held) { q.release(device, engine_held - now); }
@@ -1757,6 +1767,7 @@ struct tier {
                 x.engine=format_api->create(device,latent,hidden,x.rows,x.type[0],x.type[1],x.type[2],error,sizeof(error));
                 if(!x.engine)throw std::runtime_error(error);
             }
+            count_decode_engines();
             format_mode=true;
             worker=std::thread([this]{worker_loop();});
             if(deferred_upload)upload_thread=std::thread([this]{upload_loop();});
@@ -1883,6 +1894,7 @@ struct tier {
             void * engine=format_api->create(device,latent,hidden,resident,x.type[0],x.type[1],x.type[2],error,sizeof(error));
             if(!engine)throw std::runtime_error(error);
             format_api->destroy(x.engine);x.engine=engine;x.rows=resident;
+            count_decode_engines();
         }
         activation=*a;
         for(int k=0;k<routes;){
@@ -2603,9 +2615,10 @@ void policy_set_host_floor(void * p,uint64_t bytes){
 uint64_t policy_host_bytes(void * p){
     auto * t=static_cast<tier *>(p);if(!t)return 0;
     std::lock_guard<std::mutex> lock(t->lifecycle_mutex);
-    // on unified memory the batched engine's page-locked staging comes out of the same DRAM as its device buffers
+    // on unified memory the engines' page-locked staging comes out of the same DRAM as their device buffers
     return t->unified?t->capacity_bytes+t->prefill_transient_bytes+
-        (t->host_scratch?t->stride*t->host_scratch_slots:0)+(t->group?t->group_api->device_bytes(t->group)+t->group_api->host_bytes(t->group):0):0;}
+        (t->host_scratch?t->stride*t->host_scratch_slots:0)+(t->group?t->group_api->device_bytes(t->group)+t->group_api->host_bytes(t->group):0)+
+        t->decode_engine_device.load()+t->decode_engine_host.load():0;}
 int policy_reclaim_host(void * p,uint64_t bytes){
     auto * t=static_cast<tier *>(p);if(!t)return 1;
     try{return t->reclaim_host(size_t(std::min<uint64_t>(bytes,SIZE_MAX)),bytes?"host_reserve":"floor")?0:1;}catch(const std::exception & x){
