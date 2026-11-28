@@ -498,9 +498,80 @@ static llama_tokens window_saved_prompt() {
     return saved_prompt;
 }
 
+static llama_tokens window_parted_prompt() {
+    llama_tokens prompt(75, base_token);
+    prompt.back() = 3 + 'y';
+    return prompt;
+}
+
 static void require_cold_probability(completion actual, completion cold) {
     require(std::abs(std::log(actual.probability) - std::log(cold.probability)) < 1e-5f,
             "cached greedy log probability differs from cold inference");
+}
+
+static void make_non_causal(common_params & params) {
+    require(string_parse_kv_override("gemma2.attention.causal=bool:false", params.kv_overrides),
+            "invalid attention override");
+    params.kv_overrides.emplace_back();
+}
+
+// A slot with non-causal attention serves no later prompt: its rows depend on the tokens after them in their batch,
+// which a cold prompt that parts earlier never saw and one that goes on sees with the tokens it adds. It is not cut
+// back where it still holds every row of the window, and not extended either.
+static void test_sliding_window_non_causal_slot(common_params params) {
+    params.cache_disk.clear();
+    params.cache_ram_mib = 0;
+    make_non_causal(params);
+    const auto saved_prompt = window_saved_prompt();
+    auto extended = saved_prompt;
+    extended.push_back(3 + 'y');
+    for (const auto & prompt : {window_parted_prompt(), extended}) {
+        const auto cold = [&] {
+            server_run server(params);
+            return first_token(server.server, prompt, {}, 0, 0, 0);
+        }();
+        server_run live(params);
+        first_token(live.server, saved_prompt, {}, 0, 0, 0);
+        const auto actual = first_token(live.server, prompt, {}, 0, 0, 0);
+        require_completion(actual, 0, cold.token, "a non-causal slot served a later prompt");
+        require_cold_probability(actual, cold);
+    }
+}
+
+// Without causal attention a row also depends on the tokens after it in its batch, so a state saved at a checkpoint or
+// at the end of a shared prefix inside the batch holds rows that saw the rest of it. A server with such attention saves
+// no cached state, and a reader with the same settings, from its prefix caches or its own cache on disk, evaluates the
+// prompt as a cold server does.
+static void test_sliding_window_non_causal_cache(common_params params, const fs::path & work) {
+    make_non_causal(params);
+    params.cache_disk.clear();
+    params.cache_ram_mib = 4;
+    llama_tokens written(86, base_token);
+    written.resize(90, adapted_token);
+    llama_tokens prompt(86, base_token);
+    prompt.push_back(3 + 'y');
+    const auto request = [&](const common_params & config) {
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    };
+    const auto cold = request(params);
+    for (bool checkpoint : {true, false}) {
+        // the state after 86 tokens: a checkpoint 4 tokens before the end, or the end of the shared prefix
+        auto writer = params;
+        writer.n_ctx_checkpoints = checkpoint ? 4 : 0;
+        const auto dir = work / (checkpoint ? "non-causal-checkpoint" : "non-causal-shared-prefix");
+        writer.cache_disk = dir.string();
+        write_completed_prefix(writer, {}, written, checkpoint ? 0 : 86);
+        for (bool imported : {true, false}) {
+            auto reader = params;
+            reader.prefix_cache = imported ? dir.string() : "";
+            reader.cache_disk = imported ? "" : dir.string();
+            const auto actual = request(reader);
+            require_completion(actual, 0, cold.token, "a non-causal reader took a cached state");
+            require_cold_probability(actual, cold);
+        }
+        require(!has_prompt_file(dir), "a server without causal attention saved a cached prompt");
+    }
 }
 
 struct prompt_file_header {
@@ -533,6 +604,35 @@ static std::vector<fs::path> prompt_files(const fs::path & dir) {
     }
     std::sort(files.begin(), files.end());
     return files;
+}
+
+// Without causal attention a slot keeps the ids a prompt spells its text with as well: the same text in other ids is
+// other rows. A prompt that ends in "yy" as one token after one that ended in two "y" tokens is evaluated as on a
+// fresh slot, whether it picks the slot or names it.
+static void test_sliding_window_non_causal_text(common_params params) {
+    params.cache_disk.clear();
+    params.cache_ram_mib = 0;
+    make_non_causal(params);
+    llama_tokens split(prefix_tokens, base_token);
+    split.push_back(3 + 'y');
+    split.push_back(3 + 'y');
+    auto merged = split;
+    merged.resize(prefix_tokens);
+    merged.push_back(merged_token);
+    for (const int id_slot : { -1, 0 }) {
+        const auto cold = [&] {
+            server_run server(params);
+            return first_token(server.server, merged, {}, id_slot, 0, 0);
+        }();
+        server_run server(params);
+        const auto * ctx = server.server.get_llama_context();
+        require(common_detokenize(ctx, split, false) == common_detokenize(ctx, merged, false),
+                "the two tokenizations must render the same prompt");
+        first_token(server.server, split, {}, id_slot, 0, 0);
+        const auto actual = first_token(server.server, merged, {}, id_slot, 0, 0);
+        require_completion(actual, 0, cold.token, "a non-causal slot rewrote the prompt's ids");
+        require_cold_probability(actual, cold);
+    }
 }
 
 // A quantized KV cache stores its rows Hadamard-rotated, or with LLAMA_ATTN_ROT_DISABLE as they are: the same layout
@@ -638,6 +738,26 @@ static void test_sliding_window(common_params params, const fs::path & work) {
     params.model.path = model.string();
     test_sliding_window_writer_settings(params, work);
     test_sliding_window_kv_rotation(params, work);
+    test_sliding_window_non_causal_slot(params);
+    test_sliding_window_non_causal_cache(params, work);
+    test_sliding_window_non_causal_text(params);
+
+    // The attention type of a request: only a causal slot is cut back to the tokens a prompt shares with it, and only
+    // a causal server keeps a state.
+    for (bool causal : {true, false}) {
+        params.attention_type = causal ? LLAMA_ATTENTION_TYPE_CAUSAL : LLAMA_ATTENTION_TYPE_NON_CAUSAL;
+        params.cache_disk = (work / (causal ? "causal-cache" : "non-causal-cache")).string();
+        save_completed_prefix(params, {}, llama_tokens(prefix_tokens, base_token), causal);
+        server_run restarted(params);
+        // past the window, where the slot still holds every row the shared tokens attend to
+        llama_tokens prompt(41, base_token);
+        prompt.back() = adapted_token;
+        first_token(restarted.server, prompt, {}, 0, 0, 0);
+        prompt.pop_back();
+        prompt.back() = adapted_token;
+        const auto live = first_token(restarted.server, prompt, {}, 0, 0, 0);
+        require(live.cached == (causal ? 39 : 0), "live reuse ignored the attention mode");
+    }
 }
 
 // A model with long and short RoPE factors (LongRoPE) rotates its keys by the long ones when a sequence's context is

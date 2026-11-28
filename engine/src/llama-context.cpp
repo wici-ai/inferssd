@@ -4815,6 +4815,10 @@ void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
 
+bool llama_get_causal_attn(const llama_context * ctx) {
+    return ctx->get_cparams().causal_attn;
+}
+
 int32_t llama_rope_factors_long(const llama_context * ctx) {
     // the choice of llama_model::get_rope_factors
     const llama_model & model = ctx->get_model();

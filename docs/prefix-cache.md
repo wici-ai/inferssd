@@ -51,6 +51,11 @@ whose fingerprint is the model's, and looks for a state among them as among its 
 removes or evicts them, and they do not count against `--cache-disk-mib`. It reads the directory again when the
 directory changes, so a file that arrives while the server runs serves the next request.
 
+A server whose attention is not causal (`--attention non-causal`, or a model or metadata override that turns causal
+attention off) takes no prefix cache and keeps no prompt cache or context checkpoints: each row of its state depends on
+every token of the batch that computed it, the tokens after the row too, so the state serves no other request. Its
+slots evaluate every prompt in full, in the ids it was sent in.
+
 `inferssd serve` passes `<cache directory>/prefix-cache/<model>`, beside the prompt caches
 (`<cache directory>/prompts/<model>`), `<model>` being the model's first file name without the shard suffix and
 `.gguf`. The cache directory is `~/Library/Caches/inferssd` on macOS and `%LOCALAPPDATA%\inferssd` on Windows.

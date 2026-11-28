@@ -1402,6 +1402,15 @@ private:
                 n_swa == 0) {
             checkpoint_at_align = 0;
         }
+        // Without causal attention a row depends on every token of the batch that computed it, the ones after it
+        // too, so a state serves no other prompt: the server keeps no prompt cache, prefix caches or checkpoints, and
+        // a slot evaluates every prompt anew (update_slots).
+        const bool causal_attn = llama_get_causal_attn(ctx);
+        if (!causal_attn) {
+            SRV_WRN("%s", "prompt caching and context checkpoints are disabled: the attention is not causal\n");
+            params_base.n_ctx_checkpoints = 0;
+            checkpoint_at_align = 0;
+        }
         if (checkpoint_at_align > 0) {
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
@@ -1410,7 +1419,9 @@ private:
                 !params_base.slot_save_path.empty() ?
                 prefix_cache_fingerprint() : "";
         slot_state_fingerprint = params_base.slot_save_path.empty() ? "" : prompt_cache_fingerprint(model_fp);
-        if (!params_base.cache_disk.empty()) {
+        if (!causal_attn) {
+            // no prompt cache
+        } else if (!params_base.cache_disk.empty()) {
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
@@ -1430,7 +1441,8 @@ private:
         if (!params_base.prefix_cache.empty()) {
             if (!prompt_cache || model_fp.empty()) {
                 SRV_WRN("prefix caches in %s are not used: %s\n", params_base.prefix_cache.c_str(),
-                        prompt_cache ? "the model files cannot be read" : "the prompt cache is disabled");
+                        prompt_cache ? "the model files cannot be read" :
+                        causal_attn  ? "the prompt cache is disabled" : "the attention is not causal");
             } else {
                 prompt_cache->use_prefix_dir(params_base.prefix_cache, model_fp);
             }
@@ -1486,6 +1498,9 @@ private:
                 params_base.cache_idle_slots = false;
             } else if (params_base.cache_ram_mib == 0) {
                 SRV_WRN("%s: --cache-idle-slots requires --cache-ram, disabling\n", __func__);
+                params_base.cache_idle_slots = false;
+            } else if (!prompt_cache) {
+                SRV_WRN("%s: --cache-idle-slots requires the prompt cache, disabling\n", __func__);
                 params_base.cache_idle_slots = false;
             } else {
                 SRV_INF("%s: idle slots will be saved to prompt cache and cleared upon starting a new task\n", __func__);
@@ -1574,9 +1589,10 @@ private:
     // The prompt takes the slot's cached token ids where its text continues them (server_tokens_reuse_text): a
     // follow-up whose history renders the previous reply back into other tokens then extends the slot's prompt
     // instead of parting from it inside the reply and prefilling the reply again.
+    // It serves only a slot whose state a later prompt reuses, not one without causal attention (load_model).
     void reuse_cached_text(const server_slot & slot, server_task & task) {
         if (task.type != SERVER_TASK_TYPE_COMPLETION || !task.params.cache_prompt || task.tokens.has_mtmd ||
-                slot.prompt.tokens.has_mtmd || slot.prompt.tokens.empty()) {
+                slot.prompt.tokens.has_mtmd || slot.prompt.tokens.empty() || !llama_get_causal_attn(ctx)) {
             return;
         }
         const size_t n_before = slot.prompt.tokens.get_common_prefix(task.tokens);
@@ -3170,7 +3186,8 @@ private:
                                 continue;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // without causal attention the slot's state serves no other prompt (load_model)
+                            if (slot.task->params.cache_prompt && llama_get_causal_attn(ctx)) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
