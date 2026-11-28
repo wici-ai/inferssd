@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iterator>
 #include <optional>
 #include <random>
@@ -39,9 +40,11 @@ static void require(bool condition, const char * message) {
 // The logits choose A for the base model and B with the active value adapter.
 // With long_rope, a llama model with long and short RoPE factors (LongRoPE) whose queries and keys see the tokens:
 // its attention, and the first output with it, depends on the factors the context selects. `width` is the embedding
-// and head size.
+// and head size; a sliding-window model has `layers` layers (2 by default), with the causal attention its metadata
+// says.
 static void write_model(const fs::path & path, bool sliding_window = false, bool long_rope = false,
-                        int width = ::width) {
+                        int width = ::width, int layers = 0, bool causal = true) {
+    const int n_layer = layers > 0 ? layers : sliding_window ? 2 : 1;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
     require(weights && model, "could not create prompt-cache model fixture");
@@ -51,12 +54,15 @@ static void write_model(const fs::path & path, bool sliding_window = false, bool
     gguf_set_val_str(model.get(), "tokenizer.ggml.model", "llama");
     gguf_set_val_u32(model.get(), key("context_length").c_str(), long_rope ? 1024 : 512);
     gguf_set_val_u32(model.get(), key("embedding_length").c_str(), width);
-    gguf_set_val_u32(model.get(), key("block_count").c_str(), sliding_window ? 2 : 1);
+    gguf_set_val_u32(model.get(), key("block_count").c_str(), n_layer);
     gguf_set_val_u32(model.get(), key("feed_forward_length").c_str(), width);
     gguf_set_val_u32(model.get(), key("attention.head_count").c_str(), 1);
     gguf_set_val_f32(model.get(), key("attention.layer_norm_rms_epsilon").c_str(), 1e-5f);
     if (sliding_window) {
         gguf_set_val_u32(model.get(), "gemma2.attention.sliding_window", 16);
+        if (!causal) {
+            gguf_set_val_bool(model.get(), "gemma2.attention.causal", false);
+        }
     }
     if (long_rope) {
         // the long factors past a sequence context of 256
@@ -133,7 +139,7 @@ static void write_model(const fs::path & path, bool sliding_window = false, bool
             gguf_add_tensor(model.get(), factors);
         }
     }
-    for (int layer = 0; layer < (sliding_window ? 2 : 1); ++layer) {
+    for (int layer = 0; layer < n_layer; ++layer) {
         const auto block = "blk." + std::to_string(layer) + ".";
         add(block + "attn_norm.weight", 0, 1.0f);
         auto * queries = add(block + "attn_q.weight", width);
@@ -278,6 +284,18 @@ static size_t slot_action(server_context & server, server_task_type type, const 
     const auto * receipt = dynamic_cast<const server_task_result_slot_save_load *>(result.get());
     require(receipt != nullptr, "the slot was not saved or restored");
     return receipt->n_tokens;
+}
+
+// Waits until the server sleeps (sleep_idle_seconds), runs `while_asleep` and wakes it, which loads the model again.
+static void sleep_and_wake(server_context & server, const std::function<void()> & while_asleep) {
+    auto reader = server.get_response_reader();
+    const auto deadline = std::chrono::steady_clock::now() + 15s;
+    while (!reader.queue_tasks.is_sleeping()) {
+        require(std::chrono::steady_clock::now() < deadline, "the server did not fall asleep");
+        std::this_thread::sleep_for(20ms);
+    }
+    while_asleep();
+    reader.queue_tasks.wait_until_no_sleep();
 }
 
 // The tokens a request generates, which may shift the context to make room: n_discard tokens after the first go.
@@ -990,6 +1008,73 @@ static void test_sliding_window_writer_settings(common_params params, const fs::
     }
 }
 
+// A server that sleeps loads the model again when it wakes, and derives what its states depend on from that load. A
+// control vector it cannot apply then is not the one an earlier load applied: no state saved with it serves.
+static void test_sliding_window_wake_control_vector(common_params params, const fs::path & work) {
+    // three layers: the vector at the output of the second changes the rows of the third
+    const auto model = work / "sliding-window-3.gguf";
+    write_model(model, true, false, width, 3);
+    params.model.path = model.string();
+    params.cache_ram_mib = 4;
+    const auto saved_prompt = window_saved_prompt();
+    auto prompt = saved_prompt;
+    prompt.push_back(3 + 'y');
+    const auto cold = [&] {
+        auto config = params;
+        config.cache_disk.clear();
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    }();
+    const auto vector = work / "wake-control-vector.gguf";
+    write_control_vector(vector, 4.0f);
+    auto config = params;
+    config.control_vectors.push_back({1.0f, vector.string()});
+    config.cache_disk = (work / "wake-control-vector").string();
+    require(fs::create_directory(config.cache_disk), "could not create prompt-cache directory");
+    config.sleep_idle_seconds = 1;
+    server_run server(config);
+    first_token(server.server, saved_prompt, {}, -1, 0, 0);
+    first_token(server.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
+    sleep_and_wake(server.server, [&] { fs::remove(vector); });
+    const auto actual = first_token(server.server, prompt, {}, -1, 0, 0);
+    require_completion(actual, 0, cold.token, "a server that could not apply its control vector reused rows of it");
+    require_cold_probability(actual, cold);
+}
+
+// A model whose metadata turned its attention non-causal while the server slept: the woken server keeps no state of
+// it, under the fingerprint of the earlier load or any other.
+static void test_sliding_window_wake_attention(common_params params, const fs::path & work) {
+    const auto model = work / "sliding-window-wake.gguf";
+    write_model(model, true);
+    params.model.path = model.string();
+    params.cache_ram_mib = 4;
+    params.cache_disk = (work / "wake-attention").string();
+    require(fs::create_directory(params.cache_disk), "could not create prompt-cache directory");
+    const auto saved_prompt = window_saved_prompt();
+    auto prompt = saved_prompt;
+    prompt.push_back(3 + 'y');
+    const auto cold = [&] {
+        auto config = params;
+        config.cache_disk.clear();
+        server_run server(config);
+        return first_token(server.server, prompt, {}, -1, 0, 0);
+    }();
+    {
+        auto config = params;
+        config.sleep_idle_seconds = 1;
+        server_run server(config);
+        sleep_and_wake(server.server, [&] { write_model(model, true, false, width, 0, false); });
+        first_token(server.server, saved_prompt, {}, -1, 0, 0);
+        first_token(server.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
+    }
+    // the causal model again
+    write_model(model, true);
+    server_run server(params);
+    const auto actual = first_token(server.server, prompt, {}, -1, 0, 0);
+    require_completion(actual, 0, cold.token, "a causal server reused rows of a non-causal load");
+    require_cold_probability(actual, cold);
+}
+
 static void test_sliding_window(common_params params, const fs::path & work) {
     const auto model = work / "sliding-window.gguf";
     write_model(model, true);
@@ -1000,6 +1085,8 @@ static void test_sliding_window(common_params params, const fs::path & work) {
     test_sliding_window_non_causal_cache(params, work);
     test_sliding_window_non_causal_text(params);
     test_sliding_window_context_shift(params, work);
+    test_sliding_window_wake_control_vector(params, work);
+    test_sliding_window_wake_attention(params, work);
 
     // The attention type of a request: only a causal slot is cut back to the tokens a prompt shares with it, and only
     // a causal server keeps a state.

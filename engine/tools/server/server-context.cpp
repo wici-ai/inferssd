@@ -1010,6 +1010,9 @@ private:
     // positions at which the memory can save a state it has gone past (llama_state_seq_at_align), 0 if it cannot
     int64_t checkpoint_at_align = 0;
 
+    // the parameters the server was started with, which every load derives its own from (load_model)
+    common_params params_given;
+
 
 
     server_metrics metrics;
@@ -1187,7 +1190,13 @@ private:
 
         SRV_INF("loading model '%s'\n", params.model.path.c_str());
 
-        params_base = params;
+        // Every load, a wake from sleep included, derives what it applies from the parameters the server was started
+        // with, not from what an earlier load made of them: the settings, the attention mode, the cache and the
+        // checkpoints are this load's.
+        if (!is_resume) {
+            params_given = params;
+        }
+        params_base = params_given;
 
         adapter_identities.clear();
         if (!params_base.cache_disk.empty() || params_base.cache_ram_mib != 0 || !params_base.slot_save_path.empty()) {
@@ -1422,6 +1431,8 @@ private:
             SRV_INF("context checkpoints are taken after each prompt batch, at multiples of %" PRId64 " tokens\n", checkpoint_at_align);
         }
 
+        // the states of an earlier load are not this one's: a cache of this load's fingerprint takes those it can
+        prompt_cache.reset();
         const std::string model_fp = !params_base.cache_disk.empty() || !params_base.prefix_cache.empty() ||
                 !params_base.slot_save_path.empty() ?
                 prefix_cache_fingerprint() : "";

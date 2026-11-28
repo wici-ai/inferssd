@@ -59,6 +59,9 @@ whose fingerprint is the model's, and looks for a state among them as among its 
 removes or evicts them, and they do not count against `--cache-disk-mib`. It reads the directory again when the
 directory changes, so a file that arrives while the server runs serves the next request.
 
+A server that wakes from sleep loads the model again and derives its cache from that load, as a server that starts
+does: its fingerprint, its settings, its attention mode and its checkpoints, and a prompt cache of that fingerprint.
+
 A server whose attention is not causal (`--attention non-causal`, or a model or metadata override that turns causal
 attention off) takes no prefix cache and keeps no prompt cache or context checkpoints: each row of its state depends on
 every token of the batch that computed it, the tokens after the row too, so the state serves no other request. Its

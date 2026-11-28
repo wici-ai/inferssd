@@ -1288,6 +1288,8 @@ common_init_result_ptr common_init_from_params(common_params & params) {
         params.ctx_shift = false;
     }
 
+    // this load's, set once the vector is applied: a failed one leaves no identity, not an earlier load's
+    params.control_vector_identity.clear();
     if (!params.control_vectors.empty()) {
         if (params.control_vector_layer_start <= 0) params.control_vector_layer_start = 1;
         if (params.control_vector_layer_end   <= 0) params.control_vector_layer_end   = llama_model_n_layer(model);
