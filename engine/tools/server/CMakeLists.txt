@@ -93,3 +93,16 @@ target_include_directories(${TARGET} PRIVATE ${PROJECT_SOURCE_DIR})
 target_link_libraries(${TARGET} PRIVATE server-context PUBLIC llama-common cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
 target_compile_features(${TARGET} PRIVATE cxx_std_17)
+
+# The server reads a model in a folder whose name is not ASCII (the model's facts, which need no backend). On Windows
+# its command line comes in the process code page, which the application manifest (cmake/win-app.cmake) makes
+# UTF-8, the encoding the model reader takes: the models are under the user's profile folder, whose name can be in
+# any language.
+if (LLAMA_BUILD_TESTS AND TARGET inferssd-ci-tests)
+    set(unicode_model_dir "${CMAKE_CURRENT_BINARY_DIR}/modèle Ω")
+    file(COPY "${PROJECT_SOURCE_DIR}/models/ggml-vocab-qwen2.gguf" DESTINATION "${unicode_model_dir}")
+    add_test(NAME server_unicode_model_path
+             COMMAND ${TARGET} --ssd-model-facts "${unicode_model_dir}/ggml-vocab-qwen2.gguf")
+    set_tests_properties(server_unicode_model_path PROPERTIES PASS_REGULAR_EXPRESSION "\"architecture\":\"qwen2\"")
+    inferssd_ci_test(${TARGET} server_unicode_model_path)
+endif()
