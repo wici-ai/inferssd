@@ -1968,7 +1968,8 @@ private:
 
 
 
-    bool process_token(completion_token_output & result, server_slot & slot) {
+    // n_later: the tokens of a verified draft after this one, which the prompt already holds
+    bool process_token(completion_token_output & result, server_slot & slot, int n_later = 0) {
         const completion_token_output sampled_result = result;
         const std::string sampled_token_str = sampled_result.text_to_send;
 
@@ -1978,8 +1979,10 @@ private:
         slot.has_next_token = true;
         emit_output_token(sampled_result, slot);
 
-        // if context shifting is disabled, make sure that we don't run out of context
-        if (!params_base.ctx_shift && slot.prompt.n_tokens() + 1 >= slot.n_ctx) {
+        // if context shifting is disabled, make sure that we don't run out of context. The context is measured at
+        // this token, as a step without drafts measures it, so that a draft's block that fills the context stops at
+        // its last token, not at its first
+        if (!params_base.ctx_shift && slot.prompt.n_tokens() - n_later + 1 >= slot.n_ctx) {
             slot.truncated      = true;
             slot.stop           = STOP_TYPE_LIMIT;
             slot.has_next_token = false;
@@ -4057,7 +4060,7 @@ private:
                     // counted as it is sent, as a step without drafts counts its token: the limit stops the block at
                     // its last token, not at its first
                     slot.n_decoded += 1;
-                    if (!process_token(result, slot)) {
+                    if (!process_token(result, slot, (int) (ids.size() - 1 - i))) {
                         slot.print_timings();
                         send_final_response(slot);
                         metrics.on_prediction(slot);

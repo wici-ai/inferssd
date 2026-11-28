@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
-// A completion that drafts reports what one that does not reports: as many tokens, and for each token a verified draft
-// keeps the probabilities of its own row, whether the draft token was accepted, rejected or followed the draft.
+// A completion that drafts reports what one that does not reports: as many tokens, whether it stops at its limit or at
+// the end of the context, and for each token a verified draft keeps the probabilities of its own row, whether the draft
+// token was accepted, rejected or followed the draft.
 #include "server-context.h"
 #include "gguf.h"
 
@@ -33,13 +34,15 @@ static void require(bool condition, const std::string & message) {
 
 // A bigram model: the attention and the feed-forward block add nothing, so a token's logits depend on that token
 // alone. A is followed by B, B by C and C by A, each with two runners-up of its own.
-static void write_model(const fs::path & path) {
+// A slot's context is no longer than the model's training context, which sets it here to fewer tokens than the 256 a
+// context is padded to.
+static void write_model(const fs::path & path, uint32_t n_ctx_train = 256) {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
     require(weights && model, "could not create the model fixture");
     gguf_set_val_str(model.get(), "general.architecture", "llama");
     gguf_set_val_str(model.get(), "tokenizer.ggml.model", "llama");
-    gguf_set_val_u32(model.get(), "llama.context_length", 256);
+    gguf_set_val_u32(model.get(), "llama.context_length", n_ctx_train);
     gguf_set_val_u32(model.get(), "llama.embedding_length", width);
     gguf_set_val_u32(model.get(), "llama.block_count", 1);
     gguf_set_val_u32(model.get(), "llama.feed_forward_length", width);
@@ -126,17 +129,18 @@ struct generated {
     std::vector<completion_token_output> probs;
     int drafted = 0;
     int accepted = 0;
+    bool truncated = false;
 };
 
 // A greedy completion of C A B A A C A. Its tokens run B C A B ...; the first draft follows the prompt, where A B is
 // followed by A A, and is rejected; the later ones follow the tokens the model wrote, and are accepted.
-static generated complete(const common_params & params, bool post_sampling) {
+static generated complete(const common_params & params, bool post_sampling, int limit = n_predict) {
     server_run run(params);
     auto reader = run.server.get_response_reader();
     server_task task(SERVER_TASK_TYPE_COMPLETION);
     task.id = reader.get_new_id();
     task.tokens = server_tokens({ tok_c, tok_a, tok_b, tok_a, tok_a, tok_c, tok_a }, false);
-    task.params.n_predict = n_predict;
+    task.params.n_predict = limit;
     task.params.stream = false;
     task.params.return_tokens = true;
     task.params.sampling.temp = 0;
@@ -148,7 +152,30 @@ static generated complete(const common_params & params, bool post_sampling) {
     require(result && !result->is_error(), "the completion failed");
     const auto * done = dynamic_cast<const server_task_result_cmpl_final *>(result.get());
     require(done != nullptr, "the completion did not finish");
-    return { done->tokens, done->probs_output, done->timings.draft_n, done->timings.draft_n_accepted };
+    return { done->tokens, done->probs_output, done->timings.draft_n, done->timings.draft_n_accepted, done->truncated };
+}
+
+// A completion without a limit runs until the context is full. With drafts, it must stop at the same token: a draft
+// is shortened to fit the context, and when its block fills the context, the block's tokens before the last still
+// fit. Each of three context sizes in a row puts the end of the context at another place in the drafts' blocks.
+static void compare_context_end(common_params params, const fs::path & work) {
+    for (uint32_t n_ctx = 61; n_ctx <= 63; ++n_ctx) {
+        const fs::path model = work / ("model-" + std::to_string(n_ctx) + ".gguf");
+        write_model(model, n_ctx);
+        params.model.path = model.string();
+        common_params plain = params;
+        plain.speculative.type = COMMON_SPECULATIVE_TYPE_NONE;
+        const auto base = complete(plain, false, -1);
+        const auto drafts = complete(params, false, -1);
+
+        const std::string at = "context of " + std::to_string(n_ctx) + " tokens: ";
+        require(base.truncated && drafts.truncated, at + "the completions must stop at the end of the context");
+        require(drafts.accepted > 0, at + "the fixture must accept draft tokens");
+        require(drafts.tokens.size() == base.tokens.size(),
+                at + "the completion with drafts stopped at " + std::to_string(drafts.tokens.size()) +
+                " tokens, the one without at " + std::to_string(base.tokens.size()));
+        require(drafts.tokens == base.tokens, at + "drafts changed the greedy tokens");
+    }
 }
 
 static void compare(const common_params & params, bool post_sampling) {
@@ -211,6 +238,7 @@ int main() {
 
         compare(params, false);
         compare(params, true);
+        compare_context_end(params, work);
         std::printf("ok\n");
         return 0;
     } catch (const std::exception & error) {
