@@ -1098,6 +1098,23 @@ private:
         return settings.empty() ? "" : "settings=" + settings + "|";
     }
 
+    // What every fingerprint of this server's cached states on disk starts with, whatever build computed them: the
+    // model and the settings that change what it computes.
+    std::string prompt_cache_configuration(const std::string & model_fp) const {
+        if (!model_fp.empty()) {
+            return model_fp + "|";
+        }
+        // the model files cannot be read as GGUF files: by the first file's path, size and time
+        std::string fp = prompt_cache_settings() + params_base.model.path;
+        std::error_code ec;
+        const auto size  = std::filesystem::file_size(params_base.model.path, ec);
+        const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
+        fp += "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long) mtime.time_since_epoch().count());
+        char desc[256];
+        llama_model_desc(model, desc, sizeof(desc));
+        return fp + "|" + desc + "|";
+    }
+
     // What a cached state on disk depends on besides its tokens: the model, the settings that change what it
     // computes, and the build that computed it. A file of the cache is a prefix cache for another build
     // (prefix_cache_fingerprint is the start of its fingerprint).
@@ -1105,18 +1122,7 @@ private:
         // Legacy writable states did not identify their adapters, or the settings that change their values, including
         // states from a binary with an unknown build revision.
         constexpr char cache_revision[] = "|settings-cache=1|adapter-cache=1";
-        if (!model_fp.empty()) {
-            return model_fp + "|" + llama_build_info() + cache_revision;
-        }
-        // the model files cannot be read as GGUF files: by the first file's path, size and time
-        std::string fp = prompt_cache_settings() + llama_build_info() + "|" + params_base.model.path;
-        std::error_code ec;
-        const auto size  = std::filesystem::file_size(params_base.model.path, ec);
-        const auto mtime = std::filesystem::last_write_time(params_base.model.path, ec);
-        fp += "|" + std::to_string(ec ? 0 : size) + "|" + std::to_string(ec ? 0 : (long long) mtime.time_since_epoch().count());
-        char desc[256];
-        llama_model_desc(model, desc, sizeof(desc));
-        return fp + "|" + desc + cache_revision;
+        return prompt_cache_configuration(model_fp) + llama_build_info() + cache_revision;
     }
 
     // What a prefix cache that another server made depends on besides its tokens: the model, by the sizes and
@@ -1443,7 +1449,8 @@ private:
             SRV_WRN("prompt cache is on disk in %s, size limit: %d MiB\n", params_base.cache_disk.c_str(), params_base.cache_disk_mib);
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_disk_mib, 0);
-            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp));
+            prompt_cache->use_dir(params_base.cache_disk, prompt_cache_fingerprint(model_fp),
+                                  prompt_cache_configuration(model_fp));
         } else if (params_base.cache_ram_mib != 0) {
             if (params_base.cache_ram_mib < 0) {
                 SRV_WRN("prompt cache is enabled, size limit: %s\n", "no limit");

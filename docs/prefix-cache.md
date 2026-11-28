@@ -39,7 +39,8 @@ that `tools/server/inferssd/prompt-cache-legacy.inc` names by size and SHA-256, 
 before the marker. Reading the directory reads only the headers, where the size of a published file is enough; the
 first request that would restore such a file hashes it, once for each version of it (about 2 seconds for a 1 GB file
 on an Apple M5), and a file that is not a published one goes, the request processing the prefix itself. A writable
-prompt cache takes only files of its own build, and so drops those of a server before it.
+prompt cache takes only files of its own build, and so drops those of its model and settings that a server before it
+wrote.
 
 Writable prompt caches keep base-model and ordinary LoRA states separate. Reuse with active LoRA requires
 matching adapter contents and exact scales. Active aLoRA states stay local to their slot, where activation
@@ -65,6 +66,13 @@ does: its fingerprint, its settings, its attention mode and its checkpoints, and
 Every restore reads the fingerprint and the layout of the file it opened, from that file: one that another server,
 with this directory or another fingerprint, wrote or replaced since the server indexed it is a miss. A server writes
 its states under names of its fingerprint, and each file under a name of its own until it renames it into place.
+
+Several servers can share a `--cache-disk` directory. Opening it, a server takes the files of its fingerprint and
+leaves the others': those of other settings or another model, and the temporary files that a server still writes (a
+writer holds its file locked until it renames it into place; on Windows an open file cannot be removed). It removes
+the files of its model and settings that another build wrote, files that no server reads, and temporary files that no
+writer holds any more. `--cache-disk-mib` bounds the files of a server's fingerprint that it knows of, those it found
+on opening the directory and those it wrote since: a shared directory holds up to the sum of its servers' limits.
 
 A server whose attention is not causal (`--attention non-causal`, or a model or metadata override that turns causal
 attention off) takes no prefix cache and keeps no prompt cache or context checkpoints: each row of its state depends on

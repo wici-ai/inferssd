@@ -20,6 +20,12 @@ extern "C" {
 #include <utility>
 #include <vector>
 
+#if !defined(_WIN32)
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 static void require(bool condition, const char * message) {
     if (!condition) {
         std::fprintf(stderr, "%s\n", message);
@@ -496,7 +502,7 @@ static void test_writable_adapter_fingerprint() {
     write_prompt_file((dir / "lora.prompt").string(), current + "|lora=0123456789abcdef", { 1, 2, 3 }, 64);
 
     server_prompt_cache cache(4, 0);
-    cache.use_dir(dir.string(), current);
+    cache.use_dir(dir.string(), current, "prefix-cache 1|this model|");
     require(cache.states.size() == 2, "writable caches take only their adapter-aware fingerprint");
     require(!std::filesystem::exists(dir / "legacy.prompt"), "legacy writable state has no adapter provenance");
     require(server_prompt_cache_testing::contains(cache, make_prompt({ 1, 2, 3 }), COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
@@ -505,6 +511,68 @@ static void test_writable_adapter_fingerprint() {
     adapted.adapter_key = "0123456789abcdef";
     require(server_prompt_cache_testing::contains(cache, adapted, COMMON_CONTEXT_SEQ_RM_TYPE_FULL),
             "an adapted writable state keeps its distinct adapter key");
+    std::filesystem::remove_all(dir);
+}
+
+// A directory may be shared with servers of other settings or models: their files stay, and the cache neither takes
+// nor counts them. A file that a server of the same fingerprint is writing stays too, until it renames it into
+// place. Files of this model and settings from another build, files no server reads and temporary files that no
+// writer holds go.
+static void test_writable_dir_keeps_other_servers_files() {
+    const auto dir = fresh_dir("inferssd-test-writable-shared-dir");
+    const std::string configuration = "prefix-cache 1|this model|";
+    const std::string revision = "|settings-cache=1|adapter-cache=1";
+    const std::string current = configuration + "b2" + revision;
+    write_prompt_file((dir / "own.prompt").string(), current, { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "settings.prompt").string(), "prefix-cache 1|settings=0123456789abcdef|this model|b2" + revision,
+                      { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "model.prompt").string(), "prefix-cache 1|that model|b2" + revision, { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "adapter.prompt").string(), "prefix-cache 1|that model|b2" + revision + "|lora=0123456789abcdef",
+                      { 1, 2, 3 }, 64);
+    write_prompt_file((dir / "build.prompt").string(), configuration + "b1" + revision, { 1, 2, 3 }, 64);
+    // the same header in another version of the format
+    write_prompt_file((dir / "format.prompt").string(), current, { 1, 2, 3 }, 64);
+    {
+        std::fstream f(dir / "format.prompt", std::ios::binary | std::ios::in | std::ios::out);
+        const uint32_t version = 2;
+        f.seekp(sizeof(uint32_t));
+        f.write(reinterpret_cast<const char *>(&version), sizeof(version));
+    }
+    {
+        std::ofstream f(dir / "garbage.prompt", std::ios::binary);
+        f << "not a cached prompt";
+    }
+    const auto held = dir / "own.prompt.0123456789abcdef.tmp";
+    const auto left = dir / "own.prompt.fedcba9876543210.tmp";
+    {
+        std::ofstream f(left, std::ios::binary);
+        f << "a write that stopped";
+    }
+#if defined(_WIN32)
+    FILE * writer = std::fopen(held.string().c_str(), "wb");
+    require(writer != nullptr, "cannot write a temporary file");
+#else
+    const int writer = open(held.c_str(), O_CREAT | O_WRONLY | O_CLOEXEC, 0644);
+    require(writer >= 0 && flock(writer, LOCK_EX | LOCK_NB) == 0, "cannot hold a temporary file");
+#endif
+
+    server_prompt_cache cache(4, 0);
+    cache.use_dir(dir.string(), current, configuration);
+    require(cache.states.size() == 1 && cache.states.front().file == (dir / "own.prompt").string(),
+            "a writable cache takes only the files of its fingerprint");
+    require(cache.size() == 64, "a writable cache counts only its own files");
+    for (const char * name : { "settings.prompt", "model.prompt", "adapter.prompt", "format.prompt" }) {
+        require(std::filesystem::exists(dir / name), "a writable cache removed another server's file");
+    }
+    require(std::filesystem::exists(held), "a writable cache removed a file that another server is writing");
+    require(!std::filesystem::exists(dir / "build.prompt"), "a file of this model and settings of another build stays");
+    require(!std::filesystem::exists(dir / "garbage.prompt"), "a file that no server reads stays");
+    require(!std::filesystem::exists(left), "a temporary file that no writer holds stays");
+#if defined(_WIN32)
+    std::fclose(writer);
+#else
+    close(writer);
+#endif
     std::filesystem::remove_all(dir);
 }
 
@@ -661,6 +729,7 @@ static void test_model_identity_ignores_path_and_time() {
 int main() {
     test_prefix_dir_takes_only_this_models_files();
     test_writable_adapter_fingerprint();
+    test_writable_dir_keeps_other_servers_files();
     test_prefix_dir_takes_unproven_files_only_when_published();
     test_prefix_cache_outlives_the_cache_limits_and_newer_states();
     test_prefix_dir_is_read_again_when_it_changes();

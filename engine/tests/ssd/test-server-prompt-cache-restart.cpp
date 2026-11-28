@@ -1162,10 +1162,10 @@ static void test_long_rope(common_params params, const fs::path & work) {
     first.cache_disk = shared.string();
     auto second = first;
     second.n_ctx = 256;
-    const auto saved_state = [&](const fs::path & dir) {
+    const auto saved_state = [&](const fs::path & dir, const fs::path & other_than = {}) {
         for (const auto & path : prompt_files(dir)) {
             const auto tokens = read_prompt_header(path).tokens;
-            if (tokens.size() >= saved_prompt.size() &&
+            if (path != other_than && tokens.size() >= saved_prompt.size() &&
                     std::equal(saved_prompt.begin(), saved_prompt.end(), tokens.begin())) {
                 return path;
             }
@@ -1182,11 +1182,10 @@ static void test_long_rope(common_params params, const fs::path & work) {
         first_token(writer.server, saved_prompt, {}, -1, 0, 0);
         first_token(writer.server, llama_tokens(prefix_tokens, 3 + 'x'), {}, -1, 0, 0);
     }
-    const auto other = saved_state(shared);
-    require(!other.empty(), "expected the second server's state");
-    if (other != own) {
-        fs::copy_file(other, own, fs::copy_options::overwrite_existing);
-    }
+    // under a name of its own, beside the first server's file
+    const auto other = saved_state(shared, own);
+    require(!other.empty() && fs::exists(own), "expected the states of both servers");
+    fs::copy_file(other, own, fs::copy_options::overwrite_existing);
     const auto actual = first_token(reader.server, prompt, {}, -1, 0, 0);
     require_completion(actual, 0, cold.token, "a server took the rows of another server's file");
     require_cold_probability(actual, cold);
@@ -1260,6 +1259,18 @@ static void test_restart(const fs::path & work) {
     }
 
     save_completed_prefix(params);
+    {
+        // a server with other settings that opens the directory leaves the file of this one; it serves no request,
+        // only one that reads its adapters, to know that it runs
+        auto other = params;
+        other.rope_freq_base = 32;
+        server_run opened(other);
+        auto reader = opened.server.get_response_reader();
+        server_task task(SERVER_TASK_TYPE_GET_LORA);
+        task.id = reader.get_new_id();
+        reader.post_task(std::move(task));
+        receive(reader);
+    }
     require_completion(first_token(params), prefix_tokens, base_token,
             "restart did not restore the exact shared prefix for a different suffix");
     test_import_replacement(params, work);

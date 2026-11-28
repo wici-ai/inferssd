@@ -18,6 +18,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <cerrno>
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
@@ -29,8 +30,9 @@ extern "C" {
 #include <memory>
 #include <random>
 
-#if defined(__linux__)
+#if !defined(_WIN32)
 #include <fcntl.h>
+#include <sys/file.h>
 #include <unistd.h>
 #endif
 
@@ -161,6 +163,36 @@ static void server_prompt_file_close(FILE * f) {
 
 using server_prompt_file = std::unique_ptr<FILE, decltype(&server_prompt_file_close)>;
 
+// A file a server writes is its own until it renames it into place, and another server that opens the directory
+// meanwhile leaves it: on POSIX systems the writer holds a lock on it, and on Windows an open file cannot be removed.
+// False if another server holds it already. On a file system without locks the file stays unlocked, and a server that
+// opens the directory, which cannot lock it either, leaves it.
+static bool server_prompt_file_hold(FILE * f) {
+#if defined(_WIN32)
+    (void) f;
+    return true;
+#else
+    return flock(fileno(f), LOCK_EX | LOCK_NB) == 0 || errno != EWOULDBLOCK;
+#endif
+}
+
+// removes a temporary file unless its writer still holds it: one that no writer holds is left by a server that stopped
+static void server_prompt_remove_left_file(const std::filesystem::path & path) {
+    std::error_code ec;
+#if !defined(_WIN32)
+    const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return;
+    }
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        std::filesystem::remove(path, ec);
+    }
+    close(fd);
+#else
+    std::filesystem::remove(path, ec);
+#endif
+}
+
 static void server_prompt_file_touch(const std::string & path) {
     std::error_code ec;
     std::filesystem::last_write_time(path, std::filesystem::file_time_type::clock::now(), ec);
@@ -217,9 +249,13 @@ static bool server_prompt_is_published_legacy(FILE * f, uint64_t size,
 // file is not a prompt of this fingerprint, or with `prefix`, of a fingerprint that starts with it and a '|' (a
 // prefix cache: the model's fingerprint, then the build that saved it) whose writer recorded its provenance or whose
 // size is a `published` file's. Only the header is read: such a file is unverified until its content is hashed.
+// With `other`, a well-formed file of another fingerprint, or of another version of the format, is another server's:
+// false, and `other` says what it is of, its fingerprint or the format version. It stays empty for a file that no
+// server reads.
 static bool server_prompt_read_header(FILE * f, const std::string & fingerprint, server_prompt & prompt,
                                       bool prefix = false,
-                                      const std::vector<server_prompt_published_file> * published = nullptr) {
+                                      const std::vector<server_prompt_published_file> * published = nullptr,
+                                      std::string * other = nullptr) {
     if (server_prompt_file_seek(f, 0, SEEK_END) != 0) {
         return false;
     }
@@ -230,8 +266,16 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
 
     uint32_t magic = 0, version = 0, n_fp = 0;
     if (!server_prompt_fread(f, &magic, sizeof(magic)) || magic != SERVER_PROMPT_FILE_MAGIC ||
-        !server_prompt_fread(f, &version, sizeof(version)) || version != SERVER_PROMPT_FILE_VERSION ||
-        !server_prompt_fread(f, &n_fp, sizeof(n_fp)) || n_fp > 4096) {
+        !server_prompt_fread(f, &version, sizeof(version))) {
+        return false;
+    }
+    if (version != SERVER_PROMPT_FILE_VERSION) {
+        if (other) {
+            *other = "format " + std::to_string(version);
+        }
+        return false;
+    }
+    if (!server_prompt_fread(f, &n_fp, sizeof(n_fp)) || n_fp > 4096) {
         return false;
     }
     std::string fp(n_fp, '\0');
@@ -250,7 +294,7 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
     }
     const bool same = prefix ? fp == fingerprint || fp.compare(0, fingerprint.size() + 1, fingerprint + "|") == 0
                              : fp == fingerprint;
-    if (!same) {
+    if (!same && !other) {
         return false;
     }
     // A file of a writer before the settings provenance says nothing about the settings that computed it, which
@@ -309,6 +353,10 @@ static bool server_prompt_read_header(FILE * f, const std::string & fingerprint,
         offset += cp.file_size;
     }
     if (data_size == 0 || data_size != size_t(file_size) - offset) {
+        return false;
+    }
+    if (!same) {
+        *other = fp;
         return false;
     }
 
@@ -380,7 +428,8 @@ static bool server_prompt_restore(
     return true;
 }
 
-void server_prompt_cache::use_dir(const std::string & dir, const std::string & fingerprint) {
+void server_prompt_cache::use_dir(const std::string & dir, const std::string & fingerprint,
+                                  const std::string & configuration) {
     this->dir         = dir;
     this->fingerprint = fingerprint;
     limit_tokens      = 0;
@@ -395,21 +444,30 @@ void server_prompt_cache::use_dir(const std::string & dir, const std::string & f
     for (const auto & entry : std::filesystem::directory_iterator(dir, ec)) {
         const std::string path = entry.path().string();
         if (entry.path().extension() == ".tmp") {
-            std::filesystem::remove(entry.path(), ec);
+            server_prompt_remove_left_file(entry.path());
             continue;
         }
         if (entry.path().extension() != ".prompt") {
             continue;
         }
         server_prompt prompt;
+        std::string other;
         bool ok = false;
         if (FILE * f = std::fopen(path.c_str(), "rb")) {
-            ok = server_prompt_read_header(f, fingerprint, prompt);
+            ok = server_prompt_read_header(f, fingerprint, prompt, false, nullptr, &other);
             std::fclose(f);
         }
         if (!ok) {
-            SRV_WRN(" - removing cached prompt %s: other model, build or format\n", path.c_str());
-            std::filesystem::remove(entry.path(), ec);
+            // A file of another fingerprint is another server's, of other settings or another model, which may share
+            // the directory: it stays, and is not this cache's to count or evict. One of this server's model and
+            // settings from another build serves no server of them now, and goes, as one that no server reads.
+            const bool stale = !other.empty() && !configuration.empty() &&
+                other.compare(0, configuration.size(), configuration) == 0;
+            if (other.empty() || stale) {
+                SRV_WRN(" - removing cached prompt %s: %s\n", path.c_str(),
+                        stale ? "another build of this model and settings" : "not a cached prompt of any server");
+                std::filesystem::remove(entry.path(), ec);
+            }
             continue;
         }
         prompt.file = path;
@@ -707,12 +765,15 @@ void server_prompt_cache::save(
     entry.adapter_key = prompt.adapter_key;
 
     bool ok = false;
+    bool renamed = false;
+    std::error_code ec;
     if (FILE * f = std::fopen(tmp.c_str(), "wb")) {
         server_prompt_file source(nullptr, server_prompt_file_close);
         const uint32_t magic = SERVER_PROMPT_FILE_MAGIC, version = SERVER_PROMPT_FILE_VERSION;
         const uint32_t n_fp = file_fingerprint.size(), n_tokens = tokens.size(), n_checkpoints = prompt.checkpoints.size();
         const uint64_t data_size = state_size;
-        ok = server_prompt_fwrite(f, &magic, sizeof(magic)) && server_prompt_fwrite(f, &version, sizeof(version)) &&
+        ok = server_prompt_file_hold(f) &&
+             server_prompt_fwrite(f, &magic, sizeof(magic)) && server_prompt_fwrite(f, &version, sizeof(version)) &&
              server_prompt_fwrite(f, &n_fp, sizeof(n_fp)) && server_prompt_fwrite(f, file_fingerprint.data(), n_fp) &&
              server_prompt_fwrite(f, &n_tokens, sizeof(n_tokens)) &&
              server_prompt_fwrite(f, tokens.data(), n_tokens*sizeof(llama_token)) &&
@@ -765,16 +826,22 @@ void server_prompt_cache::save(
         ok = ok && fdatasync(fileno(f)) == 0;
 #endif
         server_prompt_file_drop_cache(f);
+#if !defined(_WIN32)
+        // into place while the writer still holds it
+        if (ok) {
+            std::filesystem::rename(tmp, path, ec);
+            ok = renamed = !ec;
+        }
+#endif
         ok = std::fclose(f) == 0 && ok;
     }
-    std::error_code ec;
-    if (ok) {
+    if (ok && !renamed) {
         std::filesystem::rename(tmp, path, ec);
         ok = !ec;
     }
     if (!ok) {
         SRV_WRN(" - failed to write cached prompt %s\n", path.c_str());
-        std::filesystem::remove(tmp, ec);
+        std::filesystem::remove(renamed ? path : tmp, ec);
         return;
     }
 
