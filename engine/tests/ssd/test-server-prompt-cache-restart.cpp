@@ -41,9 +41,10 @@ static void require(bool condition, const char * message) {
 // With long_rope, a llama model with long and short RoPE factors (LongRoPE) whose queries and keys see the tokens:
 // its attention, and the first output with it, depends on the factors the context selects. `width` is the embedding
 // and head size; a sliding-window model has `layers` layers (2 by default), with the causal attention its metadata
-// says.
+// says. With window_marker, the adapted token's marker is 2 and the last layer adds nothing: the first output sees the
+// marker only through the window of the sliding layer.
 static void write_model(const fs::path & path, bool sliding_window = false, bool long_rope = false,
-                        int width = ::width, int layers = 0, bool causal = true) {
+                        int width = ::width, int layers = 0, bool causal = true, bool window_marker = false) {
     const int n_layer = layers > 0 ? layers : sliding_window ? 2 : 1;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> weights(ggml_init({1u << 20, nullptr, false}), ggml_free);
     std::unique_ptr<gguf_context, decltype(&gguf_free)> model(gguf_init_empty(), gguf_free);
@@ -112,7 +113,7 @@ static void write_model(const fs::path & path, bool sliding_window = false, bool
         embeddings[base_token * width] = 2.0f;
         // Layer 0 copies the suffix marker into channel 1. Layer 1 reads that channel
         // from cached rows and activates a distinct output token when the suffix leaked.
-        embeddings[adapted_token * width + 1] = 1.0f;
+        embeddings[adapted_token * width + 1] = window_marker ? 2.0f : 1.0f;
         embeddings[merged_token * width + 2] = 10.0f;
     } else {
         auto * output = add("output.weight", vocab_size);
@@ -146,7 +147,9 @@ static void write_model(const fs::path & path, bool sliding_window = false, bool
         auto * keys = add(block + "attn_k.weight", width);
         auto * values = add(block + "attn_v.weight", width);
         auto * output = add(block + "attn_output.weight", width);
-        output[(layer + 1) * width + 1] = 1.0f;
+        if (!window_marker || layer + 1 < n_layer) {
+            output[(layer + 1) * width + 1] = 1.0f;
+        }
         if (long_rope) {
             for (int i = 0; i < width; ++i) {
                 queries[i * width + i] = keys[i * width + i] = values[i * width + i] = output[i * width + i] = 1.0f;
@@ -1102,6 +1105,69 @@ static void test_sliding_window_wake_idle_slots(common_params params, const fs::
     require_cold_probability(actual, cold);
 }
 
+// A server with full-size windows (--swa-full) keeps every row of a sliding layer, but a cached prompt of a writer
+// without them holds the sliding rows of the window before its end only: those of the last 256 of these 384 tokens.
+// Cut back to a prompt whose next token attends to a row the state lacks, the server evaluates the prompt anew; where
+// the state holds the whole window of that token, it reuses it, from its prefix caches and its own cache alike. The
+// state of a writer with full-size windows serves at every cut.
+static void test_sliding_window_full_size_reader(common_params params, const fs::path & work) {
+    const auto model = work / "sliding-window-marker.gguf";
+    write_model(model, true, false, width, 0, true, true);
+    params.model.path = model.string();
+    params.cache_ram_mib = 4;
+    params.cache_type_k = params.cache_type_v = GGML_TYPE_F32;
+    params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    // the marker at positions 112 to 127, before the sliding rows that the writer without full-size windows keeps
+    llama_tokens saved_prompt(prompt_tokens, base_token);
+    std::fill(saved_prompt.begin() + 112, saved_prompt.begin() + 128, adapted_token);
+    const auto written = [&](bool full) { return work / (full ? "window-full-size" : "window-compact"); };
+    for (bool full : { false, true }) {
+        auto writer = params;
+        writer.swa_full = full;
+        writer.cache_disk = written(full).string();
+        write_completed_prefix(writer, {}, saved_prompt);
+        require(has_prompt_file(writer.cache_disk), "expected the writer's state");
+    }
+    auto reader = params;
+    reader.swa_full = true;
+    reader.cache_disk.clear();
+    // the cut, and whether the prompt goes on past it or ends there, its last token evaluated again
+    const std::pair<int, bool> cuts[] = { {129, true}, {142, true}, {143, true}, {144, true}, {143, false}, {144, false} };
+    int n_reader = 0;
+    for (const auto & [cut, goes_on] : cuts) {
+        llama_tokens prompt(saved_prompt.begin(), saved_prompt.begin() + cut);
+        if (goes_on) {
+            prompt.push_back(3 + 'y');
+        }
+        const int pos_eval = goes_on ? cut : cut - 1;
+        const auto cold = [&] {
+            server_run server(reader);
+            return first_token(server.server, prompt, {}, -1, 0, 0);
+        }();
+        for (bool full : { false, true }) {
+            // the window of the token at pos_eval: the 16 positions up to it
+            const bool lacks_rows = !full && pos_eval - 15 < 128;
+            for (bool imported : { true, false }) {
+                // a copy for each reader, which may save states of its own
+                const auto copy = work / ("window-reader-" + std::to_string(n_reader++));
+                fs::copy(written(full), copy);
+                auto config = reader;
+                config.prefix_cache = imported ? copy.string() : "";
+                config.cache_disk = imported ? "" : copy.string();
+                server_run server(config);
+                const auto actual = first_token(server.server, prompt, {}, -1, 0, 0);
+                if (actual.cached != (lacks_rows ? 0 : pos_eval)) {
+                    std::fprintf(stderr, "cut %d%s, %s writer, %s\n", cut, goes_on ? " and a token" : "",
+                                 full ? "full-size" : "compact", imported ? "prefix cache" : "own cache");
+                }
+                require_completion(actual, lacks_rows ? 0 : pos_eval, cold.token,
+                                   "a full-size reader reused a state without the rows of its window, or not one with them");
+                require_cold_probability(actual, cold);
+            }
+        }
+    }
+}
+
 static void test_sliding_window(common_params params, const fs::path & work) {
     const auto model = work / "sliding-window.gguf";
     write_model(model, true);
@@ -1115,6 +1181,7 @@ static void test_sliding_window(common_params params, const fs::path & work) {
     test_sliding_window_wake_control_vector(params, work);
     test_sliding_window_wake_attention(params, work);
     test_sliding_window_wake_idle_slots(params, work);
+    test_sliding_window_full_size_reader(params, work);
 
     // The attention type of a request: only a causal slot is cut back to the tokens a prompt shares with it, and only
     // a causal server keeps a state.

@@ -993,6 +993,8 @@ private:
     // set to llama_model_n_swa(model)
     // if swa_full is enabled, this is set to 0 to simulate a non-SWA model
     int32_t n_swa;
+    // the model's window, with swa_full too: the rows a restored state needs (update_slots)
+    int32_t n_swa_model = 0;
 
     // slots / clients
     std::vector<server_slot> slots;
@@ -1352,7 +1354,8 @@ private:
             }
         }
 
-        n_swa = params_base.swa_full ? 0 : llama_model_n_swa(model);
+        n_swa_model = llama_model_n_swa(model);
+        n_swa = params_base.swa_full ? 0 : n_swa_model;
 
         // Necessary similarity of prompt for slot selection
         slot_prompt_similarity = params_base.slot_prompt_similarity;
@@ -3399,7 +3402,26 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // A full-size window (--swa-full) holds every row this server computes, but a state
+                                // restored from a cached prompt may be of a writer that kept only the model's window.
+                                // The first token evaluated, at pos_eval, attends in a sliding layer to the positions
+                                // after pos_eval - n_swa_model (llama_hparams::is_masked_swa), back to pos_min_need,
+                                // and the state holds those from pos_min on.
+                                bool rows_missing = false;
+                                if (n_swa == 0 && n_swa_model > 0) {
+                                    // [TAG_PROMPT_LOGITS] evaluates the last prompt token again
+                                    const int32_t n_eval = n_past == slot.task->n_tokens() ? n_past - 1 : n_past;
+                                    const llama_pos pos_eval = slot.prompt.tokens.pos_next(n_eval);
+                                    const llama_pos pos_min_need = std::max(0, pos_eval - n_swa_model + 1);
+                                    rows_missing = pos_min > pos_min_need;
+                                }
+
+                                if (rows_missing) {
+                                    SLT_WRN(slot, "n_past = %d, seq_id = %d, pos_min = %d: the restored state lacks rows of the model's window (%d)\n", n_past, slot.id, pos_min, n_swa_model);
+                                    SLT_WRN(slot, "%s", "forcing full prompt re-processing\n");
+                                    pos_next = 0;
+                                    n_past = 0;
+                                } else if (pos_min >= pos_min_thold) {
                                     SLT_WRN(slot, "n_past = %d, slot.prompt.tokens.size() = %d, seq_id = %d, pos_min = %d, n_swa = %d\n", n_past, (int) slot.prompt.tokens.size(), slot.id, pos_min, n_swa);
 
                                     // search for a context checkpoint

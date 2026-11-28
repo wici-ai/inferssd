@@ -78,6 +78,11 @@ the files of its model and settings that another build wrote, files that no serv
 writer holds any more. `--cache-disk-mib` bounds the files of a server's fingerprint that it knows of, those it found
 on opening the directory and those it wrote since: a shared directory holds up to the sum of its servers' limits.
 
+A server with full-size sliding windows (`--swa-full`) restores the state of a writer without them too, of the same
+fingerprint, and that state holds the sliding layers' rows of the window before its end only. Where a prompt parts from
+such a state at a token whose window reaches back past those rows, the server evaluates the prompt anew; where the
+state holds the whole window, it continues from it.
+
 A server whose attention is not causal (`--attention non-causal`, or a model or metadata override that turns causal
 attention off) takes no prefix cache and keeps no prompt cache or context checkpoints: each row of its state depends on
 every token of the batch that computed it, the tokens after the row too, so the state serves no other request. Its
