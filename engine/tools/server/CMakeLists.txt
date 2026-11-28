@@ -85,10 +85,6 @@ if (LLAMA_BUILD_WEBUI)
 else()
 endif()
 
-if (WIN32)
-    list(APPEND TARGET_SRCS windows-utf8.manifest)
-endif()
-
 add_executable(${TARGET} ${TARGET_SRCS})
 install(TARGETS ${TARGET} RUNTIME)
 
