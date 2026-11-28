@@ -59,6 +59,8 @@ bool common_speculative_mtp_step(llama_context * ctx, llama_batch & batch, std::
 // what a change costs once (another graph, other caches) is no measure of a length that keeps running. A burst
 // measures its length anew, its steps replacing what the length had: a length probed again is compared by its latest
 // burst with the recent steps of the best one, not by a mean that reaches back to its first burst on a cold cache.
+// The lengths it chooses from are n_min .. n_max: a minimum equal to the maximum fixes the length, so the drafts do
+// not depend on how long the steps took.
 struct common_speculative_adapt {
     static constexpr int    burst       = 4;
     static constexpr int    probe_every = 32;
@@ -76,8 +78,8 @@ struct common_speculative_adapt {
     int    pending = -1;       // a length whose head proposed nothing: the step decodes without drafts after its draft
     double pending_ms = 0.0;
 
-    // the draft length for a step that may draft up to n_max tokens
-    int choose(int n_max);
+    // the draft length for a step that drafts from n_min to n_max tokens
+    int choose(int n_min, int n_max);
 
     // a step decoded without drafts in ms: length 0's, or the length whose head proposed nothing (on_empty)
     void on_plain(double ms);
@@ -90,7 +92,7 @@ struct common_speculative_adapt {
 
     // the tokens a second length n gave, 0 while unmeasured
     double rate_of(int n) const;
-    int    best(int n_max) const;
+    int    best(int n_min, int n_max) const;
 };
 
 struct common_speculative_deleter {

@@ -566,7 +566,7 @@ struct server_slot {
     void update_batch(llama_batch & batch) {
         int n_draft_max = get_n_draft_max();
         if (n_draft_max > 0 && spec_adaptive && spec_draft.empty()) {
-            n_draft_max = spec_adapt.choose(n_draft_max);
+            n_draft_max = spec_adapt.choose(common_speculative_n_min(spec.get(), task->params.speculative), n_draft_max);
         }
         spec_draft_len = n_draft_max;
         if (n_draft_max > 0) {
@@ -3915,6 +3915,8 @@ private:
                 size_t spec_accepted_argmax_checked = 0;
                 size_t spec_accepted_argmax_matched = 0;
                 double spec_recompute_ms = 0.0;
+                // the probabilities of the kept tokens, when the request asks for them
+                std::vector<completion_token_output> spec_probs;
 
                 // verify and try to accept the draft
                 {
@@ -3935,7 +3937,29 @@ private:
                             logits, std::max_element(logits, logits + n_vocab)));
                     }
 
-                    auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx, slot.spec_i_batch, slot.spec_draft);
+                    // The rows are sampled in order, as common_sampler_sample_and_accept_n does, up to the first that
+                    // rejects its draft token. A request that asks for probabilities gets each kept token's from its
+                    // own row, as a step without drafts reports them: taken as the row is sampled, before the sampler
+                    // samples the next row and before a recomputation decodes again.
+                    const bool spec_with_probs = slot.task->params.sampling.n_probs > 0;
+                    llama_tokens accepted;
+                    accepted.reserve(slot.spec_i_batch.size());
+                    for (size_t i = 0; i < slot.spec_i_batch.size(); ++i) {
+                        const llama_token id = common_sampler_sample(slot.smpl.get(), slot.ctx, slot.spec_i_batch[i]);
+                        common_sampler_accept(slot.smpl.get(), id, true);
+                        accepted.push_back(id);
+                        if (spec_with_probs) {
+                            completion_token_output row;
+                            row.tok = id;
+                            row.prob = 1.0f;
+                            populate_token_probs(slot, row, slot.task->params.post_sampling_probs, params_base.special,
+                                    slot.spec_i_batch[i]);
+                            spec_probs.push_back(std::move(row));
+                        }
+                        if (i == n_draft || slot.spec_draft[i] != id) {
+                            break;
+                        }
+                    }
                     slot.spec_i_batch.clear();
 
                     SLT_DBG(slot, "%s: n_draft=%zu, accepted=%zu\n", __func__, slot.spec_draft.size(), accepted.size());
@@ -4002,7 +4026,6 @@ private:
                 slot.t_spec_step_start_us = 0;
                 slot.t_spec_draft_ms = 0.0;
 
-                slot.n_decoded += ids.size();
                 slot.t_token_generation = std::max<int64_t>(1, t_current - slot.t_start_generation) / 1e3;
 
                 // update how many tokens out of those tested were accepted
@@ -4023,13 +4046,17 @@ private:
 
                 for (size_t i = 0; i < ids.size(); ++i) {
                     completion_token_output result;
+                    result.prob = 1.0f;
+                    if (i < spec_probs.size()) {
+                        result = std::move(spec_probs[i]);
+                    }
 
                     result.tok          = ids[i];
                     result.text_to_send = common_token_to_piece(slot.ctx, result.tok, accept_special_token(slot, result.tok));
-                    result.prob         = 1.0f; // set later
 
-                    // TODO: set result.probs
-
+                    // counted as it is sent, as a step without drafts counts its token: the limit stops the block at
+                    // its last token, not at its first
+                    slot.n_decoded += 1;
                     if (!process_token(result, slot)) {
                         slot.print_timings();
                         send_final_response(slot);
